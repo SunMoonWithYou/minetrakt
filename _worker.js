@@ -5,10 +5,11 @@
  *
  *  功能概览：
  *    · Trakt OAuth 设备码登录（PKCE 流程）
- *    · 首页流式分批注入（继续观看 / 追剧日历 / 观看记录）
+ *    · 首页流式分批注入（继续观看 / 待看列表 / 追剧日历 / 观看记录）
  *    · 详情 modal（电影 / 剧集，含演职员、季集、相关推荐）
  *    · TMDB 异步富化（海报 / 简介 / 评分）
- *    · Infuse 8 单集跳转 + Trakt 单集跳转
+ *    · Infuse 跳转（电影 / 剧集下一集）+ Trakt 单集跳转
+ *    · 待看列表：分页 / 排序 / 移除
  *    · PWA（manifest + Service Worker + 启动动画）
  *
  *  Cloudflare 绑定：
@@ -22,12 +23,16 @@
  *    4. 桌面端 UA 不注册 SW，且主动注销旧 SW + 清缓存；移动端才注册
  *    5. TMDB 富化由 /api/enrich 异步补齐，服务端只用 Trakt 数据同步渲染卡片
  *    6. 客户端富化用 Promise cache 去重：同一 key 的卡片共享同一请求结果
- *    7. /sync/watched/shows 加 extended=full，首屏就能拿到海报
+ *    7. /sync/watched/shows 换成 /users/me/watched/shows?limit=N，首屏就能拿到海报且不会被全量拖垮
  *    8. Infuse 8 格式：infuse://series/{tmdb_id}-{season}-{episode}
  *       并在 next_episode 为空时从已看进度反推下一集
  *    9. KV 读写优化：L1 内存缓存 + singleFlight 去重 + 边缘 cacheTtl + 后台写入
  *   10. 主题配色适配 Logo：深酒红 / 暗红黑渐变
  *   11. 顶部视觉：black-translucent 状态栏 + tabs 完全透明
+ *   12. 电影已看状态改用 /sync/history/movies/{id}?limit=1 单条查询，避免全量超时
+ *   13. 待看列表：服务端合并 movies+shows，支持 added/released/title/rank 排序
+ *       前端支持懒加载 + 移除（POST /api/watchlist/remove）
+ *   14. 相关推荐卡片的 detailType 必须是 movie/show，不能是 episode（否则服务端 400）
  */
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -77,6 +82,10 @@ const PAGE_SIZE = 12;
 const TMDB_KV_TTL = 86400 * 7;
 /** 首页「继续观看」最多拉取的剧集数（用于批量查进度） */
 const MAX_RECENT_SHOWS = 15;
+/** 首页「继续观看」拉取的已看剧集数量（用于查进度） */
+const RECENT_SHOWS_LIMIT = 15;
+/** 待看列表每页条数（懒加载 / 首屏共用） */
+const WATCHLIST_PAGE_SIZE = 30;
 
 /* ═══════════════════════════════════════════════════════════════════════
  *  通用工具：带超时的 fetch
@@ -321,6 +330,7 @@ export default {
     if (path === '/api/season') return handleSeason(request, env, ctx);
     if (path === '/api/detail') return handleApiDetail(request, env, ctx);
     if (path === '/api/enrich' && request.method === 'POST') return handleEnrich(request, env, ctx);
+    if (path === '/api/watchlist/remove' && request.method === 'POST') return handleWatchlistRemove(request, env);
 
     // PWA 静态资源
     if (path === '/favicon.ico') return handleFavicon();
@@ -346,7 +356,7 @@ function handleManifest() {
   const manifest = {
     name: APP_NAME,
     short_name: APP_SHORT_NAME,
-    description: '继续观看 · 追剧日历 · 观看记录',
+    description: '继续观看 · 待看列表 · 追剧日历 · 观看记录',
     start_url: '/',
     scope: '/',
     display: 'standalone',
@@ -651,7 +661,8 @@ function tmdbPoster(path, size = 'w342') {
  * ═══════════════════════════════════════════════════════════════════════ */
 
 /**
- * 从 Trakt 的 history / playback / calendar 条目中提取卡片所需的通用字段。
+ * 从 Trakt 的 history / playback / calendar / watchlist 条目中
+ * 提取卡片所需的通用字段。
  *
  * 返回结构：
  *   {
@@ -676,6 +687,7 @@ function buildBaseItem(traktItem) {
   if (!kind) {
     if (traktItem.show && traktItem.episode) kind = 'episode';
     else if (traktItem.movie) kind = 'movie';
+    else if (traktItem.show) kind = 'show';
   }
 
   if (kind === 'movie' || traktItem.movie) {
@@ -694,14 +706,19 @@ function buildBaseItem(traktItem) {
     if (m.ids?.tmdb)      base.enrichKey = 'movie:tmdb:' + m.ids.tmdb;
     else if (m.ids?.imdb) base.enrichKey = 'movie:imdb:' + m.ids.imdb;
     else if (m.title)     base.enrichKey = 'movie:title:' + m.title + ':' + (m.year || '');
-  } else if (kind === 'episode' || (traktItem.show && traktItem.episode)) {
+  } else if (kind === 'episode' || kind === 'show' ||
+             (traktItem.show && traktItem.episode)) {
+    // kind === 'show' 时（比如 watchlist 条目）没有 episode 字段，
+    // 用年份作为副标题，其余逻辑与 episode 一致。
     const e = traktItem.episode || {}, s = traktItem.show || {};
     base.tag = '剧集';
     base.tagClass = 'episode';
     base.title = s.title || '';
     base.overview = s.overview || '';
     base.poster = posterOfTrakt(s);
-    base.line1 = `S${pad(e.season)}E${pad(e.number)}${e.title ? ' · ' + e.title : ''}`;
+    base.line1 = (e.season != null && e.number != null)
+      ? `S${pad(e.season)}E${pad(e.number)}${e.title ? ' · ' + e.title : ''}`
+      : (s.year ? String(s.year) : '');
     base.detailType = 'show';
     base.detailId = s.ids?.trakt ? String(s.ids.trakt) : null;
     base.enrichTitle = s.title || '';
@@ -864,6 +881,123 @@ async function handleEnrich(request, env, ctx) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+ *  待看列表：拉取 + 移除
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/**
+ * 拉取用户待看列表（movies + shows 合并）。
+ *
+ * /sync/watchlist/movies、/sync/watchlist/shows 都不分页，
+ * 一次拿全部后由服务端合并 + 切片返回。
+ *
+ * sort 支持 added / released / title / rank：
+ *   - added    ：按加入 watchlist 的时间倒序（默认）
+ *   - released ：按发行年份倒序
+ *   - title    ：按标题字母升序
+ *   - rank     ：Trakt 的热度排序，等同 added（此处做本地兜底）
+ *
+ * 两个端点各自排序后，这里再本地排一次保证全局有序。
+ *
+ * @param {object} headers  Trakt 请求头
+ * @param {string} sort     added | released | title | rank
+ * @returns {Promise<Array>}  合并排序后的原始 Trakt 条目数组
+ */
+async function getWatchlist(headers, sort = 'added') {
+  const qs = `extended=full&images=poster&sort=${encodeURIComponent(sort)}`;
+  const [movies, shows] = await Promise.all([
+    traktGet(`${TRAKT_API}/sync/watchlist/movies?${qs}`, headers),
+    traktGet(`${TRAKT_API}/sync/watchlist/shows?${qs}`, headers)
+  ]);
+
+  const merged = [];
+  if (Array.isArray(movies)) for (const x of movies) merged.push(x);
+  if (Array.isArray(shows))  for (const x of shows)  merged.push(x);
+
+  switch (sort) {
+    case 'title':
+      merged.sort((a, b) =>
+        String(a.movie?.title || a.show?.title || '').toLowerCase()
+          .localeCompare(String(b.movie?.title || b.show?.title || '').toLowerCase()));
+      break;
+    case 'released':
+      merged.sort((a, b) =>
+        (b.movie?.year || b.show?.year || 0) - (a.movie?.year || a.show?.year || 0));
+      break;
+    case 'rank':
+    case 'added':
+    default:
+      merged.sort((a, b) => (b.listed_at || '').localeCompare(a.listed_at || ''));
+  }
+
+  return merged;
+}
+
+/**
+ * 从待看列表移除一条（电影 / 剧集）。
+ * 前端 POST { type: 'movie'|'show', id: '<trakt id>' }。
+ *
+ * 说明：
+ *   - Trakt 的 /sync/watchlist/remove 支持批量，这里一次只发一条。
+ *   - 成功后返回 { ok: true }，前端据此做卡片淡出动画。
+ *   - 如果期间 access_token 被刷新，会把新 Cookie 一并返回。
+ */
+async function handleWatchlistRemove(request, env) {
+  const cookieAuth = readAuth(request);
+  if (!cookieAuth) return Response.json({ error: 'unauthorized' }, { status: 401 });
+  const auth = await refreshIfNeeded(cookieAuth, env);
+  if (!auth) return Response.json({ error: 'unauthorized' }, { status: 401 });
+  const needsCookieUpdate = auth.access_token !== cookieAuth.access_token;
+
+  let body;
+  try { body = await request.json(); } catch {
+    return Response.json({ error: 'bad body' }, { status: 400 });
+  }
+  const type = body && body.type;
+  const id = body && body.id;
+  if ((type !== 'movie' && type !== 'show') || !id) {
+    return Response.json({ error: 'bad params' }, { status: 400 });
+  }
+
+  const traktId = Number(id);
+  if (!Number.isFinite(traktId) || traktId <= 0) {
+    return Response.json({ error: 'bad id' }, { status: 400 });
+  }
+
+  const headers = makeTraktHeaders(env, auth);
+  const payload = type === 'movie'
+    ? { movies: [{ ids: { trakt: traktId } }] }
+    : { shows:  [{ ids: { trakt: traktId } }] };
+
+  let r;
+  try {
+    r = await fetchT(`${TRAKT_API}/sync/watchlist/remove`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    }, 10000);
+  } catch (e) {
+    return Response.json({ error: String(e) }, { status: 502 });
+  }
+
+  const respHeaders = { 'Content-Type': 'application/json; charset=utf-8' };
+  if (needsCookieUpdate) respHeaders['Set-Cookie'] = buildCookie(auth);
+
+  if (!r.ok) {
+    const text = await r.text().catch(() => '');
+    return new Response(JSON.stringify({ error: 'HTTP ' + r.status, detail: text }), {
+      status: r.status,
+      headers: respHeaders
+    });
+  }
+
+  const result = await r.json().catch(() => null);
+  return new Response(JSON.stringify({ ok: true, result }), {
+    status: 200,
+    headers: respHeaders
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
  *  首页 —— 流式分批注入
  *  ─────────────────────────────────────────────────────────────────────
  *  流程：
@@ -974,7 +1108,7 @@ function splashHideScript() {
 
 /**
  * 首页数据并发拉取 + 分块注入。
- * 每个 pane（继续观看 / 日历 / 历史）都并发：
+ * 每个 pane（继续观看 / 待看列表 / 日历 / 历史）都并发：
  *   · Trakt API 数据 → 渲染 HTML 字符串
  *   · 通过 <script> 注入 innerHTML
  *
@@ -1016,14 +1150,18 @@ async function streamHomeData(env, auth, write) {
     }
   };
 
-  // 6 个 API 并发拉取
-  const [profile, history, playback, watchedShows, calendar, stats] = await Promise.all([
+  // ── 并发拉取首屏数据 ──
+  // 注意：
+  //   · /sync/watched/shows 不支持 limit，改用 /users/me/watched/shows
+  //   · watchlist 用 getWatchlist（合并 movies + shows），失败降级为空数组
+  const [profile, history, playback, watchedShows, calendar, stats, watchlist] = await Promise.all([
     fetchJson(`${TRAKT_API}/users/me`),
     fetchJson(`${TRAKT_API}/users/me/history?limit=${PAGE_SIZE}&page=1&extended=full&images=poster`),
     fetchJson(`${TRAKT_API}/sync/playback?extended=full&images=poster`),
-    fetchJson(`${TRAKT_API}/sync/watched/shows?extended=full&limit=100`),
+    fetchJson(`${TRAKT_API}/users/me/watched/shows?limit=${RECENT_SHOWS_LIMIT}&extended=full&images=poster`),
     fetchJson(`${TRAKT_API}/calendars/my/shows/${today}/30?extended=full&images=poster`),
-    fetchJson(`${TRAKT_API}/users/me/stats`)
+    fetchJson(`${TRAKT_API}/users/me/stats`),
+    getWatchlist(headers, 'added').catch(() => [])
   ]);
 
   // 用户信息 / 统计
@@ -1093,6 +1231,42 @@ async function streamHomeData(env, auth, write) {
     }
   })();
 
+  /* ── 待看列表 pane ──
+   * 结构：工具栏（排序下拉） + grid（卡片） + 加载更多按钮（可选）
+   * 排序切换 / 加载更多 / 移除 三个动作都由前端 JS 触发，
+   * 复用 /api/more?type=watchlist 和 /api/watchlist/remove。 */
+  const pushWatchlist = (async () => {
+    try {
+      const list = Array.isArray(watchlist) ? watchlist : [];
+
+      let inner;
+      if (!list.length) {
+        inner = emptyWatchlistHtml();
+      } else {
+        const firstPage = list.slice(0, WATCHLIST_PAGE_SIZE);
+        const hasMore = list.length > WATCHLIST_PAGE_SIZE;
+        const cardsHtml = renderWatchlistItems(firstPage, env);
+        const moreHtml = hasMore
+          ? `<div class="load-more-wrap"><button class="load-more" data-page="2" data-sort="added" onclick="loadMoreWatchlist(this)">加载更多</button></div>`
+          : '';
+        inner = watchlistToolbarHtml('added')
+              + `<div id="watchlist-grid" class="grid">${cardsHtml}</div>`
+              + moreHtml;
+      }
+
+      await write(`<script>(function(){
+        var el=document.getElementById('watchlist');
+        if(el) el.innerHTML=${jsStr(inner)};
+        if (window.__scheduleEnrich) window.__scheduleEnrich();
+      })();<\/script>`);
+    } catch (e) {
+      await write(`<script>(function(){
+        var el=document.getElementById('watchlist');
+        if(el) el.innerHTML='<div class="empty"><p>待看列表加载失败</p></div>';
+      })();<\/script>`);
+    }
+  })();
+
   /* ── 继续观看 pane ── */
   const pushPlayback = (async () => {
     try {
@@ -1135,14 +1309,15 @@ async function streamHomeData(env, auth, write) {
     }
   })();
 
-  await Promise.all([pushHistory, pushCalendar, pushPlayback]);
+  await Promise.all([pushHistory, pushCalendar, pushPlayback, pushWatchlist]);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
  *  首页骨架 HTML
  *  ─────────────────────────────────────────────────────────────────────
- *  包含：hero、stats、tabs、三个 pane 容器、modal 骨架，
- *  以及所有客户端 JS（tabs 切换、modal 打开关闭、懒加载富化等）。
+ *  包含：hero、stats、tabs、四个 pane 容器、modal 骨架，
+ *  以及所有客户端 JS（tabs 切换、modal 打开关闭、懒加载富化、
+ *  待看列表的排序 / 加载更多 / 移除等）。
  * ═══════════════════════════════════════════════════════════════════════ */
 
 function renderHomeSkeleton(initialDetail) {
@@ -1180,11 +1355,13 @@ function renderHomeSkeleton(initialDetail) {
 
       <nav class="tabs">
         <button class="tab active" data-tab="playback">继续观看</button>
+        <button class="tab" data-tab="watchlist">待看列表</button>
         <button class="tab" data-tab="calendar">追剧日历</button>
         <button class="tab" data-tab="history">观看记录</button>
       </nav>
 
       <section id="playback" class="pane active"><div class="pane-loading"><div class="spinner"></div></div></section>
+      <section id="watchlist" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section>
       <section id="calendar" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section>
       <section id="history" class="pane"><div class="grid"></div><div id="history-more"></div></section>
     </div>
@@ -1202,7 +1379,9 @@ function renderHomeSkeleton(initialDetail) {
     </div>
 
     <script>
-      /* ────────── Tab 切换 ────────── */
+      /* ────────── Tab 切换 ──────────
+       * 四个 tab：继续观看 / 待看列表 / 追剧日历 / 观看记录
+       * 只做 class 切换，不触发数据加载（数据在首屏流式注入时已完成）。 */
       document.querySelectorAll('.tab').forEach(t => {
         t.addEventListener('click', () => {
           document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
@@ -1212,13 +1391,17 @@ function renderHomeSkeleton(initialDetail) {
         });
       });
 
-      /* ────────── 登出 ────────── */
+      /* ────────── 登出 ──────────
+       * 清空 Cookie 后整页刷新，回到登录页。 */
       async function logout() {
         await fetch('/auth/logout', { method: 'POST' });
         location.reload();
       }
 
-      /* ────────── 历史记录「加载更多」 ────────── */
+      /* ────────── 历史记录「加载更多」 ──────────
+       * 走 /api/more?type=history&page=N，
+       * 返回的是一段 HTML 片段，直接 append 到 #history .grid。
+       * X-Has-More 头告知是否还有下一页。 */
       async function loadMoreHistory(btn) {
         const page = parseInt(btn.dataset.page || '2');
         btn.disabled = true;
@@ -1247,7 +1430,134 @@ function renderHomeSkeleton(initialDetail) {
         }
       }
 
-      /* ────────── 详情 modal ────────── */
+      /* ────────── 待看列表：排序切换 ──────────
+       * 用户在下拉框改排序时触发。
+       * 1) 清空 grid、显示 loading；
+       * 2) 请求 /api/more?type=watchlist&page=1&sort=xxx；
+       * 3) 用返回的 HTML 覆盖 grid，并根据 X-Has-More 决定是否补一个「加载更多」按钮。 */
+      async function onWatchlistSortChange(sort) {
+        const grid = document.getElementById('watchlist-grid');
+        const pane = document.getElementById('watchlist');
+        if (grid) grid.innerHTML = '<div class="pane-loading"><div class="spinner"></div></div>';
+        const oldMore = pane ? pane.querySelector('.load-more-wrap') : null;
+        if (oldMore) oldMore.remove();
+
+        try {
+          const r = await fetch('/api/more?type=watchlist&page=1&sort=' + encodeURIComponent(sort));
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          const htmlText = await r.text();
+          if (grid) {
+            grid.innerHTML = htmlText || emptyWatchlistInner();
+          }
+          const hasMore = r.headers.get('X-Has-More') === 'true';
+          if (hasMore && pane && grid) {
+            const wrap = document.createElement('div');
+            wrap.className = 'load-more-wrap';
+            wrap.innerHTML = '<button class="load-more" data-page="2" data-sort="' +
+              sort + '" onclick="loadMoreWatchlist(this)">加载更多</button>';
+            pane.appendChild(wrap);
+          }
+          if (window.__scheduleEnrich) window.__scheduleEnrich();
+        } catch (e) {
+          if (grid) grid.innerHTML = '<div class="empty"><p>加载失败</p></div>';
+        }
+      }
+
+      /** 待看列表为空时的 innerHTML（前端复用，服务端也有同名版本） */
+      function emptyWatchlistInner() {
+        return '<div class="empty"><p>待看列表是空的</p></div>';
+      }
+
+      /* ────────── 待看列表：加载更多 ──────────
+       * 走 /api/more?type=watchlist&page=N&sort=xxx，
+       * 返回的是一段卡片 HTML，直接 append 到 #watchlist-grid 末尾。
+       * 到底后按钮变「已经到底啦」并禁用。 */
+      async function loadMoreWatchlist(btn) {
+        const page = parseInt(btn.dataset.page || '2');
+        const sort = btn.dataset.sort
+          || (document.getElementById('wl-sort') && document.getElementById('wl-sort').value)
+          || 'added';
+        btn.disabled = true;
+        btn.textContent = '加载中…';
+        try {
+          const r = await fetch('/api/more?type=watchlist&page=' + page
+                              + '&sort=' + encodeURIComponent(sort));
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          const htmlText = await r.text();
+          const grid = document.getElementById('watchlist-grid');
+          if (grid) grid.insertAdjacentHTML('beforeend', htmlText);
+          if (window.__scheduleEnrich) window.__scheduleEnrich();
+
+          const hasMore = r.headers.get('X-Has-More') === 'true';
+          if (hasMore) {
+            btn.dataset.page = page + 1;
+            btn.disabled = false;
+            btn.textContent = '加载更多';
+          } else {
+            btn.textContent = '已经到底啦';
+            btn.disabled = true;
+            btn.style.opacity = '0.5';
+            btn.style.cursor = 'default';
+          }
+        } catch (e) {
+          btn.textContent = '加载失败，点击重试';
+          btn.disabled = false;
+        }
+      }
+
+      /* ────────── 待看列表：移除 ──────────
+       * 用 capture 阶段拦截，避免冒泡到 .item 上的详情打开委托。
+       * 流程：
+       *   1) POST /api/watchlist/remove { type, id }
+       *   2) 成功后卡片淡出 + 从 DOM 移除
+       *   3) 若 grid 空了，显示空状态
+       *   4) 失败恢复按钮状态并 alert 提示 */
+      document.addEventListener('click', async (e) => {
+        const btn = e.target.closest('[data-wl-remove-id]');
+        if (!btn) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (btn.disabled) return;
+
+        const type = btn.dataset.wlRemoveType;
+        const id   = btn.dataset.wlRemoveId;
+        if (!type || !id) return;
+
+        const prevText = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = '…';
+
+        try {
+          const r = await fetch('/api/watchlist/remove', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ type, id })
+          });
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+
+          const card = btn.closest('.item');
+          if (card) {
+            card.style.transition = 'opacity 0.25s ease, transform 0.25s ease';
+            card.style.opacity = '0';
+            card.style.transform = 'scale(0.96)';
+            setTimeout(() => {
+              card.remove();
+              const grid = document.getElementById('watchlist-grid');
+              if (grid && !grid.querySelector('.item')) {
+                grid.innerHTML = emptyWatchlistInner();
+              }
+            }, 260);
+          }
+        } catch (err) {
+          btn.disabled = false;
+          btn.textContent = prevText;
+          alert('移除失败：' + err.message);
+        }
+      }, true);
+
+      /* ────────── 详情 modal ──────────
+       * 用递增 reqId 做竞态保护：只有最新一次请求能写入 DOM。
+       * URL 会同步到 /detail/{type}/{id}，支持直接分享链接。 */
       let modalLoadingId = 0;
 
       async function openDetail(type, id, push = true) {
@@ -1262,7 +1572,6 @@ function renderHomeSkeleton(initialDetail) {
           history.pushState({ detail: true }, '', '/detail/' + type + '/' + id);
         }
 
-        // 用递增 ID 做竞态保护：只有最新的一次请求才写入 DOM
         const reqId = ++modalLoadingId;
         body.innerHTML = '<div class="modal-loading"><div class="spinner"></div></div>';
         body.scrollTop = 0;
@@ -1279,14 +1588,21 @@ function renderHomeSkeleton(initialDetail) {
         }
       }
 
+      /**
+       * 关闭详情。
+       * 若当前 URL 是 pushState 出来的 /detail/xxx，用 history.back() 回退，
+       * 避免每次关闭都往历史栈里塞一条新记录。
+       * 回退会触发 popstate，那里再调用 closeDetail(false) 完成实际的关闭动作。
+       */
       function closeDetail(push = true) {
         const modal = document.getElementById('modal');
         if (!modal) return;
+        if (push && location.pathname.startsWith('/detail/')) {
+          history.back();
+          return;
+        }
         modal.classList.remove('open');
         document.body.style.overflow = '';
-        if (push && location.pathname.startsWith('/detail/')) {
-          history.pushState({}, '', '/');
-        }
       }
 
       // 事件委托：任何带 data-detail-type 的元素点击都打开详情
@@ -1358,7 +1674,9 @@ function renderHomeSkeleton(initialDetail) {
         }
       });
 
-      /* ────────── 详情 modal 预取 ────────── */
+      /* ────────── 详情 modal 预取 ──────────
+       * 移动端 touchstart / 桌面端 mouseover 时提前请求详情接口，
+       * 用户真正点击时就能秒开。用 Set 去重，最多缓存 60 个 key。 */
       const __prefetched = new Set();
       function __prefetchDetail(type, id) {
         if (!type || !id) return;
@@ -1370,12 +1688,10 @@ function renderHomeSkeleton(initialDetail) {
             + '&id=' + encodeURIComponent(id), { cache: 'default' })
           .catch(() => {});
       }
-      // 移动端：touchstart 预取（提前 100~300ms）
       document.addEventListener('touchstart', (e) => {
         const el = e.target.closest('[data-detail-type]');
         if (el) __prefetchDetail(el.dataset.detailType, el.dataset.detailId);
       }, { passive: true, capture: true });
-      // 桌面端：mouseover 预取
       document.addEventListener('mouseover', (e) => {
         const el = e.target.closest('[data-detail-type]');
         if (el) __prefetchDetail(el.dataset.detailType, el.dataset.detailId);
@@ -1383,8 +1699,8 @@ function renderHomeSkeleton(initialDetail) {
 
       /* ══════════════════════ TMDB 异步富化 ══════════════════════
        * 收集所有 [data-enrich-key] 元素 → 批量 POST /api/enrich
-       * → 结果按 key 回填到对应卡片（海报 / 标题 / 简介 / 评分）
-       */
+       * → 结果按 key 回填到对应卡片（海报 / 标题 / 简介 / 评分）。
+       * 同一 key 的多个元素共享同一次请求结果。 */
       let __enrichTimer = null;
       const __enrichPromises = new Map();
 
@@ -1541,7 +1857,10 @@ function renderSplash() {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- *  /api/more —— 观看记录分页加载
+ *  /api/more —— 观看记录 / 待看列表 分页加载
+ *  ─────────────────────────────────────────────────────────────────────
+ *  type=history   ：走 Trakt 原生分页，返回 HTML 片段 + X-Has-More
+ *  type=watchlist ：Trakt 端点不分页，服务端拿全量后按 WATCHLIST_PAGE_SIZE 切片
  * ═══════════════════════════════════════════════════════════════════════ */
 
 async function handleMore(request, env) {
@@ -1557,6 +1876,7 @@ async function handleMore(request, env) {
 
   const headers = makeTraktHeaders(env, auth);
 
+  /* ── 观看记录分页 ── */
   if (type === 'history') {
     let r;
     try {
@@ -1591,6 +1911,31 @@ async function handleMore(request, env) {
     return new Response(bodyHtml, { headers: outHeaders });
   }
 
+  /* ── 待看列表分页 ── */
+  if (type === 'watchlist') {
+    const sort = url.searchParams.get('sort') || 'added';
+    const pageNum = Math.max(1, parseInt(url.searchParams.get('page') || '1', 10) || 1);
+
+    // Trakt watchlist 端点不分页，一次拿全量再切片
+    const merged = await getWatchlist(headers, sort);
+    const start = (pageNum - 1) * WATCHLIST_PAGE_SIZE;
+    const slice = merged.slice(start, start + WATCHLIST_PAGE_SIZE);
+    const hasMore = start + WATCHLIST_PAGE_SIZE < merged.length;
+
+    const bodyHtml = renderWatchlistItems(slice, env);
+
+    const outHeaders = {
+      'Content-Type': 'text/html; charset=utf-8',
+      'X-Has-More': String(hasMore),
+      'X-Page': String(pageNum),
+      'X-Total': String(merged.length)
+    };
+    if (auth.access_token !== cookieAuth.access_token) {
+      outHeaders['Set-Cookie'] = buildCookie(auth);
+    }
+    return new Response(bodyHtml, { headers: outHeaders });
+  }
+
   return new Response('', { status: 400 });
 }
 
@@ -1599,7 +1944,7 @@ async function handleMore(request, env) {
  *  ─────────────────────────────────────────────────────────────────────
  *  同时拉取：
  *    · Trakt 实体（含 extended full + images）
- *    · 用户观看进度（剧集）/ 观看记录（电影）
+ *    · 用户观看进度（剧集）/ 观看记录（电影单条）
  *    · TMDB 详情（含 credits + recommendations）
  *    · 用户当前季的剧集列表（用于首屏展开）
  * ═══════════════════════════════════════════════════════════════════════ */
@@ -1609,6 +1954,7 @@ async function handleApiDetail(request, env, ctx) {
   const type = url.searchParams.get('type');
   const rawId = url.searchParams.get('id');
 
+  // 只接受 movie / show（推荐卡片会传 tmdb-xxx，见下面反查）
   if (!type || !rawId || (type !== 'movie' && type !== 'show')) {
     return new Response('bad params', { status: 400 });
   }
@@ -1620,46 +1966,54 @@ async function handleApiDetail(request, env, ctx) {
   const needsCookieUpdate = auth.access_token !== cookieAuth.access_token;
   const headers = makeTraktHeaders(env, auth);
 
+  /** 统一构造错误响应，顺便把刷新过的 Cookie 带上 */
+  const errResponse = (msg, status) => {
+    const h = { 'Content-Type': 'text/html; charset=utf-8' };
+    if (needsCookieUpdate) h['Set-Cookie'] = buildCookie(auth);
+    return new Response(simpleErr(msg), { status, headers: h });
+  };
+
   // 若 id 是 tmdb-xxx 格式（来自推荐卡片），先反查 Trakt id
   let traktId = rawId;
   if (rawId.startsWith('tmdb-')) {
     const tmdbId = rawId.slice(5);
     const arr = await traktGet(`${TRAKT_API}/search/tmdb/${tmdbId}?type=${type}`, headers);
     if (!Array.isArray(arr) || !arr.length) {
-      return new Response(simpleErr('找不到对应条目'), {
-        status: 404, headers: { 'Content-Type': 'text/html; charset=utf-8' }
-      });
+      return errResponse('找不到对应条目', 404);
     }
     const key = type === 'movie' ? 'movie' : 'show';
     traktId = arr[0][key]?.ids?.trakt;
     if (!traktId) {
-      return new Response(simpleErr('找不到对应条目'), {
-        status: 404, headers: { 'Content-Type': 'text/html; charset=utf-8' }
-      });
+      return errResponse('找不到对应条目', 404);
     }
   }
 
-  // 并发拉取 Trakt 实体 / 进度 / 已看电影
-  const [entity, userProgress, watchedMovies] = await Promise.all([
+  // 并发拉取：Trakt 实体 / 用户进度 / 电影观看记录
+  // 电影不再拉 /sync/watched/movies（全量，大账号会超时），
+  // 改为按当前电影 id 拉单条 history，limit=1。
+  const [entity, userProgress, movieHistory] = await Promise.all([
     traktGet(`${TRAKT_API}/${type}s/${traktId}?extended=full,images`, headers),
     type === 'show'
       ? traktGet(`${TRAKT_API}/shows/${traktId}/progress/watched?hidden=false&specials=false`, headers)
       : Promise.resolve(null),
     type === 'movie'
-      ? traktGet(`${TRAKT_API}/sync/watched/movies`, headers)
+      ? traktGet(`${TRAKT_API}/sync/history/movies/${traktId}?limit=1`, headers)
       : Promise.resolve(null)
   ]);
 
   if (!entity || entity.__error) {
-    return new Response(simpleErr('无法加载详情：' + (entity?.__error || '未知')), {
-      status: 502, headers: { 'Content-Type': 'text/html; charset=utf-8' }
-    });
+    return errResponse('无法加载详情：' + (entity?.__error || '未知'), 502);
   }
 
-  // 电影：在已看电影列表里找当前这条
+  // 电影：history 返回数组，第一项就是最近一次观看
   let movieWatched = null;
-  if (Array.isArray(watchedMovies)) {
-    movieWatched = watchedMovies.find(x => x.movie?.ids?.trakt === entity.ids?.trakt) || null;
+  if (Array.isArray(movieHistory) && movieHistory.length) {
+    const h = movieHistory[0];
+    movieWatched = {
+      last_watched_at: h.watched_at,
+      // 单条 history 拿不到总播放次数，用 null 让 UI 只显示时间
+      plays: null
+    };
   }
 
   // 剧集：猜测用户当前正在看的季（用于默认展开）
@@ -1750,9 +2104,10 @@ async function handleSeason(request, env, ctx) {
 
   const bodyHtml = renderSeasonEpisodes(seasonProgress, seasonData, seasonNum, slug);
 
+  // 前端只加载一次（data-loaded 标记），浏览器缓存没什么意义，直接 no-store
   const outHeaders = {
     'Content-Type': 'text/html; charset=utf-8',
-    'Cache-Control': 'private, max-age=300'
+    'Cache-Control': 'no-store'
   };
   if (needsCookieUpdate) outHeaders['Set-Cookie'] = buildCookie(auth);
   return new Response(bodyHtml, { headers: outHeaders });
@@ -1760,6 +2115,12 @@ async function handleSeason(request, env, ctx) {
 
 /* ═══════════════════════════════════════════════════════════════════════
  *  登录页
+ *  ─────────────────────────────────────────────────────────────────────
+ *  设备码流程：
+ *    ① GET /auth/device 拿 user_code + state
+ *    ② 展示二维码 + user_code 让用户去 trakt.tv/activate 授权
+ *    ③ 每 interval 秒 POST /auth/poll 轮询
+ *    ④ 收到 200 → 刷新页面（此时已有 Cookie）
  * ═══════════════════════════════════════════════════════════════════════ */
 
 function renderLoginPage() {
@@ -1773,19 +2134,13 @@ function renderLoginPage() {
           </svg>
         </div>
         <h1 class="login-title">Trakt</h1>
-        <p class="login-sub">继续观看 · 追剧日历 · 观看记录</p>
+        <p class="login-sub">继续观看 · 待看列表 · 追剧日历 · 观看记录</p>
         <div id="login-area" class="login-area">
           <button class="btn-primary" onclick="startLogin()">使用 Trakt 登录</button>
         </div>
       </div>
     </div>
     <script>
-      /* 设备码流程：
-       *   ① GET /auth/device 拿 user_code + state
-       *   ② 展示二维码 + user_code 让用户去 trakt.tv/activate 授权
-       *   ③ 每 interval 秒 POST /auth/poll 轮询
-       *   ④ 收到 200 → 刷新页面（此时已有 Cookie）
-       */
       async function startLogin() {
         const area = document.getElementById('login-area');
         area.innerHTML = '<div class="spinner"></div>';
@@ -1896,11 +2251,20 @@ function posterOfTrakt(obj) {
 /**
  * 生成单张卡片 HTML。
  * 若传入 detailType + detailId，卡片整体可点击打开 modal；
- * 若传入 enrichKey，卡片会被客户端富化逻辑补齐海报/简介/评分。
+ * 若传入 enrichKey，卡片会被客户端富化逻辑补齐海报/简介/评分；
+ * 若传入 removeType + removeId，卡片右上角会有一个「×」移除按钮
+ * （目前只在待看列表使用）。
  */
 function mediaItem({ poster, tag, tagClass, title, overview, line1, line2, rating, pct, delay,
-                     detailType, detailId, enrichKey, enrichTitle, enrichYear }) {
+                     detailType, detailId, enrichKey, enrichTitle, enrichYear,
+                     removeType, removeId }) {
   const style = delay != null ? ` style="animation-delay:${delay}ms"` : '';
+  const removeHtml = (removeType && removeId)
+    ? `<button class="wl-remove" type="button"
+              data-wl-remove-type="${esc(removeType)}"
+              data-wl-remove-id="${esc(removeId)}"
+              aria-label="从待看列表移除" title="从待看列表移除">×</button>`
+    : '';
   const bar = pct != null
     ? `<div class="bar"><div class="bar-fill" style="width:${pct}%"></div></div>`
     : '';
@@ -1916,6 +2280,7 @@ function mediaItem({ poster, tag, tagClass, title, overview, line1, line2, ratin
   const clickable = (detailType && detailId) ? ' clickable' : '';
 
   return `<div class="item${clickable}"${dataAttrs}${enrichAttrs}${style}>
+    ${removeHtml}
     <div class="poster">
       ${poster
         ? `<img src="${poster}" loading="lazy" alt="">`
@@ -1955,6 +2320,72 @@ function renderHistoryPage(items, env, isFragment = false) {
       enrichKey: e.enrichKey, enrichTitle: e.enrichTitle, enrichYear: e.enrichYear
     });
   }).join('');
+}
+
+/**
+ * 待看列表排序工具栏。
+ * 4 个排序选项：added / released / title / rank。
+ * onchange 会调用全局的 onWatchlistSortChange（骨架 script 里定义）。
+ */
+function watchlistToolbarHtml(currentSort) {
+  const opts = [
+    ['added',    '按添加时间'],
+    ['released', '按发行年份'],
+    ['title',    '按标题'],
+    ['rank',     '按热度']
+  ];
+  const options = opts.map(([v, t]) =>
+    `<option value="${v}"${v === currentSort ? ' selected' : ''}>${t}</option>`
+  ).join('');
+  return `<div class="wl-toolbar">
+    <label class="wl-sort-label">排序
+      <select id="wl-sort" class="wl-sort" onchange="onWatchlistSortChange(this.value)">
+        ${options}
+      </select>
+    </label>
+  </div>`;
+}
+
+/** 待看列表为空时的提示（服务端渲染版） */
+function emptyWatchlistHtml() {
+  return `<div class="empty">
+    <svg viewBox="0 0 24 24" width="56" height="56" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.25">
+      <circle cx="12" cy="12" r="10"/><path d="M12 8v8M8 12h8"/>
+    </svg>
+    <p>待看列表是空的</p>
+    <p style="font-size:0.82rem;color:#7a6266;margin-top:10px;line-height:1.6;text-align:center">
+      去 Trakt 上把想看的电影 / 剧集加入 watchlist，这里就会显示
+    </p>
+  </div>`;
+}
+
+/**
+ * 渲染待看列表卡片串（不带 grid 包裹）。
+ * 会被以下三处复用：
+ *   · 首屏 pushWatchlist
+ *   · /api/more?type=watchlist 返回的 HTML 片段
+ *   · 排序切换后重新请求的第一页
+ */
+function renderWatchlistItems(items, env) {
+  if (!Array.isArray(items) || !items.length) return '';
+  return items.map((item, i) => {
+    const e = buildBaseItem(item);
+    if (!e.title || !e.detailId) return '';
+    const when = item.listed_at ? '添加于 ' + fmtRelative(item.listed_at) : '';
+    const delay = Math.min(i, 24) * 20;
+    // 从条目结构判断是电影还是剧集，用于移除接口的 type 参数
+    const removeType = item.movie ? 'movie' : (item.show ? 'show' : null);
+    const removeId = e.detailId;
+
+    return mediaItem({
+      poster: e.poster, tag: e.tag, tagClass: e.tagClass,
+      title: e.title, overview: e.overview,
+      line1: e.line1, line2: when, rating: e.rating, delay,
+      detailType: e.detailType, detailId: e.detailId,
+      enrichKey: e.enrichKey, enrichTitle: e.enrichTitle, enrichYear: e.enrichYear,
+      removeType, removeId
+    });
+  }).filter(Boolean).join('');
 }
 
 /**
@@ -2068,6 +2499,9 @@ function renderCalendarPage(calendar, env) {
   const out = [];
 
   for (const [day, items] of groups.entries()) {
+    // 同一天内按播出时间升序，Trakt 返回顺序不保证
+    items.sort((a, b) => (a.first_aired || '').localeCompare(b.first_aired || ''));
+
     const d = new Date(day + 'T00:00:00Z');
     const wd = ['周日','周一','周二','周三','周四','周五','周六'][d.getUTCDay()];
     const isToday = day === today;
@@ -2148,11 +2582,12 @@ async function renderDetailFragment(d) {
   let statusHtml = '';
   if (isMovie) {
     if (movieWatched) {
+      const playsPart = movieWatched.plays ? `${movieWatched.plays} 次 · ` : '';
       statusHtml = `<div class="d-status done">
         <div class="d-status-icon">✓</div>
         <div>
           <div class="d-status-title">已观看</div>
-          <div class="d-status-sub">${movieWatched.plays} 次 · ${fmtRelative(movieWatched.last_watched_at)}</div>
+          <div class="d-status-sub">${esc(playsPart + fmtRelative(movieWatched.last_watched_at))}</div>
         </div>
       </div>`;
     } else {
@@ -2243,17 +2678,24 @@ async function renderDetailFragment(d) {
 
   /* ── 演职员（取前 20 位） ── */
   const cast = (credits?.cast || []).slice(0, 20);
-  const castHtml = cast.map(c => `
+  const castHtml = cast.map(c => {
+    // 用 Array.from 取首字符，避免 emoji / 扩展 CJK 被切成半个代理对
+    const initial = Array.from(c.name || '?')[0] || '?';
+    return `
     <div class="cast">
       ${c.profile_path
         ? `<img class="cast-img" src="${TMDB_IMG}/w185${c.profile_path}" loading="lazy" alt="">`
-        : `<div class="cast-img cast-ph">${esc((c.name || '?')[0])}</div>`}
+        : `<div class="cast-img cast-ph">${esc(initial)}</div>`}
       <div class="cast-name">${esc(c.name || '')}</div>
       <div class="cast-role">${esc(c.character || '')}</div>
     </div>
-  `).join('');
+  `;
+  }).join('');
 
-  /* ── 相关推荐（取前 12 条）── */
+  /* ── 相关推荐（取前 12 条） ──
+   * 注意：detailType 必须是 'movie' / 'show'，
+   *       服务端只认这两个值，传 'episode' 会 400。
+   *       detailId 用 tmdb-xxx，由服务端反查 Trakt id。 */
   const recs = (recommendations?.results || []).slice(0, 12);
   const recsHtml = recs.map((r, i) => mediaItem({
     poster: tmdbPoster(r.poster_path),
@@ -2263,8 +2705,7 @@ async function renderDetailFragment(d) {
     line1: (((r.release_date || r.first_air_date || '') + '')).slice(0, 4),
     rating: r.vote_average || null,
     delay: i * 20,
-    detailType: isMovie ? 'movie' : 'episode',
-    // 注意：detailType 用 movie / show，detailId 用 tmdb-xxx 让服务端反查
+    detailType: isMovie ? 'movie' : 'show',
     detailId: 'tmdb-' + r.id
   })).join('');
 
@@ -2288,6 +2729,9 @@ async function renderDetailFragment(d) {
       const bodyContent = isOpen && initialSeasonData
         ? renderSeasonEpisodes(sp, initialSeasonData, s.season_number, showSlug)
         : '';
+      // 只有真正有内容时才写 data-loaded="1"，
+      // 否则首屏没拿到 TMDB 数据时这一季会永远打不开。
+      const loadedAttr = (isOpen && bodyContent) ? ' data-loaded="1"' : '';
       return `<div class="season-item${isOpen ? ' open' : ''}">
         <button class="season-head"
                 data-show="${esc(String(traktId))}"
@@ -2300,7 +2744,7 @@ async function renderDetailFragment(d) {
             <path d="M6 9l6 6 6-6"/>
           </svg>
         </button>
-        <div class="season-body"${isOpen ? ' data-loaded="1"' : ''}>${bodyContent}</div>
+        <div class="season-body"${loadedAttr}>${bodyContent}</div>
       </div>`;
     }).join('')}</div>`;
   }
@@ -2426,17 +2870,36 @@ async function pkceChallenge(verifier) {
   return b64urlEncode(String.fromCharCode(...new Uint8Array(digest)), true);
 }
 
-/** base64url 编码（可选处理二进制字符串） */
+/**
+ * base64url 编码。
+ * - isBinary=true 时，把 str 当成「每字符一个字节」的二进制字符串（PKCE 摘要用）
+ * - 否则按 UTF-8 编码（Cookie / state 用）
+ *
+ * 用 TextEncoder / TextDecoder 替代已废弃的 escape / unescape。
+ */
 function b64urlEncode(str, isBinary) {
-  const raw = isBinary ? str : unescape(encodeURIComponent(str));
-  return btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  let bytes;
+  if (isBinary) {
+    bytes = new Uint8Array(str.length);
+    for (let i = 0; i < str.length; i++) bytes[i] = str.charCodeAt(i) & 0xff;
+  } else {
+    bytes = new TextEncoder().encode(str);
+  }
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 /** base64url 解码（自动处理 UTF-8） */
 function b64urlDecode(str) {
-  const b64 = str.replace(/-/g, '+').replace(/_/g, '/');
-  const raw = atob(b64);
-  try { return decodeURIComponent(escape(raw)); } catch { return raw; }
+  let b64 = str.replace(/-/g, '+').replace(/_/g, '/');
+  // 补回 padding
+  const pad = b64.length % 4;
+  if (pad) b64 += '='.repeat(4 - pad);
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
 }
 
 /** HTML 转义（防止 XSS） */
@@ -2446,9 +2909,15 @@ function esc(s) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
-/** 把字符串安全地嵌入到 <script> 中（JSON 编码 + 转义 `</`） */
+/**
+ * 把字符串安全地嵌入到 <script> 中。
+ * 用 \u003c 转义 `<`，避免 `</script>` 提前闭合。
+ */
 function jsStr(s) {
-  return JSON.stringify(String(s ?? '')).replace(/<\//g, '<\\/');
+  return JSON.stringify(String(s ?? ''))
+    .replace(/</g, '\\u003c')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
 }
 
 /** 两位补零 */
@@ -2458,7 +2927,9 @@ function pad(n) { return String(n ?? 0).padStart(2, '0'); }
 function fmtRelative(iso) {
   if (!iso) return '';
   const d = new Date(iso);
-  const diff = Date.now() - d.getTime();
+  const t = d.getTime();
+  if (isNaN(t)) return '';   // 无效日期直接返回空，避免 "Invalid Date"
+  const diff = Date.now() - t;
   const min = Math.floor(diff / 60000);
   if (min < 1) return '刚刚';
   if (min < 60) return min + ' 分钟前';
@@ -2747,6 +3218,7 @@ function pageHead() {
   .grid { display: flex; flex-direction: column; gap: 10px; }
 
   .item {
+    position: relative;
     display: flex; gap: 14px;
     background: var(--surface); border: 1px solid var(--border);
     border-radius: 16px; padding: 12px;
@@ -2763,6 +3235,69 @@ function pageHead() {
   }
   .item:hover { border-color: #3a1017; background: var(--surface-2); }
   .item.clickable:hover { border-color: #4a141d; }
+
+  /* ── 待看列表卡片的「移除」按钮 ── */
+  .wl-remove {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    background: rgba(0,0,0,0.65);
+    color: #fff;
+    border: 1px solid rgba(255,255,255,0.22);
+    font-size: 1rem;
+    line-height: 1;
+    font-weight: 400;
+    cursor: pointer;
+    z-index: 3;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    font-family: inherit;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    transition: background 0.15s, transform 0.15s, opacity 0.15s;
+    opacity: 0.88;
+  }
+  .wl-remove:hover {
+    background: rgba(185,19,35,0.92);
+    opacity: 1;
+    transform: scale(1.06);
+  }
+  .wl-remove:disabled { opacity: 0.5; cursor: wait; }
+
+  /* ── 待看列表排序工具栏 ── */
+  .wl-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-bottom: 14px;
+  }
+  .wl-sort-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.82rem;
+    color: var(--text-dim);
+  }
+  .wl-sort {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 7px 12px;
+    border-radius: 8px;
+    font-size: 0.82rem;
+    font-family: inherit;
+    cursor: pointer;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .wl-sort:hover { border-color: #3a1017; }
+  .wl-sort:focus { border-color: var(--accent-2); }
 
   /* ── 海报 ── */
   .poster {
@@ -2878,6 +3413,7 @@ function pageHead() {
     .meta { font-size: 0.78rem; margin-top: 4px; }
     .meta.dim { font-size: 0.74rem; margin-top: 3px; }
     .bar { margin-top: 9px; }
+    .wl-remove { top: 10px; right: 10px; width: 30px; height: 30px; }
   }
 
   @media (min-width: 1100px) {
