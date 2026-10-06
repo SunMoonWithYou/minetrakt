@@ -1,4 +1,4 @@
-<img width="1920" height="919" alt="image" src="https://github.com/user-attachments/assets/26fd1e25-c307-415e-bf43-4374670fe44a" /># MineTrakt
+# MineTrakt
 
 在 Cloudflare Workers 上运行的 Trakt 观看记录查看器 —— 继续观看 · 追剧日历 · 观看记录 · Infuse 跳转
 
