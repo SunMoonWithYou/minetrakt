@@ -9,12 +9,25 @@
 
 ---
 
-项目Demo：https://trakt.yx1314.ccwu.cc
+## 💻 项目预览
+
+<details> <summary>Demo</summary>
+
+- 在线地址：https://trakt.yx1314.ccwu.cc
+- 项目功能：
+<a href="https://ibb.co/gFDbkpcH"><img src="https://i.ibb.co/NnLgcPGQ/20261006154814.png" alt="20261006154814" border="0"></a>
+<a href="https://ibb.co/3y6RW3HN"><img src="https://i.ibb.co/4Zv1MqxT/20261006154829.png" alt="20261006154829" border="0"></a>
+<a href="https://ibb.co/nM926DzG"><img src="https://i.ibb.co/b5ThQrz0/20261006154845.png" alt="20261006154845" border="0"></a>
+<a href="https://ibb.co/1YD2xzrZ"><img src="https://i.ibb.co/8nW8VYrM/20261006154859.png" alt="20261006154859" border="0"></a>
+<a href="https://ibb.co/KxzBk1pc"><img src="https://i.ibb.co/k26zfdsV/20261006154911.png" alt="20261006154911" border="0"></a>
+<a href="https://ibb.co/3m4sChW0"><img src="https://i.ibb.co/60rZWsb4/20261006154922.png" alt="20261006154922" border="0"></a>
+
+</details>
 
 ## ✨ 特性
 
 - **继续观看** — 自动合并播放进度与已看记录，推算下一集
-- **追剧日历** — 未来 30 天待播剧集，北京时间分组
+- **追剧日历** — 未来 30 天待播剧集
 - **观看记录** — 全量历史 + 无限滚动
 - **详情 Modal** — 演职员 / 季集折叠 / 相关推荐
 - **TMDB 富化** — 海报 / 简介 / 评分异步补齐
@@ -37,13 +50,6 @@
 ### 2. 部署 Worker
 
 Cloudflare Dashboard → Workers & Pages → Create Worker，把 `worker.js` 全文粘贴后 Save and Deploy。
-
-或用 Wrangler：
-
-```bash
-wrangler login
-wrangler deploy
-```
 
 ### 3. 配置绑定
 
@@ -80,8 +86,6 @@ TMDB_CACHE → 步骤 1 创建的命名空间
 
 ## 🏗️ 架构
 
-text
-
 ```
 浏览器
   ├─ GET /              流式首页（骨架先出，数据后注入）
@@ -92,42 +96,11 @@ text
 
 
 
-**缓存层次**
-
-text
-
-```
-L1 内存(30s) → singleFlight 去重 → KV(边缘 60s) → TMDB 回源
-```
-
-
-
-**SW 策略**
+**SW策略**
 
 - `navigate` / `/api/*` / `/auth/*` 一律不拦截
 - 仅图片 / 图标 / 字体走 cache-first
 - 桌面端主动注销 SW；移动端才注册
-
-------
-
-## 🎨 主题
-
-编辑 `pageHead()` 里的 CSS 变量即可整体换肤：
-
-css
-
-```
-:root {
-  --bg: #0a0102;        /* 页面底色 */
-  --surface: #150507;   /* 卡片 */
-  --border: #300d12;    /* 边框 */
-  --text: #f5f5f7;      /* 主文字 */
-  --accent: #8f0b18;    /* 强调色（深酒红） */
-  --accent-2: #b91323;  /* 悬停色 */
-}
-```
-
-
 
 ------
 
@@ -150,6 +123,7 @@ const KV_EDGE_TTL = 60;          // KV 边缘缓存 60s
 ## ❓ FAQ
 
 <details> <summary>登录卡在「等待授权中」</summary>
+
 
 - 检查 `TRAKT_CLIENT_ID` 是否配置
 - 检查 Trakt 应用 Redirect URI 是否为 `urn:ietf:wg:oauth:2.0:oob`
