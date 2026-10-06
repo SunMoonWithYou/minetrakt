@@ -18,7 +18,7 @@ const ASSET_ORIGINS = {
 };
 const JSON_HEADERS = { 'Content-Type': 'application/json', 'User-Agent': 'TraktViewer/1.0' };
 const COOKIE_NAME = 'trakt_auth', COOKIE_MAX_AGE = 60 * 60 * 24 * 90;
-const PAGE_SIZE = 12, TMDB_KV_TTL = 86400 * 7, OMDB_KV_TTL = 86400 * 7, MAX_RECENT_SHOWS = 10, RECENT_SHOWS_LIMIT = 12, WATCHLIST_PAGE_SIZE = 30, PROGRESS_KV_TTL = 300, PROGRESS_CONCURRENCY = 5, WATCHLIST_KV_TTL = 120;
+const PAGE_SIZE = 12, TMDB_KV_TTL = 86400 * 7, OMDB_KV_TTL = 86400 * 7, WATCHLIST_PAGE_SIZE = 30, PROGRESS_KV_TTL = 300, WATCHLIST_KV_TTL = 120, CALENDAR_KV_TTL = 600;
 const HOME_AUTO_REFRESH_MINUTES = 5;
 
 async function fetchT(url, opts = {}, ms = 8000) { const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), ms); try { return await fetch(url, { ...opts, signal: ctrl.signal }); } finally { clearTimeout(t); } }
@@ -28,10 +28,27 @@ const __kvMem = new Map(), __kvMemExp = new Map(), __kvInflight = new Map();
 function kvMemGet(key) { const exp = __kvMemExp.get(key); if (exp === undefined) return undefined; if (exp < Date.now()) { __kvMem.delete(key); __kvMemExp.delete(key); return undefined; } return __kvMem.get(key); }
 function kvMemSet(key, val) { __kvMem.set(key, val); __kvMemExp.set(key, Date.now() + KV_MEM_TTL); if (__kvMem.size > 3000) { const now = Date.now(); for (const [k, t] of __kvMemExp) if (t < now) { __kvMem.delete(k); __kvMemExp.delete(k); } if (__kvMem.size > 3000) { let i = 0; for (const k of __kvMem.keys()) { __kvMem.delete(k); __kvMemExp.delete(k); if (++i >= 500) break; } } } }
 function singleFlight(key, fn) { const existing = __kvInflight.get(key); if (existing) return existing; const p = (async () => { try { return await fn(); } finally { setTimeout(() => __kvInflight.delete(key), 200); } })(); __kvInflight.set(key, p); return p; }
-async function kvGetJSON(env, key) { if (!env.TMDB_CACHE) return undefined; const mem = kvMemGet(key); if (mem !== undefined) return mem; try { const v = await env.TMDB_CACHE.get(key, { type: 'json', cacheTtl: KV_EDGE_TTL }); const result = (v === null || v === undefined) ? KV_MISS : v; kvMemSet(key, result); return result; } catch { return undefined; } }
-function kvPutJSON(env, ctx, key, payload, ttl) { kvMemSet(key, payload); if (!env.TMDB_CACHE) return; const p = env.TMDB_CACHE.put(key, JSON.stringify(payload), { expirationTtl: ttl }).catch(() => {}); if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(p); }
+async function kvGetJSON(env, key, memOnly) {
+  const mem = kvMemGet(key);
+  if (mem !== undefined) return mem;
+  if (memOnly) return undefined;
+  if (!env.TMDB_CACHE) return undefined;
+  try {
+    const v = await env.TMDB_CACHE.get(key, { type: 'json', cacheTtl: KV_EDGE_TTL });
+    const result = (v === null || v === undefined) ? KV_MISS : v;
+    kvMemSet(key, result);
+    return result;
+  } catch { return undefined; }
+}
+function kvPutJSON(env, ctx, key, payload, ttl, memOnly) {
+  kvMemSet(key, payload);
+  if (memOnly) return;
+  if (!env.TMDB_CACHE) return;
+  const p = env.TMDB_CACHE.put(key, JSON.stringify(payload), { expirationTtl: ttl }).catch(() => {});
+  if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(p);
+}
 function clearCookieHeader() { return `${COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`; }
-function invalidateWatchlistCache() { ['added', 'title', 'released', 'rank'].forEach(s => { const k = `wl:${s}`; __kvMem.delete(k); __kvMemExp.delete(k); }); }
+function invalidateWatchlistCache() { for (const k of [...__kvMem.keys()]) { if (k.startsWith('wl:')) { __kvMem.delete(k); __kvMemExp.delete(k); } } }
 
 const SW_JS_CONTENT = String.raw`/* MineTrakt SW v7 */ const VERSION = 'v7'; const RUNTIME_CACHE = 'trakt-static-' + VERSION; self.addEventListener('install', function(){ self.skipWaiting(); }); self.addEventListener('activate', function(e){ e.waitUntil((async function(){ var keys = await caches.keys(); await Promise.all(keys.filter(function(k){ return k !== RUNTIME_CACHE; }).map(function(k){ return caches.delete(k); })); await self.clients.claim(); })()); }); self.addEventListener('fetch', function(event){ var req = event.request; if (req.method !== 'GET') return; var url; try { url = new URL(req.url); } catch(e){ return; } if (url.origin !== self.location.origin) return; if (url.pathname === '/sw.js') return; if (req.mode === 'navigate') return; if (url.pathname.indexOf('/api/') === 0) return; if (url.pathname.indexOf('/auth/') === 0) return; if (url.pathname === '/app.css' || url.pathname === '/manifest.webmanifest' || url.pathname === '/favicon.ico' || url.pathname.indexOf('/assets/') === 0 || /\.(?:png|jpg|jpeg|svg|webp|ico|woff2?|css)$/i.test(url.pathname)) { event.respondWith(staleWhileRevalidate(req)); } }); async function staleWhileRevalidate(req){ var cache = await caches.open(RUNTIME_CACHE); var cached = await cache.match(req); var network = fetch(req).then(function(r){ if (r && r.ok && r.type !== 'opaque') { cache.put(req, r.clone()).catch(function(){}); } return r; }).catch(function(){ return cached; }); return cached || network; }`;
 
@@ -126,6 +143,15 @@ async function traktGet(url, headers, retries = 2) {
     catch (e) { if (i === retries) return { __error: String(e) }; await new Promise(res => setTimeout(res, 800 * (i + 1))); }
   } return { __error: 'retries exhausted' };
 }
+async function getStableUserId(auth, headers) {
+  const memKey = `uid:${auth.access_token}`;
+  const cached = kvMemGet(memKey);
+  if (cached !== undefined && cached !== KV_MISS) return String(cached);
+  let userId = 'anon';
+  try { const u = await traktGet(`${TRAKT_API}/users/me`, headers, 0); if (u && !u.__error) userId = String((u.ids && u.ids.trakt) || u.username || 'anon'); } catch {}
+  kvMemSet(memKey, userId);
+  return userId;
+}
 
 async function tmdbGet(url) { try { const r = await fetchT(url, {}, 8000); if (!r.ok) return null; return await r.json(); } catch { return null; } }
 async function tmdbDetailCached(path, env, ctx, ttl = 86400) {
@@ -164,7 +190,7 @@ function renderExtRatings(r, opts = {}) {
 }
 
 function buildBaseItem(traktItem) {
-  const base = { tag: '', tagClass: '', title: '', overview: '', poster: null, rating: null, line1: '', detailType: null, detailId: null, enrichKey: null };
+  const base = { tag: '', tagClass: '', title: '', overview: '', poster: null, line1: '', detailType: null, detailId: null, enrichKey: null };
   let kind = traktItem.type; if (!kind) { if (traktItem.show && traktItem.episode) kind = 'episode'; else if (traktItem.movie) kind = 'movie'; else if (traktItem.show) kind = 'show'; }
   if (kind === 'movie' || traktItem.movie) {
     const m = traktItem.movie || {}; base.tag = '电影'; base.tagClass = 'movie'; base.title = m.title || ''; base.overview = m.overview || ''; base.poster = posterOfTrakt(m); base.line1 = m.year ? String(m.year) : ''; base.detailType = 'movie'; base.detailId = m.ids && m.ids.trakt ? String(m.ids.trakt) : null;
@@ -214,16 +240,17 @@ async function fetchWatchlistRaw(headers, sort) {
   }
   return merged;
 }
-async function getWatchlist(headers, sort = 'added', env, ctx) {
+async function getWatchlist(headers, sort = 'added', env, ctx, userKey) {
   if (!env) return fetchWatchlistRaw(headers, sort);
-  const cacheKey = `wl:${sort}`;
+  const prefix = userKey || 'anon';
+  const cacheKey = `wl:${prefix}:${sort}`;
   const mem = kvMemGet(cacheKey);
   if (mem !== undefined && mem !== KV_MISS) return (mem && mem.data) || [];
   return singleFlight(cacheKey, async () => {
-    const cached = await kvGetJSON(env, cacheKey);
+    const cached = await kvGetJSON(env, cacheKey, true);
     if (cached !== undefined && cached !== KV_MISS) return (cached && cached.data) || [];
     const merged = await fetchWatchlistRaw(headers, sort);
-    if (merged.length) kvPutJSON(env, ctx, cacheKey, { data: merged }, WATCHLIST_KV_TTL);
+    if (merged.length) kvPutJSON(env, ctx, cacheKey, { data: merged }, WATCHLIST_KV_TTL, true);
     return merged;
   });
 }
@@ -382,44 +409,69 @@ async function handleHome(request, env, ctx) {
   const cookieAuth = readAuth(request); if (!cookieAuth) return html(renderLoginPage());
   return html(renderHomeShell(initialDetail));
 }
-async function mapPool(items, limit, fn) {
-  const results = new Array(items.length); let idx = 0;
-  const workers = Array.from({ length: Math.min(limit, items.length || 1) }, async () => { while (idx < items.length) { const i = idx++; results[i] = await fn(items[i], i); } });
-  await Promise.all(workers); return results;
-}
-async function fetchShowProgress(showId, headers, env, ctx) {
-  const cacheKey = `prog:${showId}`, mem = kvMemGet(cacheKey);
+// 保留：未来若加回“下一集”补充逻辑会用到
+async function fetchShowProgress(showId, headers, env, ctx, userKey) {
+  const prefix = userKey || 'anon';
+  const cacheKey = `prog:${prefix}:${showId}`;
+  const mem = kvMemGet(cacheKey);
   if (mem !== undefined) { if (mem === KV_MISS) return null; return mem.miss ? null : mem.data; }
   return singleFlight(cacheKey, async () => {
-    const cached = await kvGetJSON(env, cacheKey); if (cached !== undefined && cached !== KV_MISS) return cached.miss ? null : cached.data;
+    const cached = await kvGetJSON(env, cacheKey, true);
+    if (cached !== undefined && cached !== KV_MISS) return cached.miss ? null : cached.data;
     let p = null; try { const r = await fetchT(`${TRAKT_API}/shows/${showId}/progress/watched?hidden=false&specials=false`, { headers }, 6000); if (r.ok) p = await r.json(); } catch {}
-    kvPutJSON(env, ctx, cacheKey, p ? { data: p } : { miss: true }, p ? PROGRESS_KV_TTL : 60); return p;
+    kvPutJSON(env, ctx, cacheKey, p ? { data: p } : { miss: true }, p ? PROGRESS_KV_TTL : 60, true);
+    return p;
+  });
+}
+async function getCalendarCached(today, headers, env, ctx, userKey) {
+  const prefix = userKey || 'anon';
+  const cacheKey = `cal:${prefix}:${today}`;
+  const mem = kvMemGet(cacheKey);
+  if (mem !== undefined) { if (mem === KV_MISS) return null; return mem.miss ? null : mem.data; }
+  return singleFlight(cacheKey, async () => {
+    const cached = await kvGetJSON(env, cacheKey, true);
+    if (cached !== undefined && cached !== KV_MISS) return cached.miss ? null : cached.data;
+    let data = null;
+    try { const r = await fetchT(`${TRAKT_API}/calendars/my/shows/${today}/30?extended=full&images=poster`, { headers }, 9000); if (r.ok) data = await r.json(); } catch {}
+    kvPutJSON(env, ctx, cacheKey, data ? { data } : { miss: true }, data ? CALENDAR_KV_TTL : 60, true);
+    return data;
   });
 }
 
 async function handleHomeData(request, env, ctx) {
   const cookieAuth = readAuth(request); if (!cookieAuth) return Response.json({ login: true }, { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } }); const auth = await refreshIfNeeded(cookieAuth, env); if (!auth) return Response.json({ login: true }, { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } });
-  const needsCookieUpdate = auth.access_token !== cookieAuth.access_token, headers = makeTraktHeaders(env, auth), today = new Date().toISOString().split('T')[0], part = new URL(request.url).searchParams.get('part') || 'all';
+  const needsCookieUpdate = auth.access_token !== cookieAuth.access_token, headers = makeTraktHeaders(env, auth), today = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10), part = new URL(request.url).searchParams.get('part') || 'all';
+  const userKey = await getStableUserId(auth, headers);
   const fetchJson = async (url, retries = 2) => {
     for (let i = 0; i <= retries; i++) {
       try { const r = await fetchT(url, { headers }, 7000); if (r.status === 429) { if (i < retries) { await new Promise(res => setTimeout(res, Math.min(800 * Math.pow(2, i), 4000))); continue; } return { __error: 'HTTP 429', __pageCount: 1 }; } if (!r.ok) return { __error: `HTTP ${r.status}`, __pageCount: 1 }; const data = await r.json(), pageCount = parseInt(r.headers.get('X-Pagination-Page-Count') || '1'); if (Array.isArray(data)) Object.defineProperty(data, '__pageCount', { value: pageCount, enumerable: false }); return data; } catch (e) { if (i === retries) return { __error: String(e), __pageCount: 1 }; await new Promise(res => setTimeout(res, 400 * (i + 1))); }
     }
   };
   async function getProfile() {
-    const cached = await kvGetJSON(env, 'prof:me');
+    const cacheKey = `prof:${userKey}:me`;
+    const cached = await kvGetJSON(env, cacheKey, true);
     if (cached !== undefined && cached !== KV_MISS && cached.data) return cached.data;
     const p = await fetchJson(`${TRAKT_API}/users/me?extended=full`);
-    if (p && !p.__error) kvPutJSON(env, ctx, 'prof:me', { data: p }, 180);
+    if (p && !p.__error) kvPutJSON(env, ctx, cacheKey, { data: p }, 180, true);
     return p;
   }
   const outHeaders = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }; if (needsCookieUpdate) outHeaders['Set-Cookie'] = buildCookie(auth);
-  const wantPrimary = part === 'primary' || part === 'all', wantSecondary = part === 'secondary' || part === 'all'; let profile = null, stats = null, playback = null, watchedShows = null, history = null, calendar = null, watchlist = null; const tasks = [];
-  if (wantPrimary) { tasks.push((async () => { profile = await getProfile(); })()); tasks.push((async () => { stats = await fetchJson(`${TRAKT_API}/users/me/stats`); })()); tasks.push((async () => { playback = await fetchJson(`${TRAKT_API}/sync/playback?extended=full&images=poster`); })()); tasks.push((async () => { watchedShows = await fetchJson(`${TRAKT_API}/users/me/watched/shows?limit=${RECENT_SHOWS_LIMIT}&extended=full&images=poster`); })()); }
-  if (wantSecondary) { tasks.push((async () => { history = await fetchJson(`${TRAKT_API}/users/me/history?limit=${PAGE_SIZE}&page=1&extended=full&images=poster`); })()); tasks.push((async () => { calendar = await fetchJson(`${TRAKT_API}/calendars/my/shows/${today}/30?extended=full&images=poster`); })()); tasks.push((async () => { watchlist = await getWatchlist(headers, 'added', env, ctx).catch(() => []); })()); }
+  const wantPrimary = part === 'primary' || part === 'all', wantSecondary = part === 'secondary' || part === 'all'; let profile = null, stats = null, playback = null, history = null, calendar = null, watchlist = null; const tasks = [];
+  if (wantPrimary) {
+    tasks.push((async () => { profile = await getProfile(); })());
+    tasks.push((async () => { stats = await fetchJson(`${TRAKT_API}/users/me/stats`); })());
+    tasks.push((async () => { playback = await fetchJson(`${TRAKT_API}/sync/progress/up_next_nitro?extended=full&images=poster&limit=100&intent=continuing`); })());
+  }
+  if (wantSecondary) {
+    tasks.push((async () => { history = await fetchJson(`${TRAKT_API}/users/me/history?limit=${PAGE_SIZE}&page=1&extended=full&images=poster`); })());
+    tasks.push((async () => { calendar = await getCalendarCached(today, headers, env, ctx, userKey); })());
+    tasks.push((async () => { watchlist = await getWatchlist(headers, 'added', env, ctx, userKey).catch(() => []); })());
+  }
   await Promise.all(tasks); const result = { part };
   if (wantPrimary) { const username = (profile && !profile.__error && profile.username) || '我', displayName = (profile && !profile.__error && profile.name) || username, movieCount = stats && !stats.__error && stats.movies ? stats.movies.watched : 0, episodeCount = stats && !stats.__error && stats.episodes ? stats.episodes.watched : 0, showCount = stats && !stats.__error && stats.shows ? stats.shows.watched : 0, totalHours = stats && !stats.__error && stats.episodes && stats.episodes.minutes ? Math.round(stats.episodes.minutes / 60) : 0; let avatarUrl = ''; try { const imgs = profile && !profile.__error && profile.images; if (imgs && imgs.avatar) avatarUrl = imgs.avatar.full || imgs.avatar.medium || imgs.avatar.thumb || ''; } catch {}
     result.name = displayName; result.avatar = avatarUrl || null; result.statsHtml = renderStatsHtml({ movie: movieCount, show: showCount, episode: episodeCount, hours: totalHours });
-    try { const recentShows = (Array.isArray(watchedShows) ? watchedShows : []).filter(w => w.show && w.show.ids && w.show.ids.trakt).sort((a, b) => { const ta = a.last_watched_at || a.last_updated_at || '', tb = b.last_watched_at || b.last_updated_at || ''; return tb.localeCompare(ta); }).slice(0, MAX_RECENT_SHOWS); const progressList = await mapPool(recentShows, PROGRESS_CONCURRENCY, async (w) => { const p = await fetchShowProgress(w.show.ids.trakt, headers, env, ctx); if (!p) return null; return { show: w.show, last_watched_at: w.last_watched_at, progress: p }; }); result.playbackHtml = renderContinueItems(playback, progressList.filter(Boolean), env); } catch { result.playbackHtml = '<div class="empty"><p>继续观看加载失败</p></div>'; } }
+    try { result.playbackHtml = renderContinueItems(playback); } catch { result.playbackHtml = '<div class="empty"><p>继续观看加载失败</p></div>'; }
+  }
   if (wantSecondary) {
     try { const historyPageCount = (history && history.__pageCount) || 1; result.historyHtml = renderHistoryPage(history, env); result.historyMoreHtml = historyPageCount > 1 ? `<div class="load-more-wrap"><button class="load-more" data-page="2" onclick="loadMoreHistory(this)">加载更多</button></div>` : ''; } catch { result.historyHtml = '<div class="empty"><p>观看记录加载失败</p></div>'; result.historyMoreHtml = ''; }
     try { result.calendarHtml = renderCalendarPage(calendar, env, {}); } catch { result.calendarHtml = '<div class="empty"><p>日历加载失败</p></div>'; }
@@ -457,8 +509,9 @@ function renderStatsHtml(s) {
 async function handleMore(request, env, ctx) {
   const url = new URL(request.url), type = url.searchParams.get('type'), page = parseInt(url.searchParams.get('page') || '2');
   const cookieAuth = readAuth(request); if (!cookieAuth) return new Response('unauthorized', { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } }); const auth = await refreshIfNeeded(cookieAuth, env); if (!auth) return new Response('unauthorized', { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } }); const headers = makeTraktHeaders(env, auth);
+  const userKey = await getStableUserId(auth, headers);
   if (type === 'history') { let r; try { for (let i = 0; i < 3; i++) { r = await fetchT(`${TRAKT_API}/users/me/history?limit=${PAGE_SIZE}&page=${page}&extended=full&images=poster`, { headers }, 9000); if (r.status !== 429) break; await new Promise(resolve => setTimeout(resolve, Math.min(1000 * Math.pow(2, i), 5000))); } } catch (e) { return new Response('', { status: 502 }); } if (!r.ok) return new Response('', { status: r.status }); const items = await r.json(), pageCount = parseInt(r.headers.get('X-Pagination-Page-Count') || '1'), hasMore = page < pageCount, bodyHtml = renderHistoryPage(items, env, true); const outHeaders = { 'Content-Type': 'text/html; charset=utf-8', 'X-Has-More': String(hasMore), 'X-Page': String(page), 'X-Page-Count': String(pageCount) }; if (auth.access_token !== cookieAuth.access_token) outHeaders['Set-Cookie'] = buildCookie(auth); return new Response(bodyHtml, { headers: outHeaders }); }
-  if (type === 'watchlist') { const sort = url.searchParams.get('sort') || 'added', pageNum = Math.max(1, parseInt(url.searchParams.get('page') || '1', 10) || 1), merged = await getWatchlist(headers, sort, env, ctx), start = (pageNum - 1) * WATCHLIST_PAGE_SIZE, slice = merged.slice(start, start + WATCHLIST_PAGE_SIZE), hasMore = start + WATCHLIST_PAGE_SIZE < merged.length, bodyHtml = renderWatchlistItems(slice, env); const outHeaders = { 'Content-Type': 'text/html; charset=utf-8', 'X-Has-More': String(hasMore), 'X-Page': String(pageNum), 'X-Total': String(merged.length) }; if (auth.access_token !== cookieAuth.access_token) outHeaders['Set-Cookie'] = buildCookie(auth); return new Response(bodyHtml, { headers: outHeaders }); }
+  if (type === 'watchlist') { const sort = url.searchParams.get('sort') || 'added', pageNum = Math.max(1, parseInt(url.searchParams.get('page') || '1', 10) || 1), merged = await getWatchlist(headers, sort, env, ctx, userKey), start = (pageNum - 1) * WATCHLIST_PAGE_SIZE, slice = merged.slice(start, start + WATCHLIST_PAGE_SIZE), hasMore = start + WATCHLIST_PAGE_SIZE < merged.length, bodyHtml = renderWatchlistItems(slice, env); const outHeaders = { 'Content-Type': 'text/html; charset=utf-8', 'X-Has-More': String(hasMore), 'X-Page': String(pageNum), 'X-Total': String(merged.length) }; if (auth.access_token !== cookieAuth.access_token) outHeaders['Set-Cookie'] = buildCookie(auth); return new Response(bodyHtml, { headers: outHeaders }); }
   return new Response('', { status: 400 });
 }
 async function handleApiDetail(request, env, ctx) {
@@ -501,9 +554,20 @@ function renderHistoryPage(items, env, isFragment) {
 function watchlistToolbarHtml(currentSort) { const opts = [['added', '按添加时间'], ['released', '按发行年份'], ['title', '按标题'], ['rank', '按热度']], options = opts.map(([v, t]) => `<option value="${v}"${v === currentSort ? ' selected' : ''}>${t}</option>`).join(''); return `<div class="wl-toolbar"><label class="wl-sort-label">排序<select id="wl-sort" class="wl-sort" onchange="onWatchlistSortChange(this.value)">${options}</select></label></div>`; }
 function emptyWatchlistHtml() { return `<div class="empty"><svg viewBox="0 0 24 24" width="56" height="56" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.25"><circle cx="12" cy="12" r="10"/><path d="M12 8v8M8 12h8"/></svg><p>待看列表是空的</p><p style="font-size:0.82rem;color:#5a6474;margin-top:10px;line-height:1.6;text-align:center">去 Trakt 上把想看的电影 / 剧集加入 watchlist，这里就会显示</p></div>`; }
 function renderWatchlistItems(items, env) { if (!Array.isArray(items) || !items.length) return ''; return items.map((item, i) => { const e = buildBaseItem(item); if (!e.title || !e.detailId) return ''; const when = item.listed_at ? '添加于 ' + fmtRelative(item.listed_at) : '', delay = Math.min(i, 24) * 20, removeType = item.movie ? 'movie' : (item.show ? 'show' : null), removeId = e.detailId; return mediaItem({ poster: e.poster, tag: e.tag, tagClass: e.tagClass, title: e.title, overview: e.overview, line1: e.line1, line2: when, delay, detailType: e.detailType, detailId: e.detailId, enrichKey: e.enrichKey, removeType, removeId }); }).filter(Boolean).join(''); }
-function renderContinueItems(playback, progressList, env) {
-  const items = []; if (Array.isArray(playback)) for (const p of playback) items.push({ source: 'playback', sortKey: p.paused_at || '', raw: p });
-  for (const item of progressList) { if (!item || !item.progress) continue; const p = item.progress, next = p.next_episode; if (!next) continue; if (p.aired > 0 && p.completed >= p.aired) continue; if (next.first_aired && new Date(next.first_aired).getTime() > Date.now()) continue; const showId = item.show.ids.trakt, dup = items.some(c => c.source === 'playback' && c.raw.show && c.raw.show.ids && c.raw.show.ids.trakt === showId && c.raw.episode && c.raw.episode.season === next.season && c.raw.episode && c.raw.episode.number === next.number); if (dup) continue; items.push({ source: 'next', sortKey: item.last_watched_at, raw: { type: 'episode', show: item.show, episode: next, progress: null } }); }
+function renderContinueItems(upNext) {
+  const items = [];
+  if (Array.isArray(upNext)) {
+    for (const entry of upNext) {
+      if (entry.episode) { items.push({ source: 'playback', sortKey: entry.paused_at || entry.last_watched_at || '', raw: entry }); }
+      else if (entry.show && entry.progress && entry.progress.next_episode) {
+        // 过滤：至少看过一集的剧才显示，排除只加入待看、从未观看的
+        const completed = entry.progress.completed;
+        if (typeof completed === 'number' && completed <= 0) continue;
+        const next = entry.progress.next_episode;
+        items.push({ source: 'upnext', sortKey: entry.last_watched_at || entry.progress.last_watched_at || '', raw: { type: 'episode', show: entry.show, episode: next, progress: null } });
+      } else if (entry.movie) { items.push({ source: 'playback', sortKey: entry.last_watched_at || '', raw: entry }); }
+    }
+  }
   items.sort((a, b) => (b.sortKey || '').localeCompare(a.sortKey || ''));
   if (!items.length) return `<div class="empty"><svg viewBox="0 0 24 24" width="56" height="56" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.25"><circle cx="12" cy="12" r="10"/><path d="M8 12h8M12 8v8"/></svg><p>暂时没有继续观看的内容</p><p style="font-size:0.82rem;color:#5a6474;margin-top:10px;line-height:1.6;text-align:center">去 Trakt 上标记一些已看剧集后，这里会显示下一集</p></div>`;
   const parts = items.map((it, i) => { const delay = Math.min(i, 24) * 20, item = it.raw, pct = typeof item.progress === 'number' ? Math.round(item.progress) : null, ep = item.episode || {}, epTag = ep.season != null && ep.number != null ? `S${pad(ep.season)}E${pad(ep.number)}` : '', subLine = pct != null ? `已看 ${pct}%` : (epTag ? `下一集 ${epTag}` : '下一集'), e = buildBaseItem(item); let watchedType = null, watchedId = null; if (item.movie && item.movie.ids && item.movie.ids.trakt) { watchedType = 'movie'; watchedId = item.movie.ids.trakt; } else if (item.episode && item.episode.ids && item.episode.ids.trakt) { watchedType = 'episode'; watchedId = item.episode.ids.trakt; } return mediaItem({ poster: e.poster, tag: e.tag, tagClass: e.tagClass, title: e.title, overview: e.overview, line1: e.line1, line2: subLine, pct, delay, detailType: e.detailType, detailId: e.detailId, enrichKey: e.enrichKey, watchedType, watchedId }); });
