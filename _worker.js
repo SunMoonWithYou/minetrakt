@@ -1,32 +1,78 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════
- *  MineTrakt · 观看记录查看器
+ *  MineTrakt · Trakt 观看记录查看器
  * ═══════════════════════════════════════════════════════════════════════
- *  Cloudflare Workers 部署
  *
- *  绑定：
- *    - KV 命名空间：TMDB_CACHE（缓存 TMDB / OMDb 响应，可选但强烈建议）
+ *  运行环境：Cloudflare Workers（单文件部署）
  *
- *  环境变量：
- *    - TRAKT_CLIENT_ID  必填，Trakt API 应用 Client ID
- *    - TMDB_API_KEY     必填，TheMovieDB API Key
- *    - OMDB_API_KEY     可选，配了才会在详情页显示 IMDb / RT / MC 徽章
+ *  ── 绑定（可选但强烈建议）────────────────────────────────────────────
+ *    TMDB_CACHE   KV 命名空间，缓存 TMDB / OMDb / 剧集进度，显著降低延迟
  *
- *  功能：
- *    - Trakt 设备码授权登录（PKCE）
- *    - 首页四个标签：继续观看 / 待看列表 / 追剧日历 / 观看记录
- *    - 详情 modal：演员、季集、相关推荐、Infuse 跳转
- *    - PWA（Service Worker + manifest）
- *    - 卡片级异步富化（TMDB 中文标题 / 海报 / 简介）
+ *  ── 环境变量 ──────────────────────────────────────────────────────────
+ *    TRAKT_CLIENT_ID   必填，Trakt API 应用 Client ID
+ *    TMDB_API_KEY      必填，TheMovieDB API Key（中文标题 / 海报 / 详情）
+ *    OMDB_API_KEY      可选，有则详情页显示 IMDb / RT / Metacritic 徽章
  *
- *  主题：深黑底 + 冷金属蓝，与 MineTrakt 新 logo 一致
+ *  ── 功能概览 ──────────────────────────────────────────────────────────
+ *    · Trakt 设备码授权登录（OAuth Device Flow + PKCE）
+ *    · 首页四 Tab：继续观看 / 待看列表 / 追剧日历 / 观看记录
+ *    · 详情 Modal：演员、季集、相关推荐、Infuse 深链、豆瓣搜索
+ *    · PWA：manifest + Service Worker（仅缓存静态资源）
+ *    · 卡片异步富化：/api/enrich 批量补 TMDB 中文标题与海报
+ *
+ *  ── 首屏加载策略（防白屏）────────────────────────────────────────────
+ *    1. handleHome 有 Cookie 时立刻返回完整深色壳（骨架 + 样式），
+ *       不 await 任何 Trakt 请求。
+ *    2. 浏览器客户端再请求 /api/home-data，并行拉齐各 Tab 数据后填入。
+ *    3. 未登录直接返回登录页，不经过加载壳。
+ *
+ *  ── 自动刷新 ──────────────────────────────────────────────────────────
+ *    代码顶部 HOME_AUTO_REFRESH_MINUTES 控制间隔（分钟），0 = 关闭。
+ *    页面打开时定时静默刷新；后台标签页不刷；切回前台超时则补刷。
+ *
+ *  ── 主题 ──────────────────────────────────────────────────────────────
+ *    深黑底 + 冷金属蓝，与 MineTrakt logo 一致
+ *
+ *  ── 主要路由 ──────────────────────────────────────────────────────────
+ *    GET  /                     首页壳或登录页
+ *    GET  /auth/device          申请设备码
+ *    POST /auth/poll            轮询授权结果，成功写 HttpOnly Cookie
+ *    POST /auth/logout          清除 Cookie
+ *    GET  /api/home-data        首页各区域 HTML 片段（JSON）
+ *    GET  /api/more             观看记录 / 待看列表分页
+ *    GET  /api/detail           详情 Modal HTML 片段
+ *    GET  /api/season           某一季的集列表
+ *    POST /api/enrich           批量 TMDB 富化
+ *    POST /api/watchlist/remove 移出待看
+ *    POST /api/mark-watched     标记已看
+ *    POST /api/unmark-watched   取消已看
+ *    GET  /api/show-calendar    单剧播出日历
+ *    GET  /manifest.webmanifest PWA 清单
+ *    GET  /sw.js                Service Worker
+ *
+ *  ── 文件结构索引 ──────────────────────────────────────────────────────
+ *    常量 / fetchT / KV 缓存层
+ *    Service Worker 源码字符串
+ *    export default 路由入口
+ *    PWA 静态处理
+ *    Trakt 认证（设备码 + PKCE + Cookie + Token 刷新）
+ *    TMDB / OMDb 封装
+ *    卡片数据模型 buildBaseItem + /api/enrich
+ *    待看 / 标记已看 / 日历 API
+ *    handleHome + renderHomeShell + handleHomeData（首屏）
+ *    /api/home-data?part=primary|secondary 分阶段拉取
+ *    GET /app.css 长缓存全局样式
+ *    骨架 / Splash / 各列表与详情渲染
+ *    工具函数（PKCE、Base64URL、HTML 转义、相对时间）
+ *    pageHeadEarly / pageStyles / pageTail（HTML 骨架与全量 CSS）
  * ═══════════════════════════════════════════════════════════════════════
  */
 
 /* ═══════════════════════════════════════════════════════════════════════
- *  常量
+ *  常量：上游 API 地址、应用元信息、Cookie、分页与缓存 TTL
  * ═══════════════════════════════════════════════════════════════════════ */
 
+/** Trakt OAuth 与 API 根地址 */
 const TRAKT_AUTH = 'https://auth.trakt.tv';
 const TRAKT_API  = 'https://api.trakt.tv';
 const TMDB_API   = 'https://api.themoviedb.org/3';
@@ -59,15 +105,25 @@ const COOKIE_MAX_AGE = 60 * 60 * 24 * 90;   // 90 天
 const PAGE_SIZE = 12;                       // 观看记录每页条数
 const TMDB_KV_TTL = 86400 * 7;              // TMDB 缓存 7 天
 const OMDB_KV_TTL = 86400 * 7;              // OMDb 缓存 7 天
-const MAX_RECENT_SHOWS = 15;                // 继续观看检查的最近剧集数
-const RECENT_SHOWS_LIMIT = 15;
+const MAX_RECENT_SHOWS = 10;                // 继续观看检查的最近剧集数（降低以加速首屏）
+const RECENT_SHOWS_LIMIT = 12;
 const WATCHLIST_PAGE_SIZE = 30;             // 待看列表每页条数
+const PROGRESS_KV_TTL = 300;                // 剧集进度缓存 5 分钟
+const PROGRESS_CONCURRENCY = 5;             // 进度请求并发上限
+
+/**
+ * 首页自动刷新间隔（分钟）
+ *  - 改这个数字即可，例如 3 = 每 3 分钟
+ *  - 设为 0 则关闭自动刷新
+ *  - 仅在页面保持打开且前台可见时生效
+ */
+const HOME_AUTO_REFRESH_MINUTES = 5;
 
 /* ═══════════════════════════════════════════════════════════════════════
  *  通用工具
  * ═══════════════════════════════════════════════════════════════════════ */
 
-/** 带超时的 fetch（默认 8 秒） */
+/** 带超时的 fetch（默认 8 秒）；超时后 AbortController 中止，避免 Worker 挂死 */
 async function fetchT(url, opts = {}, ms = 8000) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), ms);
@@ -93,6 +149,7 @@ const __kvMemExp   = new Map();   // key → 过期时间
 const __kvInflight = new Map();   // key → Promise（single-flight）
 
 /** 从内存取，过期返回 undefined */
+/** 内存缓存读取；过期则删除并返回 undefined */
 function kvMemGet(key) {
   const exp = __kvMemExp.get(key);
   if (exp === undefined) return undefined;
@@ -104,6 +161,7 @@ function kvMemGet(key) {
 }
 
 /** 写内存，超过 3000 条时清理过期 / 最旧的条目 */
+/** 写入内存缓存；条目过多时清理过期项，仍过多则删最旧 500 条 */
 function kvMemSet(key, val) {
   __kvMem.set(key, val);
   __kvMemExp.set(key, Date.now() + KV_MEM_TTL);
@@ -123,6 +181,10 @@ function kvMemSet(key, val) {
 }
 
 /** 同一 key 的并发请求合并成一个 Promise */
+/**
+ * 同一 key 的并发请求合并为一次（single-flight），
+ * 避免首页多个卡片同时打爆上游 API。
+ */
 function singleFlight(key, fn) {
   const existing = __kvInflight.get(key);
   if (existing) return existing;
@@ -137,6 +199,7 @@ function singleFlight(key, fn) {
 }
 
 /** 从 KV 读 JSON（含内存缓存） */
+/** 三级缓存读：内存 → KV（边缘 cacheTtl）→ miss */
 async function kvGetJSON(env, key) {
   if (!env.TMDB_CACHE) return undefined;
   const mem = kvMemGet(key);
@@ -152,6 +215,7 @@ async function kvGetJSON(env, key) {
 }
 
 /** 写 KV JSON（含内存缓存），异步不阻塞 */
+/** 写 KV + 内存；put 异步，用 ctx.waitUntil 不阻塞响应 */
 function kvPutJSON(env, ctx, key, payload, ttl) {
   kvMemSet(key, payload);
   if (!env.TMDB_CACHE) return;
@@ -223,6 +287,10 @@ async function cacheFirst(req){
  *  路由入口
  * ═══════════════════════════════════════════════════════════════════════ */
 
+/**
+ * Worker 唯一入口：按 pathname 分发到认证 / API / PWA / 首页。
+ * 未匹配的路径一律走 handleHome（支持 /detail/:type/:id 深链）。
+ */
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -242,6 +310,10 @@ export default {
     if (path === '/api/mark-watched' && request.method === 'POST') return handleMarkWatched(request, env);
     if (path === '/api/unmark-watched' && request.method === 'POST') return handleUnmarkWatched(request, env);
     if (path === '/api/show-calendar') return handleShowCalendar(request, env, ctx);
+    if (path === '/api/home-data') return handleHomeData(request, env, ctx);
+
+    /* 静态资源（长缓存） */
+    if (path === '/app.css') return handleAppCss();
 
     /* PWA 静态资源 */
     if (path === '/favicon.ico') return handleFavicon();
@@ -258,6 +330,18 @@ export default {
  * ═══════════════════════════════════════════════════════════════════════ */
 
 function handleFavicon() { return Response.redirect(FAVICON_URL, 302); }
+
+/** 全站 CSS：独立路由便于浏览器长缓存，壳页面用 link 引入 */
+function handleAppCss() {
+  const css = pageStyles().replace(/^\s*<style>/, '').replace(/<\/style>\s*$/, '');
+  return new Response(css, {
+    headers: {
+      'Content-Type': 'text/css; charset=utf-8',
+      'Cache-Control': 'public, max-age=86400, stale-while-revalidate=604800'
+    }
+  });
+}
+
 
 function handleManifest() {
   const manifest = {
@@ -300,6 +384,10 @@ function handleServiceWorker() {
  * ═══════════════════════════════════════════════════════════════════════ */
 
 /** 第一步：向 Trakt 申请设备码，返回 user_code / state 给前端 */
+/**
+ * 设备码登录第一步：向 Trakt 申请 device_code，
+ * 生成 PKCE verifier/challenge，把 device_code+verifier 打进 state 返回前端。
+ */
 async function handleDevice(env) {
   const codeVerifier = randomString(64);
   const codeChallenge = await pkceChallenge(codeVerifier);
@@ -346,6 +434,10 @@ async function handleDevice(env) {
 }
 
 /** 第二步：前端轮询授权状态，成功后下发 HttpOnly Cookie */
+/**
+ * 设备码登录第二步：前端轮询。成功则下发 HttpOnly Cookie；
+ * pending/slow_down 返回 202；拒绝/过期返回对应状态码。
+ */
 async function handlePoll(request, env) {
   let body;
   try { body = await request.json(); } catch {
@@ -407,6 +499,7 @@ async function handlePoll(request, env) {
 }
 
 /** 登出：删除 Cookie */
+/** 登出：Set-Cookie Max-Age=0 清除 trakt_auth */
 function handleLogout() {
   return new Response(null, {
     status: 204,
@@ -415,12 +508,14 @@ function handleLogout() {
 }
 
 /** 把 auth 对象编码为 HttpOnly Cookie */
+/** 将 access/refresh token 等序列化进 Base64URL Cookie */
 function buildCookie(auth) {
   const encoded = b64urlEncode(JSON.stringify(auth));
   return `${COOKIE_NAME}=${encoded}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${COOKIE_MAX_AGE}`;
 }
 
 /** 从请求里读取 auth（无则 null） */
+/** 从请求 Cookie 解析 auth 对象；无效则 null */
 function readAuth(request) {
   const cookie = request.headers.get('Cookie') || '';
   const m = cookie.match(new RegExp(`(?:^|;\\s*)${COOKIE_NAME}=([^;]+)`));
@@ -429,6 +524,10 @@ function readAuth(request) {
 }
 
 /** Token 快过期时刷新（剩余 < 30 分钟触发） */
+/**
+ * Token 剩余不足 30 分钟时用 refresh_token 换新；
+ * 失败返回 null（调用方应引导重新登录）。
+ */
 async function refreshIfNeeded(auth, env) {
   if (auth.expires_at - Date.now() > 30 * 60_000) return auth;
   let res;
@@ -456,6 +555,7 @@ async function refreshIfNeeded(auth, env) {
 }
 
 /** 生成 Trakt API 请求头 */
+/** 组装 Trakt API 标准请求头（含 Bearer） */
 function makeTraktHeaders(env, auth) {
   return {
     'Content-Type': 'application/json',
@@ -467,6 +567,7 @@ function makeTraktHeaders(env, auth) {
 }
 
 /** Trakt GET 请求，带 429 指数退避重试 */
+/** Trakt GET + 429 指数退避重试；失败返回 { __error } */
 async function traktGet(url, headers, retries = 2) {
   for (let i = 0; i <= retries; i++) {
     try {
@@ -490,6 +591,7 @@ async function traktGet(url, headers, retries = 2) {
  *  TMDB 封装
  * ═══════════════════════════════════════════════════════════════════════ */
 
+/** TMDB 裸 GET，失败返回 null */
 async function tmdbGet(url) {
   try {
     const r = await fetchT(url, {}, 8000);
@@ -499,6 +601,10 @@ async function tmdbGet(url) {
 }
 
 /** 带缓存的 TMDB 详情，path 形如 `/tv/123` 或 `/movie/456` */
+/**
+ * 带 KV/内存缓存的 TMDB 详情。
+ * path 形如 /tv/123 或 /movie/456?append_to_response=credits
+ */
 async function tmdbDetailCached(path, env, ctx, ttl = 86400) {
   if (!env.TMDB_API_KEY) return null;
   const cacheKey = `td:${path}`;
@@ -523,6 +629,7 @@ async function tmdbDetailCached(path, env, ctx, ttl = 86400) {
 }
 
 /** TMDB 图片 URL 拼接 */
+/** 拼接 TMDB 图片 CDN URL */
 function tmdbPoster(path, size = 'w342') {
   if (!path) return null;
   return `${TMDB_IMG}/${size}${path}`;
@@ -533,6 +640,7 @@ function tmdbPoster(path, size = 'w342') {
  *  需配置 OMDB_API_KEY，未配置时静默跳过
  * ═══════════════════════════════════════════════════════════════════════ */
 
+/** 拉取 OMDb 的 IMDb/RT/MC 评分并缓存；未配置 key 则跳过 */
 async function fetchOmdbRatings(imdbId, env, ctx) {
   if (!imdbId || !env.OMDB_API_KEY) return null;
   const cacheKey = `omdb:${imdbId}`;
@@ -590,6 +698,7 @@ async function fetchOmdbRatings(imdbId, env, ctx) {
 }
 
 /** Metacritic 分数按段变色 */
+/** Metacritic 分数段颜色：绿 / 黄 / 红 */
 function mcColor(n) {
   if (n >= 61) return '#66cc33';
   if (n >= 40) return '#ffcc33';
@@ -597,6 +706,7 @@ function mcColor(n) {
 }
 
 /** 渲染详情页顶部的评分徽章组 */
+/** 详情页评分徽章 HTML（IMDb / Trakt / RT / MC / TMDB / 豆瓣） */
 function renderExtRatings(r, opts = {}) {
   const out = [];
   if (r && r.imdb != null) {
@@ -625,6 +735,10 @@ function renderExtRatings(r, opts = {}) {
  *  统一把 Trakt 的 movie / show / episode 数据拍平成卡片需要的字段
  * ═══════════════════════════════════════════════════════════════════════ */
 
+/**
+ * 将 Trakt 的 movie/show/episode 结构拍平为卡片字段：
+ * title, poster, enrichKey, detailType/Id, line1 等。
+ */
 function buildBaseItem(traktItem) {
   const base = {
     tag: '', tagClass: '',
@@ -684,6 +798,7 @@ function buildBaseItem(traktItem) {
  * ═══════════════════════════════════════════════════════════════════════ */
 
 /** 解析 enrichKey，形如 `movie:tmdb:123` / `tv:title:名称:2020` */
+/** 解析 enrichKey，如 movie:tmdb:123 / tv:title:名称:2020 */
 function parseEnrichKey(key) {
   if (!key) return null;
   const i1 = key.indexOf(':');
@@ -710,6 +825,7 @@ function parseEnrichKey(key) {
 }
 
 /** 富化单条 */
+/** 单条 TMDB 富化：中文标题、简介、海报；结果写入 KV */
 async function enrichOne(key, env, ctx) {
   if (!env.TMDB_API_KEY) return null;
   const parsed = parseEnrichKey(key);
@@ -779,6 +895,7 @@ async function enrichOne(key, env, ctx) {
 }
 
 /** /api/enrich 处理器：批量富化，最多 80 条 */
+/** POST /api/enrich：批量富化，最多 80 条，返回 { [key]: data|null } */
 async function handleEnrich(request, env, ctx) {
   let body;
   try { body = await request.json(); } catch {
@@ -818,6 +935,7 @@ async function handleEnrich(request, env, ctx) {
  * ═══════════════════════════════════════════════════════════════════════ */
 
 /** 拉取 watchlist（电影 + 剧集），本地重排 */
+/** 拉取电影+剧集 watchlist 并本地按 sort 重排 */
 async function getWatchlist(headers, sort = 'added') {
   const qs = `extended=full&images=poster&sort=${encodeURIComponent(sort)}`;
   const [movies, shows] = await Promise.all([
@@ -851,6 +969,7 @@ async function getWatchlist(headers, sort = 'added') {
 }
 
 /** /api/watchlist/remove —— 从待看列表移除 */
+/** POST /api/watchlist/remove：从待看列表移除 movie 或 show */
 async function handleWatchlistRemove(request, env) {
   const cookieAuth = readAuth(request);
   if (!cookieAuth) return Response.json({ error: 'unauthorized' }, { status: 401 });
@@ -911,6 +1030,7 @@ async function handleWatchlistRemove(request, env) {
  *  /api/mark-watched —— 标记为已看（加入观看历史）
  * ═══════════════════════════════════════════════════════════════════════ */
 
+/** POST /api/mark-watched：写入观看历史（movie 或 episode） */
 async function handleMarkWatched(request, env) {
   const cookieAuth = readAuth(request);
   if (!cookieAuth) return Response.json({ error: 'unauthorized' }, { status: 401 });
@@ -971,6 +1091,7 @@ async function handleMarkWatched(request, env) {
  *  /api/unmark-watched —— 取消观看（从观看历史移除）
  * ═══════════════════════════════════════════════════════════════════════ */
 
+/** POST /api/unmark-watched：从观看历史移除 */
 async function handleUnmarkWatched(request, env) {
   const cookieAuth = readAuth(request);
   if (!cookieAuth) return Response.json({ error: 'unauthorized' }, { status: 401 });
@@ -1032,6 +1153,10 @@ async function handleUnmarkWatched(request, env) {
  *  返回：{ episodes: [{ season, number, title, first_aired }] }
  * ═══════════════════════════════════════════════════════════════════════ */
 
+/**
+ * GET /api/show-calendar?id=&tmdb=
+ * 返回该剧全部集的 first_aired，可选 TMDB 中文集名。
+ */
 async function handleShowCalendar(request, env, ctx) {
   const url = new URL(request.url);
   const showId = url.searchParams.get('id');
@@ -1114,119 +1239,266 @@ async function handleShowCalendar(request, env, ctx) {
  *  先吐骨架 HTML（含 splash），再并行推送各 tab 的数据
  * ═══════════════════════════════════════════════════════════════════════ */
 
+/**
+ * 首页：先秒开完整深色页面（骨架），再由客户端拉 /api/home-data 填内容。
+ * 首屏不 await 任何 Trakt 请求。
+ */
+/**
+ * GET / 首页入口。
+ * 无 Cookie → 登录页；有 Cookie → 立刻返回深色骨架壳（不挡在 Trakt 请求上）。
+ * 深链 /detail/type/id 或 ?d=type/id 会写入 window.__initialDetail。
+ */
 async function handleHome(request, env, ctx) {
   const url = new URL(request.url);
 
-  // 深链接 /detail/movie/123 → 首页加载完后自动打开 modal
   let initialDetail = url.searchParams.get('d');
   if (!initialDetail && url.pathname.startsWith('/detail/')) {
     const parts = url.pathname.split('/').filter(Boolean);
     if (parts.length === 3) initialDetail = parts[1] + '/' + parts[2];
   }
 
-  // 未登录 → 登录页
   const cookieAuth = readAuth(request);
-  if (!cookieAuth) return html(renderLoginPage());
+  if (!cookieAuth) {
+    return html(renderLoginPage());
+  }
 
+  // ★ 有 Cookie 即出壳，Token 刷新放到 /api/home-data，不挡首屏
+  return html(renderHomeShell(initialDetail));
+}
+
+/** 完整可绘制的首页壳（含样式、骨架、拉数脚本） */
+/**
+ * 组装首页完整 HTML 壳：early head + 全局 CSS + 骨架 + 客户端拉数脚本 + tail。
+ * 客户端 loadHomeData → /api/home-data，并按 HOME_AUTO_REFRESH_MINUTES 定时静默刷新。
+ */
+function renderHomeShell(initialDetail) {
+  const boot = initialDetail
+    ? `<script>window.__initialDetail=${jsStr(initialDetail)};<\/script>`
+    : '';
+
+  return pageHeadEarly() +
+    '<link rel="stylesheet" href="/app.css">' +
+    renderHomeSkeleton(initialDetail) + `
+<script>
+(function(){
+  window.__splashT0 = Date.now();
+  window.__splashHidden = false;
+  window.__hideSplash = function(force){
+    if(window.__splashHidden) return;
+    window.__splashHidden = true;
+    var el = document.getElementById('splash');
+    if(!el) return;
+    var wait = force ? 0 : Math.max(0, 280 - (Date.now() - (window.__splashT0 || Date.now())));
+    setTimeout(function(){
+      el.classList.add('hide');
+      setTimeout(function(){ if(el && el.parentNode) el.parentNode.removeChild(el); }, 360);
+    }, wait);
+  };
+  // 骨架已在 DOM 中，尽快收起启动页
+  setTimeout(function(){ if(window.__hideSplash) window.__hideSplash(); }, 120);
+
+  function setHTML(sel, html){
+    var el = typeof sel === 'string' ? document.querySelector(sel) : sel;
+    if(el) el.innerHTML = html || '';
+  }
+
+  function applyAvatar(url){
+    if(!url) return;
+    var av = document.getElementById('hero-avatar');
+    if(!av) return;
+    var img = document.createElement('img');
+    img.src = url;
+    img.alt = '';
+    img.width = 56;
+    img.height = 56;
+    img.decoding = 'async';
+    img.onerror = function(){
+      av.innerHTML = '<span class="hero-avatar-ph">👤</span>';
+    };
+    av.innerHTML = '';
+    av.appendChild(img);
+  }
+
+  function applyPrimary(d){
+    if(!d) return;
+    var g = document.getElementById('hero-greet');
+    if(g && d.greet) g.textContent = d.greet;
+    var n = document.getElementById('hero-name');
+    if(n && d.name) n.textContent = d.name;
+    applyAvatar(d.avatar);
+    if(d.statsHtml) setHTML('#stats-box', d.statsHtml);
+    if(d.playbackHtml) setHTML('#playback', d.playbackHtml);
+    if(window.__scheduleEnrich) window.__scheduleEnrich();
+  }
+
+  function applySecondary(d){
+    if(!d) return;
+    if(d.historyHtml) setHTML('#history .grid', d.historyHtml);
+    if(d.historyMoreHtml != null) setHTML('#history-more', d.historyMoreHtml);
+    if(d.calendarHtml) setHTML('#calendar', d.calendarHtml);
+    if(d.watchlistHtml) setHTML('#watchlist', d.watchlistHtml);
+    if(window.__scheduleEnrich) window.__scheduleEnrich();
+  }
+
+  var __homeDataLoading = false;
+
+  function fetchPart(part){
+    return fetch('/api/home-data?part=' + encodeURIComponent(part), {
+      credentials: 'same-origin',
+      cache: 'no-store'
+    }).then(function(r){
+      if(r.status === 401){ location.href = '/'; return null; }
+      if(!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function(d){
+      if(!d) return null;
+      if(d.login){ location.reload(); return null; }
+      return d;
+    });
+  }
+
+  /** 首次：primary 与 secondary 并行，谁先到谁先填；primary 到了就关 splash */
+  function loadHomeData(opts){
+    opts = opts || {};
+    var silent = !!opts.silent;
+    if(__homeDataLoading && !silent) return;
+    __homeDataLoading = true;
+    __lastRefreshAt = Date.now();
+
+    var pPrimary = fetchPart('primary')
+      .then(function(d){
+        applyPrimary(d);
+        if(!silent && window.__hideSplash) window.__hideSplash(true);
+        if(!silent && window.__initialDetail){
+          var s = window.__initialDetail;
+          var idx = s.indexOf('/');
+          if(idx > 0 && window.openDetail) openDetail(s.slice(0, idx), s.slice(idx + 1), false);
+          window.__initialDetail = null;
+        }
+      })
+      .catch(function(){
+        if(!silent){
+          setHTML('#playback', '<div class="empty"><p>加载失败，请点击重试</p><p style="margin-top:12px"><button class="btn-ghost" onclick="location.reload()">重试</button></p></div>');
+          if(window.__hideSplash) window.__hideSplash(true);
+        }
+      });
+
+    var pSecondary = fetchPart('secondary')
+      .then(function(d){ applySecondary(d); })
+      .catch(function(){
+        if(!silent){
+          setHTML('#history .grid', '<div class="empty"><p>部分内容加载失败</p></div>');
+        }
+      });
+
+    Promise.all([pPrimary, pSecondary]).then(function(){
+      __homeDataLoading = false;
+    });
+  }
+
+  /** 定时刷新：只刷 primary（继续观看+统计），更轻；每 2 次再刷 secondary */
+  var __refreshTick = 0;
+  function silentRefresh(){
+    if(document.hidden) return;
+    __refreshTick++;
+    __lastRefreshAt = Date.now();
+    fetchPart('primary').then(function(d){ applyPrimary(d); }).catch(function(){});
+    if(__refreshTick % 2 === 0){
+      fetchPart('secondary').then(function(d){ applySecondary(d); }).catch(function(){});
+    }
+  }
+
+  function startHomeData(){ loadHomeData({ silent: false }); }
+
+  if(document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', startHomeData);
+  } else {
+    startHomeData();
+  }
+
+  var REFRESH_MIN = ${HOME_AUTO_REFRESH_MINUTES};
+  var REFRESH_MS = (REFRESH_MIN > 0 ? REFRESH_MIN : 0) * 60 * 1000;
+  var __lastRefreshAt = Date.now();
+  if (REFRESH_MS > 0) {
+    setInterval(silentRefresh, REFRESH_MS);
+    document.addEventListener('visibilitychange', function(){
+      if(document.hidden) return;
+      if(Date.now() - __lastRefreshAt >= REFRESH_MS) silentRefresh();
+    });
+  }
+})();<\/script>
+` + pageTail();
+}
+
+
+/** 有限并发的 map：最多 limit 个任务同时执行 */
+async function mapPool(items, limit, fn) {
+  const results = new Array(items.length);
+  let idx = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length || 1) }, async () => {
+    while (idx < items.length) {
+      const i = idx++;
+      results[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+/** 单剧观看进度，KV 缓存 + single-flight */
+async function fetchShowProgress(showId, headers, env, ctx) {
+  const cacheKey = `prog:${showId}`;
+  const mem = kvMemGet(cacheKey);
+  if (mem !== undefined) {
+    if (mem === KV_MISS) return null;
+    return mem.miss ? null : mem.data;
+  }
+  return singleFlight(cacheKey, async () => {
+    const cached = await kvGetJSON(env, cacheKey);
+    if (cached !== undefined && cached !== KV_MISS) {
+      return cached.miss ? null : cached.data;
+    }
+    let p = null;
+    try {
+      const r = await fetchT(
+        `${TRAKT_API}/shows/${showId}/progress/watched?hidden=false&specials=false`,
+        { headers },
+        6000
+      );
+      if (r.ok) p = await r.json();
+    } catch { /* miss */ }
+    kvPutJSON(env, ctx, cacheKey, p ? { data: p } : { miss: true }, p ? PROGRESS_KV_TTL : 60);
+    return p;
+  });
+}
+
+/**
+ * GET /api/home-data?part=primary|secondary|all
+ * primary：用户+统计+继续观看；secondary：记录+日历+待看
+ */
+async function handleHomeData(request, env, ctx) {
+  const cookieAuth = readAuth(request);
+  if (!cookieAuth) return Response.json({ login: true }, { status: 401 });
   const auth = await refreshIfNeeded(cookieAuth, env);
-  if (!auth) return html(renderLoginPage());
+  if (!auth) return Response.json({ login: true }, { status: 401 });
 
   const needsCookieUpdate = auth.access_token !== cookieAuth.access_token;
-
-  const headers = {
-    'Content-Type': 'text/html; charset=utf-8',
-    'Cache-Control': 'no-cache, no-store, must-revalidate',
-    'Pragma': 'no-cache',
-    'Expires': '0',
-    'X-Accel-Buffering': 'no'
-  };
-  if (needsCookieUpdate) headers['Set-Cookie'] = buildCookie(auth);
-
-  // 流式响应：writer 不断往 readable 里 push 数据
-  const { readable, writable } = new TransformStream();
-  const writer = writable.getWriter();
-  const enc = new TextEncoder();
-  const write = (s) => writer.write(enc.encode(s)).catch(() => {});
-
-  const job = (async () => {
-    try {
-      // 1. 头部 + splash
-      await write(pageHead());
-
-      // 2. 记录 splash 起始时间（用于最小展示时长）
-      await write(`<script>(function(){
-        var s=document.getElementById('splash');
-        if(s){ void s.offsetHeight; }
-        window.__splashT0=Date.now();
-      })();<\/script>`);
-
-      await new Promise(r => setTimeout(r, 80));
-
-      // 3. 骨架
-      await write(renderHomeSkeleton(initialDetail));
-      await write(splashHideScript());
-
-      // 4. 数据（并行）
-      await streamHomeData(env, auth, write, ctx);
-
-      // 5. 尾部
-      await write(pageTail());
-    } catch (e) {
-      await write(`<script>(function(){
-        var s=document.getElementById('splash');
-        if(!s)return;
-        s.innerHTML='<div style="color:#ff8080;font-size:.9rem;font-family:-apple-system,BlinkMacSystemFont,\\'PingFang SC\\',sans-serif">加载失败，请刷新重试</div>';
-      })();<\/script>`);
-      await write(pageTail());
-    } finally {
-      try { await writer.close(); } catch {}
-    }
-  })();
-  ctx.waitUntil(job);
-
-  return new Response(readable, { headers });
-}
-
-/** splash 隐藏脚本：保证至少展示 800ms 再淡出 */
-function splashHideScript() {
-  return `<script>(function(){
-    var s = document.getElementById('splash');
-    if (!s) return;
-    var t0 = window.__splashT0 || Date.now();
-    var MIN = 800;
-    var wait = Math.max(0, MIN - (Date.now() - t0));
-    setTimeout(function(){
-      s.classList.add('hide');
-      setTimeout(function(){
-        if (s && s.parentNode) s.parentNode.removeChild(s);
-      }, 420);
-    }, wait);
-  })();<\/script>`;
-}
-
-/** 并行拉取所有数据并推到页面 */
-async function streamHomeData(env, auth, write, ctx) {
   const headers = makeTraktHeaders(env, auth);
   const today = new Date().toISOString().split('T')[0];
+  const part = new URL(request.url).searchParams.get('part') || 'all';
 
-  /** 带重试的 Trakt JSON 请求 */
-  const fetchJson = async (url, retries = 3) => {
+  const fetchJson = async (url, retries = 2) => {
     for (let i = 0; i <= retries; i++) {
       try {
-        const r = await fetchT(url, { headers }, 9000);
-
+        const r = await fetchT(url, { headers }, 7000);
         if (r.status === 429) {
-          const retryAfter = parseInt(r.headers.get('Retry-After') || '0');
-          const wait = retryAfter > 0 ? retryAfter * 1000 : Math.min(1000 * Math.pow(2, i), 8000);
           if (i < retries) {
-            await new Promise(resolve => setTimeout(resolve, wait));
+            await new Promise(res => setTimeout(res, Math.min(800 * Math.pow(2, i), 4000)));
             continue;
           }
-          return { __error: `HTTP 429`, __pageCount: 1 };
+          return { __error: 'HTTP 429', __pageCount: 1 };
         }
-
         if (!r.ok) return { __error: `HTTP ${r.status}`, __pageCount: 1 };
-
         const data = await r.json();
         const pageCount = parseInt(r.headers.get('X-Pagination-Page-Count') || '1');
         if (Array.isArray(data)) {
@@ -1235,124 +1507,91 @@ async function streamHomeData(env, auth, write, ctx) {
         return data;
       } catch (e) {
         if (i === retries) return { __error: String(e), __pageCount: 1 };
-        await new Promise(resolve => setTimeout(resolve, 800 * (i + 1)));
+        await new Promise(res => setTimeout(res, 400 * (i + 1)));
       }
     }
   };
 
-  // 并行拉取首页所有数据
-  const [profile, history, playback, watchedShows, calendar, stats, watchlist] = await Promise.all([
-    fetchJson(`${TRAKT_API}/users/me`),
-    fetchJson(`${TRAKT_API}/users/me/history?limit=${PAGE_SIZE}&page=1&extended=full&images=poster`),
-    fetchJson(`${TRAKT_API}/sync/playback?extended=full&images=poster`),
-    fetchJson(`${TRAKT_API}/users/me/watched/shows?limit=${RECENT_SHOWS_LIMIT}&extended=full&images=poster`),
-    fetchJson(`${TRAKT_API}/calendars/my/shows/${today}/30?extended=full&images=poster`),
-    fetchJson(`${TRAKT_API}/users/me/stats`),
-    getWatchlist(headers, 'added').catch(() => [])
-  ]);
+  async function getProfile() {
+    const cacheKey = 'prof:me';
+    const mem = kvMemGet(cacheKey);
+    if (mem !== undefined && mem !== KV_MISS && mem.data) return mem.data;
+    const cached = await kvGetJSON(env, cacheKey);
+    if (cached && cached.data) return cached.data;
+    const p = await fetchJson(`${TRAKT_API}/users/me?extended=full`);
+    if (p && !p.__error) {
+      kvPutJSON(env, ctx, cacheKey, { data: p }, 180);
+      return p;
+    }
+    return p;
+  }
 
-  // ── 用户信息 + 统计 ──
-  const username = (profile && !profile.__error && profile.username) || '我';
-  const displayName = (profile && !profile.__error && profile.name) || username;
-  const movieCount = stats && !stats.__error && stats.movies ? stats.movies.watched : 0;
-  const episodeCount = stats && !stats.__error && stats.episodes ? stats.episodes.watched : 0;
-  const showCount = stats && !stats.__error && stats.shows ? stats.shows.watched : 0;
-  const totalHours = stats && !stats.__error && stats.episodes && stats.episodes.minutes
-    ? Math.round(stats.episodes.minutes / 60) : 0;
+  const outHeaders = {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store'
+  };
+  if (needsCookieUpdate) outHeaders['Set-Cookie'] = buildCookie(auth);
 
-  const statsInner = `
+  const wantPrimary = part === 'primary' || part === 'all';
+  const wantSecondary = part === 'secondary' || part === 'all';
+
+  let profile = null, stats = null, playback = null, watchedShows = null;
+  let history = null, calendar = null, watchlist = null;
+  const tasks = [];
+  if (wantPrimary) {
+    tasks.push((async () => { profile = await getProfile(); })());
+    tasks.push((async () => { stats = await fetchJson(`${TRAKT_API}/users/me/stats`); })());
+    tasks.push((async () => {
+      playback = await fetchJson(`${TRAKT_API}/sync/playback?extended=full&images=poster`);
+    })());
+    tasks.push((async () => {
+      watchedShows = await fetchJson(
+        `${TRAKT_API}/users/me/watched/shows?limit=${RECENT_SHOWS_LIMIT}&extended=full&images=poster`
+      );
+    })());
+  }
+  if (wantSecondary) {
+    tasks.push((async () => {
+      history = await fetchJson(
+        `${TRAKT_API}/users/me/history?limit=${PAGE_SIZE}&page=1&extended=full&images=poster`
+      );
+    })());
+    tasks.push((async () => {
+      calendar = await fetchJson(
+        `${TRAKT_API}/calendars/my/shows/${today}/30?extended=full&images=poster`
+      );
+    })());
+    tasks.push((async () => {
+      watchlist = await getWatchlist(headers, 'added').catch(() => []);
+    })());
+  }
+  await Promise.all(tasks);
+
+  const result = { part };
+
+  if (wantPrimary) {
+    const username = (profile && !profile.__error && profile.username) || '我';
+    const displayName = (profile && !profile.__error && profile.name) || username;
+    const movieCount = stats && !stats.__error && stats.movies ? stats.movies.watched : 0;
+    const episodeCount = stats && !stats.__error && stats.episodes ? stats.episodes.watched : 0;
+    const showCount = stats && !stats.__error && stats.shows ? stats.shows.watched : 0;
+    const totalHours = stats && !stats.__error && stats.episodes && stats.episodes.minutes
+      ? Math.round(stats.episodes.minutes / 60) : 0;
+    let avatarUrl = '';
+    try {
+      const imgs = profile && !profile.__error && profile.images;
+      if (imgs && imgs.avatar) {
+        avatarUrl = imgs.avatar.full || imgs.avatar.medium || imgs.avatar.thumb || '';
+      }
+    } catch {}
+    result.greet = '欢迎回来 · @' + username;
+    result.name = displayName;
+    result.avatar = avatarUrl || null;
+    result.statsHtml = `
     <div class="stat"><div class="stat-num">${movieCount}</div><div class="stat-label">电影</div></div>
     <div class="stat"><div class="stat-num">${showCount}</div><div class="stat-label">剧集</div></div>
     <div class="stat"><div class="stat-num">${episodeCount}</div><div class="stat-label">集数</div></div>
-    <div class="stat"><div class="stat-num">${totalHours}</div><div class="stat-label">小时</div></div>
-  `;
-
-  await write(`<script>(function(){
-    var g=document.getElementById('hero-greet');
-    if(g) g.textContent=${jsStr('欢迎回来 · @' + username)};
-    var n=document.getElementById('hero-name');
-    if(n) n.textContent=${jsStr(displayName)};
-    var s=document.getElementById('stats-box');
-    if(s) s.innerHTML=${jsStr(statsInner)};
-  })();<\/script>`);
-
-  const historyPageCount = history.__pageCount || 1;
-
-  // ── 观看记录 ──
-  const pushHistory = (async () => {
-    try {
-      const htmlOut = renderHistoryPage(history, env);
-      const moreHtml = historyPageCount > 1
-        ? `<div class="load-more-wrap"><button class="load-more" data-page="2" onclick="loadMoreHistory(this)">加载更多</button></div>`
-        : '';
-      await write(`<script>(function(){
-        var el=document.querySelector('#history .grid');
-        if(el) el.innerHTML=${jsStr(htmlOut)};
-        var m=document.getElementById('history-more');
-        if(m) m.innerHTML=${jsStr(moreHtml)};
-        if (window.__scheduleEnrich) window.__scheduleEnrich();
-      })();<\/script>`);
-    } catch (e) {
-      await write(`<script>(function(){
-        var el=document.querySelector('#history .grid');
-        if(el) el.innerHTML='<div class="empty"><p>观看记录加载失败</p></div>';
-      })();<\/script>`);
-    }
-  })();
-
-  // ── 追剧日历 ──
-  const pushCalendar = (async () => {
-    try {
-      const zhTitles = await fetchCalendarZhTitles(calendar, env, ctx);
-      const htmlOut = renderCalendarPage(calendar, env, zhTitles);
-      await write(`<script>(function(){
-        var el=document.getElementById('calendar');
-        if(el) el.innerHTML=${jsStr(htmlOut)};
-        if (window.__scheduleEnrich) window.__scheduleEnrich();
-      })();<\/script>`);
-    } catch (e) {
-      await write(`<script>(function(){
-        var el=document.getElementById('calendar');
-        if(el) el.innerHTML='<div class="empty"><p>日历加载失败</p></div>';
-      })();<\/script>`);
-    }
-  })();
-
-  // ── 待看列表 ──
-  const pushWatchlist = (async () => {
-    try {
-      const list = Array.isArray(watchlist) ? watchlist : [];
-
-      let inner;
-      if (!list.length) {
-        inner = emptyWatchlistHtml();
-      } else {
-        const firstPage = list.slice(0, WATCHLIST_PAGE_SIZE);
-        const hasMore = list.length > WATCHLIST_PAGE_SIZE;
-        const cardsHtml = renderWatchlistItems(firstPage, env);
-        const moreHtml = hasMore
-          ? `<div class="load-more-wrap"><button class="load-more" data-page="2" data-sort="added" onclick="loadMoreWatchlist(this)">加载更多</button></div>`
-          : '';
-        inner = watchlistToolbarHtml('added')
-              + `<div id="watchlist-grid" class="grid">${cardsHtml}</div>`
-              + moreHtml;
-      }
-
-      await write(`<script>(function(){
-        var el=document.getElementById('watchlist');
-        if(el) el.innerHTML=${jsStr(inner)};
-        if (window.__scheduleEnrich) window.__scheduleEnrich();
-      })();<\/script>`);
-    } catch (e) {
-      await write(`<script>(function(){
-        var el=document.getElementById('watchlist');
-        if(el) el.innerHTML='<div class="empty"><p>待看列表加载失败</p></div>';
-      })();<\/script>`);
-    }
-  })();
-
-  // ── 继续观看 ──
-  const pushPlayback = (async () => {
+    <div class="stat"><div class="stat-num">${totalHours}</div><div class="stat-label">小时</div></div>`;
     try {
       const recentShows = (Array.isArray(watchedShows) ? watchedShows : [])
         .filter(w => w.show && w.show.ids && w.show.ids.trakt)
@@ -1362,78 +1601,55 @@ async function streamHomeData(env, auth, write, ctx) {
           return tb.localeCompare(ta);
         })
         .slice(0, MAX_RECENT_SHOWS);
-
-      // 并行拉每部剧的 progress
-      const progressList = await Promise.all(recentShows.map(async w => {
-        const id = w.show.ids.trakt;
-        try {
-          const r = await fetchT(
-            `${TRAKT_API}/shows/${id}/progress/watched?hidden=false&specials=false`,
-            { headers },
-            8000
-          );
-          if (!r.ok) return null;
-          const p = await r.json();
-          return { show: w.show, last_watched_at: w.last_watched_at, progress: p };
-        } catch { return null; }
-      }));
-
-      const htmlOut = renderContinueItems(playback, progressList, env);
-      await write(`<script>(function(){
-        var el=document.getElementById('playback');
-        if(el) el.innerHTML=${jsStr(htmlOut)};
-        if (window.__scheduleEnrich) window.__scheduleEnrich();
-      })();<\/script>`);
-    } catch (e) {
-      await write(`<script>(function(){
-        var el=document.getElementById('playback');
-        if(el) el.innerHTML='<div class="empty"><p>继续观看加载失败</p></div>';
-      })();<\/script>`);
+      const progressList = await mapPool(recentShows, PROGRESS_CONCURRENCY, async (w) => {
+        const p = await fetchShowProgress(w.show.ids.trakt, headers, env, ctx);
+        if (!p) return null;
+        return { show: w.show, last_watched_at: w.last_watched_at, progress: p };
+      });
+      result.playbackHtml = renderContinueItems(playback, progressList.filter(Boolean), env);
+    } catch {
+      result.playbackHtml = '<div class="empty"><p>继续观看加载失败</p></div>';
     }
-  })();
-
-  await Promise.all([pushHistory, pushCalendar, pushPlayback, pushWatchlist]);
-}
-
-/** 拉取日历里所有剧集的中文名（Trakt title → TMDB name） */
-async function fetchCalendarZhTitles(calendar, env, ctx) {
-  const map = {};
-  if (!Array.isArray(calendar) || !calendar.length) return map;
-  if (!env.TMDB_API_KEY) return map;
-
-  const seen  = new Set();
-  const tasks = [];
-
-  for (const item of calendar) {
-    const show = item && item.show;
-    if (!show || !show.ids) continue;
-
-    const traktId = show.ids.trakt;
-    const tmdbId  = show.ids.tmdb;
-    if (!traktId || !tmdbId) continue;
-    if (seen.has(traktId))   continue;
-    seen.add(traktId);
-    if (tasks.length >= 60)  continue;   // 上限 60 部，避免打爆
-
-    tasks.push(
-      tmdbDetailCached(`/tv/${tmdbId}`, env, ctx, TMDB_KV_TTL)
-        .then(d => {
-          if (!d) return;
-          const zh = d.name || d.original_name;
-          if (zh) map[traktId] = zh;
-        })
-        .catch(() => {})
-    );
   }
 
-  await Promise.all(tasks);
-  return map;
+  if (wantSecondary) {
+    try {
+      const historyPageCount = (history && history.__pageCount) || 1;
+      result.historyHtml = renderHistoryPage(history, env);
+      result.historyMoreHtml = historyPageCount > 1
+        ? `<div class="load-more-wrap"><button class="load-more" data-page="2" onclick="loadMoreHistory(this)">加载更多</button></div>`
+        : '';
+    } catch {
+      result.historyHtml = '<div class="empty"><p>观看记录加载失败</p></div>';
+      result.historyMoreHtml = '';
+    }
+    try {
+      result.calendarHtml = renderCalendarPage(calendar, env, {});
+    } catch {
+      result.calendarHtml = '<div class="empty"><p>日历加载失败</p></div>';
+    }
+    try {
+      const list = Array.isArray(watchlist) ? watchlist : [];
+      if (!list.length) {
+        result.watchlistHtml = emptyWatchlistHtml();
+      } else {
+        const firstPage = list.slice(0, WATCHLIST_PAGE_SIZE);
+        const hasMore = list.length > WATCHLIST_PAGE_SIZE;
+        const cardsHtml = renderWatchlistItems(firstPage, env);
+        const moreHtml = hasMore
+          ? `<div class="load-more-wrap"><button class="load-more" data-page="2" data-sort="added" onclick="loadMoreWatchlist(this)">加载更多</button></div>`
+          : '';
+        result.watchlistHtml = watchlistToolbarHtml('added')
+          + `<div id="watchlist-grid" class="grid">${cardsHtml}</div>` + moreHtml;
+      }
+    } catch {
+      result.watchlistHtml = '<div class="empty"><p>待看列表加载失败</p></div>';
+    }
+  }
+
+  return new Response(JSON.stringify(result), { headers: outHeaders });
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
- *  首页骨架 HTML
- *  ⚠ 内联 <script> 里禁止使用反引号和 ${...}
- * ═══════════════════════════════════════════════════════════════════════ */
 
 function renderHomeSkeleton(initialDetail) {
   // 深链接时，页面加载完自动打开详情
@@ -1450,7 +1666,10 @@ function renderHomeSkeleton(initialDetail) {
 
       <header class="hero">
         <div class="hero-left">
-          <div>
+          <div class="hero-avatar" id="hero-avatar" aria-hidden="true">
+            <span class="hero-avatar-ph">👤</span>
+          </div>
+          <div class="hero-text">
             <p class="hero-greet" id="hero-greet">欢迎回来</p>
             <h1 class="hero-name" id="hero-name">…</h1>
           </div>
@@ -2571,6 +2790,7 @@ function renderLoginPage() {
  * ═══════════════════════════════════════════════════════════════════════ */
 
 /** 从 Trakt 图片结构里取海报 URL */
+
 function posterOfTrakt(obj) {
   if (!obj || !obj.images) return null;
   const p = obj.images.poster;
@@ -2581,6 +2801,10 @@ function posterOfTrakt(obj) {
 }
 
 /** 通用卡片渲染 */
+/**
+ * 通用媒体卡片 HTML。
+ * 支持：详情点击、富化 key、待看移除、标记已看/取消、播出日历按钮、进度条。
+ */
 function mediaItem(opts) {
   const poster = opts.poster;
   const tag = opts.tag;
@@ -2671,6 +2895,7 @@ function mediaItem(opts) {
 }
 
 /* ── 观看记录卡片列表 ── */
+/** 观看记录列表卡片（可带取消观看按钮） */
 function renderHistoryPage(items, env, isFragment) {
   if (isFragment === undefined) isFragment = false;
   if (!Array.isArray(items)) return isFragment ? '' : errBox('观看记录', items);
@@ -2704,6 +2929,7 @@ function renderHistoryPage(items, env, isFragment) {
 }
 
 /* ── 待看列表排序工具条 ── */
+/** 待看列表排序工具条 */
 function watchlistToolbarHtml(currentSort) {
   const opts = [
     ['added',    '按添加时间'],
@@ -2724,6 +2950,7 @@ function watchlistToolbarHtml(currentSort) {
 }
 
 /* ── 待看列表空状态 ── */
+/** 待看列表空状态 */
 function emptyWatchlistHtml() {
   return `<div class="empty">
     <svg viewBox="0 0 24 24" width="56" height="56" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.25">
@@ -2737,6 +2964,7 @@ function emptyWatchlistHtml() {
 }
 
 /* ── 待看列表卡片列表 ── */
+/** 待看列表卡片（带移除按钮） */
 function renderWatchlistItems(items, env) {
   if (!Array.isArray(items) || !items.length) return '';
   return items.map((item, i) => {
@@ -2759,6 +2987,10 @@ function renderWatchlistItems(items, env) {
 }
 
 /* ── 继续观看：合并 sync/playback 与 watched 进度 ── */
+/**
+ * 继续观看：合并 sync/playback 暂停点与各剧 next_episode，
+ * 去重排序后渲染（带标记已看）。
+ */
 function renderContinueItems(playback, progressList, env) {
   const items = [];
 
@@ -2844,6 +3076,7 @@ function renderContinueItems(playback, progressList, env) {
 }
 
 /* ── 追剧日历：按天分组 ── */
+/** 追剧日历：按北京时间日期分组，可挂「播出日历」按钮 */
 function renderCalendarPage(calendar, env, zhTitles) {
   if (!Array.isArray(calendar)) return errBox('追剧日历', calendar);
   if (!calendar.length) return emptyState('未来 30 天没有待播剧集');
@@ -2920,6 +3153,10 @@ function renderCalendarPage(calendar, env, zhTitles) {
  *  详情 modal 内容
  * ═══════════════════════════════════════════════════════════════════════ */
 
+/**
+ * 详情 Modal 主体：海报/背景、评分徽章、观看状态、Infuse、
+ * 演员横滑、季集折叠、相关推荐网格。
+ */
 async function renderDetailFragment(d) {
   const type = d.type;
   const entity = d.entity;
@@ -3163,6 +3400,7 @@ async function renderDetailFragment(d) {
 }
 
 /* ── 季集列表渲染 ── */
+/** 单季集列表；已看集打勾，可点进 Trakt 页面 */
 function renderSeasonEpisodes(seasonProgress, tmdbSeason, seasonNum, showSlug) {
   if (!tmdbSeason || !Array.isArray(tmdbSeason.episodes) || !tmdbSeason.episodes.length) {
     return '<div class="ep-empty">暂无剧集信息</div>';
@@ -3216,6 +3454,7 @@ function emptyState(text) {
  * ═══════════════════════════════════════════════════════════════════════ */
 
 /** PKCE code verifier 用的随机串 */
+/** PKCE code_verifier 用的密码学安全随机串 */
 function randomString(len) {
   const cs = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
   const v = new Uint8Array(len);
@@ -3226,6 +3465,7 @@ function randomString(len) {
 }
 
 /** PKCE S256 challenge */
+/** PKCE S256：SHA-256(verifier) 再 Base64URL */
 async function pkceChallenge(verifier) {
   const data = new TextEncoder().encode(verifier);
   const digest = await crypto.subtle.digest('SHA-256', data);
@@ -3233,6 +3473,7 @@ async function pkceChallenge(verifier) {
 }
 
 /** Base64URL 编码 */
+/** Base64URL 编码（可选按二进制字节处理） */
 function b64urlEncode(str, isBinary) {
   let bytes;
   if (isBinary) {
@@ -3247,6 +3488,7 @@ function b64urlEncode(str, isBinary) {
 }
 
 /** Base64URL 解码 */
+/** Base64URL 解码为 UTF-8 字符串 */
 function b64urlDecode(str) {
   let b64 = str.replace(/-/g, '+').replace(/_/g, '/');
   const pad = b64.length % 4;
@@ -3258,6 +3500,7 @@ function b64urlDecode(str) {
 }
 
 /** HTML 转义 */
+/** HTML 属性/文本转义，防 XSS */
 function esc(s) {
   return String(s == null ? '' : s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -3265,6 +3508,7 @@ function esc(s) {
 }
 
 /** 生成可安全嵌入 <script> 的字符串字面量 */
+/** 生成可安全嵌入 <script> 的 JSON 字符串字面量 */
 function jsStr(s) {
   return JSON.stringify(String(s == null ? '' : s))
     .replace(/</g, '\\u003c')
@@ -3273,9 +3517,11 @@ function jsStr(s) {
 }
 
 /** 数字补零到 2 位 */
+/** 季/集编号补零到 2 位 */
 function pad(n) { return String(n == null ? 0 : n).padStart(2, '0'); }
 
 /** 相对时间（"3 分钟前" / "2 天前" / "3/15"） */
+/** ISO 时间 → 相对中文描述（刚刚 / N 分钟前 / … / M/D） */
 function fmtRelative(iso) {
   if (!iso) return '';
   const d = new Date(iso);
@@ -3293,11 +3539,13 @@ function fmtRelative(iso) {
 }
 
 /** 错误盒子 */
+/** 区块加载失败提示盒 */
 function errBox(name, obj) {
   return `<div class="err-box"><p class="err-title">无法加载${name}</p><p class="err">${esc((obj && obj.__error) || '未知错误')}</p></div>`;
 }
 
 /** 简单 HTML 响应 */
+/** 包装为 text/html 响应，禁止缓存 */
 function html(body) {
   return new Response(body, {
     headers: {
@@ -3314,12 +3562,16 @@ function html(body) {
  *  主题：深黑底 + 冷金属蓝（与 MineTrakt logo 一致）
  * ═══════════════════════════════════════════════════════════════════════ */
 
-function pageHead() {
+/**
+ * 首包 HTML：meta + 关键 CSS（深色底、Splash 动画）+ body 开头 + Splash。
+ * 与 pageStyles 拆分，便于尽快完成首绘。
+ */
+function pageHeadEarly() {
   return `<!DOCTYPE html>
-<html lang="zh-CN" style="background:#141b2a">
+<html lang="zh-CN" style="background:#0a0e18">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1,user-scalable=no">
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta name="color-scheme" content="dark">
@@ -3331,32 +3583,47 @@ function pageHead() {
 <meta name="format-detection" content="telephone=no">
 <title>${APP_NAME}</title>
 <link rel="icon" href="${FAVICON_URL}" type="image/x-icon">
-<link rel="shortcut icon" href="${FAVICON_URL}" type="image/x-icon">
 <link rel="apple-touch-icon" href="${APPLE_ICON}">
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="preconnect" href="https://api.trakt.tv" crossorigin>
 <link rel="preconnect" href="https://api.themoviedb.org" crossorigin>
 <link rel="preconnect" href="https://image.tmdb.org" crossorigin>
-<link rel="preconnect" href="https://www.omdbapi.com" crossorigin>
-
 <style>
-  /* ─────── Splash 启动动画 ─────── */
-  html,body{background:#141b2a;color:#eef1f7;margin:0;padding:0}
-  .splash{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;overflow:hidden;background:radial-gradient(circle at 50% 45%,#141b2a 0%,#03050a 62%);transition:opacity .38s ease;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;-webkit-tap-highlight-color:transparent}
-  .splash.hide{opacity:0;pointer-events:none}
-  .splash-glow{position:absolute;width:340px;height:340px;border-radius:50%;background:radial-gradient(circle,rgba(125,157,212,.25) 0%,rgba(125,157,212,0) 70%);animation:splashPulse 2.4s ease-in-out infinite}
-  .splash-inner{position:relative;z-index:1;display:flex;flex-direction:column;align-items:center;gap:20px}
-  .splash-logo{color:#a8b2c4;animation:splashPop .75s cubic-bezier(.22,1.1,.36,1) both}
-  .splash-logo img{display:block}
-  .splash-name{font-size:1.35rem;font-weight:800;letter-spacing:.4px;background:linear-gradient(135deg,#ffffff 20%,#7d9dd4);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;animation:splashFadeUp .6s ease .28s both}
-  .splash-bar{width:128px;height:3px;border-radius:99px;background:rgba(255,255,255,.08);overflow:hidden;animation:splashFadeUp .6s ease .45s both}
-  .splash-bar-fill{height:100%;width:42%;border-radius:99px;background:linear-gradient(90deg,#3e5fa8,#7d9dd4);animation:splashSlide 1.15s cubic-bezier(.65,0,.35,1) infinite}
-  @keyframes splashPulse{0%,100%{transform:scale(.85);opacity:.7}50%{transform:scale(1.12);opacity:1}}
-  @keyframes splashPop{0%{opacity:0;transform:scale(.55) rotate(-8deg)}60%{opacity:1;transform:scale(1.08) rotate(2deg)}100%{opacity:1;transform:scale(1) rotate(0)}}
-  @keyframes splashFadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-  @keyframes splashSlide{0%{transform:translateX(-130%)}100%{transform:translateX(330%)}}
+html,body{background:#0a0e18!important;color:#eef1f7;margin:0;padding:0;min-height:100%;min-height:100dvh}
+.splash{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#0a0e18;background:radial-gradient(circle at 50% 45%,#141b2a 0%,#03050a 62%);transition:opacity .38s ease;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;-webkit-tap-highlight-color:transparent}
+.splash.hide{opacity:0;pointer-events:none}
+.splash-glow{position:absolute;width:340px;height:340px;border-radius:50%;background:radial-gradient(circle,rgba(125,157,212,.25) 0%,rgba(125,157,212,0) 70%);animation:splashPulse 2.4s ease-in-out infinite}
+.splash-inner{position:relative;z-index:1;display:flex;flex-direction:column;align-items:center;gap:20px}
+.splash-logo{color:#a8b2c4;animation:splashPop .75s cubic-bezier(.22,1.1,.36,1) both}
+.splash-logo img{display:block}
+.splash-name{font-size:1.35rem;font-weight:800;letter-spacing:.4px;background:linear-gradient(135deg,#ffffff 20%,#7d9dd4);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;animation:splashFadeUp .6s ease .28s both}
+.splash-bar{width:128px;height:3px;border-radius:99px;background:rgba(255,255,255,.08);overflow:hidden;animation:splashFadeUp .6s ease .45s both}
+.splash-bar-fill{height:100%;width:42%;border-radius:99px;background:linear-gradient(90deg,#3e5fa8,#7d9dd4);animation:splashSlide 1.15s cubic-bezier(.65,0,.35,1) infinite}
+@keyframes splashPulse{0%,100%{transform:scale(.85);opacity:.7}50%{transform:scale(1.12);opacity:1}}
+@keyframes splashPop{0%{opacity:0;transform:scale(.55) rotate(-8deg)}60%{opacity:1;transform:scale(1.08) rotate(2deg)}100%{opacity:1;transform:scale(1) rotate(0)}}
+@keyframes splashFadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.splash-tip{font-size:.8rem;color:#7a8394;margin-top:4px;animation:splashFadeUp .6s ease .55s both}
+@keyframes splashSlide{0%{transform:translateX(-130%)}100%{transform:translateX(330%)}}
+.spinner{width:30px;height:30px;border:3px solid #212735;border-top-color:#7d9dd4;border-radius:50%;animation:spin .8s linear infinite;margin:4px auto}
+@keyframes spin{to{transform:rotate(360deg)}}
 </style>
+</head>
+<body style="background:#0a0e18;margin:0;min-height:100vh;min-height:100dvh">
+${renderSplash()}`;
+}
 
+/** 兼容 pageShell：early 与全量样式一次返回 */
+function pageHead() {
+  // 兼容 pageShell：early + 全局样式一次返回
+  return pageHeadEarly() + pageStyles();
+}
+
+/**
+ * 全站主题与组件 CSS（卡片、Tab、Modal、日历、多端断点等）。
+ * 断点：手机 <600 / 600+ 双列 / 768+ 海报墙 / 1024+ / 1280+ / 1600+。
+ */
+function pageStyles() {
+  return `
 <style>
   /* ══════════════════════════════════════════════════════════════════
    *  全局主题变量
@@ -3522,11 +3789,30 @@ function pageHead() {
     display: flex; justify-content: space-between; align-items: center;
     padding: calc(20px + env(safe-area-inset-top)) 0 20px; gap: 16px;
   }
-  .hero-left { display: flex; align-items: center; gap: 14px; min-width: 0; }
+  .hero-left { display: flex; align-items: center; gap: 12px; min-width: 0; }
+  .hero-avatar {
+    width: 48px; height: 48px; border-radius: 50%;
+    overflow: hidden; flex-shrink: 0;
+    background: var(--surface-2);
+    border: 2px solid rgba(125,157,212,0.35);
+    box-shadow: 0 0 0 1px rgba(0,0,0,0.4);
+  }
+  .hero-avatar img {
+    width: 100%; height: 100%; object-fit: cover; display: block;
+  }
+  .hero-avatar-ph {
+    width: 100%; height: 100%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 1.25rem; background: linear-gradient(135deg, #1a2233, #2a3a55);
+  }
+  .hero-text { min-width: 0; flex: 1; }
   .hero-greet { font-size: 0.78rem; color: var(--text-dim); }
   .hero-name {
     font-size: 1.4rem; font-weight: 800; letter-spacing: -0.3px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  @media (min-width: 768px) {
+    .hero-avatar { width: 56px; height: 56px; }
   }
 
   /* ─────── 统计 ─────── */
@@ -4022,23 +4308,65 @@ function pageHead() {
     .detail-ext-ratings { justify-content: flex-start; }
   }
 
-  /* ─────── 桌面端适配 ─────── */
-  @media (min-width: 700px) {
-    .container { padding: 0 32px 100px; }
-    .hero { padding: 40px 0 28px; }
-    .hero-name { font-size: 1.7rem; }
-    .stats { gap: 12px; padding: 20px 12px; margin-bottom: 28px; }
-    .stat-num { font-size: 1.6rem; }
-    .stat-label { font-size: 0.78rem; }
-    .tabs { position: static; padding-top: 0; }
-  }
+  /* ─────── 多端布局：手机 / iPad / 电脑 ─────── */
 
-  @media (min-width: 900px) {
+  /* 手机基础（默认）：单列列表，安全区，触控友好 */
+  .container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 0 max(12px, env(safe-area-inset-left)) calc(72px + env(safe-area-inset-bottom));
+    padding-right: max(12px, env(safe-area-inset-right));
+  }
+  .tabs {
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    background: rgba(5, 7, 11, 0.85);
+    margin-left: -12px;
+    margin-right: -12px;
+    padding-left: 12px;
+    padding-right: 12px;
+  }
+  .tab { min-height: 36px; padding: 8px 14px; }
+  .btn-ghost { min-height: 36px; }
+
+  /* 大屏手机横屏 / 小平板（约 600+） */
+  @media (min-width: 600px) {
+    .container { padding-left: 20px; padding-right: 20px; }
+    .tabs { margin-left: -20px; margin-right: -20px; padding-left: 20px; padding-right: 20px; }
     .grid {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
-      gap: 20px;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 12px;
     }
+    .item { border-radius: 14px; }
+    .poster { width: 72px; height: 108px; }
+  }
+
+  /* iPad 竖屏 / 中等平板（约 768+） */
+  @media (min-width: 768px) {
+    .container {
+      max-width: 1000px;
+      padding: 0 28px calc(88px + env(safe-area-inset-bottom));
+    }
+    .hero { padding: 28px 0 22px; gap: 12px; }
+    .hero-name { font-size: 1.55rem; }
+    .stats { gap: 10px; padding: 18px 12px; margin-bottom: 24px; }
+    .stat-num { font-size: 1.45rem; }
+    .stat-label { font-size: 0.76rem; }
+    .tabs {
+      position: static;
+      margin-left: 0; margin-right: 0;
+      padding-left: 0; padding-right: 0;
+      background: transparent;
+      backdrop-filter: none;
+      -webkit-backdrop-filter: none;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+      gap: 16px;
+    }
+    /* 卡片改为竖排海报墙 */
     .item {
       display: flex; flex-direction: column; gap: 0;
       padding: 0; border-radius: 12px;
@@ -4056,21 +4384,66 @@ function pageHead() {
       transform: translateY(-4px);
       box-shadow: 0 12px 32px rgba(90,130,200,0.35), 0 4px 16px rgba(0,0,0,0.6);
     }
-    .info { display: block; padding: 12px 2px 0; flex: none; justify-content: flex-start; }
-    .name-row { line-height: 1.3; }
+    .info { display: block; padding: 10px 2px 0; flex: none; justify-content: flex-start; }
+    .name { font-size: 0.88rem; }
+    .overview { -webkit-line-clamp: 2; font-size: 0.74rem; margin-top: 4px; }
+    .meta { font-size: 0.76rem; margin-top: 3px; }
+    .meta.dim { font-size: 0.72rem; }
+    .bar { margin-top: 8px; }
+    .wl-remove, .wl-watched, .wl-unwatch {
+      top: 8px; right: 8px; width: 28px; height: 28px;
+    }
+    .day-num { font-size: 1.6rem; }
+  }
+
+  /* iPad 横屏 / 小笔记本（约 1024+） */
+  @media (min-width: 1024px) {
+    .container {
+      max-width: 1120px;
+      padding: 0 32px 100px;
+    }
+    .hero { padding: 36px 0 26px; }
+    .hero-name { font-size: 1.7rem; }
+    .stats { gap: 12px; padding: 20px 14px; margin-bottom: 28px; }
+    .stat-num { font-size: 1.6rem; }
+    .stat-label { font-size: 0.78rem; }
+    .grid {
+      grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+      gap: 20px;
+    }
     .name { font-size: 0.9rem; }
-    .overview { -webkit-line-clamp: 3; font-size: 0.76rem; margin-top: 5px; }
-    .meta { font-size: 0.78rem; margin-top: 4px; }
-    .meta.dim { font-size: 0.74rem; margin-top: 3px; }
-    .bar { margin-top: 9px; }
+    .overview { -webkit-line-clamp: 3; font-size: 0.76rem; }
     .wl-remove, .wl-watched, .wl-unwatch {
       top: 10px; right: 10px; width: 30px; height: 30px;
     }
     .wl-watched, .wl-unwatch { font-size: 0.95rem; }
   }
 
-  @media (min-width: 1100px) {
-    .grid { grid-template-columns: repeat(auto-fill, minmax(185px, 1fr)); gap: 22px; }
+  /* 大桌面（约 1280+） */
+  @media (min-width: 1280px) {
+    .container { max-width: 1280px; padding: 0 40px 110px; }
+    .grid {
+      grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+      gap: 22px;
+    }
+    .hero-name { font-size: 1.85rem; }
+  }
+
+  /* 超宽屏限制列宽，避免卡片过大 */
+  @media (min-width: 1600px) {
+    .container { max-width: 1440px; }
+    .grid {
+      grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+      gap: 24px;
+    }
+  }
+
+  /* 短屏手机（横持）略压缩顶栏 */
+  @media (max-height: 500px) and (orientation: landscape) {
+    .hero { padding: 12px 0 10px; }
+    .stats { padding: 10px 8px; margin-bottom: 12px; }
+    .stat-num { font-size: 1.1rem; }
+    .tabs { margin-bottom: 12px; }
   }
 
   /* ─────── 追剧日历分组 ─────── */
@@ -4117,7 +4490,7 @@ function pageHead() {
   .modal-body {
     pointer-events: auto;
     position: relative;
-    width: 100%; max-width: 880px;
+    width: 100%; max-width: min(880px, 100%);
     max-height: 100%;
     overflow-y: auto; overflow-x: hidden;
     background: var(--bg);
@@ -4127,6 +4500,20 @@ function pageHead() {
     animation: modalIn 0.28s cubic-bezier(0.2, 0.9, 0.3, 1);
     -webkit-overflow-scrolling: touch;
     overscroll-behavior: contain;
+  }
+  @media (max-width: 599px) {
+    .modal-panel { padding: 0; align-items: stretch; }
+    .modal-body {
+      max-width: 100%;
+      max-height: 100%;
+      border-radius: 0;
+      border: none;
+      min-height: 100%;
+      min-height: 100dvh;
+    }
+  }
+  @media (min-width: 768px) and (max-width: 1023px) {
+    .modal-body { max-width: min(720px, 92vw); }
   }
   @keyframes modalIn {
     from { opacity: 0; transform: translateY(14px) scale(0.98); }
@@ -4180,14 +4567,19 @@ function pageHead() {
     padding: 24px 20px 24px;
   }
   .detail-poster {
-    width: 130px; height: 195px; border-radius: 12px;
+    width: min(48vw, 200px);
+    height: auto;
+    aspect-ratio: 2 / 3;
+    border-radius: 14px;
     object-fit: cover; flex-shrink: 0;
-    box-shadow: 0 12px 32px rgba(0,0,0,0.7);
+    box-shadow: 0 16px 40px rgba(0,0,0,0.75);
     margin: 0 auto;
   }
   .detail-poster-ph {
     display: flex; align-items: center; justify-content: center;
-    background: var(--surface-2); font-size: 2.4rem; color: var(--text-dim);
+    background: var(--surface-2); font-size: 2.8rem; color: var(--text-dim);
+    width: min(48vw, 200px);
+    aspect-ratio: 2 / 3;
   }
   .detail-info {
     flex: 1; min-width: 0;
@@ -4197,7 +4589,7 @@ function pageHead() {
     width: 100%;
   }
   .detail-title {
-    font-size: 1.3rem; font-weight: 800; letter-spacing: -0.4px;
+    font-size: 1.45rem; font-weight: 800; letter-spacing: -0.4px;
     line-height: 1.25;
   }
   .detail-tagline { font-size: 0.85rem; color: var(--text-dim); font-style: italic; }
@@ -4374,7 +4766,7 @@ function pageHead() {
       padding: 30px;
       gap: 26px;
     }
-    .detail-poster { width: 160px; height: 240px; margin: 0; }
+    .detail-poster { width: 180px; height: auto; aspect-ratio: 2 / 3; margin: 0; }
     .detail-info { align-items: flex-start; }
     .detail-meta { justify-content: flex-start; }
     .d-status { justify-content: flex-start; }
@@ -4390,30 +4782,23 @@ function pageHead() {
       gap: 18px;
     }
   }
-</style>
-</head>
-<body>${renderSplash()}`;
+
+</style>`;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
- *  pageTail —— </body> 前的脚本
- *  包含：splash 淡出 + Service Worker 注册 / 桌面端清理
- * ═══════════════════════════════════════════════════════════════════════ */
 
+/**
+ * 关闭 body/html 前的脚本：强制收起 Splash；
+ * 移动端延迟注册 SW，桌面端卸载 SW 避免开发脏缓存。
+ */
 function pageTail() {
   return `<script>(function(){
-    // splash 至少展示 800ms，然后淡出
+    if (window.__hideSplash) window.__hideSplash(true);
     var s = document.getElementById('splash');
-    if (!s) return;
-    var t0 = window.__splashT0 || Date.now();
-    var MIN = 800;
-    var wait = Math.max(0, MIN - (Date.now() - t0));
-    setTimeout(function(){
+    if (s) {
       s.classList.add('hide');
-      setTimeout(function(){
-        if (s && s.parentNode) s.parentNode.removeChild(s);
-      }, 420);
-    }, wait);
+      setTimeout(function(){ if (s && s.parentNode) s.parentNode.removeChild(s); }, 380);
+    }
   })();<\/script>
   <script>(function(){
     if (!('serviceWorker' in navigator)) return;
@@ -4446,17 +4831,23 @@ function pageTail() {
       return;
     }
 
-    // 移动端：注册 Service Worker
+    // 移动端：延迟注册 SW，避免首次打开抢占主线程导致白屏
     if (window.__swRegistered) return;
     window.__swRegistered = true;
-    window.addEventListener('load', function(){
-      navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(function(){});
-    });
+    var regSW = function(){
+      navigator.serviceWorker.register('/sw.js', { scope: '/', updateViaCache: 'none' }).catch(function(){});
+    };
+    if (document.readyState === 'complete') {
+      setTimeout(regSW, 1500);
+    } else {
+      window.addEventListener('load', function(){ setTimeout(regSW, 1500); });
+    }
   })();<\/script>
 </body>
 </html>`;
 }
 
+/** 登录页等完整文档：head + body 片段 + tail */
 function pageShell(body) {
   return pageHead() + body + pageTail();
 }
