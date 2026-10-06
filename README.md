@@ -11,19 +11,36 @@
 
 ## 💻 项目预览
 
-<details> <summary>Demo</summary>
+<details>
+<summary>项目介绍</summary>
 
-- 在线地址：https://trakt.yx1314.ccwu.cc
-- 项目功能：
+### 🌐 在线体验
 
-<a href="https://ibb.co/gFDbkpcH"><img src="https://i.ibb.co/NnLgcPGQ/20261006154814.png" alt="20261006154814" border="0"></a>
-<a href="https://ibb.co/3y6RW3HN"><img src="https://i.ibb.co/4Zv1MqxT/20261006154829.png" alt="20261006154829" border="0"></a>
-<a href="https://ibb.co/nM926DzG"><img src="https://i.ibb.co/b5ThQrz0/20261006154845.png" alt="20261006154845" border="0"></a>
-<a href="https://ibb.co/1YD2xzrZ"><img src="https://i.ibb.co/8nW8VYrM/20261006154859.png" alt="20261006154859" border="0"></a>
-<a href="https://ibb.co/KxzBk1pc"><img src="https://i.ibb.co/k26zfdsV/20261006154911.png" alt="20261006154911" border="0"></a>
-<a href="https://ibb.co/3m4sChW0"><img src="https://i.ibb.co/60rZWsb4/20261006154922.png" alt="20261006154922" border="0"></a>
+**在线地址：**
+https://trakt.yx1314.ccwu.cc
+
+### 🎬 演示视频
+
+点击下方按钮即可观看 Demo：
+
+[▶️ 点击观看演示视频](https://img.helo.de5.net/1791276235250.mp4)
+
+### ✨ 项目功能
+
+![项目功能 1](https://i.ibb.co/NnLgcPGQ/20261006154814.png)
+
+![项目功能 2](https://i.ibb.co/4Zv1MqxT/20261006154829.png)
+
+![项目功能 3](https://i.ibb.co/b5ThQrz0/20261006154845.png)
+
+![项目功能 4](https://i.ibb.co/8nW8VYrM/20261006154859.png)
+
+![项目功能 5](https://i.ibb.co/k26zfdsV/20261006154911.png)
+
+![项目功能 6](https://i.ibb.co/60rZWsb4/20261006154922.png)
 
 </details>
+
 
 ## ✨ 特性
 
