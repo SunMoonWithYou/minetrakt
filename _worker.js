@@ -4318,13 +4318,14 @@ function pageStyles() {
     padding-right: max(12px, env(safe-area-inset-right));
   }
   .tabs {
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
-    background: rgba(5, 7, 11, 0.85);
-    margin-left: -12px;
-    margin-right: -12px;
-    padding-left: 12px;
-    padding-right: 12px;
+    /* 手机：去掉黑色毛玻璃底，与页面背景一致 */
+    background: transparent;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    margin-left: 0;
+    margin-right: 0;
+    padding-left: 0;
+    padding-right: 0;
   }
   .tab { min-height: 36px; padding: 8px 14px; }
   .btn-ghost { min-height: 36px; }
@@ -4332,7 +4333,7 @@ function pageStyles() {
   /* 大屏手机横屏 / 小平板（约 600+） */
   @media (min-width: 600px) {
     .container { padding-left: 20px; padding-right: 20px; }
-    .tabs { margin-left: -20px; margin-right: -20px; padding-left: 20px; padding-right: 20px; }
+    .tabs { margin-left: 0; margin-right: 0; padding-left: 0; padding-right: 0; }
     .grid {
       display: grid;
       grid-template-columns: repeat(2, 1fr);
@@ -4502,14 +4503,35 @@ function pageStyles() {
     overscroll-behavior: contain;
   }
   @media (max-width: 599px) {
-    .modal-panel { padding: 0; align-items: stretch; }
+    /* 顶部留出状态栏，底部贴齐屏幕，不再留大块黑边 */
+    .modal-panel {
+      padding: 0;
+      align-items: stretch;
+      justify-content: flex-start;
+    }
     .modal-body {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: calc(10px + env(safe-area-inset-top));
+      bottom: 0;
       max-width: 100%;
-      max-height: 100%;
-      border-radius: 0;
+      max-height: none;
+      width: 100%;
+      border-radius: 16px 16px 0 0;
       border: none;
-      min-height: 100%;
-      min-height: 100dvh;
+      border-top: 1px solid var(--border);
+      /* 底部内容避开 Home 指示条 */
+      padding-bottom: env(safe-area-inset-bottom);
+    }
+    .modal-close {
+      top: calc(14px + env(safe-area-inset-top));
+    }
+    .detail-inner {
+      padding-top: 16px;
+    }
+    .detail-body {
+      padding-bottom: calc(28px + env(safe-area-inset-bottom));
     }
   }
   @media (min-width: 768px) and (max-width: 1023px) {
