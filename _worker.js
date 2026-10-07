@@ -854,7 +854,8 @@ async function fetchOmdbRatings(imdbId, env, ctx) {
       if (Array.isArray(d.Ratings))
         for (const r of d.Ratings) {
           // "8.5/10" / "85%" / "72/100"
-          const v = parseFloat(String(r.Value).replace(/[^0-9.]/g, ""));
+          const match = String(r.Value).match(/[\d.]+/);
+          const v = match ? parseFloat(match[0]) : NaN;
           if (!Number.isFinite(v)) continue;
           if (r.Source === "Internet Movie Database") out.imdb = v;
           else if (r.Source === "Rotten Tomatoes") out.rt = Math.round(v);
