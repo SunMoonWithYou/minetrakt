@@ -1,3 +1,12 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════════
+ *  MineTrakt · Trakt 观看记录查看器 (Cloudflare Workers 单文件部署)
+ * ═══════════════════════════════════════════════════════════════════════
+ *  绑定：TMDB_CACHE (KV命名空间)
+ *  环境变量：TRAKT_CLIENT_ID (必填), TMDB_API_KEY (必填), OMDB_API_KEY (可选)
+ * ═══════════════════════════════════════════════════════════════════════
+ */
+
 const TRAKT_AUTH = 'https://auth.trakt.tv', TRAKT_API = 'https://api.trakt.tv', TMDB_API = 'https://api.themoviedb.org/3', TMDB_IMG = 'https://image.tmdb.org/t/p', ACTIVATE_URL = 'https://trakt.tv/activate', OMDB_API = 'https://www.omdbapi.com', DOUBAN_SEARCH = 'https://search.douban.com/movie/subject_search';
 const APP_NAME = 'MineTrakt', APP_SHORT_NAME = 'MineTrakt', THEME_COLOR = '#050505';
 const FAVICON_URL = '/assets/favicon.ico', ICON_192 = '/assets/icon-192.png', ICON_512 = '/assets/icon-512.png', APPLE_ICON = '/assets/icon-512.png', SPLASH_LOGO = '/assets/logo.png';
@@ -11,7 +20,7 @@ const JSON_HEADERS = { 'Content-Type': 'application/json', 'User-Agent': 'TraktV
 const COOKIE_NAME = 'trakt_auth', COOKIE_MAX_AGE = 60 * 60 * 24 * 90;
 const PAGE_SIZE = 12, TMDB_KV_TTL = 86400 * 7, OMDB_KV_TTL = 86400 * 7, WATCHLIST_PAGE_SIZE = 30, WATCHLIST_KV_TTL = 120, CALENDAR_KV_TTL = 600;
 const HOME_AUTO_REFRESH_MINUTES = 5;
-const APP_JS_VERSION = '3', APP_CSS_VERSION = '30';
+const APP_JS_VERSION = '4', APP_CSS_VERSION = '31';
 
 async function fetchT(url, opts = {}, ms = 8000) { const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), ms); try { return await fetch(url, { ...opts, signal: ctrl.signal }); } finally { clearTimeout(t); } }
 
@@ -42,13 +51,13 @@ function kvPutJSON(env, ctx, key, payload, ttl, memOnly) {
 function clearCookieHeader() { return `${COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`; }
 function invalidateWatchlistCache() { for (const k of [...__kvMem.keys()]) { if (k.startsWith('wl:')) { __kvMem.delete(k); __kvMemExp.delete(k); } } }
 
-const SW_JS_CONTENT = String.raw`/* MineTrakt SW v13 */ const VERSION = 'v13'; const RUNTIME_CACHE = 'trakt-static-' + VERSION; self.addEventListener('install', function(){ self.skipWaiting(); }); self.addEventListener('activate', function(e){ e.waitUntil((async function(){ var keys = await caches.keys(); await Promise.all(keys.filter(function(k){ return k !== RUNTIME_CACHE; }).map(function(k){ return caches.delete(k); })); await self.clients.claim(); })()); }); self.addEventListener('fetch', function(event){ var req = event.request; if (req.method !== 'GET') return; var url; try { url = new URL(req.url); } catch(e){ return; } if (url.origin !== self.location.origin) return; if (url.pathname === '/sw.js') return; if (req.mode === 'navigate') return; if (url.pathname.indexOf('/api/') === 0) return; if (url.pathname.indexOf('/auth/') === 0) return; if (url.pathname === '/app.css' || url.pathname === '/app.js' || url.pathname === '/manifest.webmanifest' || url.pathname === '/favicon.ico' || url.pathname.indexOf('/assets/') === 0 || /\.(?:png|jpg|jpeg|svg|webp|ico|woff2?|css|js)$/i.test(url.pathname)) { event.respondWith(staleWhileRevalidate(req)); } }); async function staleWhileRevalidate(req){ var cache = await caches.open(RUNTIME_CACHE); var cached = await cache.match(req); var network = fetch(req).then(function(r){ if (r && r.ok && r.type !== 'opaque') { cache.put(req, r.clone()).catch(function(){}); } return r; }).catch(function(){ return cached; }); return cached || network; }`;
+const SW_JS_CONTENT = String.raw`/* MineTrakt SW v14 */ const VERSION = 'v14'; const RUNTIME_CACHE = 'trakt-static-' + VERSION; self.addEventListener('install', function(){ self.skipWaiting(); }); self.addEventListener('activate', function(e){ e.waitUntil((async function(){ var keys = await caches.keys(); await Promise.all(keys.filter(function(k){ return k !== RUNTIME_CACHE; }).map(function(k){ return caches.delete(k); })); await self.clients.claim(); })()); }); self.addEventListener('fetch', function(event){ var req = event.request; if (req.method !== 'GET') return; var url; try { url = new URL(req.url); } catch(e){ return; } if (url.origin !== self.location.origin) return; if (url.pathname === '/sw.js') return; if (req.mode === 'navigate') return; if (url.pathname.indexOf('/api/') === 0) return; if (url.pathname.indexOf('/auth/') === 0) return; if (url.pathname === '/app.css' || url.pathname === '/app.js' || url.pathname === '/manifest.webmanifest' || url.pathname === '/favicon.ico' || url.pathname.indexOf('/assets/') === 0 || /\.(?:png|jpg|jpeg|svg|webp|ico|woff2?|css|js)$/i.test(url.pathname)) { event.respondWith(staleWhileRevalidate(req)); } }); async function staleWhileRevalidate(req){ var cache = await caches.open(RUNTIME_CACHE); var cached = await cache.match(req); var network = fetch(req).then(function(r){ if (r && r.ok && r.type !== 'opaque') { cache.put(req, r.clone()).catch(function(){}); } return r; }).catch(function(){ return cached; }); return cached || network; }`;
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url), path = url.pathname;
     if (path.startsWith('/assets/')) return handleAsset(path, ctx);
-    if (path === '/app.css') return handleAppCss(request);
+    if (path === '/app.css') return handleAppCss();
     if (path === '/app.js') return handleAppJs(request);
     if (path === '/favicon.ico') return Response.redirect(FAVICON_URL, 302);
     if (path === '/manifest.webmanifest') return handleManifest();
@@ -73,6 +82,7 @@ export default {
   }
 };
 
+// ═══ 资产 / 静态资源 ═══
 async function handleAsset(path, ctx) {
   const entry = ASSET_ORIGINS[path];
   if (!entry) return new Response('Not Found', { status: 404 });
@@ -89,29 +99,31 @@ async function handleAsset(path, ctx) {
     return r;
   } catch { return new Response('', { status: 502 }); }
 }
-
-function handleAppCss(request) {
-  const url = new URL(request.url);
-  const v = url.searchParams.get('v') || APP_CSS_VERSION;
-  const etag = `"css-v${v}"`;
-  const cacheHeaders = { 'Cache-Control': 'public, max-age=31536000, immutable', 'ETag': etag };
-  if (request.headers.get('If-None-Match') === etag) return new Response(null, { status: 304, headers: cacheHeaders });
-  const css = nonCriticalCss();
-  return new Response(css, { headers: { 'Content-Type': 'text/css; charset=utf-8', ...cacheHeaders } });
+function handleAppCss() {
+  const css = pageStyles();
+  return new Response(css, { headers: { 'Content-Type': 'text/css; charset=utf-8', 'Cache-Control': 'public, max-age=31536000, immutable', 'ETag': `"css-v${APP_CSS_VERSION}"` } });
 }
-
 function handleAppJs(request) {
-  const url = new URL(request.url);
-  const v = url.searchParams.get('v') || APP_JS_VERSION;
-  const etag = `"js-v${v}"`;
+  const etag = `"js-v${APP_JS_VERSION}"`;
   const cacheHeaders = { 'Cache-Control': 'public, max-age=31536000, immutable', 'ETag': etag };
   if (request.headers.get('If-None-Match') === etag) return new Response(null, { status: 304, headers: cacheHeaders });
   return new Response(getClientSideScripts(), { headers: { 'Content-Type': 'application/javascript; charset=utf-8', ...cacheHeaders } });
 }
-
 function handleManifest() { return new Response(JSON.stringify({ name: APP_NAME, short_name: APP_SHORT_NAME, description: '继续观看 · 待看列表 · 追剧日历 · 观看记录', start_url: '/', scope: '/', display: 'standalone', orientation: 'portrait', background_color: THEME_COLOR, theme_color: THEME_COLOR, lang: 'zh-CN', icons: [{ src: ICON_192, sizes: '192x192', type: 'image/png', purpose: 'any' }, { src: ICON_512, sizes: '512x512', type: 'image/png', purpose: 'any' }, { src: ICON_512, sizes: '512x512', type: 'image/png', purpose: 'maskable' }] }), { headers: { 'Content-Type': 'application/manifest+json; charset=utf-8', 'Cache-Control': 'public, max-age=86400' } }); }
 function handleServiceWorker() { return new Response(SW_JS_CONTENT, { headers: { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-cache, no-store, must-revalidate', 'Service-Worker-Allowed': '/' } }); }
 
+// ═══ 鉴权辅助 ═══
+async function requireAuth(request, env) {
+  const cookieAuth = readAuth(request);
+  if (!cookieAuth) return { ok: false };
+  const auth = await refreshIfNeeded(cookieAuth, env);
+  if (!auth) return { ok: false };
+  return { ok: true, auth, headers: makeTraktHeaders(env, auth), needsCookieUpdate: auth.access_token !== cookieAuth.access_token };
+}
+function unauthorizedJson() { return Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } }); }
+function unauthorizedHtml() { return new Response('unauthorized', { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } }); }
+
+// ═══ OAuth ═══
 async function handleDevice(env) {
   const codeVerifier = randomString(64), codeChallenge = await pkceChallenge(codeVerifier);
   let res; try { res = await fetchT(`${TRAKT_AUTH}/oauth/device/code`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ client_id: env.TRAKT_CLIENT_ID, code_challenge: codeChallenge, code_challenge_method: 'S256' }) }, 10000); } catch (e) { return Response.json({ error: '网络请求失败: ' + String(e) }, { status: 502 }); }
@@ -157,6 +169,7 @@ async function getStableUserId(auth, headers) {
   return userId;
 }
 
+// ═══ TMDB / OMDB ═══
 async function tmdbGet(url) { try { const r = await fetchT(url, {}, 8000); if (!r.ok) return null; return await r.json(); } catch { return null; } }
 async function tmdbDetailCached(path, env, ctx, ttl = 86400) {
   if (!env.TMDB_API_KEY) return null;
@@ -193,6 +206,7 @@ function renderExtRatings(r, opts = {}) {
   return out.join('');
 }
 
+// ═══ 通用构建 ═══
 function buildBaseItem(traktItem) {
   const base = { tag: '', tagClass: '', title: '', overview: '', poster: null, line1: '', detailType: null, detailId: null, enrichKey: null };
   let kind = traktItem.type; if (!kind) { if (traktItem.show && traktItem.episode) kind = 'episode'; else if (traktItem.movie) kind = 'movie'; else if (traktItem.show) kind = 'show'; }
@@ -231,6 +245,7 @@ async function handleEnrich(request, env, ctx) {
   await Promise.all(tasks); return new Response(JSON.stringify(out), { headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'public, max-age=600' } });
 }
 
+// ═══ 待看列表 ═══
 async function fetchWatchlistRaw(headers, sort) {
   const qs = `extended=full&images=poster&sort=${encodeURIComponent(sort)}`;
   const [movies, shows] = await Promise.all([traktGet(`${TRAKT_API}/sync/watchlist/movies?${qs}`, headers), traktGet(`${TRAKT_API}/sync/watchlist/shows?${qs}`, headers)]);
@@ -259,16 +274,16 @@ async function getWatchlist(headers, sort = 'added', env, ctx, userKey) {
   });
 }
 
+// ═══ 搜索 / 趋势 ═══
 async function handleSearch(request, env) {
   const url = new URL(request.url), q = (url.searchParams.get('q') || '').trim(), typeFilter = url.searchParams.get('type') || 'all';
-  const cookieAuth = readAuth(request); if (!cookieAuth) return Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } });
-  const auth = await refreshIfNeeded(cookieAuth, env); if (!auth) return Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } });
-  const needsCookieUpdate = auth.access_token !== cookieAuth.access_token;
+  const a = await requireAuth(request, env); if (!a.ok) return unauthorizedJson();
+  const { auth, headers, needsCookieUpdate } = a;
   const outHeaders = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' };
   if (needsCookieUpdate) outHeaders['Set-Cookie'] = buildCookie(auth);
   if (!q) return new Response(JSON.stringify({ items: [] }), { headers: outHeaders });
   if (!env.TMDB_API_KEY) return new Response(JSON.stringify({ items: [], error: 'no tmdb key' }), { headers: outHeaders });
-  const lang = 'zh-CN', apiKey = env.TMDB_API_KEY, headers = makeTraktHeaders(env, auth);
+  const lang = 'zh-CN', apiKey = env.TMDB_API_KEY;
   const wantMovie = typeFilter === 'all' || typeFilter === 'movie';
   const wantShow = typeFilter === 'all' || typeFilter === 'show';
   const [movieRes, tvRes, wlMovies, wlShows] = await Promise.all([
@@ -286,10 +301,8 @@ async function handleSearch(request, env) {
   merged.sort((a, b) => b.popularity - a.popularity);
   return new Response(JSON.stringify({ items: merged.slice(0, 30) }), { headers: outHeaders });
 }
-
 async function handleTrending(request, env, ctx) {
-  const cookieAuth = readAuth(request);
-  if (!cookieAuth) return Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } });
+  const a = await requireAuth(request, env); if (!a.ok) return unauthorizedJson();
   if (!env.TMDB_API_KEY) return Response.json({ items: [] });
   const url = new URL(request.url);
   const page = Math.max(1, Math.min(5, parseInt(url.searchParams.get('page') || '1', 10) || 1));
@@ -297,48 +310,29 @@ async function handleTrending(request, env, ctx) {
   let data = null;
   const mem = kvMemGet(cacheKey);
   if (mem !== undefined && mem !== KV_MISS) data = mem;
-  else {
-    const cached = await kvGetJSON(env, cacheKey);
-    if (cached !== undefined && cached !== KV_MISS) data = cached;
-  }
-  if (!data || data === KV_MISS) {
-    data = await tmdbGet(`${TMDB_API}/trending/all/day?language=zh-CN&api_key=${env.TMDB_API_KEY}&page=${page}`);
-    kvPutJSON(env, ctx, cacheKey, data ? { data } : { miss: true }, data ? 1800 : 300);
-  }
+  else { const cached = await kvGetJSON(env, cacheKey); if (cached !== undefined && cached !== KV_MISS) data = cached; }
+  if (!data || data === KV_MISS) { data = await tmdbGet(`${TMDB_API}/trending/all/day?language=zh-CN&api_key=${env.TMDB_API_KEY}&page=${page}`); kvPutJSON(env, ctx, cacheKey, data ? { data } : { miss: true }, data ? 1800 : 300); }
   const items = [];
   const results = (data && data.data && Array.isArray(data.data.results)) ? data.data.results : (data && Array.isArray(data.results) ? data.results : []);
   for (const r of results) {
     if (!r || !r.id) continue;
-    const mt = r.media_type;
-    if (mt !== 'movie' && mt !== 'tv') continue;
+    const mt = r.media_type; if (mt !== 'movie' && mt !== 'tv') continue;
     const isMovie = mt === 'movie';
-    items.push({
-      type: isMovie ? 'movie' : 'show',
-      tmdbId: r.id,
-      title: r.title || r.name || '',
-      year: (r.release_date || r.first_air_date || '').slice(0, 4),
-      poster: r.poster_path ? tmdbPoster(r.poster_path) : null,
-      overview: r.overview || '',
-      popularity: r.popularity || 0,
-    });
+    items.push({ type: isMovie ? 'movie' : 'show', tmdbId: r.id, title: r.title || r.name || '', year: (r.release_date || r.first_air_date || '').slice(0, 4), poster: r.poster_path ? tmdbPoster(r.poster_path) : null, overview: r.overview || '', popularity: r.popularity || 0 });
   }
-  return new Response(JSON.stringify({ items }), {
-    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'public, max-age=600' }
-  });
+  return new Response(JSON.stringify({ items }), { headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'public, max-age=600' } });
 }
 
+// ═══ 待看增删 ═══
 async function handleWatchlistAdd(request, env) {
-  const cookieAuth = readAuth(request); if (!cookieAuth) return Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } });
-  const auth = await refreshIfNeeded(cookieAuth, env); if (!auth) return Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } });
-  const needsCookieUpdate = auth.access_token !== cookieAuth.access_token;
+  const a = await requireAuth(request, env); if (!a.ok) return unauthorizedJson();
+  const { auth, headers, needsCookieUpdate } = a;
   let body; try { body = await request.json(); } catch { return Response.json({ error: 'bad body' }, { status: 400 }); }
   const type = body && body.type, tmdbId = body && body.tmdbId, rawId = body && body.id;
   if ((type !== 'movie' && type !== 'show') || (!tmdbId && !rawId)) return Response.json({ error: 'bad params' }, { status: 400 });
-  const headers = makeTraktHeaders(env, auth);
   let traktId = null;
-  if (rawId && !tmdbId) {
-    const n = Number(rawId); if (!Number.isFinite(n) || n <= 0) return Response.json({ error: 'bad id' }, { status: 400 }); traktId = n;
-  } else {
+  if (rawId && !tmdbId) { const n = Number(rawId); if (!Number.isFinite(n) || n <= 0) return Response.json({ error: 'bad id' }, { status: 400 }); traktId = n; }
+  else {
     const arr = await traktGet(`${TRAKT_API}/search/tmdb/${tmdbId}?type=${type}`, headers, 1);
     if (!Array.isArray(arr) || !arr.length) return Response.json({ error: 'Trakt 上没有对应条目' }, { status: 404 });
     const key = type === 'movie' ? 'movie' : 'show';
@@ -352,94 +346,69 @@ async function handleWatchlistAdd(request, env) {
   invalidateWatchlistCache();
   const result = await r.json().catch(() => null); return new Response(JSON.stringify({ ok: true, traktId, result }), { status: 200, headers: respHeaders });
 }
-
 async function handleWatchlistRemove(request, env) {
-  const cookieAuth = readAuth(request); if (!cookieAuth) return Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } }); const auth = await refreshIfNeeded(cookieAuth, env); if (!auth) return Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } }); const needsCookieUpdate = auth.access_token !== cookieAuth.access_token;
+  const a = await requireAuth(request, env); if (!a.ok) return unauthorizedJson();
+  const { auth, headers, needsCookieUpdate } = a;
   let body; try { body = await request.json(); } catch { return Response.json({ error: 'bad body' }, { status: 400 }); } const type = body && body.type, id = body && body.id;
   if ((type !== 'movie' && type !== 'show') || !id) return Response.json({ error: 'bad params' }, { status: 400 }); const traktId = Number(id); if (!Number.isFinite(traktId) || traktId <= 0) return Response.json({ error: 'bad id' }, { status: 400 });
-  const headers = makeTraktHeaders(env, auth), payload = type === 'movie' ? { movies: [{ ids: { trakt: traktId } }] } : { shows: [{ ids: { trakt: traktId } }] };
+  const payload = type === 'movie' ? { movies: [{ ids: { trakt: traktId } }] } : { shows: [{ ids: { trakt: traktId } }] };
   let r; try { r = await fetchT(`${TRAKT_API}/sync/watchlist/remove`, { method: 'POST', headers, body: JSON.stringify(payload) }, 10000); } catch (e) { return Response.json({ error: String(e) }, { status: 502 }); }
   const respHeaders = { 'Content-Type': 'application/json; charset=utf-8' }; if (needsCookieUpdate) respHeaders['Set-Cookie'] = buildCookie(auth);
   if (!r.ok) { const text = await r.text().catch(() => ''); return new Response(JSON.stringify({ error: 'HTTP ' + r.status, detail: text }), { status: r.status, headers: respHeaders }); }
   invalidateWatchlistCache();
   const result = await r.json().catch(() => null); return new Response(JSON.stringify({ ok: true, result }), { status: 200, headers: respHeaders });
 }
+
+// ═══ 标记已看 ═══
 async function handleMarkWatched(request, env) {
-  const cookieAuth = readAuth(request); if (!cookieAuth) return Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } }); const auth = await refreshIfNeeded(cookieAuth, env); if (!auth) return Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } }); const needsCookieUpdate = auth.access_token !== cookieAuth.access_token;
+  const a = await requireAuth(request, env); if (!a.ok) return unauthorizedJson();
+  const { auth, headers, needsCookieUpdate } = a;
   let body; try { body = await request.json(); } catch { return Response.json({ error: 'bad body' }, { status: 400 }); } const type = body && body.type, id = body && body.id;
   if ((type !== 'movie' && type !== 'episode') || !id) return Response.json({ error: 'bad params' }, { status: 400 }); const traktId = Number(id); if (!Number.isFinite(traktId) || traktId <= 0) return Response.json({ error: 'bad id' }, { status: 400 });
-  const headers = makeTraktHeaders(env, auth), payload = type === 'movie' ? { movies: [{ ids: { trakt: traktId } }] } : { episodes: [{ ids: { trakt: traktId } }] };
+  const payload = type === 'movie' ? { movies: [{ ids: { trakt: traktId } }] } : { episodes: [{ ids: { trakt: traktId } }] };
   let r; try { r = await fetchT(`${TRAKT_API}/sync/history`, { method: 'POST', headers, body: JSON.stringify(payload) }, 10000); } catch (e) { return Response.json({ error: String(e) }, { status: 502 }); }
   const respHeaders = { 'Content-Type': 'application/json; charset=utf-8' }; if (needsCookieUpdate) respHeaders['Set-Cookie'] = buildCookie(auth);
   if (!r.ok) { const text = await r.text().catch(() => ''); return new Response(JSON.stringify({ error: 'HTTP ' + r.status, detail: text }), { status: r.status, headers: respHeaders }); }
   const result = await r.json().catch(() => null); return new Response(JSON.stringify({ ok: true, result }), { status: 200, headers: respHeaders });
 }
 async function handleUnmarkWatched(request, env) {
-  const cookieAuth = readAuth(request); if (!cookieAuth) return Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } }); const auth = await refreshIfNeeded(cookieAuth, env); if (!auth) return Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } }); const needsCookieUpdate = auth.access_token !== cookieAuth.access_token;
+  const a = await requireAuth(request, env); if (!a.ok) return unauthorizedJson();
+  const { auth, headers, needsCookieUpdate } = a;
   let body; try { body = await request.json(); } catch { return Response.json({ error: 'bad body' }, { status: 400 }); } const type = body && body.type, id = body && body.id;
   if ((type !== 'movie' && type !== 'episode') || !id) return Response.json({ error: 'bad params' }, { status: 400 }); const traktId = Number(id); if (!Number.isFinite(traktId) || traktId <= 0) return Response.json({ error: 'bad id' }, { status: 400 });
-  const headers = makeTraktHeaders(env, auth), payload = type === 'movie' ? { movies: [{ ids: { trakt: traktId } }] } : { episodes: [{ ids: { trakt: traktId } }] };
+  const payload = type === 'movie' ? { movies: [{ ids: { trakt: traktId } }] } : { episodes: [{ ids: { trakt: traktId } }] };
   let r; try { r = await fetchT(`${TRAKT_API}/sync/history/remove`, { method: 'POST', headers, body: JSON.stringify(payload) }, 10000); } catch (e) { return Response.json({ error: String(e) }, { status: 502 }); }
   const respHeaders = { 'Content-Type': 'application/json; charset=utf-8' }; if (needsCookieUpdate) respHeaders['Set-Cookie'] = buildCookie(auth);
   if (!r.ok) { const text = await r.text().catch(() => ''); return new Response(JSON.stringify({ error: 'HTTP ' + r.status, detail: text }), { status: r.status, headers: respHeaders }); }
   const result = await r.json().catch(() => null); return new Response(JSON.stringify({ ok: true, result }), { status: 200, headers: respHeaders });
 }
-
 async function handleMarkSeasonWatched(request, env) {
-  const cookieAuth = readAuth(request);
-  if (!cookieAuth) return Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } });
-  const auth = await refreshIfNeeded(cookieAuth, env);
-  if (!auth) return Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } });
-  const needsCookieUpdate = auth.access_token !== cookieAuth.access_token;
-
-  let body;
-  try { body = await request.json(); } catch { return Response.json({ error: 'bad body' }, { status: 400 }); }
-
-  const showId = Number(body && body.showId);
-  const season = Number(body && body.season);
-  if (!Number.isFinite(showId) || showId <= 0 || !Number.isFinite(season)) {
-    return Response.json({ error: 'bad params' }, { status: 400 });
-  }
-
-  const headers = makeTraktHeaders(env, auth);
-
+  const a = await requireAuth(request, env); if (!a.ok) return unauthorizedJson();
+  const { auth, headers, needsCookieUpdate } = a;
+  let body; try { body = await request.json(); } catch { return Response.json({ error: 'bad body' }, { status: 400 }); }
+  const showId = Number(body && body.showId), season = Number(body && body.season);
+  if (!Number.isFinite(showId) || showId <= 0 || !Number.isFinite(season)) return Response.json({ error: 'bad params' }, { status: 400 });
   const seasonData = await traktGet(`${TRAKT_API}/shows/${showId}/seasons/${season}?extended=full,episodes`, headers);
-  if (!seasonData || seasonData.__error || !Array.isArray(seasonData.episodes)) {
-    return Response.json({ error: '无法获取季信息' }, { status: 502 });
-  }
-
+  if (!seasonData || seasonData.__error || !Array.isArray(seasonData.episodes)) return Response.json({ error: '无法获取季信息' }, { status: 502 });
   const now = Date.now();
   const episodes = seasonData.episodes
     .filter(ep => ep && ep.number != null && ep.first_aired)
     .filter(ep => new Date(ep.first_aired).getTime() <= now)
     .map(ep => ({ ids: { trakt: ep.ids && ep.ids.trakt } }))
     .filter(ep => ep.ids.trakt);
-
   if (!episodes.length) return Response.json({ ok: true, marked: 0 });
-
-  let r;
-  try {
-    r = await fetchT(`${TRAKT_API}/sync/history`, { method: 'POST', headers, body: JSON.stringify({ episodes }) }, 15000);
-  } catch (e) {
-    return Response.json({ error: String(e) }, { status: 502 });
-  }
-
-  const respHeaders = { 'Content-Type': 'application/json; charset=utf-8' };
-  if (needsCookieUpdate) respHeaders['Set-Cookie'] = buildCookie(auth);
-
-  if (!r.ok) {
-    const text = await r.text().catch(() => '');
-    return new Response(JSON.stringify({ error: 'HTTP ' + r.status, detail: text }), { status: r.status, headers: respHeaders });
-  }
-
-  const result = await r.json().catch(() => null);
-  return new Response(JSON.stringify({ ok: true, marked: episodes.length, result }), { status: 200, headers: respHeaders });
+  let r; try { r = await fetchT(`${TRAKT_API}/sync/history`, { method: 'POST', headers, body: JSON.stringify({ episodes }) }, 15000); } catch (e) { return Response.json({ error: String(e) }, { status: 502 }); }
+  const respHeaders = { 'Content-Type': 'application/json; charset=utf-8' }; if (needsCookieUpdate) respHeaders['Set-Cookie'] = buildCookie(auth);
+  if (!r.ok) { const text = await r.text().catch(() => ''); return new Response(JSON.stringify({ error: 'HTTP ' + r.status, detail: text }), { status: r.status, headers: respHeaders }); }
+  const result = await r.json().catch(() => null); return new Response(JSON.stringify({ ok: true, marked: episodes.length, result }), { status: 200, headers: respHeaders });
 }
 
+// ═══ 播出日历 ═══
 async function handleShowCalendar(request, env, ctx) {
   const url = new URL(request.url), showId = url.searchParams.get('id'), tmdbId = url.searchParams.get('tmdb'); if (!showId || !/^\d+$/.test(showId)) return Response.json({ error: 'bad params' }, { status: 400 });
-  const cookieAuth = readAuth(request); if (!cookieAuth) return Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } }); const auth = await refreshIfNeeded(cookieAuth, env); if (!auth) return Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } }); const needsCookieUpdate = auth.access_token !== cookieAuth.access_token;
-  const headers = makeTraktHeaders(env, auth), seasons = await traktGet(`${TRAKT_API}/shows/${showId}/seasons?extended=full,episodes`, headers, 1); if (!Array.isArray(seasons)) return Response.json({ error: 'failed' }, { status: 502 });
+  const a = await requireAuth(request, env); if (!a.ok) return unauthorizedJson();
+  const { auth, headers, needsCookieUpdate } = a;
+  const seasons = await traktGet(`${TRAKT_API}/shows/${showId}/seasons?extended=full,episodes`, headers, 1); if (!Array.isArray(seasons)) return Response.json({ error: 'failed' }, { status: 502 });
   const zhTitles = {}; let zhShowTitle = '';
   if (tmdbId && /^\d+$/.test(tmdbId) && env.TMDB_API_KEY) {
     try {
@@ -459,6 +428,7 @@ async function handleShowCalendar(request, env, ctx) {
   return new Response(JSON.stringify({ episodes, title: zhShowTitle }), { headers: respHeaders });
 }
 
+// ═══ 首页 ═══
 async function handleHome(request, env, ctx) {
   const url = new URL(request.url); let initialDetail = url.searchParams.get('d');
   if (!initialDetail && url.pathname.startsWith('/detail/')) { const parts = url.pathname.split('/').filter(Boolean); if (parts.length === 3) initialDetail = parts[1] + '/' + parts[2]; }
@@ -479,10 +449,10 @@ async function getCalendarCached(today, headers, env, ctx, userKey) {
     return data;
   });
 }
-
 async function handleHomeData(request, env, ctx) {
-  const cookieAuth = readAuth(request); if (!cookieAuth) return Response.json({ login: true }, { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } }); const auth = await refreshIfNeeded(cookieAuth, env); if (!auth) return Response.json({ login: true }, { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } });
-  const needsCookieUpdate = auth.access_token !== cookieAuth.access_token, headers = makeTraktHeaders(env, auth), today = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10), part = new URL(request.url).searchParams.get('part') || 'all';
+  const a = await requireAuth(request, env); if (!a.ok) return Response.json({ login: true }, { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } });
+  const { auth, headers, needsCookieUpdate } = a;
+  const today = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10), part = new URL(request.url).searchParams.get('part') || 'all';
   const userKey = await getStableUserId(auth, headers);
   const fetchJson = async (url, retries = 2) => {
     for (let i = 0; i <= retries; i++) {
@@ -522,12 +492,10 @@ async function handleHomeData(request, env, ctx) {
   return new Response(JSON.stringify(result), { headers: outHeaders });
 }
 
+// ═══ 首页渲染 ═══
 function renderHomeShell(initialDetail) {
   const boot = initialDetail ? `<script>window.__initialDetail=${jsStr(initialDetail)};<\/script>` : '';
-  return pageHeadEarly() +
-    `<link rel="preload" as="style" href="/app.css?v=${APP_CSS_VERSION}" onload="this.onload=null;this.rel='stylesheet'"><noscript><link rel="stylesheet" href="/app.css?v=${APP_CSS_VERSION}"></noscript>` +
-    renderHomeSkeleton(initialDetail) +
-    `<script>(function(){window.__splashT0=Date.now();window.__splashHidden=false;window.__hideSplash=function(force){if(window.__splashHidden)return;window.__splashHidden=true;var el=document.getElementById('splash');if(!el)return;var wait=force?0:Math.max(0,280-(Date.now()-(window.__splashT0||Date.now())));setTimeout(function(){el.classList.add('hide');setTimeout(function(){if(el&&el.parentNode)el.parentNode.removeChild(el);},360);},wait);};setTimeout(function(){if(window.__hideSplash)window.__hideSplash();},120);function setHTML(sel,html){var el=typeof sel==='string'?document.querySelector(sel):sel;if(el)el.innerHTML=html||'';}function applyAvatar(url){if(!url)return;var av=document.getElementById('hero-avatar');if(!av)return;var img=document.createElement('img');img.src=url;img.alt='';img.width=56;img.height=56;img.decoding='async';img.onerror=function(){av.innerHTML='<span class="hero-avatar-ph">👤</span>';};av.innerHTML='';av.appendChild(img);}function __setUpdatedAt(){var el=document.getElementById('updated-at');if(!el)return;var d=new Date(),p=function(n){return(n<10?'0':'')+n;};el.textContent='更新于 '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());el.classList.remove('flash');void el.offsetWidth;el.classList.add('flash');}function applyPrimary(d){if(!d)return;var n=document.getElementById('hero-name');if(n&&d.name)n.textContent=d.name;applyAvatar(d.avatar);if(d.statsHtml)setHTML('#stats-box',d.statsHtml);if(d.playbackHtml)setHTML('#playback',d.playbackHtml);__setUpdatedAt();if(window.__scheduleEnrich)window.__scheduleEnrich();}function applySecondary(d){if(!d)return;if(d.historyHtml)setHTML('#history .grid',d.historyHtml);if(d.historyMoreHtml!=null)setHTML('#history-more',d.historyMoreHtml);if(d.calendarHtml)setHTML('#calendar',d.calendarHtml);if(d.watchlistHtml)setHTML('#watchlist',d.watchlistHtml);if(window.__scheduleEnrich)window.__scheduleEnrich();}var __homeDataLoading=false;function fetchPart(part){return fetch('/api/home-data?part='+encodeURIComponent(part),{credentials:'same-origin',cache:'no-store'}).then(function(r){if(r.status===401){location.href='/';return null;}if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){if(!d)return null;if(d.login){location.reload();return null;}return d;});}function loadHomeData(opts){opts=opts||{};var silent=!!opts.silent;if(__homeDataLoading&&!silent)return;__homeDataLoading=true;__lastRefreshAt=Date.now();var pPrimary=fetchPart('primary').then(function(d){applyPrimary(d);if(!silent&&window.__hideSplash)window.__hideSplash(true);if(!silent&&window.__initialDetail){var s=window.__initialDetail,idx=s.indexOf('/');if(idx>0&&window.openDetail)openDetail(s.slice(0,idx),s.slice(idx+1),false);window.__initialDetail=null;}}).catch(function(){if(!silent){setHTML('#playback','<div class="empty"><p>加载失败，请点击重试</p><p style="margin-top:12px"><button class="btn-ghost" onclick="location.reload()">重试</button></p></div>');if(window.__hideSplash)window.__hideSplash(true);}});var pSecondary=fetchPart('secondary').then(function(d){applySecondary(d);}).catch(function(){if(!silent){setHTML('#history .grid','<div class="empty"><p>部分内容加载失败</p></div>');}});Promise.all([pPrimary,pSecondary]).then(function(){__homeDataLoading=false;});}var __refreshTick=0;function silentRefresh(){if(document.hidden)return;__refreshTick++;__lastRefreshAt=Date.now();fetchPart('primary').then(function(d){applyPrimary(d);}).catch(function(){});if(__refreshTick%2===0){var secActive=false;['watchlist','calendar','history'].forEach(function(id){var el=document.getElementById(id);if(el&&el.classList.contains('active'))secActive=true;});if(!secActive)fetchPart('secondary').then(function(d){applySecondary(d);}).catch(function(){});}}function startHomeData(){loadHomeData({silent:false});}if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',startHomeData);}else{startHomeData();}var REFRESH_MIN=${HOME_AUTO_REFRESH_MINUTES};var REFRESH_MS=(REFRESH_MIN>0?REFRESH_MIN:0)*60*1000;var __lastRefreshAt=Date.now();if(REFRESH_MS>0){setInterval(silentRefresh,REFRESH_MS);document.addEventListener('visibilitychange',function(){if(document.hidden)return;if(Date.now()-__lastRefreshAt>=REFRESH_MS)silentRefresh();});}})();<\/script>` + pageTail();
+  return pageHead() + renderHomeSkeleton(initialDetail) + `<script>(function(){window.__splashT0=Date.now();window.__splashHidden=false;window.__hideSplash=function(force){if(window.__splashHidden)return;window.__splashHidden=true;var el=document.getElementById('splash');if(!el)return;var wait=force?0:Math.max(0,280-(Date.now()-(window.__splashT0||Date.now())));setTimeout(function(){el.classList.add('hide');setTimeout(function(){if(el&&el.parentNode)el.parentNode.removeChild(el);},360);},wait);};setTimeout(function(){if(window.__hideSplash)window.__hideSplash();},120);function setHTML(sel,html){var el=typeof sel==='string'?document.querySelector(sel):sel;if(el)el.innerHTML=html||'';}function applyAvatar(url){if(!url)return;var av=document.getElementById('hero-avatar');if(!av)return;var img=document.createElement('img');img.src=url;img.alt='';img.width=56;img.height=56;img.decoding='async';img.onerror=function(){av.innerHTML='<span class="hero-avatar-ph">👤</span>';};av.innerHTML='';av.appendChild(img);}function __setUpdatedAt(){var el=document.getElementById('updated-at');if(!el)return;var d=new Date(),p=function(n){return(n<10?'0':'')+n;};el.textContent='更新于 '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());el.classList.remove('flash');void el.offsetWidth;el.classList.add('flash');}function applyPrimary(d){if(!d)return;var n=document.getElementById('hero-name');if(n&&d.name)n.textContent=d.name;applyAvatar(d.avatar);if(d.statsHtml)setHTML('#stats-box',d.statsHtml);if(d.playbackHtml)setHTML('#playback',d.playbackHtml);__setUpdatedAt();if(window.__scheduleEnrich)window.__scheduleEnrich();}function applySecondary(d){if(!d)return;if(d.historyHtml)setHTML('#history .grid',d.historyHtml);if(d.historyMoreHtml!=null)setHTML('#history-more',d.historyMoreHtml);if(d.calendarHtml)setHTML('#calendar',d.calendarHtml);if(d.watchlistHtml)setHTML('#watchlist',d.watchlistHtml);if(window.__scheduleEnrich)window.__scheduleEnrich();}var __homeDataLoading=false;function fetchPart(part){return fetch('/api/home-data?part='+encodeURIComponent(part),{credentials:'same-origin',cache:'no-store'}).then(function(r){if(r.status===401){location.href='/';return null;}if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){if(!d)return null;if(d.login){location.reload();return null;}return d;});}function loadHomeData(opts){opts=opts||{};var silent=!!opts.silent;if(__homeDataLoading&&!silent)return;__homeDataLoading=true;__lastRefreshAt=Date.now();var pPrimary=fetchPart('primary').then(function(d){applyPrimary(d);if(!silent&&window.__hideSplash)window.__hideSplash(true);if(!silent&&window.__initialDetail){var s=window.__initialDetail,idx=s.indexOf('/');if(idx>0&&window.openDetail)openDetail(s.slice(0,idx),s.slice(idx+1),false);window.__initialDetail=null;}}).catch(function(){if(!silent){setHTML('#playback','<div class="empty"><p>加载失败，请点击重试</p><p style="margin-top:12px"><button class="btn-ghost" onclick="location.reload()">重试</button></p></div>');if(window.__hideSplash)window.__hideSplash(true);}});var pSecondary=fetchPart('secondary').then(function(d){applySecondary(d);}).catch(function(){if(!silent){setHTML('#history .grid','<div class="empty"><p>部分内容加载失败</p></div>');}});Promise.all([pPrimary,pSecondary]).then(function(){__homeDataLoading=false;});}var __refreshTick=0;function silentRefresh(){if(document.hidden)return;__refreshTick++;__lastRefreshAt=Date.now();fetchPart('primary').then(function(d){applyPrimary(d);}).catch(function(){});if(__refreshTick%2===0){var secActive=false;['watchlist','calendar','history'].forEach(function(id){var el=document.getElementById(id);if(el&&el.classList.contains('active'))secActive=true;});if(!secActive)fetchPart('secondary').then(function(d){applySecondary(d);}).catch(function(){});}}function startHomeData(){loadHomeData({silent:false});}if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',startHomeData);}else{startHomeData();}var REFRESH_MIN=${HOME_AUTO_REFRESH_MINUTES};var REFRESH_MS=(REFRESH_MIN>0?REFRESH_MIN:0)*60*1000;var __lastRefreshAt=Date.now();if(REFRESH_MS>0){setInterval(silentRefresh,REFRESH_MS);document.addEventListener('visibilitychange',function(){if(document.hidden)return;if(Date.now()-__lastRefreshAt>=REFRESH_MS)silentRefresh();});}})();<\/script>` + pageTail();
 }
 function renderHomeSkeleton(initialDetail) {
   const boot = initialDetail ? `<script>window.addEventListener('load',()=>{const s=${jsStr(initialDetail)},idx=s.indexOf('/');if(idx>0)openDetail(s.slice(0,idx),s.slice(idx+1),false);});<\/script>` : '';
@@ -551,23 +519,24 @@ function renderStatsHtml(s) {
   return items.map(it => `<div class="stat ${it.cls}"><div class="stat-icon">${it.icon}</div><div class="stat-num">${s ? it.n : '–'}</div><div class="stat-label">${it.label}</div></div>`).join('');
 }
 
+// ═══ 分页 ═══
 async function handleMore(request, env, ctx) {
   const url = new URL(request.url), type = url.searchParams.get('type'), page = parseInt(url.searchParams.get('page') || '2');
-  const cookieAuth = readAuth(request); if (!cookieAuth) return new Response('unauthorized', { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } }); const auth = await refreshIfNeeded(cookieAuth, env); if (!auth) return new Response('unauthorized', { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } }); const headers = makeTraktHeaders(env, auth);
+  const a = await requireAuth(request, env); if (!a.ok) return unauthorizedHtml();
+  const { auth, headers, needsCookieUpdate } = a;
   const userKey = await getStableUserId(auth, headers);
-  if (type === 'history') { let r; try { for (let i = 0; i < 3; i++) { r = await fetchT(`${TRAKT_API}/users/me/history?limit=${PAGE_SIZE}&page=${page}&extended=full&images=poster`, { headers }, 9000); if (r.status !== 429) break; await new Promise(resolve => setTimeout(resolve, Math.min(1000 * Math.pow(2, i), 5000))); } } catch (e) { return new Response('', { status: 502 }); } if (!r.ok) return new Response('', { status: r.status }); const items = await r.json(), pageCount = parseInt(r.headers.get('X-Pagination-Page-Count') || '1'), hasMore = page < pageCount, bodyHtml = renderHistoryPage(items, env, true); const outHeaders = { 'Content-Type': 'text/html; charset=utf-8', 'X-Has-More': String(hasMore), 'X-Page': String(page), 'X-Page-Count': String(pageCount) }; if (auth.access_token !== cookieAuth.access_token) outHeaders['Set-Cookie'] = buildCookie(auth); return new Response(bodyHtml, { headers: outHeaders }); }
-  if (type === 'watchlist') { const sort = url.searchParams.get('sort') || 'added', pageNum = Math.max(1, parseInt(url.searchParams.get('page') || '1', 10) || 1), merged = await getWatchlist(headers, sort, env, ctx, userKey), start = (pageNum - 1) * WATCHLIST_PAGE_SIZE, slice = merged.slice(start, start + WATCHLIST_PAGE_SIZE), hasMore = start + WATCHLIST_PAGE_SIZE < merged.length, bodyHtml = renderWatchlistItems(slice, env); const outHeaders = { 'Content-Type': 'text/html; charset=utf-8', 'X-Has-More': String(hasMore), 'X-Page': String(pageNum), 'X-Total': String(merged.length) }; if (auth.access_token !== cookieAuth.access_token) outHeaders['Set-Cookie'] = buildCookie(auth); return new Response(bodyHtml, { headers: outHeaders }); }
+  if (type === 'history') { let r; try { for (let i = 0; i < 3; i++) { r = await fetchT(`${TRAKT_API}/users/me/history?limit=${PAGE_SIZE}&page=${page}&extended=full&images=poster`, { headers }, 9000); if (r.status !== 429) break; await new Promise(resolve => setTimeout(resolve, Math.min(1000 * Math.pow(2, i), 5000))); } } catch (e) { return new Response('', { status: 502 }); } if (!r.ok) return new Response('', { status: r.status }); const items = await r.json(), pageCount = parseInt(r.headers.get('X-Pagination-Page-Count') || '1'), hasMore = page < pageCount, bodyHtml = renderHistoryPage(items, env, true); const outHeaders = { 'Content-Type': 'text/html; charset=utf-8', 'X-Has-More': String(hasMore), 'X-Page': String(page), 'X-Page-Count': String(pageCount) }; if (needsCookieUpdate) outHeaders['Set-Cookie'] = buildCookie(auth); return new Response(bodyHtml, { headers: outHeaders }); }
+  if (type === 'watchlist') { const sort = url.searchParams.get('sort') || 'added', pageNum = Math.max(1, parseInt(url.searchParams.get('page') || '1', 10) || 1), merged = await getWatchlist(headers, sort, env, ctx, userKey), start = (pageNum - 1) * WATCHLIST_PAGE_SIZE, slice = merged.slice(start, start + WATCHLIST_PAGE_SIZE), hasMore = start + WATCHLIST_PAGE_SIZE < merged.length, bodyHtml = renderWatchlistItems(slice, env); const outHeaders = { 'Content-Type': 'text/html; charset=utf-8', 'X-Has-More': String(hasMore), 'X-Page': String(pageNum), 'X-Total': String(merged.length) }; if (needsCookieUpdate) outHeaders['Set-Cookie'] = buildCookie(auth); return new Response(bodyHtml, { headers: outHeaders }); }
   return new Response('', { status: 400 });
 }
+
+// ═══ 详情 ═══
 async function handleApiDetail(request, env, ctx) {
   const url = new URL(request.url), type = url.searchParams.get('type'), rawId = url.searchParams.get('id');
   if (!type || !rawId || (type !== 'movie' && type !== 'show')) return new Response('bad params', { status: 400 });
-  const cookieAuth = readAuth(request);
-  if (!cookieAuth) return new Response('unauthorized', { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } });
-  const auth = await refreshIfNeeded(cookieAuth, env);
-  if (!auth) return new Response('unauthorized', { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } });
-  const needsCookieUpdate = auth.access_token !== cookieAuth.access_token, headers = makeTraktHeaders(env, auth);
-  const errResponse = (msg, status) => { const h = { 'Content-Type': 'text/html; charset=utf-8' }; if (needsCookieUpdate) h['Set-Cookie'] = buildCookie(auth); return new Response(simpleErr(msg), { status, headers: h }); };
+  const a = await requireAuth(request, env); if (!a.ok) return unauthorizedHtml();
+  const { auth, headers, needsCookieUpdate } = a;
+  const errResponse = (msg, status) => { const h = { 'Content-Type': 'text/html; charset=utf-8' }; if (needsCookieUpdate) h['Set-Cookie'] = buildCookie(auth); return new Response(emptyView({ text: msg, error: true }), { status, headers: h }); };
   let traktId = rawId;
   if (rawId.startsWith('tmdb-')) {
     const tmdbId = rawId.slice(5), arr = await traktGet(`${TRAKT_API}/search/tmdb/${tmdbId}?type=${type}`, headers);
@@ -602,8 +571,7 @@ async function handleApiDetail(request, env, ctx) {
     const real = tmdbData.seasons.filter(s => s.season_number > 0);
     if (real.length) initialSeasonNum = real[0].season_number;
   }
-  let initialSeasonData = guessedSeasonData;
-  let initialTraktEpisodes = [];
+  let initialSeasonData = guessedSeasonData, initialTraktEpisodes = [];
   const needSecondSeasonData = initialSeasonNum != null && guessedSeason !== initialSeasonNum && tmdbId && env.TMDB_API_KEY;
   const needTraktEpisodes = type === 'show' && initialSeasonNum != null;
   if (needSecondSeasonData || needTraktEpisodes) {
@@ -612,9 +580,7 @@ async function handleApiDetail(request, env, ctx) {
       needTraktEpisodes ? traktGet(`${TRAKT_API}/shows/${traktId}/seasons/${initialSeasonNum}?extended=full,episodes`, headers) : Promise.resolve(null)
     ]);
     if (secondSeasonData) initialSeasonData = secondSeasonData;
-    if (traktSeasonData && !traktSeasonData.__error && Array.isArray(traktSeasonData.episodes)) {
-      initialTraktEpisodes = traktSeasonData.episodes;
-    }
+    if (traktSeasonData && !traktSeasonData.__error && Array.isArray(traktSeasonData.episodes)) initialTraktEpisodes = traktSeasonData.episodes;
   }
   const bodyHtml = await renderDetailFragment({ type, entity, traktId, userProgress, movieWatched, tmdb: tmdbData, credits, recommendations, initialSeasonNum, initialSeasonData, initialTraktEpisodes, thirdParty });
   const outHeaders = { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'private, max-age=120, stale-while-revalidate=300' };
@@ -628,40 +594,32 @@ async function handleSeason(request, env, ctx) {
     tmdbId = url.searchParams.get('tmdb'),
     slug = url.searchParams.get('slug') || '';
   if (!showId || isNaN(seasonNum)) return new Response('bad params', { status: 400 });
-  const cookieAuth = readAuth(request);
-  if (!cookieAuth) return new Response('unauthorized', { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } });
-  const auth = await refreshIfNeeded(cookieAuth, env);
-  if (!auth) return new Response('unauthorized', { status: 401, headers: { 'Set-Cookie': clearCookieHeader() } });
-  const needsCookieUpdate = auth.access_token !== cookieAuth.access_token;
-  const headers = makeTraktHeaders(env, auth);
+  const a = await requireAuth(request, env); if (!a.ok) return unauthorizedHtml();
+  const { auth, headers, needsCookieUpdate } = a;
   const [progress, traktSeason, tmdbSeason] = await Promise.all([
     traktGet(`${TRAKT_API}/shows/${showId}/progress/watched?hidden=false&specials=false`, headers),
     traktGet(`${TRAKT_API}/shows/${showId}/seasons/${seasonNum}?extended=full,episodes`, headers),
-    (tmdbId && env.TMDB_API_KEY)
-      ? tmdbDetailCached(`/tv/${tmdbId}/season/${seasonNum}`, env, ctx)
-      : Promise.resolve(null)
+    (tmdbId && env.TMDB_API_KEY) ? tmdbDetailCached(`/tv/${tmdbId}/season/${seasonNum}`, env, ctx) : Promise.resolve(null)
   ]);
-  const seasonProgress = Array.isArray(progress && progress.seasons)
-    ? progress.seasons.find(s => s.number === seasonNum)
-    : null;
-  const traktEpisodes = (traktSeason && !traktSeason.__error && Array.isArray(traktSeason.episodes))
-    ? traktSeason.episodes
-    : [];
+  const seasonProgress = Array.isArray(progress && progress.seasons) ? progress.seasons.find(s => s.number === seasonNum) : null;
+  const traktEpisodes = (traktSeason && !traktSeason.__error && Array.isArray(traktSeason.episodes)) ? traktSeason.episodes : [];
   const bodyHtml = renderSeasonEpisodes(seasonProgress, tmdbSeason, seasonNum, slug, traktEpisodes);
   const outHeaders = { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' };
   if (needsCookieUpdate) outHeaders['Set-Cookie'] = buildCookie(auth);
   return new Response(bodyHtml, { headers: outHeaders });
 }
 
+// ═══ 登录页 ═══
 function renderLoginPage() { return pageShell(`<div class="login-wrap"><div class="login-card"><div class="login-logo"><img src="${ICON_192}" alt="MineTrakt" width="64" height="64" style="display:block;margin:0 auto"></div><h1 class="login-title">MineTrakt</h1><p class="login-sub">继续观看 · 待看列表 · 追剧日历 · 观看记录</p><div id="login-area" class="login-area"><button class="btn-primary" onclick="startLogin()">使用 Trakt 登录</button></div></div></div><script>async function startLogin(){const area=document.getElementById('login-area');area.innerHTML='<div class="spinner"></div>';let r;try{r=await fetch('/auth/device');}catch(e){area.innerHTML='<p class="err">网络错误: '+e+'</p>';return;}if(!r.ok){const err=await r.json().catch(()=>({}));area.innerHTML='<div class="err-box"><p class="err-title">获取设备码失败</p><p class="err">'+(err.error||('HTTP '+r.status))+'</p>'+(err.detail?'<pre class="err-detail">'+err.detail+'</pre>':'')+(err.hint?'<p class="hint">'+err.hint+'</p>':'')+'</div><button class="btn-primary" onclick="location.reload()">重试</button>';return;}const d=await r.json(),activateUrl='https://trakt.tv/activate',qr='https://api.qrserver.com/v1/create-qr-code/?size=220x220&color=4a6db8&bgcolor=ffffff&data='+encodeURIComponent(activateUrl);area.innerHTML='<div class="device-flow"><div class="steps"><div class="step"><span class="n">1</span><span>打开 <a href="'+activateUrl+'" target="_blank" rel="noopener">trakt.tv/activate</a></span></div><div class="step"><span class="n">2</span><span>输入代码</span></div></div><div class="code-box">'+d.user_code+'</div><div class="step"><span class="n">3</span><span>点击授权</span></div><div class="qr-box"><img src="'+qr+'" alt="QR"></div><p id="status" class="status"><span class="pulse"></span>等待授权中…</p></div><details class="log-details"><summary>调试日志</summary><div id="log" class="log-box"></div></details>';let interval=(d.interval||5)*1000,attempt=0;const logEl=document.getElementById('log'),log=(s)=>{if(logEl)logEl.innerHTML+='<div>['+new Date().toLocaleTimeString()+'] '+s+'</div>';};const tick=async()=>{attempt++;let r2;try{r2=await fetch('/auth/poll',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({state:d.state})});}catch(e){log('网络错误');setTimeout(tick,interval);return;}if(r2.status===200){document.getElementById('status').innerHTML='✓ 授权成功，正在刷新…';document.getElementById('status').className='status success';setTimeout(()=>location.reload(),400);return;}let text='';try{text=await r2.text();}catch{}let data={};try{data=JSON.parse(text);}catch{}log('HTTP '+r2.status+' · '+(data.status||'未知'));const st=document.getElementById('status');if(r2.status===202){if(data.status==='slow_down')interval+=2000;st.innerHTML='<span class="pulse"></span>等待授权中（第 '+attempt+' 次）';setTimeout(tick,interval);return;}st.textContent='HTTP '+r2.status+' · '+(data.status||data.detail||'未知');st.className='status error';if(r2.status===403||r2.status===410)return;setTimeout(tick,interval);};setTimeout(tick,1000);}<\/script>`); }
 
+// ═══ 渲染辅助 ═══
 function posterOfTrakt(obj) { if (!obj || !obj.images) return null; const p = obj.images.poster; if (!p || !Array.isArray(p) || !p.length) return null; if (typeof p[0] === 'string') return p[0]; if (typeof p[0] === 'object') return p[0].medium || p[0].thumb || p[0].full || null; return null; }
 function mediaItem(opts) {
   const style = opts.delay != null ? ` style="animation-delay:${opts.delay}ms"` : '', removeHtml = (opts.removeType && opts.removeId) ? `<button class="wl-remove" type="button" data-wl-remove-type="${esc(opts.removeType)}" data-wl-remove-id="${esc(opts.removeId)}" aria-label="从待看列表移除" title="从待看列表移除">×</button>` : '', watchedHtml = (opts.watchedType && opts.watchedId) ? `<button class="wl-watched" type="button" data-watched-type="${esc(opts.watchedType)}" data-watched-id="${esc(opts.watchedId)}" aria-label="标记为已看" title="标记为已看">✓</button>` : '', unwatchHtml = (opts.unwatchType && opts.unwatchId) ? `<button class="wl-unwatch" type="button" data-unwatch-type="${esc(opts.unwatchType)}" data-unwatch-id="${esc(opts.unwatchId)}" aria-label="取消观看" title="取消观看">↺</button>` : '', bar = opts.pct != null ? `<div class="bar"><div class="bar-fill" style="width:${opts.pct}%"></div></div>` : '', dataAttrs = (opts.detailType && opts.detailId) ? ` data-detail-type="${esc(opts.detailType)}" data-detail-id="${esc(opts.detailId)}" role="button" tabindex="0"` : '', enrichAttrs = opts.enrichKey ? ` data-enrich-key="${esc(opts.enrichKey)}"` : '', clickable = (opts.detailType && opts.detailId) ? ' clickable' : '', tagHtml = opts.tag && opts.tagClass === 'upcoming' ? `<span class="tag ${esc(opts.tagClass)}">（${esc(opts.tag)}）</span>` : '', calendarBtnHtml = opts.calendarShowId ? `<button class="cal-open-btn" type="button" data-cal-show-id="${esc(opts.calendarShowId)}" data-cal-show-name="${esc(opts.calendarShowName || opts.title)}"${opts.calendarTmdbId ? ` data-cal-show-tmdb="${esc(String(opts.calendarTmdbId))}"` : ''} title="查看这部剧的播出日历"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>播出日历</button>` : '';
   return `<div class="item${clickable}"${dataAttrs}${enrichAttrs}${style}>${removeHtml}${watchedHtml}${unwatchHtml}<div class="poster">${opts.poster ? `<img src="${opts.poster}" loading="lazy" alt="">` : `<div class="poster-ph"><span>${opts.tagClass === 'movie' ? '🎬' : '📺'}</span></div>`}</div><div class="info"><div class="name-row"><span class="name">${esc(opts.title)}</span>${tagHtml}</div>${opts.line1 ? `<div class="meta">${esc(opts.line1)}</div>` : ''}${opts.overview ? `<div class="overview">${esc(opts.overview)}</div>` : ''}${opts.line2 ? `<div class="meta dim">${esc(opts.line2)}</div>` : ''}${bar}${calendarBtnHtml}</div></div>`;
 }
 function renderHistoryPage(items, env, isFragment) {
-  if (isFragment === undefined) isFragment = false; if (!Array.isArray(items)) return isFragment ? '' : errBox('观看记录', items); if (!items.length) return isFragment ? '' : emptyState('还没有观看记录');
+  if (isFragment === undefined) isFragment = false; if (!Array.isArray(items)) return isFragment ? '' : errBox('观看记录', items); if (!items.length) return isFragment ? '' : emptyView('还没有观看记录');
   return items.map((item, i) => { const when = fmtRelative(item.watched_at), delay = isFragment ? 0 : Math.min(i, 24) * 20, e = buildBaseItem(item); let unwatchType = null, unwatchId = null; if (item.movie && item.movie.ids && item.movie.ids.trakt) { unwatchType = 'movie'; unwatchId = item.movie.ids.trakt; } else if (item.episode && item.episode.ids && item.episode.ids.trakt) { unwatchType = 'episode'; unwatchId = item.episode.ids.trakt; } return mediaItem({ poster: e.poster, tag: e.tag, tagClass: e.tagClass, title: e.title, overview: e.overview, line1: e.line1, line2: when, delay, detailType: e.detailType, detailId: e.detailId, enrichKey: e.enrichKey, unwatchType, unwatchId }); }).join('');
 }
 function watchlistToolbarHtml(currentSort) { const opts = [['added', '按添加时间'], ['released', '按发行年份'], ['title', '按标题']], options = opts.map(([v, t]) => `<option value="${v}"${v === currentSort ? ' selected' : ''}>${t}</option>`).join(''); return `<div class="wl-toolbar"><label class="wl-sort-label">排序<select id="wl-sort" class="wl-sort" onchange="onWatchlistSortChange(this.value)">${options}</select></label></div>`; }
@@ -686,7 +644,7 @@ function renderContinueItems(upNext) {
   return `<div class="grid">${parts.join('')}</div>`;
 }
 function renderCalendarPage(calendar, env, zhTitles) {
-  if (!Array.isArray(calendar)) return errBox('追剧日历', calendar); if (!calendar.length) return emptyState('未来 30 天没有待播剧集');
+  if (!Array.isArray(calendar)) return errBox('追剧日历', calendar); if (!calendar.length) return emptyView('未来 30 天没有待播剧集');
   const toBeijingDay = (iso) => { if (!iso) return ''; const d = new Date(new Date(iso).getTime() + 8 * 3600 * 1000); return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`; }, groups = new Map();
   for (const item of calendar) { const day = toBeijingDay(item.first_aired); if (!day) continue; if (!groups.has(day)) groups.set(day, []); groups.get(day).push(item); }
   const today = toBeijingDay(new Date().toISOString()), out = [];
@@ -694,46 +652,28 @@ function renderCalendarPage(calendar, env, zhTitles) {
   return out.join('');
 }
 
+// ═══ 详情片段 ═══
 async function renderDetailFragment(d) {
   const type = d.type, entity = d.entity, traktId = d.traktId, userProgress = d.userProgress, movieWatched = d.movieWatched, tmdb = d.tmdb, credits = d.credits, recommendations = d.recommendations, initialSeasonNum = d.initialSeasonNum, initialSeasonData = d.initialSeasonData, initialTraktEpisodes = d.initialTraktEpisodes || [], thirdParty = d.thirdParty, isMovie = type === 'movie';
   const title = (tmdb && (tmdb.title || tmdb.name)) || entity.title || '', overview = (tmdb && tmdb.overview) || entity.overview || '', year = (((tmdb && tmdb.release_date) || (tmdb && tmdb.first_air_date) || '') + '').slice(0, 4) || (entity.year ? String(entity.year) : ''), tmdbRating = (tmdb && tmdb.vote_average != null && Number(tmdb.vote_average) > 0) ? Number(tmdb.vote_average) : null, traktRating = entity.rating ? Number(entity.rating) : null, runtimeMin = (tmdb && tmdb.runtime) || (tmdb && tmdb.episode_run_time && tmdb.episode_run_time[0]) || entity.runtime || 0, runtimeStr = runtimeMin ? (runtimeMin >= 60 ? `${Math.floor(runtimeMin / 60)}h ${runtimeMin % 60}m` : `${runtimeMin}m`) : '', genres = (tmdb && tmdb.genres && tmdb.genres.map(g => g.name).join(' · ')) || (entity.genres || []).join(' · '), poster = (tmdb && tmdb.poster_path) ? tmdbPoster(tmdb.poster_path, 'w342') : posterOfTrakt(entity), backdrop = (tmdb && tmdb.backdrop_path) ? tmdbPoster(tmdb.backdrop_path, 'w780') : null, tagline = entity.tagline || '', showSlug = (entity.ids && entity.ids.slug) || '', doubanQuery = ((title || '') + (year ? ' ' + year : '')).trim(), doubanUrl = doubanQuery ? `${DOUBAN_SEARCH}?search_text=${encodeURIComponent(doubanQuery)}` : '';
   let statusHtml = '';
   if (isMovie) {
-    if (movieWatched) {
-      const playsPart = movieWatched.plays ? `${movieWatched.plays} 次 · ` : '';
-      statusHtml = `<div class="d-status done"><div class="d-status-icon">✓</div><div class="d-status-body"><div class="d-status-title">已观看</div><div class="d-status-sub">${esc(playsPart + fmtRelative(movieWatched.last_watched_at))}</div></div><button class="d-mark-btn unwatch" type="button" data-unmark-movie="${esc(String(traktId))}" title="取消观看">取消观看</button></div>`;
-    } else {
-      statusHtml = `<div class="d-status"><div class="d-status-icon">○</div><div class="d-status-body"><div class="d-status-title">未观看</div><div class="d-status-sub">还没有在 Trakt 上标记</div></div><button class="d-mark-btn" type="button" data-mark-movie="${esc(String(traktId))}" title="标记已看">✓ 标记已看</button></div>`;
-    }
+    if (movieWatched) { const playsPart = movieWatched.plays ? `${movieWatched.plays} 次 · ` : ''; statusHtml = `<div class="d-status done"><div class="d-status-icon">✓</div><div class="d-status-body"><div class="d-status-title">已观看</div><div class="d-status-sub">${esc(playsPart + fmtRelative(movieWatched.last_watched_at))}</div></div><button class="d-mark-btn unwatch" type="button" data-unmark-movie="${esc(String(traktId))}" title="取消观看">取消观看</button></div>`; }
+    else { statusHtml = `<div class="d-status"><div class="d-status-icon">○</div><div class="d-status-body"><div class="d-status-title">未观看</div><div class="d-status-sub">还没有在 Trakt 上标记</div></div><button class="d-mark-btn" type="button" data-mark-movie="${esc(String(traktId))}" title="标记已看">✓ 标记已看</button></div>`; }
   }
   else if (userProgress && !userProgress.__error && userProgress.aired > 0) {
     const pct = Math.round((userProgress.completed / userProgress.aired) * 100);
     const allWatched = userProgress.completed >= userProgress.aired;
     let markSeasonBtn = '';
     if (initialSeasonNum != null) {
-      if (allWatched) {
-        markSeasonBtn = `<button class="d-mark-btn done" type="button" disabled>✓ 已看完</button>`;
-      } else {
-        markSeasonBtn = `<button class="d-mark-btn" type="button" data-mark-season-all="${esc(String(traktId))}" data-season-num="${initialSeasonNum}" title="标记本季已看">✓ 标记本季已看</button>`;
-      }
+      if (allWatched) markSeasonBtn = `<button class="d-mark-btn done" type="button" disabled>✓ 已看完</button>`;
+      else markSeasonBtn = `<button class="d-mark-btn" type="button" data-mark-season-all="${esc(String(traktId))}" data-season-num="${initialSeasonNum}" title="标记本季已看">✓ 标记本季已看</button>`;
     }
-    statusHtml = `<div class="d-status done" style="flex-direction:column;align-items:stretch;gap:10px">
-      <div class="d-status-row">
-        <div class="d-status-icon">▶</div>
-        <div class="d-status-body">
-          <div class="d-status-title">已看 ${userProgress.completed} / ${userProgress.aired} 集 · ${pct}%</div>
-          <div class="d-status-sub">${userProgress.last_watched_at ? '上次 ' + fmtRelative(userProgress.last_watched_at) : ''}</div>
-        </div>
-        ${markSeasonBtn}
-      </div>
-      <div class="bar"><div class="bar-fill" style="width:${pct}%"></div></div>
-    </div>`;
+    statusHtml = `<div class="d-status done" style="flex-direction:column;align-items:stretch;gap:10px"><div class="d-status-row"><div class="d-status-icon">▶</div><div class="d-status-body"><div class="d-status-title">已看 ${userProgress.completed} / ${userProgress.aired} 集 · ${pct}%</div><div class="d-status-sub">${userProgress.last_watched_at ? '上次 ' + fmtRelative(userProgress.last_watched_at) : ''}</div></div>${markSeasonBtn}</div><div class="bar"><div class="bar-fill" style="width:${pct}%"></div></div></div>`;
   }
   else {
     let markSeasonBtn = '';
-    if (initialSeasonNum != null) {
-      markSeasonBtn = `<button class="d-mark-btn" type="button" data-mark-season-all="${esc(String(traktId))}" data-season-num="${initialSeasonNum}" title="标记本季已看">✓ 标记本季已看</button>`;
-    }
+    if (initialSeasonNum != null) markSeasonBtn = `<button class="d-mark-btn" type="button" data-mark-season-all="${esc(String(traktId))}" data-season-num="${initialSeasonNum}" title="标记本季已看">✓ 标记本季已看</button>`;
     statusHtml = `<div class="d-status"><div class="d-status-icon">○</div><div class="d-status-body"><div class="d-status-title">尚未观看</div><div class="d-status-sub">还没有观看记录</div></div>${markSeasonBtn}</div>`;
   }
   let infuseHtml = '';
@@ -747,67 +687,37 @@ async function renderDetailFragment(d) {
     if (Array.isArray(userProgress && userProgress.seasons)) userProgress.seasons.forEach(s => progressSeasons.set(s.number, s));
     const seasons = tmdb.seasons.filter(s => s.season_number > 0);
     seasonsHtml = `<div class="seasons">${seasons.map(s => {
-      const sp = progressSeasons.get(s.season_number),
-        total = s.episode_count || 0,
-        watched = sp ? (sp.completed || 0) : 0,
-        isOpen = s.season_number === initialSeasonNum,
-        bodyContent = isOpen && initialSeasonData
-          ? renderSeasonEpisodes(sp, initialSeasonData, s.season_number, showSlug, isOpen ? initialTraktEpisodes : [])
-          : '',
-        loadedAttr = (isOpen && bodyContent) ? ' data-loaded="1"' : '';
+      const sp = progressSeasons.get(s.season_number), total = s.episode_count || 0, watched = sp ? (sp.completed || 0) : 0, isOpen = s.season_number === initialSeasonNum, bodyContent = isOpen && initialSeasonData ? renderSeasonEpisodes(sp, initialSeasonData, s.season_number, showSlug, isOpen ? initialTraktEpisodes : []) : '', loadedAttr = (isOpen && bodyContent) ? ' data-loaded="1"' : '';
       return `<div class="season-item${isOpen ? ' open' : ''}"><div class="season-head" data-show="${esc(String(traktId))}" data-season="${s.season_number}" data-tmdb="${esc(String(tmdb.id))}" data-slug="${esc(showSlug)}"><span class="season-title">${esc(s.name || ('第 ' + s.season_number + ' 季'))}</span><span class="season-meta">${watched} / ${total} 集</span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg></div><div class="season-body"${loadedAttr}>${bodyContent}</div></div>`;
     }).join('')}</div>`;
   }
   return `<div class="detail-wrap"><div class="detail-hero">${backdrop ? `<img class="detail-bg" src="${backdrop}" alt="">` : ''}<div class="detail-inner">${poster ? `<img class="detail-poster" src="${poster}" alt="">` : `<div class="detail-poster detail-poster-ph">${isMovie ? '🎬' : '📺'}</div>`}<div class="detail-info"><h1 class="detail-title">${esc(title)}</h1>${tagline ? `<div class="detail-tagline">${esc(tagline)}</div>` : ''}<div class="detail-meta">${year ? `<span>${esc(year)}</span>` : ''}${runtimeStr ? `<span>${esc(runtimeStr)}</span>` : ''}</div>${(thirdParty || traktRating != null || tmdbRating != null || doubanUrl) ? `<div class="detail-ext-ratings">${renderExtRatings(thirdParty, { trakt: traktRating, tmdb: tmdbRating, doubanUrl })}</div>` : ''}${genres ? `<div class="detail-genres">${esc(genres)}</div>` : ''}${overview ? `<p class="detail-overview">${esc(overview)}</p>` : ''}${statusHtml}${infuseHtml}</div></div></div><div class="detail-body">${castHtml ? `<section class="d-section"><h2 class="d-section-title">演员</h2><div class="cast-scroll">${castHtml}</div></section>` : ''}${seasonsHtml ? `<section class="d-section"><h2 class="d-section-title">季与集</h2>${seasonsHtml}</section>` : ''}${recsHtml ? `<section class="d-section"><h2 class="d-section-title">相关推荐</h2><div class="grid">${recsHtml}</div></section>` : ''}</div></div>`;
 }
 function renderSeasonEpisodes(seasonProgress, tmdbSeason, seasonNum, showSlug, traktEpisodes) {
-  if (!tmdbSeason || !Array.isArray(tmdbSeason.episodes) || !tmdbSeason.episodes.length) {
-    return '<div class="ep-empty">暂无剧集信息</div>';
-  }
+  if (!tmdbSeason || !Array.isArray(tmdbSeason.episodes) || !tmdbSeason.episodes.length) return '<div class="ep-empty">暂无剧集信息</div>';
   const watched = new Map();
-  if (Array.isArray(seasonProgress && seasonProgress.episodes)) {
-    seasonProgress.episodes.forEach(e => watched.set(e.number, e));
-  }
+  if (Array.isArray(seasonProgress && seasonProgress.episodes)) seasonProgress.episodes.forEach(e => watched.set(e.number, e));
   const traktMap = new Map();
-  if (Array.isArray(traktEpisodes)) {
-    traktEpisodes.forEach(e => {
-      if (e && e.number != null) traktMap.set(e.number, e);
-    });
-  }
+  if (Array.isArray(traktEpisodes)) traktEpisodes.forEach(e => { if (e && e.number != null) traktMap.set(e.number, e); });
   return tmdbSeason.episodes.map(ep => {
-    const num = ep.episode_number;
-    const w = watched.get(num);
-    const isWatched = !!(w && w.completed);
-    const traktEp = traktMap.get(num);
-    const epId = (traktEp && traktEp.ids && traktEp.ids.trakt)
-      || (w && w.ids && w.ids.trakt)
-      || null;
-    const traktUrl = showSlug
-      ? `https://trakt.tv/shows/${showSlug}/seasons/${seasonNum}/episodes/${num}`
-      : '';
+    const num = ep.episode_number, w = watched.get(num), isWatched = !!(w && w.completed), traktEp = traktMap.get(num);
+    const epId = (traktEp && traktEp.ids && traktEp.ids.trakt) || (w && w.ids && w.ids.trakt) || null;
+    const traktUrl = showSlug ? `https://trakt.tv/shows/${showSlug}/seasons/${seasonNum}/episodes/${num}` : '';
     const clickable = traktUrl ? ' clickable' : '';
-    const attrs = traktUrl
-      ? ` data-trakt-url="${esc(traktUrl)}" role="link" tabindex="0" title="在 Trakt 中打开"`
-      : '';
-    const actionHtml = isWatched
-      ? '<div class="ep-check">✓</div>'
-      : (epId
-          ? `<button class="ep-watch-btn" type="button" data-episode-id="${esc(String(epId))}" data-episode-title="${esc(ep.name || '')}" title="标记本集已看">标记已看</button>`
-          : '');
-    return `<div class="episode${isWatched ? ' watched' : ''}${clickable}"${attrs}>
-      <div class="ep-num">E${pad(num)}</div>
-      <div class="ep-body">
-        <div class="ep-title">${esc(ep.name || '')}</div>
-        ${ep.overview ? `<div class="ep-overview">${esc(ep.overview)}</div>` : ''}
-      </div>
-      <div class="ep-actions">${actionHtml}</div>
-    </div>`;
+    const attrs = traktUrl ? ` data-trakt-url="${esc(traktUrl)}" role="link" tabindex="0" title="在 Trakt 中打开"` : '';
+    const actionHtml = isWatched ? '<div class="ep-check">✓</div>' : (epId ? `<button class="ep-watch-btn" type="button" data-episode-id="${esc(String(epId))}" data-episode-title="${esc(ep.name || '')}" title="标记本集已看">标记已看</button>` : '');
+    return `<div class="episode${isWatched ? ' watched' : ''}${clickable}"${attrs}><div class="ep-num">E${pad(num)}</div><div class="ep-body"><div class="ep-title">${esc(ep.name || '')}</div>${ep.overview ? `<div class="ep-overview">${esc(ep.overview)}</div>` : ''}</div><div class="ep-actions">${actionHtml}</div></div>`;
   }).join('');
 }
 
-function simpleErr(msg) { return `<div style="padding:80px 20px;text-align:center"><p style="color:#9db5e0;font-size:1rem">${esc(msg)}</p></div>`; }
-function emptyState(text) { return `<div class="empty"><svg viewBox="0 0 24 24" width="56" height="56" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.25"><circle cx="12" cy="12" r="10"/><path d="M8 12h8M12 8v8"/></svg><p>${text}</p></div>`; }
-
+// ═══ 通用工具 ═══
+function emptyView(opts) {
+  if (typeof opts === 'string') opts = { text: opts };
+  const text = opts.text || '';
+  if (opts.error) return `<div class="empty" style="color:#9db5e0;padding:80px 20px"><p style="margin:0;font-size:1rem">${esc(text)}</p></div>`;
+  return `<div class="empty"><svg viewBox="0 0 24 24" width="56" height="56" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.25"><circle cx="12" cy="12" r="10"/><path d="M8 12h8M12 8v8"/></svg><p>${text}</p></div>`;
+}
+function errBox(name, obj) { return `<div class="err-box"><p class="err-title">无法加载${name}</p><p class="err">${esc((obj && obj.__error) || '未知错误')}</p></div>`; }
 function randomString(len) { const cs = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~', v = new Uint8Array(len); crypto.getRandomValues(v); let s = ''; for (let i = 0; i < len; i++) s += cs[v[i] % cs.length]; return s; }
 async function pkceChallenge(verifier) { const data = new TextEncoder().encode(verifier), digest = await crypto.subtle.digest('SHA-256', data); return b64urlEncode(String.fromCharCode(...new Uint8Array(digest)), true); }
 function b64urlEncode(str, isBinary) { let bytes; if (isBinary) { bytes = new Uint8Array(str.length); for (let i = 0; i < str.length; i++) bytes[i] = str.charCodeAt(i) & 0xff; } else { bytes = new TextEncoder().encode(str); } let bin = ''; for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]); return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
@@ -816,92 +726,179 @@ function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').repla
 function jsStr(s) { return JSON.stringify(String(s == null ? '' : s)).replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029'); }
 function pad(n) { return String(n == null ? 0 : n).padStart(2, '0'); }
 function fmtRelative(iso) { if (!iso) return ''; const d = new Date(iso), t = d.getTime(); if (isNaN(t)) return ''; const diff = Date.now() - t, min = Math.floor(diff / 60000); if (min < 1) return '刚刚'; if (min < 60) return min + ' 分钟前'; const h = Math.floor(min / 60); if (h < 24) return h + ' 小时前'; const day = Math.floor(h / 24); if (day < 7) return day + ' 天前'; return d.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' }); }
-function errBox(name, obj) { return `<div class="err-box"><p class="err-title">无法加载${name}</p><p class="err">${esc((obj && obj.__error) || '未知错误')}</p></div>`; }
 function html(body) { return new Response(body, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache, no-store, must-revalidate', 'Pragma': 'no-cache', 'Expires': '0' } }); }
 
-function criticalCss() {
-  return `html,body{background:#000000!important;color:#eef1f7;margin:0;padding:0;min-height:100%;min-height:100dvh}.splash{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000;background:radial-gradient(circle at 50% 45%,#0a0a0a 0%,#000000 62%);transition:opacity .38s ease;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;-webkit-tap-highlight-color:transparent}.splash.hide{opacity:0;pointer-events:none}.splash-glow{position:absolute;width:340px;height:340px;border-radius:50%;background:radial-gradient(circle,rgba(125,157,212,.25) 0%,rgba(125,157,212,0) 70%);animation:splashPulse 2.4s ease-in-out infinite}.splash-inner{position:relative;z-index:1;display:flex;flex-direction:column;align-items:center;gap:20px}.splash-logo{color:#a8b2c4;animation:splashPop .75s cubic-bezier(.22,1.1,.36,1) both}.splash-logo img{display:block}.splash-name{font-size:1.35rem;font-weight:800;letter-spacing:.4px;background:linear-gradient(135deg,#fff 20%,#7d9dd4);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;animation:splashFadeUp .6s ease .28s both}.splash-bar{width:128px;height:3px;border-radius:99px;background:rgba(255,255,255,.08);overflow:hidden;animation:splashFadeUp .6s ease .45s both}.splash-bar-fill{height:100%;width:42%;border-radius:99px;background:#fff;animation:splashSlide 1.15s cubic-bezier(.65,0,.35,1) infinite}@keyframes splashPulse{0%,100%{transform:scale(.85);opacity:.7}50%{transform:scale(1.12);opacity:1}}@keyframes splashPop{0%{opacity:0;transform:scale(.55) rotate(-8deg)}60%{opacity:1;transform:scale(1.08) rotate(2deg)}100%{opacity:1;transform:scale(1) rotate(0)}}@keyframes splashFadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}@keyframes splashSlide{0%{transform:translateX(-130%)}100%{transform:translateX(330%)}}.spinner{width:30px;height:30px;border:3px solid #212735;border-top-color:#7d9dd4;border-radius:50%;animation:spin .8s linear infinite;margin:4px auto}@keyframes spin{to{transform:rotate(360deg)}}*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;background-color:#050505;color:#f4f4f5;-webkit-font-smoothing:antialiased;line-height:1.5;overflow-x:hidden;overscroll-behavior-y:none}a{color:#c4b5fd;text-decoration:none}img{display:block;max-width:100%}.container{max-width:1200px;margin:0 auto;padding:0 16px calc(80px + env(safe-area-inset-bottom))}.hero{display:flex;justify-content:space-between;align-items:center;padding:calc(20px + env(safe-area-inset-top)) 0 20px;gap:16px}.hero-left{display:flex;align-items:center;gap:12px;min-width:0}.hero-avatar{width:50px;height:50px;border-radius:50%;overflow:hidden;flex-shrink:0;background:#16161a;border:2px solid rgba(167,139,250,.5)}.hero-avatar-ph{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:1.25rem;background:linear-gradient(135deg,#1a2233,#2a3a55)}.hero-text{min-width:0;flex:1;display:flex;flex-direction:column;align-items:flex-start;gap:1px}.hero-name{font-size:1.45rem;font-weight:800;letter-spacing:-.4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:linear-gradient(135deg,#fff 20%,#c4b5fd 90%);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}.hero-actions{display:flex;gap:8px;flex-shrink:0}.btn-action{display:inline-flex;align-items:center;gap:6px;background:rgba(255,255,255,.04);color:#a1a1aa;border:1px solid rgba(255,255,255,.08);padding:8px 14px;border-radius:10px;font-size:.82rem;font-weight:600;cursor:pointer;font-family:inherit}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;background:linear-gradient(165deg,#16161a 0%,#0e0e10 100%);border:1px solid rgba(255,255,255,.08);border-radius:18px;padding:18px 10px;margin-bottom:24px;position:relative;overflow:hidden}.stat{text-align:center;display:flex;flex-direction:column;align-items:center;gap:2px;padding:6px 2px}.stat-num{font-size:1.35rem;font-weight:800;letter-spacing:-.6px}.stat-label{font-size:.7rem;color:#71717a;font-weight:500}.tabs{display:flex;gap:4px;margin-bottom:22px;position:sticky;top:0;z-index:10}.tab{flex:1 1 0;min-width:0;background:transparent;border:none;color:#a1a1aa;padding:9px 2px;border-radius:999px;font-size:.75rem;font-weight:600;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:center;font-family:inherit}.tab.active{background:linear-gradient(135deg,#7c3aed 0%,#a78bfa 100%);color:#fff;font-weight:700}.pane{display:none}.pane.active{display:block}.pane-loading{padding:60px 20px;text-align:center}.grid{display:flex;flex-direction:column;gap:10px}`;
-}
-
+// ═══ 页面 ═══
 function pageHeadEarly() {
-  return `<!DOCTYPE html><html lang="zh-CN" style="background:#000000"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1,user-scalable=no"><meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"><meta http-equiv="Pragma" content="no-cache"><meta name="color-scheme" content="dark"><meta name="theme-color" content="${THEME_COLOR}"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="${APP_SHORT_NAME}"><meta name="mobile-web-app-capable" content="yes"><meta name="format-detection" content="telephone=no"><title>${APP_NAME}</title><link rel="icon" href="${FAVICON_URL}" type="image/png"><link rel="apple-touch-icon" href="${APPLE_ICON}"><link rel="manifest" href="/manifest.webmanifest"><link rel="preconnect" href="https://api.trakt.tv" crossorigin><link rel="preconnect" href="https://api.themoviedb.org" crossorigin><link rel="preconnect" href="https://image.tmdb.org" crossorigin><style>${criticalCss()}</style></head><body style="background:#000000;margin:0;min-height:100vh;min-height:100dvh">${renderSplash()}`;
+  return `<!DOCTYPE html><html lang="zh-CN" style="background:#000000"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1,user-scalable=no"><meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"><meta http-equiv="Pragma" content="no-cache"><meta name="color-scheme" content="dark"><meta name="theme-color" content="${THEME_COLOR}"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="${APP_SHORT_NAME}"><meta name="mobile-web-app-capable" content="yes"><meta name="format-detection" content="telephone=no"><title>${APP_NAME}</title><link rel="icon" href="${FAVICON_URL}" type="image/png"><link rel="apple-touch-icon" href="${APPLE_ICON}"><link rel="manifest" href="/manifest.webmanifest"><link rel="preconnect" href="https://api.trakt.tv" crossorigin><link rel="preconnect" href="https://api.themoviedb.org" crossorigin><link rel="preconnect" href="https://image.tmdb.org" crossorigin><link rel="stylesheet" href="/app.css?v=${APP_CSS_VERSION}"></head><body style="background:#000000;margin:0;min-height:100vh;min-height:100dvh">${renderSplash()}`;
 }
-function pageHead() { return pageHeadEarly() + pageStyles(); }
-function pageStyles() { return `<style>${nonCriticalCss()}</style>`; }
-
-function nonCriticalCss() {
-  return `
-  :root { --bg: #050505; --surface: #0e0e10; --surface-2: #16161a; --surface-3: #1c1c22; --border: rgba(255,255,255,0.08); --border-strong: rgba(255,255,255,0.14); --text: #f4f4f5; --text-dim: #a1a1aa; --text-mute: #71717a; --accent: #a78bfa; --accent-2: #c4b5fd; --accent-soft: rgba(167,139,250,0.12); --accent-glow: rgba(167,139,250,0.28); --success: #34d399; --blue: #c4b5fd; --radius-sm: 10px; --radius-md: 14px; --radius-lg: 18px; --radius-xl: 22px; --shadow-card: 0 8px 32px rgba(0,0,0,0.55); }
-  body { background: radial-gradient(ellipse 120% 70% at 50% -20%, #1a1528 0%, transparent 50%), radial-gradient(ellipse 50% 40% at 100% 0%, rgba(167,139,250,0.08) 0%, transparent 45%), radial-gradient(ellipse 40% 30% at 0% 100%, rgba(52,211,153,0.04) 0%, transparent 40%), #050505; background-attachment: fixed; }
-  a:hover { color: #ddd6fe; }
-  .stats { box-shadow: var(--shadow-card), inset 0 1px 0 rgba(255,255,255,0.04); }
-  .stats::before { content: ''; position: absolute; top: 0; left: 10%; right: 10%; height: 1px; background: linear-gradient(90deg, transparent, rgba(167,139,250,0.35), transparent); }
-  .stat { position: relative; border-radius: 12px; transition: background 0.2s ease; }
-  .stat:hover { background: rgba(255,255,255,0.025); }
-  .stat + .stat::before { content: ''; position: absolute; left: -4px; top: 18%; bottom: 18%; width: 1px; background: linear-gradient(180deg, transparent, rgba(255,255,255,0.08), transparent); }
-  .stat-icon { transition: transform 0.25s ease, box-shadow 0.25s ease; }
-  .stat:hover .stat-icon { transform: translateY(-1px) scale(1.06); }
-  .stat-movie .stat-icon { background: linear-gradient(135deg, rgba(167,139,250,0.18), rgba(167,139,250,0.06)); color: #c4b5fd; box-shadow: 0 4px 14px rgba(167,139,250,0.18), inset 0 0 0 1px rgba(167,139,250,0.18); }
-  .stat-show .stat-icon { background: linear-gradient(135deg, rgba(96,165,250,0.18), rgba(96,165,250,0.06)); color: #93c5fd; box-shadow: 0 4px 14px rgba(96,165,250,0.18), inset 0 0 0 1px rgba(96,165,250,0.18); }
-  .stat-episode .stat-icon { background: linear-gradient(135deg, rgba(52,211,153,0.18), rgba(52,211,153,0.06)); color: #6ee7b7; box-shadow: 0 4px 14px rgba(52,211,153,0.18), inset 0 0 0 1px rgba(52,211,153,0.18); }
-  .stat-hours .stat-icon { background: linear-gradient(135deg, rgba(251,191,36,0.18), rgba(251,191,36,0.06)); color: #fcd34d; box-shadow: 0 4px 14px rgba(251,191,36,0.18), inset 0 0 0 1px rgba(251,191,36,0.18); }
-  .stat-num { background: linear-gradient(180deg, #ffffff 0%, #c4b5fd 100%); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
-  .load-more-wrap { text-align: center; margin-top: 24px; } .load-more { background: var(--surface-2); border: 1px solid var(--border); color: var(--text); padding: 11px 32px; border-radius: var(--radius-md); font-size: 0.9rem; font-weight: 600; cursor: pointer; transition: all 0.2s; font-family: inherit; } .load-more:hover:not(:disabled) { border-color: rgba(91,124,250,0.45); color: var(--accent-2); box-shadow: 0 4px 20px var(--accent-glow); background: var(--surface-3); } .load-more:disabled { cursor: not-allowed; }
-  .login-wrap { min-height: 100vh; min-height: 100dvh; display: flex; align-items: center; justify-content: center; padding: 20px; } .login-card { width: 100%; max-width: 440px; background: linear-gradient(165deg, #16161a 0%, #0e0e10 100%); border: 1px solid var(--border-strong); border-radius: 24px; padding: 44px 32px; text-align: center; box-shadow: 0 24px 64px rgba(0,0,0,0.7), inset 0 1px 0 rgba(255,255,255,0.05); } .login-logo { color: #a8b2c4; margin-bottom: 16px; } .login-title { font-size: 1.75rem; font-weight: 800; letter-spacing: -0.5px; background: linear-gradient(135deg, #ffffff 20%, #7d9dd4); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 6px; } .login-sub { color: var(--text-dim); font-size: 0.9rem; margin-bottom: 28px; } .btn-primary { background: linear-gradient(135deg, #7c3aed 0%, #a78bfa 100%); color: #fff; border: none; padding: 13px 30px; border-radius: 12px; font-size: 0.95rem; font-weight: 700; cursor: pointer; box-shadow: 0 6px 24px rgba(167,139,250,0.35); } .btn-primary:hover { filter: brightness(1.08); transform: translateY(-1px); } .btn-ghost { background: rgba(255,255,255,0.04); color: var(--text-dim); border: 1px solid var(--border); padding: 8px 16px; border-radius: 10px; font-size: 0.85rem; cursor: pointer; transition: all 0.15s; font-family: inherit; } .btn-ghost:hover { color: #fff; border-color: var(--border-strong); background: rgba(255,255,255,0.08); }
-  .btn-action svg { flex-shrink: 0; transition: transform 0.25s ease; } .btn-action:hover { color: #fff; border-color: var(--border-strong); background: rgba(167,139,250,0.10); box-shadow: 0 4px 16px rgba(167,139,250,0.18); } .btn-action:hover svg { transform: rotate(180deg); } .btn-action:active { transform: scale(0.97); } .btn-action:last-child:hover { background: rgba(224,85,96,0.10); border-color: rgba(224,85,96,0.35); } .btn-action:last-child:hover svg { transform: translateX(2px); } @media (max-width: 420px) { .btn-action span { display: none; } .btn-action { padding: 9px; } .hero-actions { gap: 6px; } }
-  .steps { display: flex; flex-direction: column; gap: 6px; } .step { display: flex; align-items: center; gap: 10px; text-align: left; padding: 4px 0; font-size: 0.9rem; } .step .n { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; background: var(--accent); color: #fff; border-radius: 50%; font-size: 0.72rem; font-weight: 700; flex-shrink: 0; } .code-box { font-family: ui-monospace, Menlo, monospace; font-size: 1.75rem; font-weight: 800; letter-spacing: 6px; color: #a8c0e8; background: rgba(90,120,180,0.12); border: 1px solid rgba(140,170,220,0.35); border-radius: 14px; padding: 14px; margin: 14px 0; user-select: all; text-align: center; } .qr-box { background: #fff; border-radius: 14px; padding: 10px; display: inline-block; margin: 6px 0 14px; } .qr-box img { border-radius: 8px; } .status { display: inline-flex; align-items: center; gap: 8px; font-size: 0.88rem; padding: 8px 16px; border-radius: 20px; color: var(--text-dim); background: var(--surface-2); } .status.success { color: #4ade80; background: rgba(74,222,128,0.1); } .status.error { color: #e05560; background: rgba(224,85,96,0.12); } .pulse { display: inline-block; width: 8px; height: 8px; background: #7d9dd4; border-radius: 50%; animation: pulse 1.4s ease-in-out infinite; } @keyframes pulse { 0%, 100% { opacity: 0.35; transform: scale(0.85); } 50% { opacity: 1; transform: scale(1.15); } }
-  .err-box { background: rgba(224,85,96,0.10); border: 1px solid rgba(224,85,96,0.28); border-radius: 12px; padding: 14px; text-align: left; margin-bottom: 14px; } .err-title { font-weight: 600; color: #e05560; margin-bottom: 4px; font-size: 0.92rem; } .err { color: #e8a3ab; font-size: 0.85rem; } .err-detail { font-family: ui-monospace, Menlo, monospace; font-size: 0.72rem; color: var(--text-dim); background: #000; padding: 8px 10px; border-radius: 6px; margin-top: 8px; white-space: pre-wrap; word-break: break-all; max-height: 120px; overflow: auto; } .hint { color: var(--text-dim); font-size: 0.82rem; margin-top: 6px; } .log-details { margin-top: 18px; text-align: left; } .log-details summary { cursor: pointer; font-size: 0.76rem; color: var(--text-dim); padding: 4px 0; user-select: none; } .log-box { font-family: ui-monospace, Menlo, monospace; font-size: 0.7rem; color: var(--text-dim); background: #000; border: 1px solid var(--border); border-radius: 8px; padding: 10px; max-height: 160px; overflow: auto; margin-top: 6px; line-height: 1.6; }
-  .updated-at { font-size: 0.72rem; color: var(--text-mute); font-weight: 400; letter-spacing: 0.2px; transition: color 0.4s ease; } .updated-at:empty { display: none; } .updated-at.flash { animation: updatedFlash 1.1s ease-out; } @keyframes updatedFlash { 0% { color: var(--accent-2); } 100% { color: var(--text-mute); } }
-  @media (min-width: 768px) { .hero-avatar { width: 56px; height: 56px; } .hero-name { font-size: 1.55rem; } }
-  .stat-icon { width: 30px; height: 30px; border-radius: 9px; display: flex; align-items: center; justify-content: center; margin-bottom: 4px; }
-  .tab:hover { color: var(--text); background: rgba(255,255,255,0.06); }
-  .pane.active { animation: fadeIn 0.3s ease; } @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
-  .item { position: relative; display: flex; gap: 14px; background: linear-gradient(160deg, #141416 0%, #0e0e10 100%); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 12px; transition: transform 0.2s ease, border-color 0.2s, box-shadow 0.2s; animation: fadeInUp 0.4s ease backwards; overflow: hidden; box-shadow: 0 4px 20px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.03); text-decoration: none; color: inherit; } .item.clickable { cursor: pointer; } .item.clickable:active { transform: scale(0.985); background: var(--surface-2); } @keyframes fadeInUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } } .item:hover { border-color: rgba(167,139,250,0.25); box-shadow: 0 8px 28px rgba(0,0,0,0.45), 0 0 0 1px rgba(167,139,250,0.08); transform: translateY(-1px); }
-  .wl-remove, .wl-watched, .wl-unwatch { position: absolute; top: 6px; right: 6px; width: 26px; height: 26px; border-radius: 50%; background: rgba(0,0,0,0.65); line-height: 1; cursor: pointer; z-index: 3; display: flex; align-items: center; justify-content: center; padding: 0; font-family: inherit; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); transition: background 0.15s, transform 0.15s, opacity 0.15s, color 0.15s; } .wl-remove { color: #fff; border: 1px solid rgba(255,255,255,0.22); font-size: 1rem; font-weight: 400; opacity: 0.88; } .wl-remove:hover { background: rgba(200,70,80,0.92); opacity: 1; transform: scale(1.06); } .wl-watched { color: #4ade80; border: 1px solid rgba(74,222,128,0.45); font-size: 0.85rem; font-weight: 700; opacity: 0.9; } .wl-watched:hover { background: rgba(74,222,128,0.95); color: #000; opacity: 1; transform: scale(1.06); } .wl-unwatch { color: #ffb84d; border: 1px solid rgba(255,184,77,0.45); font-size: 0.9rem; font-weight: 700; opacity: 0.9; } .wl-unwatch:hover { background: rgba(255,184,77,0.95); color: #000; opacity: 1; transform: scale(1.06); } .wl-remove:disabled, .wl-watched:disabled, .wl-unwatch:disabled { opacity: 0.5; cursor: wait; }
-  .wl-toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-bottom: 14px; } .wl-sort-label { display: inline-flex; align-items: center; gap: 8px; font-size: 0.82rem; color: var(--text-dim); } .wl-sort { background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 7px 12px; border-radius: 8px; font-size: 0.82rem; font-family: inherit; cursor: pointer; outline: none; transition: border-color 0.15s; } .wl-sort:hover { border-color: #2a3345; } .wl-sort:focus { border-color: #7d9dd4; }
-  .poster { width: 76px; height: 114px; border-radius: 10px; overflow: hidden; flex-shrink: 0; background: var(--surface-2); position: relative; } .poster img { width: 100%; height: 100%; object-fit: cover; } .poster-ph { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; font-size: 1.8rem; background: linear-gradient(135deg, var(--surface-2), #1a2233); color: var(--text-dim); }
-  .info { flex: 1; min-width: 0; display: flex; flex-direction: column; justify-content: center; gap: 4px; } .name-row { display: flex; align-items: baseline; gap: 0; overflow: hidden; white-space: nowrap; line-height: 1.3; letter-spacing: -0.2px; } .name { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 1rem; font-weight: 700; color: var(--text); } .tag { flex: 0 0 auto; font-size: inherit; font-weight: inherit; letter-spacing: 0; white-space: nowrap; } .tag.upcoming { color: #ffb84d; } .overview { font-size: 0.8rem; color: var(--text-dim); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; line-height: 1.45; margin-top: 4px; } .meta { font-size: 0.8rem; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .meta.dim { color: #7a8394; font-size: 0.78rem; margin-top: 2px; } .bar { height: 3px; background: rgba(255,255,255,0.06); border-radius: 99px; overflow: hidden; margin-top: 8px; } .bar-fill { height: 100%; background: linear-gradient(90deg, #7c3aed, #c4b5fd); border-radius: 99px; box-shadow: 0 0 10px rgba(167,139,250,0.5); }
-  .cal-open-btn { align-self: flex-start; margin-top: 8px; background: rgba(90,120,180,0.14); border: 1px solid rgba(140,170,220,0.35); color: #9db5e0; padding: 5px 12px; border-radius: 8px; font-size: 0.74rem; font-weight: 600; cursor: pointer; font-family: inherit; transition: all 0.15s; display: inline-flex; align-items: center; gap: 5px; } .cal-open-btn:hover { background: rgba(120,150,210,0.28); color: #c2d4f0; border-color: rgba(140,170,220,0.65); } .cal-open-btn svg { flex-shrink: 0; } .cal-open-btn.wl-added { background: rgba(74,222,128,0.14) !important; border-color: rgba(74,222,128,0.38) !important; color: #4ade80 !important; cursor: default !important; }
-  .search-bar { margin-bottom: 16px; } .search-input { width: 100%; background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 12px 16px; border-radius: 12px; font-size: 0.95rem; font-family: inherit; outline: none; transition: border-color 0.15s, background 0.15s; -webkit-appearance: none; appearance: none; } .search-input:focus { border-color: var(--accent); background: var(--surface-2); box-shadow: 0 0 0 3px var(--accent-soft); } .search-input::placeholder { color: var(--text-mute); }
-  .trending-head { display: flex; align-items: center; gap: 8px; font-size: 0.88rem; font-weight: 700; color: var(--text); margin: 4px 0 14px; padding-left: 2px; letter-spacing: 0.2px; } .trending-head::before { content: ''; width: 3px; height: 14px; border-radius: 2px; background: linear-gradient(180deg, #f97316, #ef4444); }
-  .show-cal-modal { position: fixed; inset: 0; z-index: 130; display: none; } .show-cal-modal.open { display: block; } .show-cal-backdrop { position: absolute; inset: 0; background: rgba(2,4,8,0.78); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); animation: fadeIn 0.2s ease; } .show-cal-panel { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: min(92vw, 440px); max-height: 90vh; overflow-y: auto; background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 20px; box-shadow: 0 30px 80px rgba(0,0,0,0.8); animation: modalIn 0.25s cubic-bezier(0.2, 0.9, 0.3, 1); } .show-cal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; } .show-cal-name { font-size: 0.95rem; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; } .show-cal-close { width: 32px; height: 32px; flex-shrink: 0; background: rgba(255,255,255,0.04); border: 1px solid var(--border); color: var(--text-dim); border-radius: 50%; cursor: pointer; font-size: 1.1rem; line-height: 1; display: flex; align-items: center; justify-content: center; transition: all 0.15s; font-family: inherit; } .show-cal-close:hover { color: var(--text); border-color: #3a4a68; } .show-cal-info { font-size: 0.72rem; color: var(--text-dim); margin-bottom: 12px; line-height: 1.4; } .show-cal-nav { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; font-size: 0.88rem; color: var(--text); font-weight: 600; } .show-cal-nav button { width: 30px; height: 30px; background: rgba(255,255,255,0.04); border: 1px solid var(--border); color: var(--text-dim); border-radius: 8px; cursor: pointer; font-size: 1rem; line-height: 1; display: flex; align-items: center; justify-content: center; transition: all 0.15s; font-family: inherit; } .show-cal-nav button:hover { color: var(--text); border-color: #3a4a68; } .show-cal-weekdays { display: grid; grid-template-columns: repeat(7, 1fr); text-align: center; font-size: 0.7rem; color: var(--text-dim); margin-bottom: 6px; } .show-cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; } .sc-day { position: relative; aspect-ratio: 1; display: flex; align-items: center; justify-content: center; border-radius: 8px; font-size: 0.8rem; color: var(--text-dim); cursor: default; border: 1px solid transparent; transition: background 0.15s, border-color 0.15s; } .sc-day.sc-has { cursor: pointer; font-weight: 700; } .sc-day.sc-past { background: rgba(90,120,180,0.22); color: #9db0d0; border-color: rgba(120,150,210,0.5); } .sc-day.sc-past:hover { background: rgba(120,150,210,0.4); color: #d0dcf0; } .sc-day.sc-today-day { background: #4a6db8; color: #fff; border-color: #7d9dd4; box-shadow: 0 0 14px rgba(125,157,212,0.7); } .sc-day.sc-today-day:hover { background: #5b7fc4; } .sc-day.sc-future { background: rgba(255,184,77,0.18); color: #ffd693; border-color: rgba(255,184,77,0.55); } .sc-day.sc-future:hover { background: rgba(255,184,77,0.4); color: #fff0d0; } .sc-day.sc-active { outline: 2px solid #fff; outline-offset: -2px; } .sc-day.sc-empty { visibility: hidden; } .sc-badge { position: absolute; top: 2px; right: 2px; min-width: 14px; height: 14px; padding: 0 3px; border-radius: 7px; background: #4a6db8; color: #fff; font-size: 0.6rem; font-weight: 700; line-height: 14px; text-align: center; } .sc-day.sc-future .sc-badge { background: #d99a3a; } .show-cal-legend { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; margin-top: 14px; font-size: 0.7rem; color: var(--text-dim); } .legend-item { display: inline-flex; align-items: center; gap: 5px; } .legend-dot { display: inline-block; width: 10px; height: 10px; border-radius: 3px; } .legend-past { background: rgba(90,120,180,0.5); border: 1px solid rgba(140,170,220,0.8); } .legend-today { background: #4a6db8; border: 1px solid #7d9dd4; } .legend-future { background: rgba(255,184,77,0.4); border: 1px solid rgba(255,184,77,0.8); } .show-cal-detail { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 12px; min-height: 20px; } .sc-ep { display: flex; gap: 10px; align-items: baseline; padding: 6px 0; font-size: 0.82rem; } .sc-ep-tag { font-family: ui-monospace, Menlo, monospace; font-size: 0.72rem; font-weight: 700; color: #7d9dd4; flex-shrink: 0; } .sc-ep-title { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ext-rating { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 6px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.10); line-height: 1; font-size: 0.78rem; color: var(--text); white-space: nowrap; } .ext-label { font-size: 0.68rem; font-weight: 800; letter-spacing: 0.4px; text-transform: uppercase; opacity: 0.92; } .ext-score { font-weight: 800; letter-spacing: 0.2px; } .ext-rating.ext-imdb { background: #f5c518; border-color: #d4a800; color: #000; } .ext-rating.ext-rt { background: rgba(250, 50, 10, 0.16); border-color: rgba(250, 50, 10, 0.35); color: #ff7666; } .ext-rating.ext-mc { background: rgba(255,255,255,0.05); border-color: rgba(255,255,255,0.12); color: var(--text); } .ext-rating.ext-trakt { background: rgba(237, 28, 36, 0.16); border-color: rgba(237, 28, 36, 0.38); color: #ff6b70; } .ext-rating.ext-tmdb { background: rgba(1, 180, 228, 0.16); border-color: rgba(1, 180, 228, 0.38); color: #4dd0e1; } .ext-rating.ext-douban { background: rgba(46, 150, 61, 0.16); border-color: rgba(46, 150, 61, 0.42); color: #4ecb71; text-decoration: none; transition: background 0.15s, border-color 0.15s, color 0.15s; } .ext-rating.ext-douban:hover { background: rgba(46, 150, 61, 0.30); border-color: rgba(46, 150, 61, 0.70); color: #6fe089; text-decoration: none; } .detail-ext-ratings { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 6px; } @media (min-width: 700px) { .detail-ext-ratings { justify-content: flex-start; } }
-  @media (min-width: 600px) { .container { padding-left: 20px; padding-right: 20px; } .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; } .item { border-radius: 14px; } .poster { width: 72px; height: 108px; } } @media (min-width: 768px) { .container { max-width: 1000px; padding: 0 28px calc(88px + env(safe-area-inset-bottom)); } .hero { padding: 28px 0 22px; gap: 12px; } .stats { gap: 10px; padding: 18px 12px; margin-bottom: 24px; } .stat-num { font-size: 1.5rem; } .stat-label { font-size: 0.76rem; } .stat-icon { width: 34px; height: 34px; border-radius: 10px; } .tabs { position: static; background: transparent !important; } .tab { flex: 0 0 auto; padding: 9px 18px; font-size: 0.87rem; } .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 16px; } .item { display: flex; flex-direction: column; gap: 0; padding: 0; border-radius: 12px; background: transparent; border: none; overflow: visible; } .item:hover { background: transparent; border: none; } .item.clickable:active { transform: none; background: transparent; } .poster { width: 100%; height: auto; aspect-ratio: 2 / 3; border-radius: 12px; transition: transform 0.25s ease, box-shadow 0.25s ease; box-shadow: 0 4px 16px rgba(0,0,0,0.5); } .item:hover .poster { transform: translateY(-4px); box-shadow: 0 12px 32px rgba(91,124,250,0.3), 0 4px 16px rgba(0,0,0,0.6); } .info { display: block; padding: 10px 2px 0; flex: none; justify-content: flex-start; } .name { font-size: 0.88rem; } .overview { -webkit-line-clamp: 2; font-size: 0.74rem; margin-top: 4px; } .meta { font-size: 0.76rem; margin-top: 3px; } .meta.dim { font-size: 0.72rem; } .bar { margin-top: 8px; } .wl-remove, .wl-watched, .wl-unwatch { top: 8px; right: 8px; width: 28px; height: 28px; } .day-num { font-size: 1.6rem; } } @media (min-width: 1024px) { .container { max-width: 1120px; padding: 0 32px 100px; } .hero { padding: 36px 0 26px; } .hero-name { font-size: 1.7rem; } .stats { gap: 12px; padding: 20px 14px; margin-bottom: 28px; } .stat-num { font-size: 1.7rem; } .stat-label { font-size: 0.78rem; } .stat-icon { width: 36px; height: 36px; } .grid { grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: 20px; } .name { font-size: 0.9rem; } .overview { -webkit-line-clamp: 3; font-size: 0.76rem; } .wl-remove, .wl-watched, .wl-unwatch { top: 10px; right: 10px; width: 30px; height: 30px; } .wl-watched, .wl-unwatch { font-size: 0.95rem; } } @media (min-width: 1280px) { .container { max-width: 1280px; padding: 0 40px 110px; } .grid { grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 22px; } .hero-name { font-size: 1.85rem; } } @media (min-width: 1600px) { .container { max-width: 1440px; } .grid { grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 24px; } }
-  .day { margin-bottom: 26px; } .day-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; padding-left: 2px; } .day-num { font-size: 1.8rem; font-weight: 800; color: #7d9dd4; line-height: 1; letter-spacing: -1px; } .day-mon { font-size: 0.75rem; color: var(--text-dim); } .day-wd { font-size: 0.85rem; font-weight: 600; color: var(--text); } .today { background: var(--accent); color: #fff; font-size: 0.68rem; padding: 3px 9px; border-radius: 999px; font-weight: 700; margin-left: auto; }
-  .empty { text-align: center; padding: 80px 20px; color: var(--text-dim); } .empty p { margin-top: 14px; font-size: 0.92rem; } @media (min-width: 700px) { .empty { padding: 120px 20px; } }
-  .modal { position: fixed; inset: 0; z-index: 100; display: none; } .modal.open { display: block; } .modal-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,0.75); backdrop-filter: blur(12px) saturate(1.1); -webkit-backdrop-filter: blur(12px) saturate(1.1); animation: fadeIn 0.2s ease; } .modal-panel { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 12px; padding-top: calc(12px + env(safe-area-inset-top)); padding-bottom: calc(12px + env(safe-area-inset-bottom)); pointer-events: none; } .modal-body { pointer-events: auto; position: relative; width: 100%; max-width: min(880px, 100%); max-height: 100%; overflow-y: auto; overflow-x: hidden; background: #000; border: 1px solid var(--border); border-radius: 18px; box-shadow: 0 40px 100px rgba(0,0,0,0.85); animation: modalIn 0.28s cubic-bezier(0.2, 0.9, 0.3, 1); -webkit-overflow-scrolling: touch; overscroll-behavior: contain; } @media (max-width: 599px) { .modal-panel { padding: 0; align-items: stretch; justify-content: flex-start; } .modal-body { position: absolute; left: 0; right: 0; top: calc(10px + env(safe-area-inset-top)); bottom: 0; max-width: 100%; max-height: none; width: 100%; border-radius: 16px 16px 0 0; border: none; border-top: 1px solid var(--border); padding-bottom: env(safe-area-inset-bottom); } .modal-close { top: calc(14px + env(safe-area-inset-top)); right: max(14px, env(safe-area-inset-right)); width: 44px; height: 44px; } .modal-close::before { inset: -12px; } .detail-inner { padding-top: 16px; } .detail-body { padding-bottom: calc(28px + env(safe-area-inset-bottom)); } } @media (min-width: 768px) and (max-width: 1023px) { .modal-body { max-width: min(720px, 92vw); } } @keyframes modalIn { from { opacity: 0; transform: translateY(14px) scale(0.98); } to { opacity: 1; transform: translateY(0) scale(1); } } .modal-close { position: fixed; top: max(14px, env(safe-area-inset-top)); right: max(14px, env(safe-area-inset-right)); z-index: 130; width: 44px; height: 44px; border-radius: 50%; background: rgba(13,16,23,0.92); border: 1px solid rgba(255,255,255,0.18); color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); transition: background 0.15s, transform 0.15s, border-color 0.15s; padding: 0; box-shadow: 0 4px 16px rgba(0,0,0,0.55); touch-action: manipulation; -webkit-tap-highlight-color: transparent; } .modal-close::before { content: ''; position: absolute; inset: -10px; border-radius: 50%; } .modal-close:hover { background: rgba(30,38,58,0.95); transform: scale(1.05); border-color: rgba(255,255,255,0.28); } .modal-close:active { transform: scale(0.94); background: rgba(50,60,88,0.95); } .modal-loading { padding: 100px 20px; text-align: center; } .modal-error { padding: 80px 20px; text-align: center; color: #9db5e0; font-size: 0.9rem; } @media (min-width: 700px) { .modal-panel { padding: 40px 24px; } }
-  .detail-hero { position: relative; overflow: hidden; background: var(--surface); border-radius: 18px 18px 0 0; } .detail-bg { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; filter: blur(30px) saturate(1.2) brightness(0.5); transform: scale(1.15); z-index: 0; } .detail-hero::after { content: ''; position: absolute; inset: 0; z-index: 1; background: linear-gradient(180deg, rgba(10,14,24,0.6), rgba(10,14,24,0.95)); } .detail-inner { position: relative; z-index: 2; display: flex; flex-direction: column; align-items: center; text-align: center; gap: 16px; padding: 24px 20px 24px; } .detail-poster { width: min(48vw, 200px); height: auto; aspect-ratio: 2 / 3; border-radius: 14px; object-fit: cover; flex-shrink: 0; box-shadow: 0 16px 40px rgba(0,0,0,0.75); margin: 0 auto; } .detail-poster-ph { display: flex; align-items: center; justify-content: center; background: var(--surface-2); font-size: 2.8rem; color: var(--text-dim); width: min(48vw, 200px); aspect-ratio: 2 / 3; } .detail-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; align-items: center; width: 100%; } .detail-title { font-size: 1.45rem; font-weight: 800; letter-spacing: -0.4px; line-height: 1.25; } .detail-tagline { font-size: 0.85rem; color: var(--text-dim); font-style: italic; } .detail-meta { display: flex; flex-wrap: wrap; gap: 10px; font-size: 0.85rem; color: var(--text-dim); justify-content: center; } .detail-genres { font-size: 0.82rem; color: var(--text-dim); } .detail-overview { font-size: 0.88rem; color: #c0c8d6; line-height: 1.55; margin-top: 4px; display: -webkit-box; -webkit-line-clamp: 5; -webkit-box-orient: vertical; overflow: hidden; text-align: center; }
-  .d-status { display: flex; gap: 12px; align-items: center; background: linear-gradient(135deg, #16161a, #0e0e10); border: 1px solid var(--border); border-radius: 14px; padding: 12px 14px; margin-top: 8px; width: 100%; justify-content: flex-start; } .d-status.done { border-color: rgba(74,222,128,0.3); background: rgba(74,222,128,0.06); } .d-status-row { display: flex; gap: 12px; align-items: center; width: 100%; } .d-status-icon { width: 32px; height: 32px; border-radius: 50%; background: var(--surface-2); color: var(--text-dim); display: flex; align-items: center; justify-content: center; font-weight: 700; flex-shrink: 0; font-size: 0.95rem; } .d-status.done .d-status-icon { background: rgba(74,222,128,0.15); color: #4ade80; } .d-status-body { flex: 1; min-width: 0; text-align: left; } .d-status-title { font-size: 0.88rem; font-weight: 600; } .d-status-sub { font-size: 0.76rem; color: var(--text-dim); margin-top: 2px; }
-  .d-mark-btn { flex-shrink: 0; background: rgba(52, 211, 153, 0.12); border: 1px solid rgba(52, 211, 153, 0.35); color: #6ee7b7; padding: 8px 14px; border-radius: 10px; font-size: 0.78rem; font-weight: 700; cursor: pointer; font-family: inherit; transition: all 0.15s; white-space: nowrap; } .d-mark-btn:hover { background: rgba(52, 211, 153, 0.25); color: #a7f3d0; } .d-mark-btn:disabled { opacity: 0.6; cursor: wait; } .d-mark-btn.done { background: rgba(52, 211, 153, 0.2); color: #34d399; cursor: default; } .d-mark-btn.unwatch { background: rgba(255, 184, 77, 0.12); border-color: rgba(255, 184, 77, 0.35); color: #ffb84d; } .d-mark-btn.unwatch:hover { background: rgba(255, 184, 77, 0.25); color: #ffd693; }
-  .infuse-btn { display: inline-flex; align-items: center; gap: 8px; align-self: center; background: linear-gradient(135deg, #7c3aed 0%, #a78bfa 100%); border: 1px solid transparent; color: #fff; padding: 10px 20px; border-radius: 12px; font-size: 0.85rem; font-weight: 700; text-decoration: none; margin-top: 10px; box-shadow: 0 6px 22px rgba(167,139,250,0.3); transition: all 0.2s ease; cursor: pointer; font-family: inherit; } .infuse-btn:hover { border-color: rgba(125,157,212,0.75); background: linear-gradient(135deg, #15203a, #233258); color: #d0dcf0; box-shadow: 0 4px 20px rgba(90,130,200,0.35); text-decoration: none; } .infuse-btn svg { flex-shrink: 0; }
-  .detail-body { padding: 20px 22px 24px; } .d-section { margin-top: 8px; margin-bottom: 26px; } .d-section:last-child { margin-bottom: 0; } .d-section-title { font-size: 1rem; font-weight: 700; letter-spacing: 0.2px; margin-bottom: 14px; color: var(--text); display: flex; align-items: center; gap: 8px; } .d-section-title::before { content: ''; width: 3px; height: 16px; border-radius: 2px; background: #7d9dd4; }
-  .cast-scroll { display: flex; gap: 14px; overflow-x: auto; padding-bottom: 8px; scrollbar-width: none; } .cast-scroll::-webkit-scrollbar { display: none; } .cast { flex-shrink: 0; width: 84px; text-align: center; } .cast-img { width: 84px; height: 84px; border-radius: 50%; object-fit: cover; background: var(--surface-2); } .cast-ph { display: flex; align-items: center; justify-content: center; color: var(--text-dim); font-size: 1.6rem; font-weight: 600; background: linear-gradient(135deg, var(--surface-2), #1a2233); } .cast-name { font-size: 0.75rem; font-weight: 600; margin-top: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .cast-role { font-size: 0.68rem; color: var(--text-dim); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .seasons { display: flex; flex-direction: column; gap: 8px; } .season-item { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; transition: border-color 0.15s; } .season-item.open { border-color: #2a3345; } .season-head { width: 100%; background: none; border: none; color: inherit; display: flex; align-items: center; gap: 10px; padding: 14px 16px; cursor: pointer; font-family: inherit; text-align: left; transition: background 0.15s; } .season-head:hover { background: var(--surface-2); } .season-title { font-weight: 600; font-size: 0.9rem; flex: 1; } .season-meta { font-size: 0.76rem; color: var(--text-dim); } .chev { width: 16px; height: 16px; color: var(--text-dim); transition: transform 0.2s ease; flex-shrink: 0; } .season-item.open .chev { transform: rotate(180deg); } .season-body { display: none; border-top: 1px solid var(--border); } .season-item.open .season-body { display: block; } .ep-empty { padding: 20px; text-align: center; color: var(--text-dim); font-size: 0.85rem; } .episode { display: flex; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--border); align-items: flex-start; transition: background 0.15s; } .episode:last-child { border-bottom: none; } .episode.clickable { cursor: pointer; } .episode.clickable:hover { background: var(--surface-2); } .episode.clickable:active { background: #1a2233; } .episode.clickable:hover .ep-title { color: #7d9dd4; } .episode.watched .ep-title { color: var(--text-dim); } .episode.watched.clickable:hover .ep-title { color: #7d9dd4; } .ep-num { font-family: ui-monospace, Menlo, monospace; font-size: 0.76rem; color: var(--text-dim); font-weight: 700; flex-shrink: 0; padding-top: 3px; width: 32px; letter-spacing: 0.5px; } .ep-body { flex: 1; min-width: 0; } .ep-title { font-size: 0.86rem; font-weight: 600; line-height: 1.3; } .ep-overview { font-size: 0.76rem; color: var(--text-dim); margin-top: 4px; line-height: 1.45; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; } .ep-check { color: #4ade80; font-weight: 700; flex-shrink: 0; font-size: 0.9rem; padding-top: 2px; }
-  .ep-actions { flex-shrink: 0; display: flex; align-items: center; } .ep-watch-btn { background: rgba(52, 211, 153, 0.12); border: 1px solid rgba(52, 211, 153, 0.35); color: #6ee7b7; padding: 3px 9px; border-radius: 7px; font-size: 0.7rem; font-weight: 700; cursor: pointer; font-family: inherit; transition: all 0.15s; } .ep-watch-btn:hover { background: rgba(52, 211, 153, 0.25); color: #a7f3d0; } .ep-watch-btn:disabled { opacity: 0.6; cursor: wait; } .ep-watch-btn.done { background: rgba(52, 211, 153, 0.2); color: #34d399; cursor: default; }
-  .modal-body .grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 16px; } @media (min-width: 700px) { .detail-inner { flex-direction: row; align-items: flex-start; text-align: left; padding: 30px; gap: 26px; } .detail-poster { width: 180px; height: auto; aspect-ratio: 2 / 3; margin: 0; } .detail-info { align-items: flex-start; } .detail-meta { justify-content: flex-start; } .infuse-btn { align-self: flex-start; } .detail-overview { text-align: left; } .detail-title { font-size: 1.85rem; } .detail-overview { font-size: 0.92rem; -webkit-line-clamp: 6; } .detail-body { padding: 26px 30px 30px; } .cast { width: 96px; } .cast-img { width: 96px; height: 96px; } .modal-body .grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 18px; } }
-  .confirm-modal { position: fixed; inset: 0; z-index: 200; display: none; }
-  .confirm-modal.open { display: block; }
-  .confirm-backdrop { position: absolute; inset: 0; background: rgba(2,4,8,0.7); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); animation: fadeIn 0.18s ease; }
-  .confirm-panel { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: min(88vw, 340px); background: linear-gradient(165deg, #16161a 0%, #0e0e10 100%); border: 1px solid var(--border-strong); border-radius: 18px; padding: 24px 22px 18px; box-shadow: 0 30px 80px rgba(0,0,0,0.8); text-align: center; animation: confirmIn 0.22s cubic-bezier(0.2,0.9,0.3,1); }
-  @keyframes confirmIn { from { opacity: 0; transform: translate(-50%, -48%) scale(0.95); } to { opacity: 1; transform: translate(-50%, -50%) scale(1); } }
-  .confirm-icon { width: 48px; height: 48px; margin: 0 auto 12px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 1.4rem; background: var(--accent-soft); color: var(--accent-2); }
-  .confirm-icon.danger { background: rgba(224,85,96,0.14); color: #ff7b85; }
-  .confirm-icon.warn { background: rgba(255,184,77,0.14); color: #ffb84d; }
-  .confirm-icon.success { background: rgba(52,211,153,0.14); color: #34d399; }
-  .confirm-title { font-size: 1.02rem; font-weight: 700; margin-bottom: 6px; color: var(--text); }
-  .confirm-msg { font-size: 0.84rem; color: var(--text-dim); line-height: 1.55; word-break: break-word; }
-  .confirm-actions { display: flex; gap: 10px; margin-top: 20px; }
-  .confirm-btn { flex: 1; padding: 11px 14px; border-radius: 12px; font-size: 0.88rem; font-weight: 700; font-family: inherit; cursor: pointer; border: 1px solid transparent; transition: all 0.15s; -webkit-tap-highlight-color: transparent; }
-  .confirm-cancel { background: rgba(255,255,255,0.05); border-color: var(--border); color: var(--text-dim); }
-  .confirm-cancel:hover { background: rgba(255,255,255,0.09); color: #fff; }
-  .confirm-ok { background: linear-gradient(135deg, #7c3aed 0%, #a78bfa 100%); color: #fff; box-shadow: 0 6px 20px rgba(167,139,250,0.3); }
-  .confirm-ok:hover { filter: brightness(1.08); }
-  .confirm-ok.danger { background: linear-gradient(135deg, #dc2626 0%, #f87171 100%); box-shadow: 0 6px 20px rgba(248,113,113,0.28); }
-  .confirm-ok:disabled, .confirm-cancel:disabled { opacity: 0.6; cursor: wait; }
-  `;
-}
-
-function pageTail() {
-  return `<script>(function(){if(window.__hideSplash)window.__hideSplash(true);var s=document.getElementById('splash');if(s){s.classList.add('hide');setTimeout(function(){if(s&&s.parentNode)s.parentNode.removeChild(s);},380);}})();<\/script><script>(function(){if(!('serviceWorker' in navigator))return;if(window.__swRegistered)return;window.__swRegistered=true;var regSW=function(){navigator.serviceWorker.register('/sw.js',{scope:'/',updateViaCache:'none'}).catch(function(){});};if(document.readyState==='complete'){setTimeout(regSW,1500);}else{window.addEventListener('load',function(){setTimeout(regSW,1500);});}})();<\/script></body></html>`;
-}
+function pageHead() { return pageHeadEarly(); }
+function pageTail() { return `<script>(function(){if(window.__hideSplash)window.__hideSplash(true);var s=document.getElementById('splash');if(s){s.classList.add('hide');setTimeout(function(){if(s&&s.parentNode)s.parentNode.removeChild(s);},380);}})();<\/script><script>(function(){if(!('serviceWorker' in navigator))return;if(window.__swRegistered)return;window.__swRegistered=true;var regSW=function(){navigator.serviceWorker.register('/sw.js',{scope:'/',updateViaCache:'none'}).catch(function(){});};if(document.readyState==='complete'){setTimeout(regSW,1500);}else{window.addEventListener('load',function(){setTimeout(regSW,1500);});}})();<\/script></body></html>`; }
 function pageShell(body) { return pageHead() + body + pageTail(); }
+
+// ═══ CSS ═══
+function pageStyles() {
+  return `html,body{background:#000000!important;color:#eef1f7;margin:0;padding:0;min-height:100%;min-height:100dvh}*{box-sizing:border-box;margin:0;padding:0}
+.splash{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000;background:radial-gradient(circle at 50% 45%,#0a0a0a 0%,#000000 62%);transition:opacity .38s ease;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;-webkit-tap-highlight-color:transparent}
+.splash.hide{opacity:0;pointer-events:none}
+.splash-glow{position:absolute;width:340px;height:340px;border-radius:50%;background:radial-gradient(circle,rgba(125,157,212,.25) 0%,rgba(125,157,212,0) 70%);animation:splashPulse 2.4s ease-in-out infinite}
+.splash-inner{position:relative;z-index:1;display:flex;flex-direction:column;align-items:center;gap:20px}
+.splash-logo{color:#a8b2c4;animation:splashPop .75s cubic-bezier(.22,1.1,.36,1) both}
+.splash-logo img{display:block}
+.splash-name{font-size:1.35rem;font-weight:800;letter-spacing:.4px;background:linear-gradient(135deg,#fff 20%,#7d9dd4);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;animation:splashFadeUp .6s ease .28s both}
+.splash-bar{width:128px;height:3px;border-radius:99px;background:rgba(255,255,255,.08);overflow:hidden;animation:splashFadeUp .6s ease .45s both}
+.splash-bar-fill{height:100%;width:42%;border-radius:99px;background:#fff;animation:splashSlide 1.15s cubic-bezier(.65,0,.35,1) infinite}
+@keyframes splashPulse{0%,100%{transform:scale(.85);opacity:.7}50%{transform:scale(1.12);opacity:1}}
+@keyframes splashPop{0%{opacity:0;transform:scale(.55) rotate(-8deg)}60%{opacity:1;transform:scale(1.08) rotate(2deg)}100%{opacity:1;transform:scale(1) rotate(0)}}
+@keyframes splashFadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@keyframes splashSlide{0%{transform:translateX(-130%)}100%{transform:translateX(330%)}}
+.spinner{width:30px;height:30px;border:3px solid #212735;border-top-color:#7d9dd4;border-radius:50%;animation:spin .8s linear infinite;margin:4px auto}
+@keyframes spin{to{transform:rotate(360deg)}}
+:root{--bg:#050505;--surface:#0e0e10;--surface-2:#16161a;--surface-3:#1c1c22;--border:rgba(255,255,255,0.08);--border-strong:rgba(255,255,255,0.14);--text:#f4f4f5;--text-dim:#a1a1aa;--text-mute:#71717a;--accent:#a78bfa;--accent-2:#c4b5fd;--accent-soft:rgba(167,139,250,0.12);--accent-glow:rgba(167,139,250,0.28);--success:#34d399;--blue:#c4b5fd;--radius-sm:10px;--radius-md:14px;--radius-lg:18px;--radius-xl:22px;--shadow-card:0 8px 32px rgba(0,0,0,0.55)}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;background:radial-gradient(ellipse 120% 70% at 50% -20%,#1a1528 0%,transparent 50%),radial-gradient(ellipse 50% 40% at 100% 0%,rgba(167,139,250,0.08) 0%,transparent 45%),radial-gradient(ellipse 40% 30% at 0% 100%,rgba(52,211,153,0.04) 0%,transparent 40%),#050505;background-attachment:fixed;color:var(--text);-webkit-font-smoothing:antialiased;line-height:1.5;overflow-x:hidden;overscroll-behavior-y:none}
+a{color:var(--accent-2);text-decoration:none;transition:color .15s}a:hover{color:#ddd6fe}img{display:block;max-width:100%}
+.container{max-width:1200px;margin:0 auto;padding:0 16px calc(80px + env(safe-area-inset-bottom))}
+.pane-loading{padding:60px 20px;text-align:center}
+.load-more-wrap{text-align:center;margin-top:24px}.load-more{background:var(--surface-2);border:1px solid var(--border);color:var(--text);padding:11px 32px;border-radius:var(--radius-md);font-size:.9rem;font-weight:600;cursor:pointer;transition:all .2s;font-family:inherit}.load-more:hover:not(:disabled){border-color:rgba(91,124,250,.45);color:var(--accent-2);box-shadow:0 4px 20px var(--accent-glow);background:var(--surface-3)}.load-more:disabled{cursor:not-allowed}
+.login-wrap{min-height:100vh;min-height:100dvh;display:flex;align-items:center;justify-content:center;padding:20px}.login-card{width:100%;max-width:440px;background:linear-gradient(165deg,#16161a 0%,#0e0e10 100%);border:1px solid var(--border-strong);border-radius:24px;padding:44px 32px;text-align:center;box-shadow:0 24px 64px rgba(0,0,0,.7),inset 0 1px 0 rgba(255,255,255,.05)}.login-logo{color:#a8b2c4;margin-bottom:16px}.login-title{font-size:1.75rem;font-weight:800;letter-spacing:-.5px;background:linear-gradient(135deg,#fff 20%,#7d9dd4);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:6px}.login-sub{color:var(--text-dim);font-size:.9rem;margin-bottom:28px}
+.btn-primary{background:linear-gradient(135deg,#7c3aed 0%,#a78bfa 100%);color:#fff;border:none;padding:13px 30px;border-radius:12px;font-size:.95rem;font-weight:700;cursor:pointer;box-shadow:0 6px 24px rgba(167,139,250,.35)}.btn-primary:hover{filter:brightness(1.08);transform:translateY(-1px)}
+.btn-ghost{background:rgba(255,255,255,.04);color:var(--text-dim);border:1px solid var(--border);padding:8px 16px;border-radius:10px;font-size:.85rem;cursor:pointer;transition:all .15s;font-family:inherit}.btn-ghost:hover{color:#fff;border-color:var(--border-strong);background:rgba(255,255,255,.08)}
+.steps{display:flex;flex-direction:column;gap:6px}.step{display:flex;align-items:center;gap:10px;text-align:left;padding:4px 0;font-size:.9rem}.step .n{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;background:var(--accent);color:#fff;border-radius:50%;font-size:.72rem;font-weight:700;flex-shrink:0}
+.code-box{font-family:ui-monospace,Menlo,monospace;font-size:1.75rem;font-weight:800;letter-spacing:6px;color:#a8c0e8;background:rgba(90,120,180,.12);border:1px solid rgba(140,170,220,.35);border-radius:14px;padding:14px;margin:14px 0;user-select:all;text-align:center}
+.qr-box{background:#fff;border-radius:14px;padding:10px;display:inline-block;margin:6px 0 14px}.qr-box img{border-radius:8px}
+.status{display:inline-flex;align-items:center;gap:8px;font-size:.88rem;padding:8px 16px;border-radius:20px;color:var(--text-dim);background:var(--surface-2)}.status.success{color:#4ade80;background:rgba(74,222,128,.1)}.status.error{color:#e05560;background:rgba(224,85,96,.12)}
+.pulse{display:inline-block;width:8px;height:8px;background:#7d9dd4;border-radius:50%;animation:pulse 1.4s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:.35;transform:scale(.85)}50%{opacity:1;transform:scale(1.15)}}
+.err-box{background:rgba(224,85,96,.10);border:1px solid rgba(224,85,96,.28);border-radius:12px;padding:14px;text-align:left;margin-bottom:14px}.err-title{font-weight:600;color:#e05560;margin-bottom:4px;font-size:.92rem}.err{color:#e8a3ab;font-size:.85rem}.err-detail{font-family:ui-monospace,Menlo,monospace;font-size:.72rem;color:var(--text-dim);background:#000;padding:8px 10px;border-radius:6px;margin-top:8px;white-space:pre-wrap;word-break:break-all;max-height:120px;overflow:auto}.hint{color:var(--text-dim);font-size:.82rem;margin-top:6px}
+.log-details{margin-top:18px;text-align:left}.log-details summary{cursor:pointer;font-size:.76rem;color:var(--text-dim);padding:4px 0;user-select:none}.log-box{font-family:ui-monospace,Menlo,monospace;font-size:.7rem;color:var(--text-dim);background:#000;border:1px solid var(--border);border-radius:8px;padding:10px;max-height:160px;overflow:auto;margin-top:6px;line-height:1.6}
+.hero{display:flex;justify-content:space-between;align-items:center;padding:calc(20px + env(safe-area-inset-top)) 0 20px;gap:16px}.hero-left{display:flex;align-items:center;gap:12px;min-width:0}
+.hero-avatar{width:50px;height:50px;border-radius:50%;overflow:hidden;flex-shrink:0;background:var(--surface-2);border:2px solid rgba(167,139,250,.5);box-shadow:0 0 0 3px rgba(167,139,250,.12),0 4px 20px rgba(0,0,0,.5)}.hero-avatar img{width:100%;height:100%;object-fit:cover;display:block}
+.hero-avatar-ph{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:1.25rem;background:linear-gradient(135deg,#1a2233,#2a3a55)}
+.hero-text{min-width:0;flex:1;display:flex;flex-direction:column;align-items:flex-start;gap:1px}
+.hero-name{font-size:1.45rem;font-weight:800;letter-spacing:-.4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:linear-gradient(135deg,#fff 20%,#c4b5fd 90%);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.updated-at{font-size:.72rem;color:var(--text-mute);font-weight:400;letter-spacing:.2px;transition:color .4s ease}.updated-at:empty{display:none}.updated-at.flash{animation:updatedFlash 1.1s ease-out}
+@keyframes updatedFlash{0%{color:var(--accent-2)}100%{color:var(--text-mute)}}
+.hero-actions{display:flex;gap:8px;flex-shrink:0}
+.btn-action{display:inline-flex;align-items:center;gap:6px;background:rgba(255,255,255,.04);color:var(--text-dim);border:1px solid var(--border);padding:8px 14px;border-radius:10px;font-size:.82rem;font-weight:600;cursor:pointer;font-family:inherit;transition:all .18s ease;-webkit-tap-highlight-color:transparent}
+.btn-action svg{flex-shrink:0;transition:transform .25s ease}.btn-action:hover{color:#fff;border-color:var(--border-strong);background:rgba(167,139,250,.10);box-shadow:0 4px 16px rgba(167,139,250,.18)}.btn-action:hover svg{transform:rotate(180deg)}.btn-action:active{transform:scale(.97)}.btn-action:last-child:hover{background:rgba(224,85,96,.10);border-color:rgba(224,85,96,.35);box-shadow:0 4px 16px rgba(224,85,96,.15)}.btn-action:last-child:hover svg{transform:translateX(2px)}
+@media (max-width:420px){.btn-action span{display:none}.btn-action{padding:9px}.hero-actions{gap:6px}}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;background:linear-gradient(165deg,#16161a 0%,#0e0e10 100%);border:1px solid var(--border);border-radius:var(--radius-lg);padding:18px 10px;margin-bottom:24px;box-shadow:var(--shadow-card),inset 0 1px 0 rgba(255,255,255,.04);position:relative;overflow:hidden}
+.stats::before{content:'';position:absolute;top:0;left:10%;right:10%;height:1px;background:linear-gradient(90deg,transparent,rgba(167,139,250,.35),transparent)}
+.stat{position:relative;text-align:center;display:flex;flex-direction:column;align-items:center;gap:2px;padding:6px 2px;border-radius:12px;transition:background .2s ease}.stat:hover{background:rgba(255,255,255,.025)}
+.stat+.stat::before{content:'';position:absolute;left:-4px;top:18%;bottom:18%;width:1px;background:linear-gradient(180deg,transparent,rgba(255,255,255,.08),transparent)}
+.stat-icon{width:30px;height:30px;border-radius:9px;display:flex;align-items:center;justify-content:center;margin-bottom:4px;transition:transform .25s ease,box-shadow .25s ease}.stat:hover .stat-icon{transform:translateY(-1px) scale(1.06)}
+.stat-movie .stat-icon{background:linear-gradient(135deg,rgba(167,139,250,.18),rgba(167,139,250,.06));color:#c4b5fd;box-shadow:0 4px 14px rgba(167,139,250,.18),inset 0 0 0 1px rgba(167,139,250,.18)}
+.stat-show .stat-icon{background:linear-gradient(135deg,rgba(96,165,250,.18),rgba(96,165,250,.06));color:#93c5fd;box-shadow:0 4px 14px rgba(96,165,250,.18),inset 0 0 0 1px rgba(96,165,250,.18)}
+.stat-episode .stat-icon{background:linear-gradient(135deg,rgba(52,211,153,.18),rgba(52,211,153,.06));color:#6ee7b7;box-shadow:0 4px 14px rgba(52,211,153,.18),inset 0 0 0 1px rgba(52,211,153,.18)}
+.stat-hours .stat-icon{background:linear-gradient(135deg,rgba(251,191,36,.18),rgba(251,191,36,.06));color:#fcd34d;box-shadow:0 4px 14px rgba(251,191,36,.18),inset 0 0 0 1px rgba(251,191,36,.18)}
+.stat-num{font-size:1.35rem;font-weight:800;letter-spacing:-.6px;line-height:1.15;background:linear-gradient(180deg,#fff 0%,#c4b5fd 100%);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.stat-label{font-size:.7rem;color:var(--text-mute);font-weight:500}
+.tabs{display:flex;gap:4px;margin-bottom:22px;position:sticky;top:0;z-index:10}
+.tab{flex:1 1 0;min-width:0;background:transparent;border:none;color:var(--text-dim);padding:9px 2px;border-radius:999px;font-size:.75rem;font-weight:600;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:center;transition:color .2s ease,background .2s ease;font-family:inherit;outline:none!important}
+.tab:hover{color:var(--text);background:rgba(255,255,255,.06)}.tab.active{background:linear-gradient(135deg,#7c3aed 0%,#a78bfa 100%);color:#fff;font-weight:700}
+.pane{display:none}.pane.active{display:block;animation:fadeIn .3s ease}@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.grid{display:flex;flex-direction:column;gap:10px}
+.item{position:relative;display:flex;gap:14px;background:linear-gradient(160deg,#141416 0%,#0e0e10 100%);border:1px solid var(--border);border-radius:var(--radius-lg);padding:12px;transition:transform .2s ease,border-color .2s,box-shadow .2s;animation:fadeInUp .4s ease backwards;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.35),inset 0 1px 0 rgba(255,255,255,.03);text-decoration:none;color:inherit}
+.item.clickable{cursor:pointer}.item.clickable:active{transform:scale(.985);background:var(--surface-2)}
+@keyframes fadeInUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+.item:hover{border-color:rgba(167,139,250,.25);box-shadow:0 8px 28px rgba(0,0,0,.45),0 0 0 1px rgba(167,139,250,.08);transform:translateY(-1px)}
+.wl-remove,.wl-watched,.wl-unwatch{position:absolute;top:6px;right:6px;width:26px;height:26px;border-radius:50%;background:rgba(0,0,0,.65);line-height:1;cursor:pointer;z-index:3;display:flex;align-items:center;justify-content:center;padding:0;font-family:inherit;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);transition:background .15s,transform .15s,opacity .15s,color .15s}
+.wl-remove{color:#fff;border:1px solid rgba(255,255,255,.22);font-size:1rem;font-weight:400;opacity:.88}.wl-remove:hover{background:rgba(200,70,80,.92);opacity:1;transform:scale(1.06)}
+.wl-watched{color:#4ade80;border:1px solid rgba(74,222,128,.45);font-size:.85rem;font-weight:700;opacity:.9}.wl-watched:hover{background:rgba(74,222,128,.95);color:#000;opacity:1;transform:scale(1.06)}
+.wl-unwatch{color:#ffb84d;border:1px solid rgba(255,184,77,.45);font-size:.9rem;font-weight:700;opacity:.9}.wl-unwatch:hover{background:rgba(255,184,77,.95);color:#000;opacity:1;transform:scale(1.06)}
+.wl-remove:disabled,.wl-watched:disabled,.wl-unwatch:disabled{opacity:.5;cursor:wait}
+.wl-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-bottom:14px}.wl-sort-label{display:inline-flex;align-items:center;gap:8px;font-size:.82rem;color:var(--text-dim)}
+.wl-sort{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:7px 12px;border-radius:8px;font-size:.82rem;font-family:inherit;cursor:pointer;outline:none;transition:border-color .15s}.wl-sort:hover{border-color:#2a3345}.wl-sort:focus{border-color:#7d9dd4}
+.poster{width:76px;height:114px;border-radius:10px;overflow:hidden;flex-shrink:0;background:var(--surface-2);position:relative}.poster img{width:100%;height:100%;object-fit:cover}
+.poster-ph{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:1.8rem;background:linear-gradient(135deg,var(--surface-2),#1a2233);color:var(--text-dim)}
+.info{flex:1;min-width:0;display:flex;flex-direction:column;justify-content:center;gap:4px}
+.name-row{display:flex;align-items:baseline;gap:0;overflow:hidden;white-space:nowrap;line-height:1.3;letter-spacing:-.2px}
+.name{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:1rem;font-weight:700;color:var(--text)}
+.tag{flex:0 0 auto;font-size:inherit;font-weight:inherit;letter-spacing:0;white-space:nowrap}.tag.upcoming{color:#ffb84d}
+.overview{font-size:.8rem;color:var(--text-dim);overflow:hidden;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;line-height:1.45;margin-top:4px}
+.meta{font-size:.8rem;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.meta.dim{color:#7a8394;font-size:.78rem;margin-top:2px}
+.bar{height:3px;background:rgba(255,255,255,.06);border-radius:99px;overflow:hidden;margin-top:8px}.bar-fill{height:100%;background:linear-gradient(90deg,#7c3aed,#c4b5fd);border-radius:99px;box-shadow:0 0 10px rgba(167,139,250,.5)}
+.cal-open-btn{align-self:flex-start;margin-top:8px;background:rgba(90,120,180,.14);border:1px solid rgba(140,170,220,.35);color:#9db5e0;padding:5px 12px;border-radius:8px;font-size:.74rem;font-weight:600;cursor:pointer;font-family:inherit;transition:all .15s;display:inline-flex;align-items:center;gap:5px}
+.cal-open-btn:hover{background:rgba(120,150,210,.28);color:#c2d4f0;border-color:rgba(140,170,220,.65)}.cal-open-btn svg{flex-shrink:0}
+.cal-open-btn.wl-added{background:rgba(74,222,128,.14)!important;border-color:rgba(74,222,128,.38)!important;color:#4ade80!important;cursor:default!important}
+.search-bar{margin-bottom:16px}
+.search-input{width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:12px 16px;border-radius:12px;font-size:.95rem;font-family:inherit;outline:none;transition:border-color .15s,background .15s;-webkit-appearance:none;appearance:none}
+.search-input:focus{border-color:var(--accent);background:var(--surface-2);box-shadow:0 0 0 3px var(--accent-soft)}.search-input::placeholder{color:var(--text-mute)}
+.trending-head{display:flex;align-items:center;gap:8px;font-size:.88rem;font-weight:700;color:var(--text);margin:4px 0 14px;padding-left:2px;letter-spacing:.2px}
+.trending-head::before{content:'';width:3px;height:14px;border-radius:2px;background:linear-gradient(180deg,#f97316,#ef4444)}
+.show-cal-modal{position:fixed;inset:0;z-index:130;display:none}.show-cal-modal.open{display:block}
+.show-cal-backdrop{position:absolute;inset:0;background:rgba(2,4,8,.78);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);animation:fadeIn .2s ease}
+.show-cal-panel{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:min(92vw,440px);max-height:90vh;overflow-y:auto;background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:20px;box-shadow:0 30px 80px rgba(0,0,0,.8);animation:modalIn .25s cubic-bezier(.2,.9,.3,1)}
+.show-cal-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}
+.show-cal-name{font-size:.95rem;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
+.show-cal-close{width:32px;height:32px;flex-shrink:0;background:rgba(255,255,255,.04);border:1px solid var(--border);color:var(--text-dim);border-radius:50%;cursor:pointer;font-size:1.1rem;line-height:1;display:flex;align-items:center;justify-content:center;transition:all .15s;font-family:inherit}.show-cal-close:hover{color:var(--text);border-color:#3a4a68}
+.show-cal-info{font-size:.72rem;color:var(--text-dim);margin-bottom:12px;line-height:1.4}
+.show-cal-nav{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;font-size:.88rem;color:var(--text);font-weight:600}
+.show-cal-nav button{width:30px;height:30px;background:rgba(255,255,255,.04);border:1px solid var(--border);color:var(--text-dim);border-radius:8px;cursor:pointer;font-size:1rem;line-height:1;display:flex;align-items:center;justify-content:center;transition:all .15s;font-family:inherit}.show-cal-nav button:hover{color:var(--text);border-color:#3a4a68}
+.show-cal-weekdays{display:grid;grid-template-columns:repeat(7,1fr);text-align:center;font-size:.7rem;color:var(--text-dim);margin-bottom:6px}
+.show-cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:4px}
+.sc-day{position:relative;aspect-ratio:1;display:flex;align-items:center;justify-content:center;border-radius:8px;font-size:.8rem;color:var(--text-dim);cursor:default;border:1px solid transparent;transition:background .15s,border-color .15s}.sc-day.sc-has{cursor:pointer;font-weight:700}
+.sc-day.sc-past{background:rgba(90,120,180,.22);color:#9db0d0;border-color:rgba(120,150,210,.5)}.sc-day.sc-past:hover{background:rgba(120,150,210,.4);color:#d0dcf0}
+.sc-day.sc-today-day{background:#4a6db8;color:#fff;border-color:#7d9dd4;box-shadow:0 0 14px rgba(125,157,212,.7)}.sc-day.sc-today-day:hover{background:#5b7fc4}
+.sc-day.sc-future{background:rgba(255,184,77,.18);color:#ffd693;border-color:rgba(255,184,77,.55)}.sc-day.sc-future:hover{background:rgba(255,184,77,.4);color:#fff0d0}
+.sc-day.sc-active{outline:2px solid #fff;outline-offset:-2px}.sc-day.sc-empty{visibility:hidden}
+.sc-badge{position:absolute;top:2px;right:2px;min-width:14px;height:14px;padding:0 3px;border-radius:7px;background:#4a6db8;color:#fff;font-size:.6rem;font-weight:700;line-height:14px;text-align:center}.sc-day.sc-future .sc-badge{background:#d99a3a}
+.show-cal-legend{display:flex;flex-wrap:wrap;gap:12px;justify-content:center;margin-top:14px;font-size:.7rem;color:var(--text-dim)}.legend-item{display:inline-flex;align-items:center;gap:5px}.legend-dot{display:inline-block;width:10px;height:10px;border-radius:3px}
+.legend-past{background:rgba(90,120,180,.5);border:1px solid rgba(140,170,220,.8)}.legend-today{background:#4a6db8;border:1px solid #7d9dd4}.legend-future{background:rgba(255,184,77,.4);border:1px solid rgba(255,184,77,.8)}
+.show-cal-detail{margin-top:14px;border-top:1px solid var(--border);padding-top:12px;min-height:20px}
+.sc-ep{display:flex;gap:10px;align-items:baseline;padding:6px 0;font-size:.82rem}.sc-ep-tag{font-family:ui-monospace,Menlo,monospace;font-size:.72rem;font-weight:700;color:#7d9dd4;flex-shrink:0}.sc-ep-title{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ext-rating{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:6px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);line-height:1;font-size:.78rem;color:var(--text);white-space:nowrap}
+.ext-label{font-size:.68rem;font-weight:800;letter-spacing:.4px;text-transform:uppercase;opacity:.92}.ext-score{font-weight:800;letter-spacing:.2px}
+.ext-rating.ext-imdb{background:#f5c518;border-color:#d4a800;color:#000}.ext-rating.ext-rt{background:rgba(250,50,10,.16);border-color:rgba(250,50,10,.35);color:#ff7666}.ext-rating.ext-mc{background:rgba(255,255,255,.05);border-color:rgba(255,255,255,.12);color:var(--text)}.ext-rating.ext-trakt{background:rgba(237,28,36,.16);border-color:rgba(237,28,36,.38);color:#ff6b70}.ext-rating.ext-tmdb{background:rgba(1,180,228,.16);border-color:rgba(1,180,228,.38);color:#4dd0e1}
+.ext-rating.ext-douban{background:rgba(46,150,61,.16);border-color:rgba(46,150,61,.42);color:#4ecb71;text-decoration:none;transition:background .15s,border-color .15s,color .15s}.ext-rating.ext-douban:hover{background:rgba(46,150,61,.30);border-color:rgba(46,150,61,.70);color:#6fe089;text-decoration:none}
+.detail-ext-ratings{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:6px}
+@media (min-width:600px){.container{padding-left:20px;padding-right:20px}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}.item{border-radius:14px}.poster{width:72px;height:108px}}
+@media (min-width:768px){.container{max-width:1000px;padding:0 28px calc(88px + env(safe-area-inset-bottom))}.hero{padding:28px 0 22px;gap:12px}.hero-avatar{width:56px;height:56px}.hero-name{font-size:1.55rem}.stats{gap:10px;padding:18px 12px;margin-bottom:24px}.stat-num{font-size:1.5rem}.stat-label{font-size:.76rem}.stat-icon{width:34px;height:34px;border-radius:10px}.tabs{position:static}.tab{flex:0 0 auto;padding:9px 18px;font-size:.87rem}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:16px}.item{display:flex;flex-direction:column;gap:0;padding:0;border-radius:12px;background:transparent;border:none;overflow:visible}.item:hover{background:transparent;border:none}.item.clickable:active{transform:none;background:transparent}.poster{width:100%;height:auto;aspect-ratio:2/3;border-radius:12px;transition:transform .25s ease,box-shadow .25s ease;box-shadow:0 4px 16px rgba(0,0,0,.5)}.item:hover .poster{transform:translateY(-4px);box-shadow:0 12px 32px rgba(91,124,250,.3),0 4px 16px rgba(0,0,0,.6)}.info{display:block;padding:10px 2px 0;flex:none;justify-content:flex-start}.name{font-size:.88rem}.overview{-webkit-line-clamp:2;font-size:.74rem;margin-top:4px}.meta{font-size:.76rem;margin-top:3px}.meta.dim{font-size:.72rem}.bar{margin-top:8px}.wl-remove,.wl-watched,.wl-unwatch{top:8px;right:8px;width:28px;height:28px}.day-num{font-size:1.6rem}}
+@media (min-width:1024px){.container{max-width:1120px;padding:0 32px 100px}.hero{padding:36px 0 26px}.hero-name{font-size:1.7rem}.stats{gap:12px;padding:20px 14px;margin-bottom:28px}.stat-num{font-size:1.7rem}.stat-label{font-size:.78rem}.stat-icon{width:36px;height:36px}.grid{grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:20px}.name{font-size:.9rem}.overview{-webkit-line-clamp:3;font-size:.76rem}.wl-remove,.wl-watched,.wl-unwatch{top:10px;right:10px;width:30px;height:30px}.wl-watched,.wl-unwatch{font-size:.95rem}}
+@media (min-width:1280px){.container{max-width:1280px;padding:0 40px 110px}.grid{grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:22px}.hero-name{font-size:1.85rem}}
+@media (min-width:1600px){.container{max-width:1440px}.grid{grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:24px}}
+.day{margin-bottom:26px}.day-head{display:flex;align-items:center;gap:12px;margin-bottom:12px;padding-left:2px}.day-num{font-size:1.8rem;font-weight:800;color:#7d9dd4;line-height:1;letter-spacing:-1px}.day-mon{font-size:.75rem;color:var(--text-dim)}.day-wd{font-size:.85rem;font-weight:600;color:var(--text)}.today{background:var(--accent);color:#fff;font-size:.68rem;padding:3px 9px;border-radius:999px;font-weight:700;margin-left:auto}
+.empty{text-align:center;padding:80px 20px;color:var(--text-dim)}.empty p{margin-top:14px;font-size:.92rem}
+@media (min-width:700px){.empty{padding:120px 20px}}
+.modal{position:fixed;inset:0;z-index:100;display:none}.modal.open{display:block}
+.modal-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.75);backdrop-filter:blur(12px) saturate(1.1);-webkit-backdrop-filter:blur(12px) saturate(1.1);animation:fadeIn .2s ease}
+.modal-panel{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:12px;padding-top:calc(12px + env(safe-area-inset-top));padding-bottom:calc(12px + env(safe-area-inset-bottom));pointer-events:none}
+.modal-body{pointer-events:auto;position:relative;width:100%;max-width:min(880px,100%);max-height:100%;overflow-y:auto;overflow-x:hidden;background:#000;border:1px solid var(--border);border-radius:18px;box-shadow:0 40px 100px rgba(0,0,0,.85);animation:modalIn .28s cubic-bezier(.2,.9,.3,1);-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
+@media (max-width:599px){.modal-panel{padding:0;align-items:stretch;justify-content:flex-start}.modal-body{position:absolute;left:0;right:0;top:calc(10px + env(safe-area-inset-top));bottom:0;max-width:100%;max-height:none;width:100%;border-radius:16px 16px 0 0;border:none;border-top:1px solid var(--border);padding-bottom:env(safe-area-inset-bottom)}.modal-close{top:calc(14px + env(safe-area-inset-top));right:max(14px,env(safe-area-inset-right));width:44px;height:44px}.modal-close::before{inset:-12px}.detail-inner{padding-top:16px}.detail-body{padding-bottom:calc(28px + env(safe-area-inset-bottom))}}
+@media (min-width:768px) and (max-width:1023px){.modal-body{max-width:min(720px,92vw)}}
+@keyframes modalIn{from{opacity:0;transform:translateY(14px) scale(.98)}to{opacity:1;transform:translateY(0) scale(1)}}
+.modal-close{position:fixed;top:max(14px,env(safe-area-inset-top));right:max(14px,env(safe-area-inset-right));z-index:130;width:44px;height:44px;border-radius:50%;background:rgba(13,16,23,.92);border:1px solid rgba(255,255,255,.18);color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);transition:background .15s,transform .15s,border-color .15s;padding:0;box-shadow:0 4px 16px rgba(0,0,0,.55);touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+.modal-close::before{content:'';position:absolute;inset:-10px;border-radius:50%}.modal-close:hover{background:rgba(30,38,58,.95);transform:scale(1.05);border-color:rgba(255,255,255,.28)}.modal-close:active{transform:scale(.94);background:rgba(50,60,88,.95)}
+.modal-loading{padding:100px 20px;text-align:center}.modal-error{padding:80px 20px;text-align:center;color:#9db5e0;font-size:.9rem}
+@media (min-width:700px){.modal-panel{padding:40px 24px}}
+.detail-hero{position:relative;overflow:hidden;background:var(--surface);border-radius:18px 18px 0 0}.detail-bg{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:blur(30px) saturate(1.2) brightness(.5);transform:scale(1.15);z-index:0}.detail-hero::after{content:'';position:absolute;inset:0;z-index:1;background:linear-gradient(180deg,rgba(10,14,24,.6),rgba(10,14,24,.95))}
+.detail-inner{position:relative;z-index:2;display:flex;flex-direction:column;align-items:center;text-align:center;gap:16px;padding:24px 20px 24px}
+.detail-poster{width:min(48vw,200px);height:auto;aspect-ratio:2/3;border-radius:14px;object-fit:cover;flex-shrink:0;box-shadow:0 16px 40px rgba(0,0,0,.75);margin:0 auto}.detail-poster-ph{display:flex;align-items:center;justify-content:center;background:var(--surface-2);font-size:2.8rem;color:var(--text-dim);width:min(48vw,200px);aspect-ratio:2/3}
+.detail-info{flex:1;min-width:0;display:flex;flex-direction:column;gap:8px;align-items:center;width:100%}.detail-title{font-size:1.45rem;font-weight:800;letter-spacing:-.4px;line-height:1.25}.detail-tagline{font-size:.85rem;color:var(--text-dim);font-style:italic}.detail-meta{display:flex;flex-wrap:wrap;gap:10px;font-size:.85rem;color:var(--text-dim);justify-content:center}.detail-genres{font-size:.82rem;color:var(--text-dim)}.detail-overview{font-size:.88rem;color:#c0c8d6;line-height:1.55;margin-top:4px;display:-webkit-box;-webkit-line-clamp:5;-webkit-box-orient:vertical;overflow:hidden;text-align:center}
+.d-status{display:flex;gap:12px;align-items:center;background:linear-gradient(135deg,#16161a,#0e0e10);border:1px solid var(--border);border-radius:14px;padding:12px 14px;margin-top:8px;width:100%;justify-content:flex-start}.d-status.done{border-color:rgba(74,222,128,.3);background:rgba(74,222,128,.06)}.d-status-row{display:flex;gap:12px;align-items:center;width:100%}
+.d-status-icon{width:32px;height:32px;border-radius:50%;background:var(--surface-2);color:var(--text-dim);display:flex;align-items:center;justify-content:center;font-weight:700;flex-shrink:0;font-size:.95rem}.d-status.done .d-status-icon{background:rgba(74,222,128,.15);color:#4ade80}
+.d-status-body{flex:1;min-width:0;text-align:left}.d-status-title{font-size:.88rem;font-weight:600}.d-status-sub{font-size:.76rem;color:var(--text-dim);margin-top:2px}
+.d-mark-btn{flex-shrink:0;background:rgba(52,211,153,.12);border:1px solid rgba(52,211,153,.35);color:#6ee7b7;padding:8px 14px;border-radius:10px;font-size:.78rem;font-weight:700;cursor:pointer;font-family:inherit;transition:all .15s;white-space:nowrap}.d-mark-btn:hover{background:rgba(52,211,153,.25);color:#a7f3d0}.d-mark-btn:disabled{opacity:.6;cursor:wait}.d-mark-btn.done{background:rgba(52,211,153,.2);color:#34d399;cursor:default}.d-mark-btn.unwatch{background:rgba(255,184,77,.12);border-color:rgba(255,184,77,.35);color:#ffb84d}.d-mark-btn.unwatch:hover{background:rgba(255,184,77,.25);color:#ffd693}
+.infuse-btn{display:inline-flex;align-items:center;gap:8px;align-self:center;background:linear-gradient(135deg,#7c3aed 0%,#a78bfa 100%);border:1px solid transparent;color:#fff;padding:10px 20px;border-radius:12px;font-size:.85rem;font-weight:700;text-decoration:none;margin-top:10px;box-shadow:0 6px 22px rgba(167,139,250,.3);transition:all .2s ease;cursor:pointer;font-family:inherit}.infuse-btn:hover{border-color:rgba(125,157,212,.75);background:linear-gradient(135deg,#15203a,#233258);color:#d0dcf0;box-shadow:0 4px 20px rgba(90,130,200,.35);text-decoration:none}.infuse-btn svg{flex-shrink:0}
+.detail-body{padding:20px 22px 24px}.d-section{margin-top:8px;margin-bottom:26px}.d-section:last-child{margin-bottom:0}.d-section-title{font-size:1rem;font-weight:700;letter-spacing:.2px;margin-bottom:14px;color:var(--text);display:flex;align-items:center;gap:8px}.d-section-title::before{content:'';width:3px;height:16px;border-radius:2px;background:#7d9dd4}
+.cast-scroll{display:flex;gap:14px;overflow-x:auto;padding-bottom:8px;scrollbar-width:none}.cast-scroll::-webkit-scrollbar{display:none}.cast{flex-shrink:0;width:84px;text-align:center}.cast-img{width:84px;height:84px;border-radius:50%;object-fit:cover;background:var(--surface-2)}.cast-ph{display:flex;align-items:center;justify-content:center;color:var(--text-dim);font-size:1.6rem;font-weight:600;background:linear-gradient(135deg,var(--surface-2),#1a2233)}.cast-name{font-size:.75rem;font-weight:600;margin-top:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.cast-role{font-size:.68rem;color:var(--text-dim);margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.seasons{display:flex;flex-direction:column;gap:8px}.season-item{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;transition:border-color .15s}.season-item.open{border-color:#2a3345}
+.season-head{width:100%;background:none;border:none;color:inherit;display:flex;align-items:center;gap:10px;padding:14px 16px;cursor:pointer;font-family:inherit;text-align:left;transition:background .15s}.season-head:hover{background:var(--surface-2)}
+.season-title{font-weight:600;font-size:.9rem;flex:1}.season-meta{font-size:.76rem;color:var(--text-dim)}
+.chev{width:16px;height:16px;color:var(--text-dim);transition:transform .2s ease;flex-shrink:0}.season-item.open .chev{transform:rotate(180deg)}
+.season-body{display:none;border-top:1px solid var(--border)}.season-item.open .season-body{display:block}.ep-empty{padding:20px;text-align:center;color:var(--text-dim);font-size:.85rem}
+.episode{display:flex;gap:12px;padding:12px 16px;border-bottom:1px solid var(--border);align-items:flex-start;transition:background .15s}.episode:last-child{border-bottom:none}.episode.clickable{cursor:pointer}.episode.clickable:hover{background:var(--surface-2)}.episode.clickable:active{background:#1a2233}.episode.clickable:hover .ep-title{color:#7d9dd4}.episode.watched .ep-title{color:var(--text-dim)}.episode.watched.clickable:hover .ep-title{color:#7d9dd4}
+.ep-num{font-family:ui-monospace,Menlo,monospace;font-size:.76rem;color:var(--text-dim);font-weight:700;flex-shrink:0;padding-top:3px;width:32px;letter-spacing:.5px}.ep-body{flex:1;min-width:0}.ep-title{font-size:.86rem;font-weight:600;line-height:1.3}.ep-overview{font-size:.76rem;color:var(--text-dim);margin-top:4px;line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ep-check{color:#4ade80;font-weight:700;flex-shrink:0;font-size:.9rem;padding-top:2px}
+.ep-actions{flex-shrink:0;display:flex;align-items:center}.ep-watch-btn{background:rgba(52,211,153,.12);border:1px solid rgba(52,211,153,.35);color:#6ee7b7;padding:3px 9px;border-radius:7px;font-size:.7rem;font-weight:700;cursor:pointer;font-family:inherit;transition:all .15s}.ep-watch-btn:hover{background:rgba(52,211,153,.25);color:#a7f3d0}.ep-watch-btn:disabled{opacity:.6;cursor:wait}.ep-watch-btn.done{background:rgba(52,211,153,.2);color:#34d399;cursor:default}
+.modal-body .grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:16px}
+@media (min-width:700px){.detail-inner{flex-direction:row;align-items:flex-start;text-align:left;padding:30px;gap:26px}.detail-poster{width:180px;height:auto;aspect-ratio:2/3;margin:0}.detail-info{align-items:flex-start}.detail-meta{justify-content:flex-start}.infuse-btn{align-self:flex-start}.detail-overview{text-align:left}.detail-title{font-size:1.85rem}.detail-overview{font-size:.92rem;-webkit-line-clamp:6}.detail-body{padding:26px 30px 30px}.cast{width:96px}.cast-img{width:96px;height:96px}.modal-body .grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:18px}.detail-ext-ratings{justify-content:flex-start}}
+.confirm-modal{position:fixed;inset:0;z-index:200;display:none}.confirm-modal.open{display:block}
+.confirm-backdrop{position:absolute;inset:0;background:rgba(2,4,8,.7);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);animation:fadeIn .18s ease}
+.confirm-panel{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:min(88vw,340px);background:linear-gradient(165deg,#16161a 0%,#0e0e10 100%);border:1px solid var(--border-strong);border-radius:18px;padding:24px 22px 18px;box-shadow:0 30px 80px rgba(0,0,0,.8);text-align:center;animation:confirmIn .22s cubic-bezier(.2,.9,.3,1)}
+@keyframes confirmIn{from{opacity:0;transform:translate(-50%,-48%) scale(.95)}to{opacity:1;transform:translate(-50%,-50%) scale(1)}}
+.confirm-icon{width:48px;height:48px;margin:0 auto 12px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:1.4rem;background:var(--accent-soft);color:var(--accent-2)}.confirm-icon.danger{background:rgba(224,85,96,.14);color:#ff7b85}.confirm-icon.warn{background:rgba(255,184,77,.14);color:#ffb84d}.confirm-icon.success{background:rgba(52,211,153,.14);color:#34d399}
+.confirm-title{font-size:1.02rem;font-weight:700;margin-bottom:6px;color:var(--text)}.confirm-msg{font-size:.84rem;color:var(--text-dim);line-height:1.55;word-break:break-word}.confirm-actions{display:flex;gap:10px;margin-top:20px}
+.confirm-btn{flex:1;padding:11px 14px;border-radius:12px;font-size:.88rem;font-weight:700;font-family:inherit;cursor:pointer;border:1px solid transparent;transition:all .15s;-webkit-tap-highlight-color:transparent}
+.confirm-cancel{background:rgba(255,255,255,.05);border-color:var(--border);color:var(--text-dim)}.confirm-cancel:hover{background:rgba(255,255,255,.09);color:#fff}
+.confirm-ok{background:linear-gradient(135deg,#7c3aed 0%,#a78bfa 100%);color:#fff;box-shadow:0 6px 20px rgba(167,139,250,.3)}.confirm-ok:hover{filter:brightness(1.08)}.confirm-ok.danger{background:linear-gradient(135deg,#dc2626 0%,#f87171 100%);box-shadow:0 6px 20px rgba(248,113,113,.28)}.confirm-ok:disabled,.confirm-cancel:disabled{opacity:.6;cursor:wait}`;
+}
