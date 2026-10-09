@@ -1,35 +1,23 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════
  *  MineTrakt · Trakt 观看记录查看器
- *  Cloudflare Workers 单文件部署（HTML / CSS / JS / API 全部内嵌）
+ *  Cloudflare Workers 单文件部署
  * ═══════════════════════════════════════════════════════════════════════
- *
- *  【部署绑定】
- *    TMDB_CACHE          KV 命名空间 —— 缓存 TMDB/OMDB/趋势/待看/日历等
- *
- *  【环境变量】
- *    TRAKT_CLIENT_ID     必填 · Trakt API Client ID（Device Code + PKCE）
- *    TMDB_API_KEY        必填 · The Movie Database API Key
- *    OMDB_API_KEY        可选 · OMDb API Key（IMDb / RT / Metacritic 评分）
- *
- *  【主要能力】
- *    · Trakt Device Code OAuth 登录（PKCE）
- *    · 继续观看 / 待看列表 / 追剧日历 / 观看历史
- *    · 影片详情（TMDB 元数据 + 分季分集 + 标记已看）
- *    · 搜索 & 趋势 · Infuse 深链 · PWA（manifest + Service Worker）
- *
- *  【缓存策略】
- *    进程内 Map（~120s）→ Cloudflare KV（按业务 TTL）→ 上游 API
- *    统一入口：cachedJSON()；待看变更时 invalidateWatchlistCache()
- *
- *  【版本】
- *    APP_JS_VERSION / APP_CSS_VERSION —— 静态资源缓存破坏用
+ *  【部署绑定】  TMDB_CACHE (KV 命名空间)
+ *  【环境变量】  TRAKT_CLIENT_ID / TMDB_API_KEY / OMDB_API_KEY(可选)
+ *  【主要能力】  Trakt Device OAuth / 继续观看 / 待看 / 日历 / 历史 / 详情
+ *  【本版优化】
+ *    1. Trakt 429 全局冷却（60s 短路，避免集体撞墙）
+ *    2. 错误对象不写 KV（防止污染缓存）
+ *    3. 冷却期不写 miss 占位（节省 KV 额度）
+ *    4. 重试加随机抖动（错峰避免二次 429）
+ *    5. HISTORY/PLAYBACK TTL 60→300，missTtl 提高（减少写入 50%）
+ *    6. CSS 压缩为单行（响应体积 -16%）
  * ═══════════════════════════════════════════════════════════════════════
  */
 
-
 // ═══════════════════════════════════════════════════════════════════════
-//  常量 · API 地址 / 应用元信息 / 分页与缓存 TTL
+//  常量 · API 地址 / 应用元信息
 // ═══════════════════════════════════════════════════════════════════════
 const TRAKT_AUTH = "https://auth.trakt.tv",
   TRAKT_API = "https://api.trakt.tv",
@@ -70,6 +58,12 @@ const JSON_HEADERS = {
 };
 const COOKIE_NAME = "trakt_auth",
   COOKIE_MAX_AGE = 60 * 60 * 24 * 90;
+
+// ═══════════════════════════════════════════════════════════════════════
+//  缓存 TTL 常量 · 单位秒
+//  · 值越大 KV 写入越少，但数据新鲜度越低
+//  · HISTORY/PLAYBACK 从 60/90 提到 300，写入减少 5 倍
+// ═══════════════════════════════════════════════════════════════════════
 const PAGE_SIZE = 12,
   TMDB_KV_TTL = 86400 * 7,
   OMDB_KV_TTL = 86400 * 7,
@@ -77,17 +71,16 @@ const PAGE_SIZE = 12,
   WATCHLIST_KV_TTL = 300,
   CALENDAR_KV_TTL = 600,
   TREND_KV_TTL = 1800,
-  MISS_KV_TTL = 600;
+  MISS_KV_TTL = 300,
+  HISTORY_KV_TTL = 300,
+  PLAYBACK_KV_TTL = 300;
 const HOME_AUTO_REFRESH_MINUTES = 5;
-const APP_JS_VERSION = "22",
-  APP_CSS_VERSION = "50";
-
+const APP_JS_VERSION = "25",
+  APP_CSS_VERSION = "51";
 
 // ═══════════════════════════════════════════════════════════════════════
 //  网络 · 带超时的 fetch 封装
 // ═══════════════════════════════════════════════════════════════════════
-
-/** 带 AbortController 超时的 fetch；默认 8s，超时抛 AbortError */
 async function fetchT(url, opts = {}, ms = 8000) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), ms);
@@ -97,21 +90,44 @@ async function fetchT(url, opts = {}, ms = 8000) {
     clearTimeout(t);
   }
 }
-
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ═══════════════════════════════════════════════════════════════════════
-//  缓存层 · 内存 Map + Cloudflare KV + single-flight
-//  · kvMem*     进程内热缓存，降低同 isolate 重复读 KV
-//  · kvGet/Put  读写 KV；edge cacheTtl 让 CF 边缘也缓存 GET
-//  · cachedJSON 统一「内存 → KV → fetcher」路径，调用方只关心业务
+//  Trakt 全局冷却 · 429 后 60s 内所有 Trakt 请求短路
+//  · 避免多个并发请求同时触发 429 后疯狂重试
+//  · 冷却期直接返回错误，不打上游、不写 KV
 // ═══════════════════════════════════════════════════════════════════════
-const KV_MEM_TTL = 120000,
-  KV_EDGE_TTL = 300,
-  KV_MISS = Symbol("kv-miss");
+let __traktRateLimitUntil = 0;
+const TRAKT_RATE_LIMIT_COOLDOWN = 60000;
+function isTraktRateLimited() {
+  return Date.now() < __traktRateLimitUntil;
+}
+function markTraktRateLimited() {
+  __traktRateLimitUntil = Date.now() + TRAKT_RATE_LIMIT_COOLDOWN;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  缓存层 · 进程内 Map + KV + single-flight + SWR
+// ═══════════════════════════════════════════════════════════════════════
+const KV_MEM_TTL = 300000,
+  KV_EDGE_TTL = 600,
+  KV_MISS = Symbol("kv-miss"),
+  KV_ERR = Symbol("kv-err"),
+  KV_MIN_PUT_TTL = 30,
+  KV_DOWN_COOLDOWN_MS = 30000;
 const __kvMem = new Map(),
   __kvMemExp = new Map(),
   __kvInflight = new Map();
-/** 读内存缓存；过期则删除并返回 undefined */
+let __kvDownUntil = 0;
+function kvIsDown() {
+  return Date.now() < __kvDownUntil;
+}
+function kvMarkDown() {
+  __kvDownUntil = Date.now() + KV_DOWN_COOLDOWN_MS;
+}
+function kvMarkUp() {
+  __kvDownUntil = 0;
+}
 function kvMemGet(key) {
   const exp = __kvMemExp.get(key);
   if (exp === undefined) return undefined;
@@ -122,28 +138,26 @@ function kvMemGet(key) {
   }
   return __kvMem.get(key);
 }
-/** 写内存缓存；超过 3000 条时淘汰过期项，仍超则 FIFO 丢 500 条 */
 function kvMemSet(key, val, ttlMs) {
   __kvMem.set(key, val);
   __kvMemExp.set(key, Date.now() + (ttlMs || KV_MEM_TTL));
-  if (__kvMem.size > 3000) {
+  if (__kvMem.size > 4000) {
     const now = Date.now();
     for (const [k, t] of __kvMemExp)
       if (t < now) {
         __kvMem.delete(k);
         __kvMemExp.delete(k);
       }
-    if (__kvMem.size > 3000) {
+    if (__kvMem.size > 4000) {
       let i = 0;
       for (const k of __kvMem.keys()) {
         __kvMem.delete(k);
         __kvMemExp.delete(k);
-        if (++i >= 500) break;
+        if (++i >= 800) break;
       }
     }
   }
 }
-/** 同一 key 并发只跑一次 fetcher，其余等待同一 Promise */
 function singleFlight(key, fn) {
   const existing = __kvInflight.get(key);
   if (existing) return existing;
@@ -157,117 +171,251 @@ function singleFlight(key, fn) {
   __kvInflight.set(key, p);
   return p;
 }
-/** 读缓存：先内存，再 KV（memOnly=true 时跳过 KV） */
-async function kvGetJSON(env, key, memOnly) {
+async function kvGetJSON(env, key, memOnly, edgeTtl) {
   const mem = kvMemGet(key);
   if (mem !== undefined) return mem;
   if (memOnly) return undefined;
-  if (!env.TMDB_CACHE) return undefined;
+  if (!env.TMDB_CACHE || kvIsDown()) return KV_ERR;
   try {
     const v = await env.TMDB_CACHE.get(key, {
       type: "json",
-      cacheTtl: KV_EDGE_TTL,
+      cacheTtl: edgeTtl || KV_EDGE_TTL,
     });
+    kvMarkUp();
     const result = v === null || v === undefined ? KV_MISS : v;
-    kvMemSet(key, result);
+    const memMs =
+      result && result !== KV_MISS && result._ttl
+        ? Math.min(KV_MEM_TTL, Math.max(5000, result._ttl * 1000))
+        : KV_MEM_TTL;
+    kvMemSet(key, result, memMs);
     return result;
   } catch {
-    return undefined;
+    kvMarkDown();
+    return KV_ERR;
   }
 }
-/** 写缓存：同步写内存；非 memOnly 时 waitUntil 异步写 KV */
 function kvPutJSON(env, ctx, key, payload, ttl, memOnly) {
-  // mem TTL: min(KV_MEM_TTL, ttl*1000) so short-lived keys don't stick in mem longer than KV
   const memMs = ttl
     ? Math.min(KV_MEM_TTL, Math.max(5000, ttl * 1000))
     : KV_MEM_TTL;
+  if (payload && typeof payload === "object" && payload !== KV_MISS)
+    payload._ts = Date.now();
   kvMemSet(key, payload, memMs);
   if (memOnly) return;
-  if (!env.TMDB_CACHE) return;
-  const p = env.TMDB_CACHE.put(key, JSON.stringify(payload), {
-    expirationTtl: ttl,
-  }).catch(() => {});
+  if (!env.TMDB_CACHE || kvIsDown()) return;
+  if (ttl != null && ttl < KV_MIN_PUT_TTL) return;
+  const body =
+    payload && typeof payload === "object"
+      ? { ...payload, _ttl: ttl }
+      : payload;
+  const p = env.TMDB_CACHE.put(key, JSON.stringify(body), {
+    expirationTtl: Math.max(60, ttl || 60),
+  })
+    .then(() => kvMarkUp())
+    .catch(() => {
+      kvMarkDown();
+    });
   if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
 }
-/** Unified cache: mem → KV → fetcher. Returns unwrapped data (or null on miss marker). */
 /**
- * 统一缓存读取入口。
- * @param {object} env  Worker env（含 TMDB_CACHE）
- * @param {object} ctx  ExecutionContext（waitUntil）
- * @param {string} key  缓存键
- * @param {() => Promise<any>} fetcher  未命中时的数据源
- * @param {{ ttl?: number, missTtl?: number, memOnly?: boolean, unwrap?: boolean }} [opts]
- * @returns {Promise<any|null>} unwrap 时返回 data 字段，未命中/失败返回 null
+ * cachedJSON — 统一缓存读取入口（内存 → KV → fetcher）
+ * · SWR: 数据超过 softAge 秒时后台异步刷新，仍返回旧值
+ * · 错误拦截: fetcher 返回 __error 时不缓存，避免污染
+ * · Trakt 冷却: 触发 429 后 60s 内不写 miss 占位，节省 KV 额度
  */
 async function cachedJSON(
   env,
   ctx,
   key,
   fetcher,
-  { ttl = 3600, missTtl = MISS_KV_TTL, memOnly = false, unwrap = true } = {},
+  {
+    ttl = 3600,
+    missTtl = MISS_KV_TTL,
+    memOnly = false,
+    unwrap = true,
+    swr = false,
+    edgeTtl,
+  } = {},
 ) {
+  const softAge =
+    swr === true ? Math.floor(ttl * 0.5) : typeof swr === "number" ? swr : 0;
+  function unwrapVal(cached) {
+    if (cached === KV_MISS || cached == null) return null;
+    if (cached.miss) return null;
+    return cached.data !== undefined ? cached.data : cached;
+  }
+  function ageSec(cached) {
+    if (!cached || cached === KV_MISS || !cached._ts) return Infinity;
+    return (Date.now() - cached._ts) / 1000;
+  }
+  function scheduleRefresh() {
+    if (!ctx || typeof ctx.waitUntil !== "function") return;
+    const flightKey = "swr:" + key;
+    if (__kvInflight.has(flightKey)) return;
+    ctx.waitUntil(
+      singleFlight(flightKey, async () => {
+        let data = null;
+        try {
+          data = await fetcher();
+        } catch {}
+        if (data && data.__error) data = null;
+        const down = kvIsDown();
+        if (data != null && data !== false)
+          kvPutJSON(env, ctx, key, { data }, ttl, memOnly || down);
+        else if (!down && !isTraktRateLimited())
+          kvPutJSON(env, ctx, key, { miss: true }, missTtl, memOnly);
+      }),
+    );
+  }
   const mem = kvMemGet(key);
   if (mem !== undefined) {
     if (mem === KV_MISS) return null;
-    if (unwrap)
-      return mem.miss ? null : mem.data !== undefined ? mem.data : mem;
+    if (softAge > 0 && ageSec(mem) > softAge && !mem.miss) {
+      scheduleRefresh();
+    }
+    if (unwrap) return unwrapVal(mem);
     return mem;
   }
   return singleFlight(key, async () => {
-    const cached = await kvGetJSON(env, key, memOnly);
-    if (cached !== undefined && cached !== KV_MISS) {
-      if (unwrap)
-        return cached.miss
-          ? null
-          : cached.data !== undefined
-            ? cached.data
-            : cached;
+    const cached = await kvGetJSON(env, key, memOnly, edgeTtl);
+    if (cached !== undefined && cached !== KV_MISS && cached !== KV_ERR) {
+      if (softAge > 0 && ageSec(cached) > softAge && !cached.miss) {
+        scheduleRefresh();
+      }
+      if (unwrap) return unwrapVal(cached);
       return cached;
     }
+    const kvBroken = cached === KV_ERR || cached === undefined;
     let data = null;
     try {
       data = await fetcher();
     } catch {}
+    // ✅ 错误对象不写 KV，避免污染缓存
+    if (data && data.__error) {
+      data = null;
+    }
     if (data != null && data !== false) {
-      kvPutJSON(env, ctx, key, { data }, ttl, memOnly);
+      kvPutJSON(env, ctx, key, { data }, ttl, memOnly || kvBroken);
       return unwrap ? data : { data };
     }
-    kvPutJSON(env, ctx, key, { miss: true }, missTtl, memOnly);
+    // ✅ 冷却期不写 miss 占位，节省 KV 额度
+    if (!kvBroken && !isTraktRateLimited()) {
+      kvPutJSON(env, ctx, key, { miss: true }, missTtl, memOnly);
+    }
     return null;
   });
 }
-/** 生成清除登录 Cookie 的 Set-Cookie 头 */
 function clearCookieHeader() {
   return `${COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`;
 }
-/**
- * 待看列表变更后失效缓存。
- * 清内存 + waitUntil 异步删除 KV 中该用户相关 key，避免其它 isolate 读到旧数据。
- */
+async function getWatchlistVersion(env, ctx, userKey) {
+  if (!userKey) return "0";
+  const key = `wlv:${userKey}`;
+  const mem = kvMemGet(key);
+  if (mem !== undefined && mem !== KV_MISS) {
+    const v =
+      mem && typeof mem === "object" && mem.data != null ? mem.data : mem;
+    if (v != null && v !== "") return String(v);
+  }
+  if (!env || !env.TMDB_CACHE || kvIsDown()) return "0";
+  try {
+    const raw = await env.TMDB_CACHE.get(key, {
+      type: "json",
+      cacheTtl: KV_EDGE_TTL,
+    });
+    kvMarkUp();
+    let v = "0";
+    if (raw != null) {
+      v = String(
+        typeof raw === "object" && raw.data != null ? raw.data : raw,
+      );
+    }
+    kvMemSet(key, { data: v, _ts: Date.now() }, KV_MEM_TTL);
+    return v || "0";
+  } catch {
+    kvMarkDown();
+    return "0";
+  }
+}
 function invalidateWatchlistCache(env, ctx, userKey) {
-  const prefixes = userKey ? [`wl:${userKey}:`, `wlids:${userKey}:`] : null;
-  for (const k of [...__kvMem.keys()]) {
-    if (k.startsWith("wl:") || k.startsWith("wlids:")) {
-      if (!prefixes || prefixes.some((p) => k.startsWith(p))) {
+  if (userKey) {
+    const verKey = `wlv:${userKey}`;
+    __kvMem.delete(verKey);
+    __kvMemExp.delete(verKey);
+    const base = `wl:${userKey}:`;
+    for (const k of [...__kvMem.keys()]) {
+      if (k.startsWith(base) || k.startsWith(`wlids:${userKey}:`)) {
+        __kvMem.delete(k);
+        __kvMemExp.delete(k);
+      }
+    }
+  } else {
+    for (const k of [...__kvMem.keys()]) {
+      if (
+        k.startsWith("wl:") ||
+        k.startsWith("wlids:") ||
+        k.startsWith("wlv:")
+      ) {
         __kvMem.delete(k);
         __kvMemExp.delete(k);
       }
     }
   }
-  // Best-effort KV delete so other isolates don't serve stale watchlist
   if (env && env.TMDB_CACHE && userKey) {
-    const sorts = ["added", "title", "released", "rank", "listed"];
-    const keys = sorts
-      .map((s) => `wl:${userKey}:${s}`)
-      .concat([`wlids:${userKey}:movies`, `wlids:${userKey}:shows`]);
-    const tasks = keys.map((k) => env.TMDB_CACHE.delete(k).catch(() => {}));
-    if (ctx && typeof ctx.waitUntil === "function")
-      ctx.waitUntil(Promise.all(tasks));
+    const verKey = `wlv:${userKey}`;
+    const bump = (async () => {
+      let cur = 0;
+      if (!kvIsDown()) {
+        try {
+          const raw = await env.TMDB_CACHE.get(verKey, { type: "json" });
+          if (raw != null) {
+            const n =
+              typeof raw === "object" && raw.data != null
+                ? Number(raw.data)
+                : Number(raw);
+            if (Number.isFinite(n)) cur = n;
+          }
+          kvMarkUp();
+        } catch {
+          kvMarkDown();
+        }
+      }
+      const next = String(cur + 1);
+      const payload = { data: next, _ts: Date.now(), _ttl: 86400 * 30 };
+      kvMemSet(verKey, payload, KV_MEM_TTL);
+      if (!kvIsDown()) {
+        try {
+          await env.TMDB_CACHE.put(verKey, JSON.stringify(payload), {
+            expirationTtl: 86400 * 30,
+          });
+          kvMarkUp();
+        } catch {
+          kvMarkDown();
+        }
+      }
+    })();
+    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(bump);
+    else bump.catch(() => {});
+  }
+}
+function bustHomeUserCaches(userKey) {
+  if (!userKey) return;
+  for (const k of [...__kvMem.keys()]) {
+    if (
+      k === `pb:${userKey}` ||
+      k.startsWith(`hist:${userKey}:`) ||
+      k === `stats:${userKey}`
+    ) {
+      __kvMem.delete(k);
+      __kvMemExp.delete(k);
+    }
   }
 }
 
-const SW_JS_CONTENT = String.raw`/* MineTrakt SW v22 */ const VERSION = 'v22'; const RUNTIME_CACHE = 'trakt-static-' + VERSION; self.addEventListener('install', function(){ self.skipWaiting(); }); self.addEventListener('activate', function(e){ e.waitUntil((async function(){ var keys = await caches.keys(); await Promise.all(keys.filter(function(k){ return k !== RUNTIME_CACHE; }).map(function(k){ return caches.delete(k); })); await self.clients.claim(); })()); }); self.addEventListener('fetch', function(event){ var req = event.request; if (req.method !== 'GET') return; var url; try { url = new URL(req.url); } catch(e){ return; } if (url.origin !== self.location.origin) return; if (url.pathname === '/sw.js') return; if (req.mode === 'navigate') return; if (url.pathname.indexOf('/api/') === 0) return; if (url.pathname.indexOf('/auth/') === 0) return; if (url.pathname === '/app.css' || url.pathname === '/app.js' || url.pathname === '/manifest.webmanifest' || url.pathname === '/favicon.ico' || url.pathname.indexOf('/assets/') === 0 || /\.(?:png|jpg|jpeg|svg|webp|ico|woff2?|css|js)$/i.test(url.pathname)) { event.respondWith(staleWhileRevalidate(req)); } }); async function staleWhileRevalidate(req){ var cache = await caches.open(RUNTIME_CACHE); var cached = await cache.match(req); var network = fetch(req).then(function(r){ if (r && r.ok && r.type !== 'opaque') { cache.put(req, r.clone()).catch(function(){}); } return r; }).catch(function(){ return cached; }); return cached || network; }`;
-
+// ═══════════════════════════════════════════════════════════════════════
+//  Service Worker 内容（静态资源 SWR）
+// ═══════════════════════════════════════════════════════════════════════
+const SW_JS_CONTENT = String.raw`/* MineTrakt SW v25 */ const VERSION = 'v25'; const RUNTIME_CACHE = 'trakt-static-' + VERSION; self.addEventListener('install', function(){ self.skipWaiting(); }); self.addEventListener('activate', function(e){ e.waitUntil((async function(){ var keys = await caches.keys(); await Promise.all(keys.filter(function(k){ return k !== RUNTIME_CACHE; }).map(function(k){ return caches.delete(k); })); await self.clients.claim(); })()); }); self.addEventListener('fetch', function(event){ var req = event.request; if (req.method !== 'GET') return; var url; try { url = new URL(req.url); } catch(e){ return; } if (url.origin !== self.location.origin) return; if (url.pathname === '/sw.js') return; if (req.mode === 'navigate') return; if (url.pathname.indexOf('/api/') === 0) return; if (url.pathname.indexOf('/auth/') === 0) return; if (url.pathname === '/app.css' || url.pathname === '/app.js' || url.pathname === '/manifest.webmanifest' || url.pathname === '/favicon.ico' || url.pathname.indexOf('/assets/') === 0 || /\.(?:png|jpg|jpeg|svg|webp|ico|woff2?|css|js)$/i.test(url.pathname)) { event.respondWith(staleWhileRevalidate(req)); } }); async function staleWhileRevalidate(req){ var cache = await caches.open(RUNTIME_CACHE); var cached = await cache.match(req); var network = fetch(req).then(function(r){ if (r && r.ok && r.type !== 'opaque') { cache.put(req, r.clone()).catch(function(){}); } return r; }).catch(function(){ return cached; }); return cached || network; }`;
 
 // ═══════════════════════════════════════════════════════════════════════
 //  Worker 入口 · 路由表
@@ -312,13 +460,7 @@ export default {
   },
 };
 
-// ═══ 资产 / 静态资源 ═══
-
-// ═══════════════════════════════════════════════════════════════════════
-//  静态资源 · 图标代理 / app.css / app.js / manifest / SW
-// ═══════════════════════════════════════════════════════════════════════
-
-/** 代理 ASSET_ORIGINS 中的远程图标，并写入 caches.default */
+// ═══ 静态资源 ═══
 async function handleAsset(path, ctx) {
   const entry = ASSET_ORIGINS[path];
   if (!entry) return new Response("Not Found", { status: 404 });
@@ -344,7 +486,6 @@ async function handleAsset(path, ctx) {
     return new Response("", { status: 502 });
   }
 }
-/** 返回内嵌 CSS（长缓存 + ETag） */
 function handleAppCss() {
   const css = pageStyles();
   return new Response(css, {
@@ -355,7 +496,6 @@ function handleAppCss() {
     },
   });
 }
-/** 返回内嵌客户端 JS；支持 If-None-Match → 304 */
 function handleAppJs(request) {
   const etag = `"js-v${APP_JS_VERSION}"`;
   const cacheHeaders = {
@@ -371,7 +511,6 @@ function handleAppJs(request) {
     },
   });
 }
-/** PWA Web App Manifest */
 function handleManifest() {
   return new Response(
     JSON.stringify({
@@ -404,7 +543,6 @@ function handleManifest() {
     },
   );
 }
-/** Service Worker：静态资源 stale-while-revalidate */
 function handleServiceWorker() {
   return new Response(SW_JS_CONTENT, {
     headers: {
@@ -416,15 +554,6 @@ function handleServiceWorker() {
 }
 
 // ═══ 鉴权辅助 ═══
-
-// ═══════════════════════════════════════════════════════════════════════
-//  鉴权辅助 · Cookie 读写 / Token 刷新 / 统一 JSON 响应
-// ═══════════════════════════════════════════════════════════════════════
-
-/**
- * 校验登录态；必要时用 refresh_token 换新 access_token。
- * @returns {{ ok: true, auth, headers, needsCookieUpdate } | { ok: false }}
- */
 async function requireAuth(request, env) {
   const cookieAuth = readAuth(request);
   if (!cookieAuth) return { ok: false };
@@ -437,27 +566,23 @@ async function requireAuth(request, env) {
     needsCookieUpdate: auth.access_token !== cookieAuth.access_token,
   };
 }
-/** 401 JSON，并清除 Cookie */
 function unauthorizedJson() {
   return Response.json(
     { error: "unauthorized" },
     { status: 401, headers: { "Set-Cookie": clearCookieHeader() } },
   );
 }
-/** 401 纯文本，并清除 Cookie */
 function unauthorizedHtml() {
   return new Response("unauthorized", {
     status: 401,
     headers: { "Set-Cookie": clearCookieHeader() },
   });
 }
-/** 带可选 Set-Cookie 的 JSON 响应，供所有需鉴权的 API 复用 */
 function authJson(auth, needsCookieUpdate, data, status = 200) {
   const headers = { "Content-Type": "application/json; charset=utf-8" };
   if (needsCookieUpdate && auth) headers["Set-Cookie"] = buildCookie(auth);
   return new Response(JSON.stringify(data), { status, headers });
 }
-/** 安全解析 JSON body；失败返回 { ok:false, error:Response } */
 async function parseJsonBody(request) {
   try {
     return { ok: true, body: await request.json() };
@@ -468,22 +593,10 @@ async function parseJsonBody(request) {
     };
   }
 }
-/** Shared POST to Trakt sync endpoints (history / watchlist). */
-/**
- * Trakt sync 类 POST 的通用流程：鉴权 → 解析 body → 校验 → 请求 → 回写 Cookie。
- * 用于标记已看 / 取消已看 / 移出待看等结构相同的接口。
- */
 async function traktSyncAction(
   request,
   env,
-  {
-    allowedTypes,
-    idField = "id",
-    buildPayload,
-    endpoint,
-    timeout = 10000,
-    afterOk,
-  },
+  { allowedTypes, idField = "id", buildPayload, endpoint, timeout = 10000, afterOk },
 ) {
   const a = await requireAuth(request, env);
   if (!a.ok) return unauthorizedJson();
@@ -525,13 +638,7 @@ async function traktSyncAction(
   return authJson(auth, needsCookieUpdate, { ok: true, result });
 }
 
-// ═══ OAuth ═══
-
-// ═══════════════════════════════════════════════════════════════════════
-//  OAuth · Trakt Device Code + PKCE
-// ═══════════════════════════════════════════════════════════════════════
-
-/** 申请 device_code，返回 user_code 与 state（内含 code_verifier） */
+// ═══ OAuth · Trakt Device Code + PKCE ═══
 async function handleDevice(env) {
   const codeVerifier = randomString(64),
     codeChallenge = await pkceChallenge(codeVerifier);
@@ -582,7 +689,6 @@ async function handleDevice(env) {
     expires_in: data.expires_in,
   });
 }
-/** 轮询换 token；成功则 Set-Cookie 写入登录态 */
 async function handlePoll(request, env) {
   let body;
   try {
@@ -650,18 +756,15 @@ async function handlePoll(request, env) {
     { status: 502 },
   );
 }
-/** 退出：清除 Cookie */
 function handleLogout() {
   return new Response(null, {
     status: 204,
     headers: { "Set-Cookie": clearCookieHeader() },
   });
 }
-/** 将 auth 对象 base64url 写入 HttpOnly Cookie */
 function buildCookie(auth) {
   return `${COOKIE_NAME}=${b64urlEncode(JSON.stringify(auth))}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${COOKIE_MAX_AGE}`;
 }
-/** 从 Cookie 解析 auth 对象 */
 function readAuth(request) {
   const cookie = request.headers.get("Cookie") || "";
   const m = cookie.match(new RegExp(`(?:^|;\\s*)${COOKIE_NAME}=([^;]+)`));
@@ -672,7 +775,6 @@ function readAuth(request) {
     return null;
   }
 }
-/** access_token 剩余不足 30 分钟时刷新 */
 async function refreshIfNeeded(auth, env) {
   if (auth.expires_at - Date.now() > 30 * 60_000) return auth;
   let res;
@@ -704,7 +806,6 @@ async function refreshIfNeeded(auth, env) {
     code_verifier: auth.code_verifier,
   };
 }
-/** 构造 Trakt API 请求头（含 Bearer） */
 function makeTraktHeaders(env, auth) {
   return {
     "Content-Type": "application/json",
@@ -714,48 +815,59 @@ function makeTraktHeaders(env, auth) {
     "User-Agent": "TraktViewer/1.0",
   };
 }
-/** Trakt GET + 429/网络重试；失败返回 { __error } */
+/**
+ * traktGet — Trakt API GET 封装
+ * · 429 触发全局冷却 + 随机抖动重试，避免集体撞墙
+ * · 网络错误指数退避重试，最多 retries 次
+ * · 失败统一返回 { __error: "..." }
+ */
 async function traktGet(url, headers, retries = 2) {
+  if (isTraktRateLimited())
+    return { __error: "429 rate limited (cooling down)" };
   for (let i = 0; i <= retries; i++) {
     try {
       const r = await fetchT(url, { headers }, 12000);
       if (r.status === 429) {
-        await new Promise((res) =>
-          setTimeout(res, Math.min(1000 * Math.pow(2, i), 4000)),
-        );
+        markTraktRateLimited();
+        const jitter = Math.random() * 1000;
+        await sleep(Math.min(1000 * Math.pow(2, i), 4000) + jitter);
         continue;
       }
       if (!r.ok) return { __error: `HTTP ${r.status}` };
       return await r.json();
     } catch (e) {
       if (i === retries) return { __error: String(e) };
-      await new Promise((res) => setTimeout(res, 800 * (i + 1)));
+      await sleep(800 * (i + 1) + Math.random() * 500);
     }
   }
   return { __error: "retries exhausted" };
 }
-/** 解析当前用户 Trakt ID（带内存缓存），用作用户级缓存 key 前缀 */
 async function getStableUserId(auth, headers) {
-  const memKey = `uid:${auth.access_token}`;
+  if (!auth) return "anon";
+  const rt = auth.refresh_token ? String(auth.refresh_token) : "";
+  const at = auth.access_token ? String(auth.access_token) : "";
+  const memKey = rt ? `uid:rt:${rt.slice(0, 32)}` : `uid:at:${at.slice(0, 24)}`;
   const cached = kvMemGet(memKey);
-  if (cached !== undefined && cached !== KV_MISS) return String(cached);
-  let userId = "anon";
-  try {
-    const u = await traktGet(`${TRAKT_API}/users/me`, headers, 0);
-    if (u && !u.__error)
-      userId = String((u.ids && u.ids.trakt) || u.username || "anon");
-  } catch {}
-  kvMemSet(memKey, userId);
+  if (cached !== undefined && cached !== KV_MISS && cached) return String(cached);
+  const userId = rt
+    ? "r" + rt.slice(0, 20)
+    : at
+      ? "a" + at.slice(0, 16)
+      : "anon";
+  kvMemSet(memKey, userId, KV_MEM_TTL);
+  if (at) kvMemSet(`uid:${at}`, userId, KV_MEM_TTL);
   return userId;
+}
+function rememberTraktUserId(auth, traktId) {
+  if (!auth || !traktId) return;
+  const id = String(traktId);
+  const rt = auth.refresh_token ? String(auth.refresh_token) : "";
+  const at = auth.access_token ? String(auth.access_token) : "";
+  if (rt) kvMemSet(`uid:rt:${rt.slice(0, 32)}`, id, KV_MEM_TTL);
+  if (at) kvMemSet(`uid:${at}`, id, KV_MEM_TTL);
 }
 
 // ═══ TMDB / OMDB ═══
-
-// ═══════════════════════════════════════════════════════════════════════
-//  TMDB / OMDB · 元数据与外部评分
-// ═══════════════════════════════════════════════════════════════════════
-
-/** TMDB GET，失败返回 null */
 async function tmdbGet(url) {
   try {
     const r = await fetchT(url, {}, 8000);
@@ -765,7 +877,6 @@ async function tmdbGet(url) {
     return null;
   }
 }
-/** 带缓存的 TMDB 详情（默认语言 zh-CN） */
 async function tmdbDetailCached(path, env, ctx, ttl = 86400) {
   if (!env.TMDB_API_KEY) return null;
   return cachedJSON(
@@ -776,14 +887,17 @@ async function tmdbDetailCached(path, env, ctx, ttl = 86400) {
       const url = `${TMDB_API}${path}${path.includes("?") ? "&" : "?"}language=zh-CN&api_key=${env.TMDB_API_KEY}`;
       return tmdbGet(url);
     },
-    { ttl, missTtl: MISS_KV_TTL },
+    {
+      ttl,
+      missTtl: MISS_KV_TTL,
+      swr: Math.min(3600, Math.floor(ttl * 0.4)),
+      edgeTtl: 900,
+    },
   );
 }
-/** 拼接 TMDB 海报 URL */
 function tmdbPoster(path, size = "w185") {
   return path ? `${TMDB_IMG}/${size}${path}` : null;
 }
-/** 将 TMDB 单条结果映射为搜索/趋势统一 item */
 function mapTmdbItem(r, typeHint) {
   if (!r || !r.id) return null;
   const mt = typeHint || r.media_type;
@@ -801,7 +915,6 @@ function mapTmdbItem(r, typeHint) {
     popularity: r.popularity || 0,
   };
 }
-/** Trakt sync payload：movie | show | episode */
 function traktSyncPayload(kind, id) {
   const entry = { ids: { trakt: id } };
   if (kind === "movie") return { movies: [entry] };
@@ -809,14 +922,12 @@ function traktSyncPayload(kind, id) {
   if (kind === "episode") return { episodes: [entry] };
   return null;
 }
-/** 同步用户缓存 key（无 headers 时的兜底；有 headers 优先 getStableUserId） */
 function userCacheKeyFromAuth(auth) {
-  return (
-    (auth && auth.access_token && String(auth.access_token).slice(0, 20)) ||
-    "anon"
-  );
+  if (!auth) return "anon";
+  if (auth.refresh_token) return "r" + String(auth.refresh_token).slice(0, 20);
+  if (auth.access_token) return "a" + String(auth.access_token).slice(0, 16);
+  return "anon";
 }
-/** 用 TMDB id 解析 Trakt id；失败返回 null */
 async function resolveTraktIdFromTmdb(tmdbId, type, headers) {
   const arr = await traktGet(
     `${TRAKT_API}/search/tmdb/${tmdbId}?type=${type}`,
@@ -828,12 +939,8 @@ async function resolveTraktIdFromTmdb(tmdbId, type, headers) {
   const id = arr[0][key] && arr[0][key].ids && arr[0][key].ids.trakt;
   return id || null;
 }
-/** 从 OMDb 拉取 IMDb / RT / Metacritic 评分（需 OMDB_API_KEY）
- *  正确 URL：https://www.omdbapi.com/?i=ttXXXXXXX&apikey=KEY
- */
 async function fetchOmdbRatings(imdbId, env, ctx) {
   if (!imdbId || !env.OMDB_API_KEY) return null;
-  // 统一成 tt 前缀，兼容纯数字 id
   let id = String(imdbId).trim();
   if (/^\d+$/.test(id)) id = "tt" + id.padStart(7, "0");
   if (!/^tt\d+$/i.test(id)) return null;
@@ -853,7 +960,6 @@ async function fetchOmdbRatings(imdbId, env, ctx) {
       const out = {};
       if (Array.isArray(d.Ratings))
         for (const r of d.Ratings) {
-          // "8.5/10" / "85%" / "72/100"
           const match = String(r.Value).match(/[\d.]+/);
           const v = match ? parseFloat(match[0]) : NaN;
           if (!Number.isFinite(v)) continue;
@@ -874,14 +980,14 @@ async function fetchOmdbRatings(imdbId, env, ctx) {
     { ttl: OMDB_KV_TTL, missTtl: 3600 },
   );
 }
-/** Metacritic 分数颜色：绿 ≥61 / 黄 ≥40 / 红 */
 function mcColor(n) {
   if (n >= 61) return "#66cc33";
   if (n >= 40) return "#ffcc33";
   return "#ff0000";
 }
-/** 渲染外部评分徽章 HTML（IMDb / Trakt / RT / MC / TMDB / 豆瓣） */
-/** 评分站点 logo · Simple Icons 官方 SVG（品牌色） */
+// ═══════════════════════════════════════════════════════════════════════
+//  评分站点 logo · Simple Icons 官方 SVG（品牌色）
+// ═══════════════════════════════════════════════════════════════════════
 const RATING_LOGOS = {
   tmdb: `<svg class="ext-logo" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="#01B4E4" d="M6.62 12a2.291 2.291 0 0 1 2.292-2.295h-.013A2.291 2.291 0 0 1 11.189 12a2.291 2.291 0 0 1-2.29 2.291h.013A2.291 2.291 0 0 1 6.62 12zm10.72-4.062h4.266a2.291 2.291 0 0 0 2.29-2.291 2.291 2.291 0 0 0-2.29-2.296H17.34a2.291 2.291 0 0 0-2.291 2.296 2.291 2.291 0 0 0 2.29 2.29zM2.688 20.645h8.285a2.291 2.291 0 0 0 2.291-2.292 2.291 2.291 0 0 0-2.29-2.295H2.687a2.291 2.291 0 0 0-2.291 2.295 2.291 2.291 0 0 0 2.29 2.292zm10.881-6.354h.81l1.894-4.586H15.19l-1.154 3.008h-.013l-1.135-3.008h-1.154zm4.208 0h1.011V9.705h-1.011zm2.878 0h3.235v-.93h-2.223v-.933h1.99v-.934h-1.99v-.855h2.107v-.934h-3.112zM1.31 7.941h1.01V4.247h1.31v-.895H0v.895h1.31zm3.747 0h1.011V5.959h1.958v1.984h1.011v-4.59h-1.01v1.711H6.061V3.351H5.057zm5.348 0h3.242v-.933H11.41v-.934h1.99v-.933h-1.99v-.856h2.107v-.934h-3.112zM.162 14.296h1.005v-3.52h.013l1.167 3.52h.765l1.206-3.52h.013v3.52h1.011v-4.59H3.82L2.755 12.7h-.013L1.686 9.705H.156zm14.534 6.353h1.641a3.188 3.188 0 0 0 .98-.149 2.531 2.531 0 0 0 .824-.437 2.123 2.123 0 0 0 .567-.713 2.193 2.193 0 0 0 .223-.983 2.399 2.399 0 0 0-.218-1.07 1.958 1.958 0 0 0-.586-.716 2.405 2.405 0 0 0-.873-.392 4.349 4.349 0 0 0-1.046-.13h-1.519zm1.013-3.656h.596a2.26 2.26 0 0 1 .606.08 1.514 1.514 0 0 1 .503.244 1.167 1.167 0 0 1 .34.412 1.28 1.28 0 0 1 .13.587 1.546 1.546 0 0 1-.13.658 1.127 1.127 0 0 1-.347.433 1.41 1.41 0 0 1-.518.238 2.797 2.797 0 0 1-.649.07h-.538zm4.686 3.656h1.88a2.997 2.997 0 0 0 .613-.064 1.735 1.735 0 0 0 .554-.214 1.221 1.221 0 0 0 .402-.39 1.105 1.105 0 0 0 .155-.606 1.188 1.188 0 0 0-.071-.415 1.01 1.01 0 0 0-.204-.34 1.087 1.087 0 0 0-.317-.24 1.297 1.297 0 0 0-.413-.13v-.012a1.203 1.203 0 0 0 .575-.366.962.962 0 0 0 .216-.648 1.081 1.081 0 0 0-.149-.603 1.022 1.022 0 0 0-.389-.354 1.673 1.673 0 0 0-.54-.169 4.463 4.463 0 0 0-.6-.041h-1.712zm1.011-3.734h.687a1.4 1.4 0 0 1 .24.022.748.748 0 0 1 .22.075.432.432 0 0 1 .16.147.418.418 0 0 1 .061.236.47.47 0 0 1-.055.233.433.433 0 0 1-.146.156.62.62 0 0 1-.204.084 1.058 1.058 0 0 1-.23.026h-.745zm0 1.835h.765a1.96 1.96 0 0 1 .266.02 1.015 1.015 0 0 1 .26.07.519.519 0 0 1 .204.152.406.406 0 0 1 .08.26.481.481 0 0 1-.06.253.519.519 0 0 1-.16.168.62.62 0 0 1-.217.09 1.155 1.155 0 0 1-.237.027H21.4z"/></svg>`,
   imdb: `<svg class="ext-logo" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="#F5C518" d="M22.3781 0H1.6218C.7411.0583.0587.7437.0018 1.5953l-.001 20.783c.0585.8761.7125 1.543 1.5559 1.6191A.337.337 0 0 0 1.6016 24h20.7971a.4579.4579 0 0 0 .0437-.002c.8727-.0768 1.5568-.8271 1.5568-1.7085V1.7098c0-.8914-.696-1.6416-1.584-1.7078A.3294.3294 0 0 0 22.3781 0zm0 .496a1.2144 1.2144 0 0 1 1.1252 1.2139v20.5797c0 .6377-.4875 1.1602-1.1045 1.2145H1.6016c-.5967-.0543-1.0645-.5297-1.1053-1.1258V1.6284C.5371 1.0185 1.0184.5364 1.6217.496h20.7564zM4.7954 8.2603v7.3636H2.8899V8.2603h1.9055zm6.5367 0v7.3636H9.6707v-4.9704l-.6711 4.9704H7.813l-.6986-4.8618-.0066 4.8618h-1.668V8.2603h2.468c.0748.4476.1492.9694.2307 1.5734l.2712 1.8713.4407-3.4447h2.4817zm2.9772 1.3289c.0742.0404.122.108.1417.2034.0279.0953.0345.3118.0345.6442v2.8548c0 .4881-.0345.7867-.0955.8954-.0609.1152-.2304.1695-.5018.1695V9.5211c.204 0 .3457.0205.4211.0681zm-.0211 6.0347c.4543 0 .8006-.0265 1.0245-.0742.2304-.0477.4204-.1357.5694-.2648.1556-.1218.2642-.298.3251-.5219.0611-.2238.1021-.6648.1021-1.3224v-2.5832c0-.6986-.0271-1.1668-.0742-1.4039-.041-.237-.1431-.4543-.3126-.6437-.1695-.1973-.4198-.3324-.7456-.421-.3191-.0808-.8542-.1285-1.7694-.1285h-1.4244v7.3636h2.3051zm5.14-1.7827c0 .3523-.0199.5762-.0544.6708-.033.0947-.1894.1424-.3046.1424-.1086 0-.19-.0477-.2238-.1351-.041-.0887-.0609-.2986-.0609-.6238v-1.9469c0-.3324.0199-.5423.0543-.6237.0338-.0808.1086-.122.2171-.122.1153 0 .2709.0412.3114.1425.041.0947.0609.2986.0609.6032v1.8926zm-2.4747-5.5809v7.3636h1.7157l.1152-.4675c.1556.1894.3251.3324.5152.4271.1828.0881.4608.1357.678.1357.3047 0 .5629-.0748.7802-.237.2165-.1562.3589-.3462.4198-.5628.0543-.2173.0887-.543.0887-.9841v-2.0675c0-.4409-.0139-.7324-.0344-.8681-.0199-.1357-.0742-.2781-.1695-.4204-.1021-.1425-.2437-.251-.4272-.3325-.1834-.0742-.3999-.1152-.6576-.1152-.2172 0-.4952.0477-.6846.1285-.1835.0887-.353.2238-.5086.4007V8.2603h-1.8309z"/></svg>`,
@@ -891,15 +997,9 @@ const RATING_LOGOS = {
   douban: `<svg class="ext-logo" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="#2D963D" d="M.51 3.06h22.98V.755H.51V3.06Zm20.976 2.537v9.608h-2.137l-1.669 5.76H24v2.28H0v-2.28h6.32l-1.67-5.76H2.515V5.597h18.972Zm-5.066 9.608H7.58l1.67 5.76h5.501l1.67-5.76ZM18.367 7.9H5.634v5.025h12.733V7.9Z"/></svg>`,
 };
 
+/** 渲染外部评分徽章 HTML（IMDb / MC / RT / TMDB / Trakt / 豆瓣） */
 function renderExtRatings(r, opts = {}) {
   const out = [];
-  // 展示顺序按可靠性：IMDb → Metacritic → RT → TMDB → Trakt → 豆瓣
-  // 格式按各平台自身习惯：
-  //   IMDb       → 0–10，一位小数
-  //   Metacritic → 0–100 整数
-  //   RT         → 新鲜度百分比
-  //   TMDB       → User Score 百分比（vote_average × 10）
-  //   Trakt      → 百分比（API 多为 0–10，×10 取整）
   if (r && r.imdb != null)
     out.push(
       `<span class="ext-rating ext-imdb" title="IMDb ${r.imdb.toFixed(1)}/10">${RATING_LOGOS.imdb}<span class="ext-score">${r.imdb.toFixed(1)}</span></span>`,
@@ -933,11 +1033,6 @@ function renderExtRatings(r, opts = {}) {
 }
 
 // ═══ 通用构建 ═══
-
-// ═══════════════════════════════════════════════════════════════════════
-//  列表项构建 · 从 Trakt 对象抽出统一展示字段
-// ═══════════════════════════════════════════════════════════════════════
-
 /** 将 movie / show / episode 统一成卡片所需的 title/poster/enrichKey 等 */
 function buildBaseItem(traktItem) {
   const base = {
@@ -998,7 +1093,6 @@ function buildBaseItem(traktItem) {
   }
   return base;
 }
-/** 解析 enrichKey：movie|tv : tmdb|imdb|tvdb|title : value */
 function parseEnrichKey(key) {
   if (!key) return null;
   const i1 = key.indexOf(":");
@@ -1025,7 +1119,6 @@ function parseEnrichKey(key) {
   }
   return { kind, source, value: rest };
 }
-/** 按 enrichKey 查 TMDB，补中文标题/简介/海报（结果缓存） */
 async function enrichOne(key, env, ctx) {
   if (!env.TMDB_API_KEY) return null;
   const parsed = parseEnrichKey(key);
@@ -1084,7 +1177,6 @@ async function enrichOne(key, env, ctx) {
     { ttl: TMDB_KV_TTL, missTtl: 3600 },
   );
 }
-/** POST /api/enrich —— 批量补全列表项元数据（最多 80 条） */
 async function handleEnrich(request, env, ctx) {
   let body;
   try {
@@ -1122,12 +1214,6 @@ async function handleEnrich(request, env, ctx) {
 }
 
 // ═══ 待看列表 ═══
-
-// ═══════════════════════════════════════════════════════════════════════
-//  待看列表 · 拉取 / 缓存 / TMDB ID 集合
-// ═══════════════════════════════════════════════════════════════════════
-
-/** 直接请求 Trakt 合并 movies+shows 待看并排序 */
 async function fetchWatchlistRaw(headers, sort) {
   const qs = `extended=full&images=poster&sort=${encodeURIComponent(sort)}`;
   const [movies, shows] = await Promise.all([
@@ -1163,25 +1249,19 @@ async function fetchWatchlistRaw(headers, sort) {
   }
   return merged;
 }
-/** 带 KV 缓存的待看列表（按用户 + 排序维度缓存） */
 async function getWatchlist(headers, sort = "added", env, ctx, userKey) {
   if (!env) return fetchWatchlistRaw(headers, sort);
   const prefix = userKey || "anon";
+  const ver = await getWatchlistVersion(env, ctx, prefix);
   const data = await cachedJSON(
     env,
     ctx,
-    `wl:${prefix}:${sort}`,
+    `wl:${prefix}:${ver}:${sort}`,
     () => fetchWatchlistRaw(headers, sort),
-    {
-      ttl: WATCHLIST_KV_TTL,
-      missTtl: 60,
-      memOnly: false,
-    },
+    { ttl: WATCHLIST_KV_TTL, missTtl: 180, memOnly: false, swr: 90 },
   );
   return Array.isArray(data) ? data : [];
 }
-// 分页拉取整个 watchlist 的 TMDB ID 列表（最多 10 页 = 1000 条）
-/** 分页拉取待看条目的 TMDB ID（最多 10 页 × 100） */
 async function fetchAllWatchlistIds(headers, type) {
   const ids = [];
   let page = 1;
@@ -1216,31 +1296,20 @@ async function fetchAllWatchlistIds(headers, type) {
   }
   return ids;
 }
-// 带 KV 缓存的 watchlist TMDB ID 集合
-/** 带缓存的待看 TMDB ID 列表（用于详情页判断是否已在待看） */
 async function getWatchlistTmdbIds(headers, env, ctx, userKey, type) {
   const prefix = userKey || "anon";
+  const ver = await getWatchlistVersion(env, ctx, prefix);
   const data = await cachedJSON(
     env,
     ctx,
-    `wlids:${prefix}:${type}`,
+    `wlids:${prefix}:${ver}:${type}`,
     () => fetchAllWatchlistIds(headers, type),
-    {
-      ttl: WATCHLIST_KV_TTL,
-      missTtl: 60,
-      memOnly: false,
-    },
+    { ttl: WATCHLIST_KV_TTL, missTtl: 180, memOnly: false, swr: 90 },
   );
   return Array.isArray(data) ? data : [];
 }
 
 // ═══ 搜索 / 趋势 ═══
-
-// ═══════════════════════════════════════════════════════════════════════
-//  搜索 / 趋势
-// ═══════════════════════════════════════════════════════════════════════
-
-/** GET /api/search?q=&type= —— TMDB 搜索电影/剧集 */
 async function handleSearch(request, env) {
   const url = new URL(request.url),
     q = (url.searchParams.get("q") || "").trim(),
@@ -1291,7 +1360,6 @@ async function handleSearch(request, env) {
     headers: outHeaders,
   });
 }
-/** GET /api/trending —— TMDB 日趋势（缓存 TREND_KV_TTL） */
 async function handleTrending(request, env, ctx) {
   const a = await requireAuth(request, env);
   if (!a.ok) return unauthorizedJson();
@@ -1309,7 +1377,7 @@ async function handleTrending(request, env, ctx) {
       tmdbGet(
         `${TMDB_API}/trending/all/day?language=zh-CN&api_key=${env.TMDB_API_KEY}&page=${page}`,
       ),
-    { ttl: TREND_KV_TTL, missTtl: 300 },
+    { ttl: TREND_KV_TTL, missTtl: 300, swr: 600, edgeTtl: 600 },
   );
   const items = [];
   const results = data && Array.isArray(data.results) ? data.results : [];
@@ -1325,13 +1393,7 @@ async function handleTrending(request, env, ctx) {
   });
 }
 
-// ═══ 待看增删 ═══
-
-// ═══════════════════════════════════════════════════════════════════════
-//  待看增删 · 标记已看 / 取消 / 整季已看
-// ═══════════════════════════════════════════════════════════════════════
-
-/** POST /api/watchlist/add —— 支持 tmdbId 或 trakt id */
+// ═══ 待看增删 / 标记已看 ═══
 async function handleWatchlistAdd(request, env, ctx) {
   const a = await requireAuth(request, env);
   if (!a.ok) return unauthorizedJson();
@@ -1385,7 +1447,6 @@ async function handleWatchlistAdd(request, env, ctx) {
   const result = await r.json().catch(() => null);
   return authJson(auth, needsCookieUpdate, { ok: true, traktId, result });
 }
-/** POST /api/watchlist/remove */
 async function handleWatchlistRemove(request, env, ctx) {
   return traktSyncAction(request, env, {
     allowedTypes: ["movie", "show"],
@@ -1397,25 +1458,28 @@ async function handleWatchlistRemove(request, env, ctx) {
     },
   });
 }
-
-// ═══ 标记已看 ═══
-/** POST /api/mark-watched —— movie | episode */
 async function handleMarkWatched(request, env) {
   return traktSyncAction(request, env, {
     allowedTypes: ["movie", "episode"],
     endpoint: "/sync/history",
     buildPayload: (type, id) => traktSyncPayload(type, id),
+    afterOk: async (auth, headers) => {
+      const userKey = await getStableUserId(auth, headers);
+      bustHomeUserCaches(userKey);
+    },
   });
 }
-/** POST /api/unmark-watched */
 async function handleUnmarkWatched(request, env) {
   return traktSyncAction(request, env, {
     allowedTypes: ["movie", "episode"],
     endpoint: "/sync/history/remove",
     buildPayload: (type, id) => traktSyncPayload(type, id),
+    afterOk: async (auth, headers) => {
+      const userKey = await getStableUserId(auth, headers);
+      bustHomeUserCaches(userKey);
+    },
   });
 }
-/** POST /api/mark-season-watched —— 仅标记已播出的集 */
 async function handleMarkSeasonWatched(request, env) {
   const a = await requireAuth(request, env);
   if (!a.ok) return unauthorizedJson();
@@ -1461,6 +1525,8 @@ async function handleMarkSeasonWatched(request, env) {
     );
   }
   const result = await r.json().catch(() => null);
+  const userKey = await getStableUserId(auth, headers);
+  bustHomeUserCaches(userKey);
   return authJson(auth, needsCookieUpdate, {
     ok: true,
     marked: episodes.length,
@@ -1469,12 +1535,6 @@ async function handleMarkSeasonWatched(request, env) {
 }
 
 // ═══ 播出日历 ═══
-
-// ═══════════════════════════════════════════════════════════════════════
-//  播出日历（单剧）
-// ═══════════════════════════════════════════════════════════════════════
-
-/** GET /api/show-calendar?id=&tmdb= —— 返回各集首播日与中文标题 */
 async function handleShowCalendar(request, env, ctx) {
   const url = new URL(request.url),
     showId = url.searchParams.get("id"),
@@ -1547,26 +1607,14 @@ async function handleShowCalendar(request, env, ctx) {
     headers: respHeaders,
   });
 }
-
-// ═══ 首页 ═══
-
-// ═══════════════════════════════════════════════════════════════════════
-//  首页 · SSR 壳 + 客户端拉取 /api/home-data
-// ═══════════════════════════════════════════════════════════════════════
-
-/** 未登录 → 登录页；已登录 → SPA 壳（数据由 home-data 异步填充） */
-
-/**
- * GET /api/summary?period=month|year&ref=YYYY-MM|YYYY
- * 聚合指定月/年的观看历史，生成小结数据（带短时 KV 缓存）。
- */
+// ═══ 小结（Summary）═══
 async function handleSummary(request, env, ctx) {
   const a = await requireAuth(request, env);
   if (!a.ok) return unauthorizedJson();
   const { auth, headers, needsCookieUpdate } = a;
   const url = new URL(request.url);
   const period = url.searchParams.get("period") === "year" ? "year" : "month";
-  const now = new Date(Date.now() + 8 * 3600 * 1000); // Asia/Shanghai 近似
+  const now = new Date(Date.now() + 8 * 3600 * 1000);
   let ref = (url.searchParams.get("ref") || "").trim();
   if (period === "month") {
     if (!/^\d{4}-\d{2}$/.test(ref)) ref = now.toISOString().slice(0, 7);
@@ -1584,10 +1632,7 @@ async function handleSummary(request, env, ctx) {
   );
   return authJson(auth, needsCookieUpdate, data || { error: "empty" });
 }
-
-/** 计算 period 的起止时间（按东八区日历日） */
 function summaryRange(period, ref) {
-  // 用固定 +08:00 构造边界，避免服务器时区干扰
   if (period === "year") {
     const y = ref;
     return {
@@ -1605,14 +1650,16 @@ function summaryRange(period, ref) {
     label: `${y} 年 ${Number(m)} 月`,
   };
 }
-
-/** 拉取时间范围内的 history（movies+episodes），最多翻 8 页避免过重 */
 async function fetchHistoryRange(headers, start, end) {
   const out = [];
   const limit = 100;
   for (let page = 1; page <= 8; page++) {
     const qs = `extended=full&page=${page}&limit=${limit}&start_at=${encodeURIComponent(start)}&end_at=${encodeURIComponent(end)}`;
-    const r = await fetchT(`${TRAKT_API}/users/me/history?${qs}`, { headers }, 12000);
+    const r = await fetchT(
+      `${TRAKT_API}/users/me/history?${qs}`,
+      { headers },
+      12000,
+    );
     if (!r.ok) break;
     let batch;
     try {
@@ -1622,39 +1669,38 @@ async function fetchHistoryRange(headers, start, end) {
     }
     if (!Array.isArray(batch) || !batch.length) break;
     out.push(...batch);
-    const pageCount = parseInt(r.headers.get("X-Pagination-Page-Count") || "1") || 1;
+    const pageCount =
+      parseInt(r.headers.get("X-Pagination-Page-Count") || "1") || 1;
     if (page >= pageCount || batch.length < limit) break;
   }
   return out;
 }
-
 async function buildSummary(headers, period, ref, env, ctx) {
   const { start, end, label } = summaryRange(period, ref);
   const items = await fetchHistoryRange(headers, start, end);
-  const moviePlays = new Map(); // id -> { title, year, plays, minutes }
-  const showEpisodes = new Map(); // showId -> { title, episodes: Set, minutes }
-  const dayCount = new Map(); // YYYY-MM-DD -> count
+  const moviePlays = new Map();
+  const showEpisodes = new Map();
+  const dayCount = new Map();
   let totalMinutes = 0;
   let episodePlays = 0;
-
   for (const it of items) {
     if (!it) continue;
     const watchedAt = it.watched_at || "";
-    // 转东八区日期
     let day = "";
     if (watchedAt) {
       try {
         const d = new Date(watchedAt);
-        day = new Date(d.getTime() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+        day = new Date(d.getTime() + 8 * 3600 * 1000)
+          .toISOString()
+          .slice(0, 10);
       } catch {}
     }
     if (day) dayCount.set(day, (dayCount.get(day) || 0) + 1);
-
     if (it.type === "movie" || it.movie) {
       const m = it.movie || {};
       const traktId = m.ids && m.ids.trakt;
       const tmdbId = m.ids && m.ids.tmdb;
-      const id = traktId || tmdbId || m.ids && m.ids.imdb || m.title;
+      const id = traktId || tmdbId || (m.ids && m.ids.imdb) || m.title;
       if (!id) continue;
       const key = String(id);
       const runtime = Number(m.runtime) || 0;
@@ -1704,14 +1750,10 @@ async function buildSummary(headers, period, ref, env, ctx) {
       showEpisodes.set(key, prev);
     }
   }
-
-  // busiest day
   let busiest = null;
   for (const [d, n] of dayCount) {
     if (!busiest || n > busiest.count) busiest = { date: d, count: n };
   }
-
-  // TOP 列表（带 tmdb / trakt，便于中文名与点进详情）
   let topMovies = [...moviePlays.values()]
     .sort((a, b) => b.plays - a.plays || b.minutes - a.minutes)
     .slice(0, 8);
@@ -1727,8 +1769,6 @@ async function buildSummary(headers, period, ref, env, ctx) {
     }))
     .sort((a, b) => b.episodes - a.episodes || b.plays - a.plays)
     .slice(0, 8);
-
-  /** 拉取中文标题：TMDB zh-CN → 标题搜索兜底 */
   async function zhTitle(kind, item) {
     const fallback = item.title || "";
     if (!env || !env.TMDB_API_KEY) return fallback;
@@ -1741,7 +1781,6 @@ async function buildSummary(headers, period, ref, env, ctx) {
         const name = d && (d.title || d.name);
         if (name && name.trim()) return name.trim();
       }
-      // 无 tmdb 或无中文名时按原名搜索
       if (fallback) {
         const q = encodeURIComponent(fallback);
         const yp = item.year ? `&year=${item.year}` : "";
@@ -1796,13 +1835,9 @@ async function buildSummary(headers, period, ref, env, ctx) {
         ? "tmdb-" + s.tmdb
         : null,
   }));
-
-  // heatmap / chart points
   const days = [...dayCount.entries()]
     .sort((a, b) => a[0].localeCompare(b[0]))
     .map(([date, count]) => ({ date, count }));
-
-  // prev/next ref for navigation
   let prevRef = null,
     nextRef = null;
   if (period === "month") {
@@ -1816,7 +1851,6 @@ async function buildSummary(headers, period, ref, env, ctx) {
     prevRef = String(y - 1);
     nextRef = String(y + 1);
   }
-
   return {
     period,
     ref,
@@ -1842,7 +1876,7 @@ async function buildSummary(headers, period, ref, env, ctx) {
   };
 }
 
-
+// ═══ 首页 SSR 壳 ═══
 async function handleHome(request, env, ctx) {
   const url = new URL(request.url);
   let initialDetail = url.searchParams.get("d");
@@ -1854,7 +1888,6 @@ async function handleHome(request, env, ctx) {
   if (!cookieAuth) return html(renderLoginPage());
   return html(renderHomeShell(initialDetail));
 }
-/** 用户追剧日历（未来 30 天），按用户+日期缓存 */
 async function getCalendarCached(today, headers, env, ctx, userKey) {
   const prefix = userKey || "anon";
   return cachedJSON(
@@ -1872,10 +1905,17 @@ async function getCalendarCached(today, headers, env, ctx, userKey) {
       } catch {}
       return null;
     },
-    { ttl: CALENDAR_KV_TTL, missTtl: 60, memOnly: false },
+    { ttl: CALENDAR_KV_TTL, missTtl: 180, memOnly: false, swr: 180 },
   );
 }
-/** GET /api/home-data?part=primary|secondary —— 首页分片数据 */
+
+/**
+ * handleHomeData — 首页数据 API（支持分片）
+ * part=primary：profile + stats + playback（首屏关键）
+ * part=secondary：history + calendar + watchlist（次屏）
+ * · 内部 fetchJson 已接入 Trakt 全局冷却 + 随机抖动
+ * · 各处 missTtl 已提高，降低 KV 写入
+ */
 async function handleHomeData(request, env, ctx) {
   const a = await requireAuth(request, env);
   if (!a.ok)
@@ -1888,24 +1928,27 @@ async function handleHomeData(request, env, ctx) {
       .toISOString()
       .slice(0, 10),
     part = new URL(request.url).searchParams.get("part") || "all";
-  // 用 token 前缀作缓存键，避免首屏多一次 /users/me
   const userKey = await getStableUserId(auth, headers);
   const fetchJson = async (url, retries = 2) => {
+    // ✅ Trakt 全局冷却：冷却期直接短路，不打上游
+    if (isTraktRateLimited())
+      return { __error: "429 rate limited", __pageCount: 1 };
     for (let i = 0; i <= retries; i++) {
       try {
         const r = await fetchT(url, { headers }, 7000);
         if (r.status === 429) {
+          markTraktRateLimited();
           if (i < retries) {
-            await new Promise((res) =>
-              setTimeout(res, Math.min(800 * Math.pow(2, i), 4000)),
-            );
+            const jitter = Math.random() * 1000;
+            await sleep(Math.min(800 * Math.pow(2, i), 4000) + jitter);
             continue;
           }
           return { __error: "HTTP 429", __pageCount: 1 };
         }
         if (!r.ok) return { __error: `HTTP ${r.status}`, __pageCount: 1 };
         const data = await r.json(),
-          pageCount = parseInt(r.headers.get("X-Pagination-Page-Count") || "1");
+          pageCount =
+            parseInt(r.headers.get("X-Pagination-Page-Count") || "1") || 1;
         if (Array.isArray(data))
           Object.defineProperty(data, "__pageCount", {
             value: pageCount,
@@ -1914,7 +1957,7 @@ async function handleHomeData(request, env, ctx) {
         return data;
       } catch (e) {
         if (i === retries) return { __error: String(e), __pageCount: 1 };
-        await new Promise((res) => setTimeout(res, 400 * (i + 1)));
+        await sleep(400 * (i + 1) + Math.random() * 300);
       }
     }
   };
@@ -1924,11 +1967,10 @@ async function handleHomeData(request, env, ctx) {
       ctx,
       `prof:${userKey}:me`,
       async () => {
-        // extended=full 才能拿到头像；缓存 10 分钟
         const p = await fetchJson(`${TRAKT_API}/users/me?extended=full`);
         return p && !p.__error ? p : null;
       },
-      { ttl: 600, missTtl: 60 },
+      { ttl: 600, missTtl: 180, swr: 180 },
     );
   }
   const outHeaders = {
@@ -1953,7 +1995,6 @@ async function handleHomeData(request, env, ctx) {
     );
     tasks.push(
       (async () => {
-        // 统计缓存 5 分钟，减少首屏等待
         stats = await cachedJSON(
           env,
           ctx,
@@ -1962,15 +2003,21 @@ async function handleHomeData(request, env, ctx) {
             const s = await fetchJson(`${TRAKT_API}/users/me/stats`);
             return s && !s.__error ? s : null;
           },
-          { ttl: 300, missTtl: 60 },
+          { ttl: 300, missTtl: 180, swr: 120 },
         );
       })(),
     );
     tasks.push(
       (async () => {
-        // 首屏只需少量「继续观看」；完整列表可后续再扩
-        playback = await fetchJson(
-          `${TRAKT_API}/sync/progress/up_next_nitro?extended=full&images=poster&limit=20&intent=continuing`,
+        playback = await cachedJSON(
+          env,
+          ctx,
+          `pb:${userKey}`,
+          () =>
+            fetchJson(
+              `${TRAKT_API}/sync/progress/up_next_nitro?extended=full&images=poster&limit=20&intent=continuing`,
+            ),
+          { ttl: PLAYBACK_KV_TTL, missTtl: 60, swr: 30, unwrap: true },
         );
       })(),
     );
@@ -1978,8 +2025,15 @@ async function handleHomeData(request, env, ctx) {
   if (wantSecondary) {
     tasks.push(
       (async () => {
-        history = await fetchJson(
-          `${TRAKT_API}/users/me/history?limit=${PAGE_SIZE}&page=1&extended=full&images=poster`,
+        history = await cachedJSON(
+          env,
+          ctx,
+          `hist:${userKey}:p1`,
+          () =>
+            fetchJson(
+              `${TRAKT_API}/users/me/history?limit=${PAGE_SIZE}&page=1&extended=full&images=poster`,
+            ),
+          { ttl: HISTORY_KV_TTL, missTtl: 60, swr: 45, unwrap: true },
         );
       })(),
     );
@@ -2003,6 +2057,9 @@ async function handleHomeData(request, env, ctx) {
   await Promise.all(tasks);
   const result = { part };
   if (wantPrimary) {
+    if (profile && !profile.__error && profile.ids && profile.ids.trakt) {
+      rememberTraktUserId(auth, profile.ids.trakt);
+    }
     const username = (profile && !profile.__error && profile.username) || "我",
       displayName = (profile && !profile.__error && profile.name) || username,
       movieCount =
@@ -2033,7 +2090,6 @@ async function handleHomeData(request, env, ctx) {
     try {
       const pbList = Array.isArray(playback) ? playback : [];
       result.playbackHtml = renderContinueItems(pbList);
-      // 满页则可能还有下一页，展示「加载更多」
       result.playbackMoreHtml =
         pbList.length >= 20
           ? `<div class="load-more-wrap"><button class="load-more" data-page="2" onclick="loadMorePlayback(this)">加载更多</button></div>`
@@ -2082,7 +2138,6 @@ async function handleHomeData(request, env, ctx) {
   return new Response(JSON.stringify(result), { headers: outHeaders });
 }
 
-// ═══ 首页渲染 ═══
 /** 已登录首页 HTML 壳（含启动脚本） */
 function renderHomeShell(initialDetail) {
   const boot = initialDetail
@@ -2091,19 +2146,17 @@ function renderHomeShell(initialDetail) {
   return (
     pageHeadEarly() +
     renderHomeSkeleton(initialDetail) +
-    `<script>(function(){window.__splashT0=Date.now();window.__splashHidden=false;window.__hideSplash=function(force){if(window.__splashHidden)return;window.__splashHidden=true;var el=document.getElementById('splash');if(!el)return;var wait=force?0:Math.max(0,120-(Date.now()-(window.__splashT0||Date.now())));setTimeout(function(){el.classList.add('hide');setTimeout(function(){if(el&&el.parentNode)el.parentNode.removeChild(el);},280);},wait);};setTimeout(function(){if(window.__hideSplash)window.__hideSplash();},80);window.__primaryBoot=null;window.__primaryBootP=fetch('/api/home-data?part=primary',{credentials:'same-origin',cache:'no-store'}).then(function(r){if(r.status===401){location.href='/';return null;}if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){window.__primaryBoot=d;return d;}).catch(function(){return null;});function setHTML(sel,html){var el=typeof sel==='string'?document.querySelector(sel):sel;if(el)el.innerHTML=html||'';}function applyAvatar(url){if(!url)return;var av=document.getElementById('hero-avatar');if(!av)return;var img=document.createElement('img');img.src=url;img.alt='';img.width=56;img.height=56;img.decoding='async';img.onerror=function(){av.innerHTML='<span class="hero-avatar-ph">👤</span>';};av.innerHTML='';av.appendChild(img);}function __setUpdatedAt(){var el=document.getElementById('updated-at');if(!el)return;var d=new Date(),p=function(n){return(n<10?'0':'')+n;};el.textContent='更新于 '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());el.classList.remove('flash');void el.offsetWidth;el.classList.add('flash');}function applyPrimary(d){if(!d)return;var n=document.getElementById('hero-name');if(n&&d.name)n.textContent=d.name;applyAvatar(d.avatar);if(d.statsHtml)setHTML('#stats-box',d.statsHtml);if(d.playbackHtml)setHTML('#playback',d.playbackHtml+(d.playbackMoreHtml||''));__setUpdatedAt();if(window.__scheduleEnrich)window.__scheduleEnrich();}function applySecondary(d){if(!d)return;if(d.historyHtml)setHTML('#history .grid',d.historyHtml);if(d.historyMoreHtml!=null)setHTML('#history-more',d.historyMoreHtml);if(d.calendarHtml)setHTML('#calendar',d.calendarHtml);if(d.watchlistHtml)setHTML('#watchlist',d.watchlistHtml);if(window.__scheduleEnrich)window.__scheduleEnrich();}var __homeDataLoading=false;function fetchPart(part){return fetch('/api/home-data?part='+encodeURIComponent(part),{credentials:'same-origin',cache:'no-store'}).then(function(r){if(r.status===401){location.href='/';return null;}if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){if(!d)return null;if(d.login){location.reload();return null;}return d;});}function loadHomeData(opts){opts=opts||{};var silent=!!opts.silent;if(__homeDataLoading&&!silent)return;__homeDataLoading=true;__lastRefreshAt=Date.now();function onPrimary(d){if(!d)return;applyPrimary(d);if(!silent&&window.__hideSplash)window.__hideSplash(true);if(!silent&&window.__initialDetail){var s=window.__initialDetail,idx=s.indexOf('/');if(idx>0&&window.openDetail)openDetail(s.slice(0,idx),s.slice(idx+1),false);window.__initialDetail=null;}}var pPrimary;if(!silent&&window.__primaryBootP){pPrimary=window.__primaryBootP.then(function(d){window.__primaryBootP=null;if(d){onPrimary(d);return d;}return fetchPart('primary').then(onPrimary);}).catch(function(){return fetchPart('primary').then(onPrimary);});}else{pPrimary=fetchPart('primary').then(onPrimary);}pPrimary=pPrimary.catch(function(){if(!silent){setHTML('#playback','<div class="empty"><p>加载失败，请点击重试</p><p style="margin-top:12px"><button class="btn-ghost" onclick="location.reload()">重试</button></p></div>');if(window.__hideSplash)window.__hideSplash(true);}});var pSecondary=pPrimary.then(function(){return new Promise(function(res){var run=function(){fetchPart('secondary').then(function(d){applySecondary(d);res(d);}).catch(function(){if(!silent){setHTML('#history .grid','<div class="empty"><p>部分内容加载失败</p></div>');}res(null);});};if(window.requestIdleCallback)requestIdleCallback(run,{timeout:1200});else setTimeout(run,50);});});Promise.all([pPrimary,pSecondary]).then(function(){__homeDataLoading=false;});}var __refreshTick=0;function silentRefresh(){if(document.hidden)return;__refreshTick++;__lastRefreshAt=Date.now();fetchPart('primary').then(function(d){applyPrimary(d);}).catch(function(){});if(__refreshTick%2===0){var secActive=false;['watchlist','calendar','history'].forEach(function(id){var el=document.getElementById(id);if(el&&el.classList.contains('active'))secActive=true;});if(!secActive)fetchPart('secondary').then(function(d){applySecondary(d);}).catch(function(){});}}window.__refreshStats=silentRefresh;function startHomeData(){loadHomeData({silent:false});}if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',startHomeData);}else{startHomeData();}var REFRESH_MIN=${HOME_AUTO_REFRESH_MINUTES};var REFRESH_MS=(REFRESH_MIN>0?REFRESH_MIN:0)*60*1000;var __lastRefreshAt=Date.now();if(REFRESH_MS>0){setInterval(silentRefresh,REFRESH_MS);document.addEventListener('visibilitychange',function(){if(document.hidden)return;if(Date.now()-__lastRefreshAt>=REFRESH_MS)silentRefresh();});}})();<\/script>` +
+    `<script>(function(){window.__splashT0=Date.now();window.__splashHidden=false;window.__hideSplash=function(force){if(window.__splashHidden)return;window.__splashHidden=true;var el=document.getElementById('splash');if(!el)return;var wait=force?0:Math.max(0,120-(Date.now()-(window.__splashT0||Date.now())));setTimeout(function(){el.classList.add('hide');setTimeout(function(){if(el&&el.parentNode)el.parentNode.removeChild(el);},280);},wait);};setTimeout(function(){if(window.__hideSplash)window.__hideSplash();},80);window.__primaryBoot=null;window.__primaryBootP=fetch('/api/home-data?part=primary',{credentials:'same-origin',cache:'no-store'}).then(function(r){if(r.status===401){location.href='/';return null;}if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){window.__primaryBoot=d;return d;}).catch(function(){return null;});function setHTML(sel,html){var el=typeof sel==='string'?document.querySelector(sel):sel;if(el)el.innerHTML=html||'';}function applyAvatar(url){if(!url)return;var av=document.getElementById('hero-avatar');if(!av)return;var img=document.createElement('img');img.src=url;img.alt='';img.width=56;img.height=56;img.decoding='async';img.onerror=function(){av.innerHTML='<span class="hero-avatar-ph">👤</span>';};av.innerHTML='';av.appendChild(img);}function __setUpdatedAt(){var el=document.getElementById('updated-at');if(!el)return;var d=new Date(),p=function(n){return(n<10?'0':'')+n;};el.textContent='更新于 '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());el.classList.remove('flash');void el.offsetWidth;el.classList.add('flash');}function applyPrimary(d){if(!d)return;var n=document.getElementById('hero-name');if(n&&d.name)n.textContent=d.name;applyAvatar(d.avatar);if(d.statsHtml)setHTML('#stats-box',d.statsHtml);if(d.playbackHtml)setHTML('#playback',d.playbackHtml+(d.playbackMoreHtml||''));__setUpdatedAt();if(window.__scheduleEnrich)window.__scheduleEnrich();}function applySecondary(d){if(!d)return;if(d.historyHtml)setHTML('#history .grid',d.historyHtml);if(d.historyMoreHtml!=null)setHTML('#history-more',d.historyMoreHtml);if(d.calendarHtml)setHTML('#calendar',d.calendarHtml);if(d.watchlistHtml)setHTML('#watchlist',d.watchlistHtml);if(window.__scheduleEnrich)window.__scheduleEnrich();}var __homeDataLoading=false;function fetchPart(part){return fetch('/api/home-data?part='+encodeURIComponent(part),{credentials:'same-origin',cache:'no-store'}).then(function(r){if(r.status===401){location.href='/';return null;}if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){if(!d)return null;if(d.login){location.reload();return null;}return d;});}function loadHomeData(opts){opts=opts||{};var silent=!!opts.silent;if(__homeDataLoading&&!silent)return;__homeDataLoading=true;__lastRefreshAt=Date.now();function onPrimary(d){if(!d)return;applyPrimary(d);if(!silent&&window.__hideSplash)window.__hideSplash(true);if(!silent&&window.__initialDetail){var s=window.__initialDetail,idx=s.indexOf('/');if(idx>0&&window.openDetail)openDetail(s.slice(0,idx),s.slice(idx+1),false);window.__initialDetail=null;}}var pPrimary;if(!silent&&window.__primaryBootP){pPrimary=window.__primaryBootP.then(function(d){window.__primaryBootP=null;if(d){onPrimary(d);return d;}return fetchPart('primary').then(onPrimary);}).catch(function(){return fetchPart('primary').then(onPrimary);});}else{pPrimary=fetchPart('primary').then(onPrimary);}pPrimary=pPrimary.catch(function(){if(!silent){setHTML('#playback','<div class="empty"><p>请求过于频繁或网络异常，请稍后重试</p><p style="margin-top:12px"><button class="btn-ghost" onclick="location.reload()">重试</button></p></div>');if(window.__hideSplash)window.__hideSplash(true);}});var pSecondary=pPrimary.then(function(){return new Promise(function(res){var run=function(){fetchPart('secondary').then(function(d){applySecondary(d);res(d);}).catch(function(){if(!silent){setHTML('#history .grid','<div class="empty"><p>部分内容加载失败</p></div>');}res(null);});};if(window.requestIdleCallback)requestIdleCallback(run,{timeout:1200});else setTimeout(run,50);});});Promise.all([pPrimary,pSecondary]).then(function(){__homeDataLoading=false;});}var __refreshTick=0;function silentRefresh(){if(document.hidden)return;__refreshTick++;__lastRefreshAt=Date.now();fetchPart('primary').then(function(d){applyPrimary(d);}).catch(function(){});if(__refreshTick%2===0){var secActive=false;['watchlist','calendar','history'].forEach(function(id){var el=document.getElementById(id);if(el&&el.classList.contains('active'))secActive=true;});if(!secActive)fetchPart('secondary').then(function(d){applySecondary(d);}).catch(function(){});}}window.__refreshStats=silentRefresh;function startHomeData(){loadHomeData({silent:false});}if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',startHomeData);}else{startHomeData();}var REFRESH_MIN=${HOME_AUTO_REFRESH_MINUTES};var REFRESH_MS=(REFRESH_MIN>0?REFRESH_MIN:0)*60*1000;var __lastRefreshAt=Date.now();if(REFRESH_MS>0){setInterval(silentRefresh,REFRESH_MS);document.addEventListener('visibilitychange',function(){if(document.hidden)return;if(Date.now()-__lastRefreshAt>=REFRESH_MS)silentRefresh();});}})();<\/script>` +
     pageTail()
   );
 }
-/** 首页骨架 DOM（hero / stats / tabs / panes） */
 function renderHomeSkeleton(initialDetail) {
   const boot = initialDetail
     ? `<script>window.addEventListener('load',()=>{const s=${jsStr(initialDetail)},idx=s.indexOf('/');if(idx>0)openDetail(s.slice(0,idx),s.slice(idx+1),false);});<\/script>`
     : "";
   return `<div class="container"><header class="hero"><div class="hero-left"><button type="button" class="hero-avatar" id="hero-avatar" title="观看小结" aria-label="打开观看小结"><span class="hero-avatar-ph">👤</span></button><div class="hero-text"><h1 class="hero-name" id="hero-name">…</h1><p class="updated-at" id="updated-at"></p></div></div><div class="hero-actions"><button class="btn-action" onclick="location.reload()" title="刷新数据"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg><span>刷新</span></button><button class="btn-action" onclick="logout()" title="退出登录"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg><span>退出</span></button></div></header><div class="stats" id="stats-box">${renderStatsHtml(null)}</div><nav class="tabs"><button class="tab active" data-tab="playback">继续观看</button><button class="tab" data-tab="watchlist">待看列表</button><button class="tab" data-tab="calendar">追剧日历</button><button class="tab" data-tab="history">观看记录</button><button class="tab" data-tab="search">搜索</button></nav><section id="playback" class="pane active"><div class="pane-loading"><div class="spinner"></div></div></section><section id="watchlist" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="calendar" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="history" class="pane"><div class="grid"></div><div id="history-more"></div></section><section id="search" class="pane"><div class="search-bar"><input id="search-input" class="search-input" type="search" placeholder="搜索电影 / 剧集" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></div><div id="search-results" class="grid"></div></section></div><div id="summary-modal" class="summary-modal" style="display:none" role="dialog" aria-modal="true" aria-label="观看小结"><div class="summary-backdrop" onclick="window.__closeSummary()"></div><div class="summary-panel"><div class="summary-head"><h2 class="summary-title">观看小结</h2><button type="button" class="summary-close" onclick="window.__closeSummary()" aria-label="关闭">×</button></div><div id="summary-modal-body" class="summary-body"><div class="pane-loading"><div class="spinner"></div></div></div></div></div><div id="confirm-modal" class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title" style="display:none"><div class="confirm-backdrop"></div><div class="confirm-panel"><div class="confirm-icon" id="confirm-icon">?</div><div class="confirm-title" id="confirm-title"></div><div class="confirm-msg" id="confirm-msg"></div><div class="confirm-actions"><button class="confirm-btn confirm-cancel" id="confirm-cancel" type="button">取消</button><button class="confirm-btn confirm-ok" id="confirm-ok" type="button">确定</button></div></div></div><div id="modal" class="modal"><div class="modal-backdrop" onclick="closeDetail()"></div><div class="modal-panel"><div class="modal-body" id="modal-body"></div><button class="modal-close" onclick="closeDetail()" aria-label="关闭"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div></div><div id="show-cal-modal" class="show-cal-modal"><div class="show-cal-backdrop" onclick="closeShowCal()"></div><div class="show-cal-panel"><div class="show-cal-head"><div class="show-cal-name" id="show-cal-name"></div><button class="show-cal-close" onclick="closeShowCal()" aria-label="关闭">×</button></div><div class="show-cal-info" id="show-cal-info"></div><div class="show-cal-nav"><button onclick="calShiftMonth(-1)" aria-label="上个月">‹</button><div id="show-cal-month">—</div><button onclick="calShiftMonth(1)" aria-label="下个月">›</button></div><div class="show-cal-weekdays"><span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span></div><div class="show-cal-grid" id="show-cal-grid"></div><div class="show-cal-legend"><span class="legend-item"><i class="legend-dot legend-past"></i>已播出</span><span class="legend-item"><i class="legend-dot legend-today"></i>今天</span><span class="legend-item"><i class="legend-dot legend-future"></i>待播出</span></div><div class="show-cal-detail" id="show-cal-detail"></div></div></div><script src="/app.js?v=${APP_JS_VERSION}" defer><\/script>${boot}`;
 }
-
-/** 客户端全部交互逻辑（详情弹层、标记已看、搜索等） */
+/** 客户端交互脚本（详情弹层 / 标记已看 / 搜索 / 日历 / 小结等） */
 function getClientSideScripts() {
   return `function __esc(s){s=String(s==null?'':s);return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}function __confirm(opts){opts=opts||{};return new Promise(function(resolve){var modal=document.getElementById('confirm-modal');if(!modal){resolve(window.confirm(opts.message||opts.title||'确认操作'));return;}var iconEl=document.getElementById('confirm-icon'),titleEl=document.getElementById('confirm-title'),msgEl=document.getElementById('confirm-msg'),okBtn=document.getElementById('confirm-ok'),cancelBtn=document.getElementById('confirm-cancel'),backdrop=modal.querySelector('.confirm-backdrop');iconEl.className='confirm-icon'+(opts.tone?' '+opts.tone:'');iconEl.textContent=opts.icon||'?';titleEl.textContent=opts.title||'确认操作';msgEl.textContent=opts.message||'';msgEl.style.display=opts.message?'':'none';okBtn.textContent=opts.okText||'确定';cancelBtn.textContent=opts.cancelText||'取消';okBtn.className='confirm-btn confirm-ok'+(opts.tone==='danger'?' danger':'');var settled=false;function cleanup(){okBtn.removeEventListener('click',onOk);cancelBtn.removeEventListener('click',onCancel);backdrop.removeEventListener('click',onCancel);document.removeEventListener('keydown',onKey,true);modal.classList.remove('open');modal.style.display='none';}function finish(v){if(settled)return;settled=true;cleanup();resolve(v);}function onOk(){finish(true);}function onCancel(){finish(false);}function onKey(e){if(e.key==='Escape'){e.preventDefault();e.stopPropagation();finish(false);}}okBtn.addEventListener('click',onOk);cancelBtn.addEventListener('click',onCancel);backdrop.addEventListener('click',onCancel);document.addEventListener('keydown',onKey,true);modal.style.display='block';modal.classList.add('open');setTimeout(function(){try{okBtn.focus();}catch(err){}},40);});}window.__confirm=__confirm;function __fadeRemoveCard(card){if(!card)return;card.style.transition='opacity 0.25s ease, transform 0.25s ease';card.style.opacity='0';card.style.transform='scale(0.96)';setTimeout(function(){var day=card.closest('.day'),pane=card.closest('.pane');card.remove();if(day&&!day.querySelector('.item')){day.style.transition='opacity 0.2s ease';day.style.opacity='0';setTimeout(function(){if(day.parentNode)day.remove();__maybeShowEmpty(pane);if(window.__refreshStats)window.__refreshStats();},200);return;}__maybeShowEmpty(pane);if(window.__refreshStats)window.__refreshStats();},260);}function __maybeShowEmpty(pane){if(!pane)return;setTimeout(function(){if(pane.querySelector('.item'))return;if(pane.querySelector('.empty'))return;var grid=pane.querySelector('.grid');if(!grid)return;var pid=pane.id,txt='这里暂时没有内容';if(pid==='playback')txt='暂时没有继续观看的内容';else if(pid==='watchlist')txt='待看列表是空的';else if(pid==='calendar')txt='未来 30 天没有待播剧集';else if(pid==='history')txt='还没有观看记录';grid.innerHTML='<div class="empty"><p>'+txt+'</p></div>';},120);}document.querySelectorAll('.tab').forEach(t=>{t.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.pane').forEach(x=>x.classList.remove('active'));t.classList.add('active');var pane=document.getElementById(t.dataset.tab);if(pane)pane.classList.add('active');if(t.dataset.tab==='search'){setTimeout(function(){var inp=document.getElementById('search-input');if(inp)inp.focus();if(inp&&!inp.value.trim()&&window.__loadTrending)window.__loadTrending();},60);}});});async function logout(){if(!(await __confirm({icon:'🚪',title:'退出登录',message:'确定要退出当前 Trakt 账号吗？',okText:'退出',cancelText:'取消',tone:'warn'})))return;await fetch('/auth/logout',{method:'POST'});location.reload();}async function loadMoreHistory(btn){const page=parseInt(btn.dataset.page||'2');btn.disabled=true;btn.textContent='加载中…';try{const r=await fetch('/api/more?type=history&page='+page);if(!r.ok)throw new Error('HTTP '+r.status);const htmlText=await r.text();document.querySelector('#history .grid').insertAdjacentHTML('beforeend',htmlText);if(window.__scheduleEnrich)window.__scheduleEnrich();const hasMore=r.headers.get('X-Has-More')==='true';if(hasMore){btn.dataset.page=page+1;btn.disabled=false;btn.textContent='加载更多';}else{btn.textContent='已经到底啦';btn.disabled=true;btn.style.opacity='0.5';btn.style.cursor='default';}}catch(e){btn.textContent='加载失败，点击重试';btn.disabled=false;}}async function loadMorePlayback(btn){const page=parseInt(btn.dataset.page||'2');btn.disabled=true;btn.textContent='加载中…';try{const r=await fetch('/api/more?type=playback&page='+page);if(!r.ok)throw new Error('HTTP '+r.status);const htmlText=await r.text();const grid=document.querySelector('#playback .grid');if(grid)grid.insertAdjacentHTML('beforeend',htmlText);if(window.__scheduleEnrich)window.__scheduleEnrich();const hasMore=r.headers.get('X-Has-More')==='true';if(hasMore){btn.dataset.page=page+1;btn.disabled=false;btn.textContent='加载更多';}else{btn.textContent='已经到底啦';btn.disabled=true;btn.style.opacity='0.5';btn.style.cursor='default';}}catch(e){btn.textContent='加载失败，点击重试';btn.disabled=false;}}
 async function onWatchlistSortChange(sort){const grid=document.getElementById('watchlist-grid'),pane=document.getElementById('watchlist');if(grid)grid.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';const oldMore=pane?pane.querySelector('.load-more-wrap'):null;if(oldMore)oldMore.remove();try{const r=await fetch('/api/more?type=watchlist&page=1&sort='+encodeURIComponent(sort));if(!r.ok)throw new Error('HTTP '+r.status);const htmlText=await r.text();if(grid)grid.innerHTML=htmlText||emptyWatchlistInner();const hasMore=r.headers.get('X-Has-More')==='true';if(hasMore&&pane&&grid){const wrap=document.createElement('div');wrap.className='load-more-wrap';wrap.innerHTML='<button class="load-more" data-page="2" data-sort="'+sort+'" onclick="loadMoreWatchlist(this)">加载更多</button>';pane.appendChild(wrap);}if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){if(grid)grid.innerHTML='<div class="empty"><p>加载失败</p></div>';}}function emptyWatchlistInner(){return '<div class="empty"><p>待看列表是空的</p></div>';}async function loadMoreWatchlist(btn){const page=parseInt(btn.dataset.page||'2'),sort=btn.dataset.sort||(document.getElementById('wl-sort')&&document.getElementById('wl-sort').value)||'added';btn.disabled=true;btn.textContent='加载中…';try{const r=await fetch('/api/more?type=watchlist&page='+page+'&sort='+encodeURIComponent(sort));if(!r.ok)throw new Error('HTTP '+r.status);const htmlText=await r.text();const grid=document.getElementById('watchlist-grid');if(grid)grid.insertAdjacentHTML('beforeend',htmlText);if(window.__scheduleEnrich)window.__scheduleEnrich();const hasMore=r.headers.get('X-Has-More')==='true';if(hasMore){btn.dataset.page=page+1;btn.disabled=false;btn.textContent='加载更多';}else{btn.textContent='已经到底啦';btn.disabled=true;btn.style.opacity='0.5';btn.style.cursor='default';}}catch(e){btn.textContent='加载失败，点击重试';btn.disabled=false;}}document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-wl-remove-id]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.wlRemoveType,id=btn.dataset.wlRemoveId;if(!type||!id)return;const item=btn.closest('.item'),nameEl=item?item.querySelector('.name'):null,name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'🗑',title:'移除待看',message:'确定要把「'+(name||'该条目')+'」从待看列表移除吗？',okText:'移除',tone:'danger'})))return;const prevText=btn.textContent;btn.disabled=true;btn.textContent='…';try{const r=await fetch('/api/watchlist/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type,id})});if(!r.ok)throw new Error('HTTP '+r.status);__fadeRemoveCard(btn.closest('.item'));}catch(err){btn.disabled=false;btn.textContent=prevText;alert('移除失败：'+err.message);}},true);document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-watched-id]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.watchedType,id=btn.dataset.watchedId;if(!type||!id)return;const item=btn.closest('.item'),nameEl=item?item.querySelector('.name'):null,name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'✓',title:'标记为已观看',message:'确定要把「'+(name||'该条目')+'」标记为已观看吗？',okText:'标记',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{const r=await fetch('/api/mark-watched',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type,id})});if(!r.ok)throw new Error('HTTP '+r.status);__fadeRemoveCard(btn.closest('.item'));}catch(err){btn.disabled=false;btn.textContent=prev;alert('标记失败：'+err.message);}},true);document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-unwatch-id]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.unwatchType,id=btn.dataset.unwatchId;if(!type||!id)return;const item=btn.closest('.item'),nameEl=item?item.querySelector('.name'):null,name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'↺',title:'取消观看',message:'确定要取消「'+(name||'该条目')+'」的观看记录吗？',okText:'取消观看',tone:'warn'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{const r=await fetch('/api/unmark-watched',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type,id})});if(!r.ok)throw new Error('HTTP '+r.status);__fadeRemoveCard(btn.closest('.item'));}catch(err){btn.disabled=false;btn.textContent=prev;alert('取消失败：'+err.message);}},true);var __searchTimer=null,__searchSeq=0;function __renderSearchItem(it){var emoji=it.type==='movie'?'🎬':'📺';var poster=it.poster?'<img src="'+__esc(it.poster)+'" loading="lazy" alt="">':'<div class="poster-ph"><span>'+emoji+'</span></div>';var tag=it.type==='movie'?'电影':'剧集';var meta=tag+(it.year?' · '+__esc(String(it.year)):'');var ov=it.overview?'<div class="overview">'+__esc(it.overview)+'</div>':'';return '<div class="item clickable" data-detail-type="'+it.type+'" data-detail-id="tmdb-'+it.tmdbId+'" role="button" tabindex="0"><div class="poster">'+poster+'</div><div class="info"><div class="name-row"><span class="name">'+__esc(it.title)+'</span></div><div class="meta">'+meta+'</div>'+ov+'</div></div>';}async function __doSearch(q){var box=document.getElementById('search-results');if(!box)return;if(!q){__loadTrending();return;}var seq=++__searchSeq;box.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';try{var r=await fetch('/api/search?q='+encodeURIComponent(q));if(seq!==__searchSeq)return;if(!r.ok)throw new Error('HTTP '+r.status);var data=await r.json();if(seq!==__searchSeq)return;var items=(data&&data.items)||[];if(!items.length){box.innerHTML='<div class="empty"><p>没有找到相关结果</p></div>';return;}box.innerHTML=items.map(__renderSearchItem).join('');}catch(err){if(seq!==__searchSeq)return;box.innerHTML='<div class="empty"><p>搜索失败：'+__esc(err.message)+'</p></div>';}}var __trendingLoaded=false;async function __loadTrending(force){var box=document.getElementById('search-results');if(!box)return;var inp=document.getElementById('search-input');if(inp&&inp.value.trim())return;if(box.querySelector('.trending-head')&&!force)return;box.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';try{var r=await fetch('/api/trending');if(!r.ok)throw new Error('HTTP '+r.status);var data=await r.json();var items=(data&&data.items)||[];if(!items.length){box.innerHTML='<div class="empty"><p>暂无趋势内容</p></div>';return;}__trendingLoaded=true;box.innerHTML='<div class="trending-head">TMDB 今日趋势</div>'+items.map(__renderSearchItem).join('');}catch(err){box.innerHTML='<div class="empty"><p>趋势加载失败：'+__esc(err.message)+'</p></div>';}}window.__loadTrending=__loadTrending;(function(){var inp=document.getElementById('search-input');if(!inp)return;inp.addEventListener('input',function(){if(__searchTimer)clearTimeout(__searchTimer);var q=inp.value.trim();if(!q){__loadTrending();return;}__searchTimer=setTimeout(function(){__doSearch(q);},380);});inp.addEventListener('keydown',function(e){if(e.key==='Enter'){if(__searchTimer)clearTimeout(__searchTimer);var q=inp.value.trim();if(q)__doSearch(q);else __loadTrending(true);}});})();document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-wl-add-detail]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.wlAddDetailType,tmdbId=btn.dataset.wlAddDetail;if(!type||!tmdbId)return;const nameEl=document.querySelector('.detail-title');const name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'＋',title:'加入待看',message:'确定要把「'+(name||'该条目')+'」加入待看列表吗？',okText:'加入',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{const r=await fetch('/api/watchlist/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type,tmdbId})});if(!r.ok)throw new Error('HTTP '+r.status);const span=document.createElement('span');span.className='d-watchlist-badge';span.textContent='✓ 已在待看';btn.replaceWith(span);if(document.getElementById('watchlist-grid')&&typeof onWatchlistSortChange==='function'){const sort=(document.getElementById('wl-sort')&&document.getElementById('wl-sort').value)||'added';onWatchlistSortChange(sort);}if(window.__refreshStats)window.__refreshStats();}catch(err){btn.disabled=false;btn.textContent=prev;alert('加入失败：'+err.message);}},true);let modalLoadingId=0;async function openDetail(type,id,push=true){const modal=document.getElementById('modal'),body=document.getElementById('modal-body');if(!modal||!body)return;modal.classList.add('open');document.body.style.overflow='hidden';if(push&&location.pathname!=='/detail/'+type+'/'+id)history.pushState({detail:true},'','/detail/'+type+'/'+id);const reqId=++modalLoadingId;body.innerHTML='<div class="modal-loading"><div class="spinner"></div></div>';body.scrollTop=0;try{const r=await fetch('/api/detail?type='+encodeURIComponent(type)+'&id='+encodeURIComponent(id));if(reqId!==modalLoadingId)return;if(!r.ok)throw new Error('HTTP '+r.status);body.innerHTML=await r.text();}catch(e){if(reqId!==modalLoadingId)return;body.innerHTML='<div class="modal-error">加载失败</div>';}}function closeDetail(push=true){const modal=document.getElementById('modal');if(!modal)return;if(push&&location.pathname.startsWith('/detail/')){history.back();return;}modal.classList.remove('open');document.body.style.overflow='';}document.addEventListener('click',(e)=>{const el=e.target.closest('[data-detail-type]');if(!el)return;const t=el.dataset.detailType,i=el.dataset.detailId;if(!t||!i)return;if(e.target.closest('button,a,.ep-watch-btn,.d-mark-btn,.d-watchlist-btn'))return;e.preventDefault();openDetail(t,i);});document.addEventListener('click',(e)=>{const mb=document.getElementById('modal-body');if(!mb||!mb.contains(e.target))return;const inner=e.target.closest('.detail-hero');if(!inner)return;if(e.target.closest('button,a,.item,.episode,.season-head'))return;const rect=inner.getBoundingClientRect();const y=e.clientY-rect.top;if(y<70)closeDetail();},true);document.addEventListener('keydown',(e)=>{if(e.key!=='Escape')return;const sc=document.getElementById('show-cal-modal');if(sc&&sc.classList.contains('open')){closeShowCal();return;}closeDetail();});document.addEventListener('click',(e)=>{const head=e.target.closest('.season-head');if(!head)return;toggleSeason(head);});document.addEventListener('click',(e)=>{const ep=e.target.closest('.episode');if(!ep)return;const url=ep.dataset.traktUrl;if(!url)return;if(e.target.closest('.ep-watch-btn'))return;e.preventDefault();e.stopPropagation();window.open(url,'_blank','noopener');});async function toggleSeason(headEl){if(!headEl)return;const item=headEl.closest('.season-item');if(!item)return;const body=item.querySelector('.season-body');if(!body)return;if(item.classList.contains('open')){item.classList.remove('open');return;}item.classList.add('open');if(body.dataset.loaded)return;body.innerHTML='<div class="modal-loading" style="padding:24px"><div class="spinner"></div></div>';try{const r=await fetch('/api/season?show='+encodeURIComponent(headEl.dataset.show)+'&season='+encodeURIComponent(headEl.dataset.season)+'&tmdb='+encodeURIComponent(headEl.dataset.tmdb)+'&slug='+encodeURIComponent(headEl.dataset.slug||''));if(!r.ok)throw new Error('HTTP '+r.status);body.innerHTML=await r.text();body.dataset.loaded='1';}catch(e){body.innerHTML='<div class="modal-error" style="padding:20px">加载失败</div>';}}window.addEventListener('popstate',()=>{const path=location.pathname;if(path.startsWith('/detail/')){const parts=path.split('/').filter(Boolean);if(parts.length===3)openDetail(parts[1],parts[2],false);}else{closeDetail(false);}});const __prefetched=new Set();function __prefetchDetail(type,id){if(!type||!id)return;const key=type+'/'+id;if(__prefetched.has(key))return;if(__prefetched.size>=60){const first=__prefetched.values().next().value;if(first!==undefined)__prefetched.delete(first);}__prefetched.add(key);fetch('/api/detail?type='+encodeURIComponent(type)+'&id='+encodeURIComponent(id),{cache:'default'}).catch(()=>{});}document.addEventListener('touchstart',(e)=>{const el=e.target.closest('[data-detail-type]');if(el)__prefetchDetail(el.dataset.detailType,el.dataset.detailId);},{passive:true,capture:true});document.addEventListener('mouseover',(e)=>{const el=e.target.closest('[data-detail-type]');if(el)__prefetchDetail(el.dataset.detailType,el.dataset.detailId);},{passive:true});var __showCal={byDay:{},year:0,month:0};function __pad2(n){return(n<10?'0':'')+n;}function __escShowCal(s){s=String(s==null?'':s);return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}function __bjDay(iso){if(!iso)return '';var d=new Date(new Date(iso).getTime()+8*3600*1000);return d.getUTCFullYear()+'-'+__pad2(d.getUTCMonth()+1)+'-'+__pad2(d.getUTCDate());}function openShowCalendar(showId,showName,tmdbId){var modal=document.getElementById('show-cal-modal'),nameEl=document.getElementById('show-cal-name'),infoEl=document.getElementById('show-cal-info'),gridEl=document.getElementById('show-cal-grid'),detailEl=document.getElementById('show-cal-detail');if(!modal||!gridEl)return;var now=new Date();__showCal.year=now.getFullYear();__showCal.month=now.getMonth();__showCal.byDay={};modal.classList.add('open');nameEl.textContent=showName||'';infoEl.textContent='正在加载…';gridEl.innerHTML='<div class="modal-loading" style="grid-column:1/-1;padding:40px 10px"><div class="spinner"></div></div>';detailEl.innerHTML='';renderShowCal();var apiUrl='/api/show-calendar?id='+encodeURIComponent(showId);if(tmdbId)apiUrl+='&tmdb='+encodeURIComponent(tmdbId);fetch(apiUrl).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(data){if(data&&data.title)nameEl.textContent=data.title;var map={},eps=(data&&data.episodes)||[];for(var i=0;i<eps.length;i++){var ep=eps[i],day=__bjDay(ep.first_aired);if(!day)continue;if(!map[day])map[day]=[];map[day].push(ep);}__showCal.byDay=map;if(!eps.length){infoEl.textContent='暂无播出记录';}else{var keys=Object.keys(map).sort(),minLabel=keys[0].slice(0,7),maxLabel=keys[keys.length-1].slice(0,7);infoEl.textContent='共 '+keys.length+' 天有更新 · '+minLabel+' ~ '+maxLabel+'（点 ◀ ▶ 翻月）';}renderShowCal();}).catch(function(){infoEl.textContent='加载失败';gridEl.innerHTML='<div class="modal-error" style="grid-column:1/-1;padding:40px 10px">加载失败</div>';});}function closeShowCal(){var modal=document.getElementById('show-cal-modal');if(modal)modal.classList.remove('open');}function calShiftMonth(delta){var m=__showCal.month+delta,y=__showCal.year;while(m<0){m+=12;y--;}while(m>11){m-=12;y++;}__showCal.month=m;__showCal.year=y;renderShowCal();}function renderShowCal(){var titleEl=document.getElementById('show-cal-month'),gridEl=document.getElementById('show-cal-grid'),detailEl=document.getElementById('show-cal-detail');if(!titleEl||!gridEl)return;var y=__showCal.year,m=__showCal.month;titleEl.textContent=y+' 年 '+(m+1)+' 月';var firstDow=new Date(Date.UTC(y,m,1)).getUTCDay(),daysInMonth=new Date(Date.UTC(y,m+1,0)).getUTCDate(),todayStr=__bjDay(new Date().toISOString()),html='',i;for(i=0;i<firstDow;i++){html+='<div class="sc-day sc-empty"></div>';}for(var d=1;d<=daysInMonth;d++){var dayStr=y+'-'+__pad2(m+1)+'-'+__pad2(d),eps=__showCal.byDay[dayStr]||[],cls='sc-day';if(eps.length){if(dayStr===todayStr)cls+=' sc-has sc-today-day';else if(dayStr<todayStr)cls+=' sc-has sc-past';else cls+=' sc-has sc-future';}var badge=eps.length?'<span class="sc-badge">'+eps.length+'</span>':'';html+='<div class="'+cls+'" data-day="'+dayStr+'"><span class="sc-num">'+d+'</span>'+badge+'</div>';}gridEl.innerHTML=html;detailEl.innerHTML='';var days=gridEl.querySelectorAll('.sc-day[data-day]');for(var j=0;j<days.length;j++){(function(el){el.addEventListener('click',function(){var day=el.getAttribute('data-day'),arr=__showCal.byDay[day]||[];if(!arr.length)return;var all=gridEl.querySelectorAll('.sc-day');for(var q=0;q<all.length;q++)all[q].classList.remove('sc-active');el.classList.add('sc-active');var dh='';for(var e=0;e<arr.length;e++){var ep=arr[e];dh+='<div class="sc-ep"><span class="sc-ep-tag">S'+__pad2(ep.season)+'E'+__pad2(ep.number)+'</span><span class="sc-ep-title">'+__escShowCal(ep.title||'')+'</span></div>';}detailEl.innerHTML=dh;});})(days[j]);}}document.addEventListener('click',function(e){var btn=e.target.closest('[data-cal-show-id]');if(!btn)return;e.preventDefault();e.stopPropagation();openShowCalendar(btn.getAttribute('data-cal-show-id'),btn.getAttribute('data-cal-show-name')||'',btn.getAttribute('data-cal-show-tmdb')||'');},true);document.addEventListener('click',async(e)=>{const btn=e.target.closest('.ep-watch-btn');if(!btn)return;e.preventDefault();e.stopPropagation();const episodeId=btn.dataset.episodeId;if(!episodeId)return;if(!(await __confirm({icon:'✓',title:'标记本集已看',message:'确定要把这一集标记为已看吗？',okText:'标记',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{const r=await fetch('/api/mark-watched',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'episode',id:episodeId})});if(!r.ok)throw new Error('HTTP '+r.status);btn.textContent='✓';btn.classList.add('done');const parts=location.pathname.split('/').filter(Boolean);if(parts[0]==='detail'&&parts.length===3){setTimeout(()=>openDetail(parts[1],parts[2],false),400);}}catch(err){btn.disabled=false;btn.textContent=prev;alert('标记失败：'+err.message);}},true);document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-mark-movie]');if(!btn)return;e.preventDefault();e.stopPropagation();const id=btn.dataset.markMovie;if(!id)return;if(!(await __confirm({icon:'✓',title:'标记已观看',message:'确定要把这部电影标记为已观看吗？',okText:'标记',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{const r=await fetch('/api/mark-watched',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'movie',id})});if(!r.ok)throw new Error('HTTP '+r.status);btn.textContent='✓ 已标记';btn.classList.add('done');const parts=location.pathname.split('/').filter(Boolean);if(parts[0]==='detail'&&parts.length===3){setTimeout(()=>openDetail(parts[1],parts[2],false),400);}if(window.__refreshStats)window.__refreshStats();}catch(err){btn.disabled=false;btn.textContent=prev;alert('标记失败：'+err.message);}},true);document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-unmark-movie]');if(!btn)return;e.preventDefault();e.stopPropagation();const id=btn.dataset.unmarkMovie;if(!id)return;if(!(await __confirm({icon:'↺',title:'取消观看',message:'确定要取消这部电影的观看记录吗？',okText:'取消观看',tone:'warn'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{const r=await fetch('/api/unmark-watched',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'movie',id})});if(!r.ok)throw new Error('HTTP '+r.status);btn.textContent='已取消';const parts=location.pathname.split('/').filter(Boolean);if(parts[0]==='detail'&&parts.length===3){setTimeout(()=>openDetail(parts[1],parts[2],false),400);}if(window.__refreshStats)window.__refreshStats();}catch(err){btn.disabled=false;btn.textContent=prev;alert('取消失败：'+err.message);}},true);document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-mark-season-all]');if(!btn)return;e.preventDefault();e.stopPropagation();const showId=btn.dataset.markSeasonAll,season=btn.dataset.seasonNum;if(!showId||season==null)return;if(!(await __confirm({icon:'✓',title:'标记本季已看',message:'确定要把第 '+season+' 季所有已播出集数标记为已看吗？',okText:'标记',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{const r=await fetch('/api/mark-season-watched',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({showId,season})});if(!r.ok)throw new Error('HTTP '+r.status);btn.textContent='✓ 已标记';btn.classList.add('done');const parts=location.pathname.split('/').filter(Boolean);if(parts[0]==='detail'&&parts.length===3){setTimeout(()=>openDetail(parts[1],parts[2],false),400);}if(window.__refreshStats)window.__refreshStats();}catch(err){btn.disabled=false;btn.textContent=prev;alert('标记失败：'+err.message);}},true);let __enrichTimer=null;const __enrichPromises=new Map();function __scheduleEnrich(){if(__enrichTimer)return;__enrichTimer=setTimeout(__runEnrich,60);}window.__scheduleEnrich=__scheduleEnrich;async function __runEnrich(){__enrichTimer=null;const els=[...document.querySelectorAll('[data-enrich-key]')];if(!els.length)return;const byKey=new Map();for(const el of els){const k=el.dataset.enrichKey;if(!k)continue;if(!byKey.has(k))byKey.set(k,[]);byKey.get(k).push(el);el.removeAttribute('data-enrich-key');}if(!byKey.size)return;const needFetch=[];for(const[k,group]of byKey.entries()){const existing=__enrichPromises.get(k);if(existing){existing.then(d=>{if(d)group.forEach(el=>__applyEnrich(el,d));});}else{needFetch.push(k);}}if(!needFetch.length)return;const items=needFetch.map(k=>({key:k}));const batchPromise=fetch('/api/enrich',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items})}).then(r=>(r.ok?r.json():{})).catch(()=>({}));for(const k of needFetch){const perKey=batchPromise.then(data=>(data&&data[k])||null);__enrichPromises.set(k,perKey);perKey.then(d=>{if(d)byKey.get(k).forEach(el=>__applyEnrich(el,d));});}if(__enrichPromises.size>400){const arr=[...__enrichPromises.keys()];for(let i=0;i<200;i++)__enrichPromises.delete(arr[i]);}}function __applyEnrich(el,d){const posterBox=el.querySelector('.poster');if(posterBox&&d.poster){const cur=posterBox.querySelector('img, .poster-ph');if(cur&&cur.tagName==='IMG'){if(cur.src!==d.poster)cur.src=d.poster;}else if(cur){const img=document.createElement('img');img.src=d.poster;img.loading='lazy';img.alt='';cur.replaceWith(img);}}if(d.title){const nameEl=el.querySelector('.name');if(nameEl)nameEl.textContent=d.title;}if(d.overview){const info=el.querySelector('.info');if(info){let ov=info.querySelector('.overview');if(!ov){ov=document.createElement('div');ov.className='overview';const meta=info.querySelector('.meta');if(meta&&meta.nextSibling)info.insertBefore(ov,meta.nextSibling);else info.appendChild(ov);}ov.textContent=d.overview;}}}
@@ -2232,15 +2285,12 @@ document.addEventListener('keydown',function(e){
   if(e.key==='Escape'){var m=document.getElementById('summary-modal');if(m&&m.classList.contains('open'))window.__closeSummary();}
 });
 window.addEventListener('load',()=>{setTimeout(__runEnrich,200);});`;
-
 }
 
-/** 启动闪屏 HTML */
+// ═══ 通用渲染辅助 ═══
 function renderSplash() {
   return `<div id="splash" class="splash" style="position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;overflow:hidden;background:radial-gradient(circle at 50% 45%,#0a0a0a 0%,#000000 62%)"><div class="splash-glow"></div><div class="splash-inner"><div class="splash-logo"><img src="${SPLASH_LOGO}" alt="MineTrakt" width="96" height="96" style="display:block;filter:drop-shadow(0 0 22px rgba(125,157,212,.55))"></div><div class="splash-name">MineTrakt</div><div class="splash-bar"><div class="splash-bar-fill"></div></div></div></div>`;
 }
-
-/** 用户统计四宫格 HTML */
 function renderStatsHtml(s) {
   const movieCount = s ? s.movie : 0,
     showCount = s ? s.show : 0,
@@ -2280,13 +2330,7 @@ function renderStatsHtml(s) {
     .join("");
 }
 
-// ═══ 分页 ═══
-
-// ═══════════════════════════════════════════════════════════════════════
-//  分页 / 详情 / 分季 API
-// ═══════════════════════════════════════════════════════════════════════
-
-/** GET /api/more —— 历史或待看「加载更多」 */
+// ═══ 分页 API ═══
 async function handleMore(request, env, ctx) {
   const url = new URL(request.url),
     type = url.searchParams.get("type"),
@@ -2344,12 +2388,13 @@ async function handleMore(request, env, ctx) {
     } catch (e) {
       return new Response("", { status: 502 });
     }
-    if (!r || !r.ok) return new Response("", { status: (r && r.status) || 502 });
+    if (!r || !r.ok)
+      return new Response("", { status: (r && r.status) || 502 });
     const items = await r.json();
     const list = Array.isArray(items) ? items : [];
-    const pageCount = parseInt(r.headers.get("X-Pagination-Page-Count") || "0") || 0;
-    const hasMore =
-      pageCount > 0 ? page < pageCount : list.length >= limit;
+    const pageCount =
+      parseInt(r.headers.get("X-Pagination-Page-Count") || "0") || 0;
+    const hasMore = pageCount > 0 ? page < pageCount : list.length >= limit;
     const bodyHtml = renderContinueItems(list, true);
     const outHeaders = {
       "Content-Type": "text/html; charset=utf-8",
@@ -2382,8 +2427,7 @@ async function handleMore(request, env, ctx) {
   return new Response("", { status: 400 });
 }
 
-// ═══ 详情 ═══
-/** GET /api/detail —— 电影/剧集详情（进度、演员、推荐等） */
+// ═══ 详情 API ═══
 async function handleApiDetail(request, env, ctx) {
   const url = new URL(request.url),
     type = url.searchParams.get("type"),
@@ -2423,7 +2467,10 @@ async function handleApiDetail(request, env, ctx) {
         )
       : Promise.resolve(null),
     type === "movie"
-      ? traktGet(`${TRAKT_API}/sync/history/movies/${traktId}?limit=1`, headers)
+      ? traktGet(
+          `${TRAKT_API}/sync/history/movies/${traktId}?limit=1`,
+          headers,
+        )
       : Promise.resolve(null),
   ]);
   if (!entity || entity.__error)
@@ -2492,7 +2539,11 @@ async function handleApiDetail(request, env, ctx) {
   if (needSecondSeasonData || needTraktEpisodes) {
     const [secondSeasonData, traktSeasonData] = await Promise.all([
       needSecondSeasonData
-        ? tmdbDetailCached(`/tv/${tmdbId}/season/${initialSeasonNum}`, env, ctx)
+        ? tmdbDetailCached(
+            `/tv/${tmdbId}/season/${initialSeasonNum}`,
+            env,
+            ctx,
+          )
         : Promise.resolve(null),
       needTraktEpisodes
         ? traktGet(
@@ -2509,7 +2560,6 @@ async function handleApiDetail(request, env, ctx) {
     )
       initialTraktEpisodes = traktSeasonData.episodes;
   }
-  // 判断是否已在待看
   let inWatchlist = false;
   const wlTmdbId =
     type === "movie" ? tmdbData && tmdbData.id : entity.ids && entity.ids.tmdb;
@@ -2544,7 +2594,6 @@ async function handleApiDetail(request, env, ctx) {
   if (needsCookieUpdate) outHeaders["Set-Cookie"] = buildCookie(auth);
   return new Response(bodyHtml, { headers: outHeaders });
 }
-/** GET /api/season —— 单季分集列表 + 观看状态 */
 async function handleSeason(request, env, ctx) {
   const url = new URL(request.url),
     showId = url.searchParams.get("show"),
@@ -2592,12 +2641,6 @@ async function handleSeason(request, env, ctx) {
 }
 
 // ═══ 登录页 ═══
-
-// ═══════════════════════════════════════════════════════════════════════
-//  页面渲染 · 登录 / 列表卡片 / 详情 / 工具函数
-// ═══════════════════════════════════════════════════════════════════════
-
-/** Device Code 登录页 HTML */
 function renderLoginPage() {
   return pageShell(
     `<div class="login-wrap"><div class="login-card"><div class="login-logo"><img src="${ICON_192}" alt="MineTrakt" width="64" height="64" style="display:block;margin:0 auto"></div><h1 class="login-title">MineTrakt</h1><p class="login-sub">继续观看 · 待看列表 · 追剧日历 · 观看记录</p><div id="login-area" class="login-area"><button class="btn-primary" onclick="startLogin()">使用 Trakt 登录</button></div></div></div><script>async function startLogin(){const area=document.getElementById('login-area');area.innerHTML='<div class="spinner"></div>';let r;try{r=await fetch('/auth/device');}catch(e){area.innerHTML='<p class="err">网络错误: '+e+'</p>';return;}if(!r.ok){const err=await r.json().catch(()=>({}));area.innerHTML='<div class="err-box"><p class="err-title">获取设备码失败</p><p class="err">'+(err.error||('HTTP '+r.status))+'</p>'+(err.detail?'<pre class="err-detail">'+err.detail+'</pre>':'')+(err.hint?'<p class="hint">'+err.hint+'</p>':'')+'</div><button class="btn-primary" onclick="location.reload()">重试</button>';return;}const d=await r.json(),activateUrl='https://trakt.tv/activate',qr='https://api.qrserver.com/v1/create-qr-code/?size=220x220&color=4a6db8&bgcolor=ffffff&data='+encodeURIComponent(activateUrl);area.innerHTML='<div class="device-flow"><div class="steps"><div class="step"><span class="n">1</span><span>打开 <a href="'+activateUrl+'" target="_blank" rel="noopener">trakt.tv/activate</a></span></div><div class="step"><span class="n">2</span><span>输入代码</span></div></div><div class="code-box">'+d.user_code+'</div><div class="step"><span class="n">3</span><span>点击授权</span></div><div class="qr-box"><img src="'+qr+'" alt="QR"></div><p id="status" class="status"><span class="pulse"></span>等待授权中…</p></div><details class="log-details"><summary>调试日志</summary><div id="log" class="log-box"></div></details>';let interval=(d.interval||5)*1000,attempt=0;const logEl=document.getElementById('log'),log=(s)=>{if(logEl)logEl.innerHTML+='<div>['+new Date().toLocaleTimeString()+'] '+s+'</div>';};const tick=async()=>{attempt++;let r2;try{r2=await fetch('/auth/poll',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({state:d.state})});}catch(e){log('网络错误');setTimeout(tick,interval);return;}if(r2.status===200){document.getElementById('status').innerHTML='✓ 授权成功，正在刷新…';document.getElementById('status').className='status success';setTimeout(()=>location.reload(),400);return;}let text='';try{text=await r2.text();}catch{}let data={};try{data=JSON.parse(text);}catch{}log('HTTP '+r2.status+' · '+(data.status||'未知'));const st=document.getElementById('status');if(r2.status===202){if(data.status==='slow_down')interval+=2000;st.innerHTML='<span class="pulse"></span>等待授权中（第 '+attempt+' 次）';setTimeout(tick,interval);return;}st.textContent='HTTP '+r2.status+' · '+(data.status||data.detail||'未知');st.className='status error';if(r2.status===403||r2.status===410)return;setTimeout(tick,interval);};setTimeout(tick,1000);}<\/script>`,
@@ -2605,7 +2648,6 @@ function renderLoginPage() {
 }
 
 // ═══ 渲染辅助 ═══
-/** 从 Trakt images 字段取海报 URL */
 function posterOfTrakt(obj) {
   if (!obj || !obj.images) return null;
   const p = obj.images.poster;
@@ -2615,7 +2657,6 @@ function posterOfTrakt(obj) {
     return p[0].medium || p[0].thumb || p[0].full || null;
   return null;
 }
-/** 通用媒体卡片 HTML（海报 + 标题 + 可选进度条/操作按钮） */
 function mediaItem(opts) {
   const style =
       opts.delay != null ? ` style="animation-delay:${opts.delay}ms"` : "",
@@ -2652,7 +2693,6 @@ function mediaItem(opts) {
       : "";
   return `<div class="item${clickable}"${dataAttrs}${enrichAttrs}${style}>${removeHtml}${watchedHtml}${unwatchHtml}<div class="poster">${opts.poster ? `<img src="${opts.poster}" loading="lazy" alt="">` : `<div class="poster-ph"><span>${opts.tagClass === "movie" ? "🎬" : "📺"}</span></div>`}</div><div class="info"><div class="name-row"><span class="name">${esc(opts.title)}</span>${tagHtml}</div>${opts.line1 ? `<div class="meta">${esc(opts.line1)}</div>` : ""}${opts.overview ? `<div class="overview">${esc(opts.overview)}</div>` : ""}${opts.line2 ? `<div class="meta dim">${esc(opts.line2)}</div>` : ""}${bar}${calendarBtnHtml}</div></div>`;
 }
-/** 观看历史列表 HTML */
 function renderHistoryPage(items, env, isFragment) {
   if (isFragment === undefined) isFragment = false;
   if (!Array.isArray(items)) return isFragment ? "" : errBox("观看记录", items);
@@ -2689,7 +2729,6 @@ function renderHistoryPage(items, env, isFragment) {
     })
     .join("");
 }
-/** 待看列表排序工具条 */
 function watchlistToolbarHtml(currentSort) {
   const opts = [
       ["added", "按添加时间"],
@@ -2704,11 +2743,9 @@ function watchlistToolbarHtml(currentSort) {
       .join("");
   return `<div class="wl-toolbar"><label class="wl-sort-label">排序<select id="wl-sort" class="wl-sort" onchange="onWatchlistSortChange(this.value)">${options}</select></label></div>`;
 }
-/** 待看空状态 */
 function emptyWatchlistHtml() {
   return `<div class="empty"><svg viewBox="0 0 24 24" width="56" height="56" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.25"><circle cx="12" cy="12" r="10"/><path d="M12 8v8M8 12h8"/></svg><p>待看列表是空的</p><p style="font-size:0.82rem;color:#5a6474;margin-top:10px;line-height:1.6;text-align:center">去 Trakt 上把想看的电影 / 剧集加入 watchlist，这里就会显示</p></div>`;
 }
-/** 待看列表卡片们 */
 function renderWatchlistItems(items, env) {
   if (!Array.isArray(items) || !items.length) return "";
   return items
@@ -2740,7 +2777,6 @@ function renderWatchlistItems(items, env) {
     .filter(Boolean)
     .join("");
 }
-/** 继续观看（up-next）卡片们 */
 function renderContinueItems(upNext, isFragment = false) {
   const items = [];
   if (Array.isArray(upNext)) {
@@ -2759,6 +2795,10 @@ function renderContinueItems(upNext, isFragment = false) {
           source: "upnext",
           sortKey:
             entry.last_watched_at || entry.progress.last_watched_at || "",
+          showProgress: {
+            completed: Number(entry.progress.completed) || 0,
+            aired: Number(entry.progress.aired) || 0,
+          },
           raw: {
             type: "episode",
             show: entry.show,
@@ -2781,16 +2821,34 @@ function renderContinueItems(upNext, isFragment = false) {
   const parts = items.map((it, i) => {
     const delay = Math.min(i, 24) * 20,
       item = it.raw,
-      pct =
-        typeof item.progress === "number" ? Math.round(item.progress) : null,
       ep = item.episode || {},
       epTag =
         ep.season != null && ep.number != null
           ? `S${pad(ep.season)}E${pad(ep.number)}`
           : "",
-      subLine =
-        pct != null ? `已看 ${pct}%` : epTag ? `下一集 ${epTag}` : "下一集",
+      playPct =
+        typeof item.progress === "number" ? Math.round(item.progress) : null,
       e = buildBaseItem(item);
+    let barPct = playPct;
+    if (barPct == null && it.showProgress && it.showProgress.aired > 0) {
+      barPct = Math.max(
+        0,
+        Math.min(
+          100,
+          Math.round(
+            (it.showProgress.completed / it.showProgress.aired) * 100,
+          ),
+        ),
+      );
+    }
+    const subLine =
+      it.showProgress && it.showProgress.aired > 0
+        ? `已看 ${it.showProgress.completed} / ${it.showProgress.aired} 集`
+        : playPct != null
+          ? `已看 ${playPct}%`
+          : epTag
+            ? `下一集 ${epTag}`
+            : "下一集";
     let watchedType = null,
       watchedId = null;
     if (item.movie && item.movie.ids && item.movie.ids.trakt) {
@@ -2808,7 +2866,7 @@ function renderContinueItems(upNext, isFragment = false) {
       overview: e.overview,
       line1: e.line1,
       line2: subLine,
-      pct,
+      pct: barPct,
       delay,
       detailType: e.detailType,
       detailId: e.detailId,
@@ -2820,7 +2878,6 @@ function renderContinueItems(upNext, isFragment = false) {
   if (isFragment) return parts.join("");
   return `<div class="grid">${parts.join("")}</div>`;
 }
-/** 追剧日历按日分组 HTML */
 function renderCalendarPage(calendar, env, zhTitles) {
   if (!Array.isArray(calendar)) return errBox("追剧日历", calendar);
   if (!calendar.length) return emptyView("未来 30 天没有待播剧集");
@@ -2884,7 +2941,23 @@ function renderCalendarPage(calendar, env, zhTitles) {
 }
 
 // ═══ 详情片段 ═══
-/** 详情弹层主体 HTML（进度卡 + Trakt 风格操作栏 + 演员/分季/推荐） */
+function firstUnwatchedEpisode(userProgress) {
+  if (!userProgress || userProgress.__error) return null;
+  const ne = userProgress.next_episode;
+  if (ne && ne.season != null && ne.number != null) return ne;
+  const seasons = Array.isArray(userProgress.seasons)
+    ? userProgress.seasons
+    : [];
+  for (const s of seasons) {
+    if (!s || !(s.number > 0) || !Array.isArray(s.episodes)) continue;
+    for (const ep of s.episodes) {
+      if (ep && ep.number != null && !ep.completed) {
+        return { season: s.number, number: ep.number };
+      }
+    }
+  }
+  return null;
+}
 async function renderDetailFragment(d) {
   const type = d.type,
     entity = d.entity,
@@ -2941,7 +3014,6 @@ async function renderDetailFragment(d) {
       ? `${DOUBAN_SEARCH}?search_text=${encodeURIComponent(doubanQuery)}`
       : "";
   let statusHtml = "";
-  // --- progress / status (info only) ---
   if (isMovie) {
     if (movieWatched) {
       const playsPart = movieWatched.plays ? `${movieWatched.plays} 次 · ` : "";
@@ -2950,12 +3022,13 @@ async function renderDetailFragment(d) {
       statusHtml = `<div class="d-status"><div class="d-status-icon">○</div><div class="d-status-body"><div class="d-status-title">未观看</div><div class="d-status-sub">还没有在 Trakt 上标记</div></div></div>`;
     }
   } else if (userProgress && !userProgress.__error && userProgress.aired > 0) {
-    const pct = Math.round((userProgress.completed / userProgress.aired) * 100);
+    const pct = Math.round(
+      (userProgress.completed / userProgress.aired) * 100,
+    );
     statusHtml = `<div class="d-status done d-status-progress"><div class="d-status-row"><div class="d-status-icon">▶</div><div class="d-status-body"><div class="d-status-title">已看 ${userProgress.completed} / ${userProgress.aired} 集 · ${pct}%</div><div class="d-status-sub">${userProgress.last_watched_at ? "上次 " + fmtRelative(userProgress.last_watched_at) : ""}</div></div></div><div class="bar"><div class="bar-fill" style="width:${pct}%"></div></div></div>`;
   } else if (!isMovie) {
     statusHtml = `<div class="d-status"><div class="d-status-icon">○</div><div class="d-status-body"><div class="d-status-title">尚未观看</div><div class="d-status-sub">还没有观看记录</div></div></div>`;
   }
-  // --- Trakt-style compact action bar ---
   const iconCheck =
     '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="5 12.5 10 17.5 19 7"/></svg>';
   const iconBm =
@@ -2965,7 +3038,6 @@ async function renderDetailFragment(d) {
   const iconPlay =
     '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" stroke="none"><path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11.04-6.86a1 1 0 0 0 0-1.72L9.5 4.28A1 1 0 0 0 8 5.14z"/></svg>';
   let barBtns = "";
-  // watched toggle
   if (isMovie) {
     if (movieWatched)
       barBtns += `<button class="d-act d-act-watched active" type="button" data-unmark-movie="${esc(String(traktId))}" title="取消观看">${iconCheck}</button>`;
@@ -2982,41 +3054,21 @@ async function renderDetailFragment(d) {
     else
       barBtns += `<button class="d-act d-act-watched" type="button" data-mark-season-all="${esc(String(traktId))}" data-season-num="${initialSeasonNum}" title="标记本季已看">${iconCheck}</button>`;
   }
-  // watchlist
   if (wlTmdbId) {
     if (inWatchlist)
       barBtns += `<button class="d-act d-act-wl active" type="button" disabled title="已在待看">${iconBmFill}</button>`;
     else
       barBtns += `<button class="d-act d-act-wl" type="button" data-wl-add-detail="${esc(String(wlTmdbId))}" data-wl-add-detail-type="${isMovie ? "movie" : "show"}" title="加入待看">${iconBm}</button>`;
   }
-  // Infuse play
   let infuseHref = "";
-  if (isMovie && tmdb && tmdb.id) infuseHref = `infuse://movie/${tmdb.id}`;
-  else if (!isMovie && tmdb && tmdb.id) {
-    let ne =
-      userProgress && !userProgress.__error ? userProgress.next_episode : null;
-    if (
-      !ne &&
-      userProgress &&
-      !userProgress.__error &&
-      Array.isArray(userProgress.seasons)
-    ) {
-      outer: for (let i = userProgress.seasons.length - 1; i >= 0; i--) {
-        const s = userProgress.seasons[i];
-        if (!s || s.completed <= 0 || !Array.isArray(s.episodes)) continue;
-        for (let j = s.episodes.length - 1; j >= 0; j--) {
-          const ep = s.episodes[j];
-          if (ep && ep.completed) {
-            ne = { season: s.number, number: ep.number + 1 };
-            break outer;
-          }
-        }
-      }
-    }
-    const hasEp = ne && ne.season != null && ne.number != null;
-    infuseHref = hasEp
-      ? `infuse://series/${tmdb.id}-${ne.season}-${ne.number}`
-      : `infuse://series/${tmdb.id}`;
+  if (isMovie && tmdb && tmdb.id) {
+    infuseHref = `infuse://movie/${tmdb.id}`;
+  } else if (!isMovie && tmdb && tmdb.id) {
+    const ne = firstUnwatchedEpisode(userProgress);
+    infuseHref =
+      ne && ne.season != null && ne.number != null
+        ? `infuse://series/${tmdb.id}-${ne.season}-${ne.number}`
+        : `infuse://series/${tmdb.id}`;
   }
   if (infuseHref)
     barBtns += `<a class="d-act d-act-play" href="${esc(infuseHref)}" rel="noopener" title="在 Infuse 中查看">${iconPlay}</a>`;
@@ -3076,7 +3128,6 @@ async function renderDetailFragment(d) {
   }
   return `<div class="detail-wrap"><div class="detail-hero">${backdrop ? `<img class="detail-bg" src="${backdrop}" alt="">` : ""}<div class="detail-inner">${poster ? `<img class="detail-poster" src="${poster}" alt="">` : `<div class="detail-poster detail-poster-ph">${isMovie ? "🎬" : "📺"}</div>`}<div class="detail-info"><h1 class="detail-title">${esc(title)}</h1>${tagline ? `<div class="detail-tagline">${esc(tagline)}</div>` : ""}<div class="detail-meta">${year ? `<span>${esc(year)}</span>` : ""}${runtimeStr ? `<span>${esc(runtimeStr)}</span>` : ""}</div>${thirdParty || traktRating != null || tmdbRating != null || doubanUrl ? `<div class="detail-ext-ratings">${renderExtRatings(thirdParty, { trakt: traktRating, tmdb: tmdbRating, doubanUrl })}</div>` : ""}${genres ? `<div class="detail-genres">${esc(genres)}</div>` : ""}${overview ? `<p class="detail-overview">${esc(overview)}</p>` : ""}${statusHtml}${actionsHtml}</div></div></div><div class="detail-body">${castHtml ? `<section class="d-section"><h2 class="d-section-title">演员</h2><div class="cast-scroll">${castHtml}</div></section>` : ""}${seasonsHtml ? `<section class="d-section"><h2 class="d-section-title">季与集</h2>${seasonsHtml}</section>` : ""}${recsHtml ? `<section class="d-section"><h2 class="d-section-title">相关推荐</h2><div class="grid">${recsHtml}</div></section>` : ""}</div></div>`;
 }
-/** 单季分集列表 HTML（含已看标记与标记按钮） */
 function renderSeasonEpisodes(
   seasonProgress,
   tmdbSeason,
@@ -3126,7 +3177,6 @@ function renderSeasonEpisodes(
 }
 
 // ═══ 通用工具 ═══
-/** 通用空状态块 */
 function emptyView(opts) {
   if (typeof opts === "string") opts = { text: opts };
   const text = opts.text || "";
@@ -3134,16 +3184,9 @@ function emptyView(opts) {
     return `<div class="empty" style="color:#9db5e0;padding:80px 20px"><p style="margin:0;font-size:1rem">${esc(text)}</p></div>`;
   return `<div class="empty"><svg viewBox="0 0 24 24" width="56" height="56" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.25"><circle cx="12" cy="12" r="10"/><path d="M8 12h8M12 8v8"/></svg><p>${text}</p></div>`;
 }
-/** 调试用错误信息块 */
 function errBox(name, obj) {
   return `<div class="err-box"><p class="err-title">无法加载${name}</p><p class="err">${esc((obj && obj.__error) || "未知错误")}</p></div>`;
 }
-
-// ═══════════════════════════════════════════════════════════════════════
-//  工具 · PKCE / Base64URL / HTML 转义 / 相对时间
-// ═══════════════════════════════════════════════════════════════════════
-
-/** 生成随机字符串（PKCE code_verifier） */
 function randomString(len) {
   const cs =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~",
@@ -3153,13 +3196,11 @@ function randomString(len) {
   for (let i = 0; i < len; i++) s += cs[v[i] % cs.length];
   return s;
 }
-/** S256 code_challenge = BASE64URL(SHA256(verifier)) */
 async function pkceChallenge(verifier) {
   const data = new TextEncoder().encode(verifier),
     digest = await crypto.subtle.digest("SHA-256", data);
   return b64urlEncode(String.fromCharCode(...new Uint8Array(digest)), true);
 }
-/** Base64 URL-safe 编码 */
 function b64urlEncode(str, isBinary) {
   let bytes;
   if (isBinary) {
@@ -3172,7 +3213,6 @@ function b64urlEncode(str, isBinary) {
   for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
   return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
-/** Base64 URL-safe 解码为 UTF-8 字符串 */
 function b64urlDecode(str) {
   let b64 = str.replace(/-/g, "+").replace(/_/g, "/");
   const pad = b64.length % 4;
@@ -3182,7 +3222,6 @@ function b64urlDecode(str) {
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return new TextDecoder().decode(bytes);
 }
-/** HTML 属性/文本转义 */
 function esc(s) {
   return String(s == null ? "" : s)
     .replace(/&/g, "&amp;")
@@ -3191,18 +3230,15 @@ function esc(s) {
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
 }
-/** 安全嵌入 JS 字符串字面量 */
 function jsStr(s) {
   return JSON.stringify(String(s == null ? "" : s))
     .replace(/</g, "\\u003c")
     .replace(/\u2028/g, "\\u2028")
     .replace(/\u2029/g, "\\u2029");
 }
-/** 两位数补零（季/集编号） */
 function pad(n) {
   return String(n == null ? 0 : n).padStart(2, "0");
 }
-/** ISO 时间 → 相对中文描述（刚刚 / n 分钟前 / …） */
 function fmtRelative(iso) {
   if (!iso) return "";
   const d = new Date(iso),
@@ -3218,7 +3254,6 @@ function fmtRelative(iso) {
   if (day < 7) return day + " 天前";
   return d.toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" });
 }
-/** HTML Response（禁止缓存） */
 function html(body) {
   return new Response(body, {
     headers: {
@@ -3230,264 +3265,18 @@ function html(body) {
   });
 }
 
-// ═══ 页面 ═══
-
-// ═══════════════════════════════════════════════════════════════════════
-//  HTML 骨架 · head / tail / 全量 CSS
-// ═══════════════════════════════════════════════════════════════════════
-
-/** 文档 head + 闪屏；暗色主题与 PWA meta */
+// ═══ 页面骨架 ═══
 function pageHeadEarly() {
   return `<!DOCTYPE html><html lang="zh-CN" style="background:#000000"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1,user-scalable=no"><meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"><meta http-equiv="Pragma" content="no-cache"><meta name="color-scheme" content="dark"><meta name="theme-color" content="${THEME_COLOR}"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="${APP_SHORT_NAME}"><meta name="mobile-web-app-capable" content="yes"><meta name="format-detection" content="telephone=no"><title>${APP_NAME}</title><link rel="icon" href="${FAVICON_URL}" type="image/png"><link rel="apple-touch-icon" href="${APPLE_ICON}"><link rel="manifest" href="/manifest.webmanifest"><link rel="preconnect" href="https://api.trakt.tv" crossorigin><link rel="preconnect" href="https://api.themoviedb.org" crossorigin><link rel="preconnect" href="https://image.tmdb.org" crossorigin><link rel="stylesheet" href="/app.css?v=${APP_CSS_VERSION}"></head><body style="background:#000000;margin:0;min-height:100vh;min-height:100dvh">${renderSplash()}`;
 }
-/** 关闭闪屏脚本 + 注册 Service Worker */
 function pageTail() {
   return `<script>(function(){if(window.__hideSplash)window.__hideSplash(true);var s=document.getElementById('splash');if(s){s.classList.add('hide');setTimeout(function(){if(s&&s.parentNode)s.parentNode.removeChild(s);},380);}})();<\/script><script>(function(){if(!('serviceWorker' in navigator))return;if(window.__swRegistered)return;window.__swRegistered=true;var regSW=function(){navigator.serviceWorker.register('/sw.js',{scope:'/',updateViaCache:'none'}).catch(function(){});};if(document.readyState==='complete'){setTimeout(regSW,4000);}else{window.addEventListener('load',function(){setTimeout(regSW,4000);});}})();<\/script></body></html>`;
 }
-/** head + body + tail 完整页 */
 function pageShell(body) {
   return pageHeadEarly() + body + pageTail();
 }
 
-// ═══ CSS ═══
-/** 全站 CSS（暗色 UI、列表、详情、日历、操作栏等） */
+// ═══ CSS（压缩为单行） ═══
 function pageStyles() {
-  return `html,body{background:#000000!important;color:#eef1f7;margin:0;padding:0;min-height:100%;min-height:100dvh}*{box-sizing:border-box;margin:0;padding:0}
-.splash{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000;background:radial-gradient(circle at 50% 45%,#0a0a0a 0%,#000000 62%);transition:opacity .38s ease;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;-webkit-tap-highlight-color:transparent}
-.splash.hide{opacity:0;pointer-events:none}
-.splash-glow{position:absolute;width:340px;height:340px;border-radius:50%;background:radial-gradient(circle,rgba(125,157,212,.25) 0%,rgba(125,157,212,0) 70%);animation:splashPulse 2.4s ease-in-out infinite}
-.splash-inner{position:relative;z-index:1;display:flex;flex-direction:column;align-items:center;gap:20px}
-.splash-logo{color:#a8b2c4;animation:splashPop .75s cubic-bezier(.22,1.1,.36,1) both}
-.splash-logo img{display:block}
-.splash-name{font-size:1.35rem;font-weight:800;letter-spacing:.4px;background:linear-gradient(135deg,#fff 20%,#7d9dd4);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;animation:splashFadeUp .6s ease .28s both}
-.splash-bar{width:128px;height:3px;border-radius:99px;background:rgba(255,255,255,.08);overflow:hidden;animation:splashFadeUp .6s ease .45s both}
-.splash-bar-fill{height:100%;width:42%;border-radius:99px;background:#fff;animation:splashSlide 1.15s cubic-bezier(.65,0,.35,1) infinite}
-@keyframes splashPulse{0%,100%{transform:scale(.85);opacity:.7}50%{transform:scale(1.12);opacity:1}}
-@keyframes splashPop{0%{opacity:0;transform:scale(.55) rotate(-8deg)}60%{opacity:1;transform:scale(1.08) rotate(2deg)}100%{opacity:1;transform:scale(1) rotate(0)}}
-@keyframes splashFadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-@keyframes splashSlide{0%{transform:translateX(-130%)}100%{transform:translateX(330%)}}
-.spinner{width:30px;height:30px;border:3px solid #212735;border-top-color:#7d9dd4;border-radius:50%;animation:spin .8s linear infinite;margin:4px auto}
-@keyframes spin{to{transform:rotate(360deg)}}
-:root{--bg:#050505;--surface:#0e0e10;--surface-2:#16161a;--surface-3:#1c1c22;--border:rgba(255,255,255,0.08);--border-strong:rgba(255,255,255,0.14);--text:#f4f4f5;--text-dim:#a1a1aa;--text-mute:#71717a;--accent:#a78bfa;--accent-2:#c4b5fd;--accent-soft:rgba(167,139,250,0.12);--accent-glow:rgba(167,139,250,0.28);--success:#34d399;--blue:#c4b5fd;--radius-sm:10px;--radius-md:14px;--radius-lg:18px;--radius-xl:22px;--shadow-card:0 8px 32px rgba(0,0,0,0.55)}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;background:radial-gradient(ellipse 120% 70% at 50% -20%,#1a1528 0%,transparent 50%),radial-gradient(ellipse 50% 40% at 100% 0%,rgba(167,139,250,0.08) 0%,transparent 45%),radial-gradient(ellipse 40% 30% at 0% 100%,rgba(52,211,153,0.04) 0%,transparent 40%),#050505;background-attachment:fixed;color:var(--text);-webkit-font-smoothing:antialiased;line-height:1.5;overflow-x:hidden;overscroll-behavior-y:none}
-a{color:var(--accent-2);text-decoration:none;transition:color .15s}a:hover{color:#ddd6fe}img{display:block;max-width:100%}
-.container{max-width:1200px;margin:0 auto;padding:0 16px calc(80px + env(safe-area-inset-bottom))}
-.pane-loading{padding:60px 20px;text-align:center}
-.load-more-wrap{text-align:center;margin-top:24px}.load-more{background:var(--surface-2);border:1px solid var(--border);color:var(--text);padding:11px 32px;border-radius:var(--radius-md);font-size:.9rem;font-weight:600;cursor:pointer;transition:all .2s;font-family:inherit}.load-more:hover:not(:disabled){border-color:rgba(91,124,250,.45);color:var(--accent-2);box-shadow:0 4px 20px var(--accent-glow);background:var(--surface-3)}.load-more:disabled{cursor:not-allowed}
-.login-wrap{min-height:100vh;min-height:100dvh;display:flex;align-items:center;justify-content:center;padding:20px}.login-card{width:100%;max-width:440px;background:linear-gradient(165deg,#16161a 0%,#0e0e10 100%);border:1px solid var(--border-strong);border-radius:24px;padding:44px 32px;text-align:center;box-shadow:0 24px 64px rgba(0,0,0,.7),inset 0 1px 0 rgba(255,255,255,.05)}.login-logo{color:#a8b2c4;margin-bottom:16px}.login-title{font-size:1.75rem;font-weight:800;letter-spacing:-.5px;background:linear-gradient(135deg,#fff 20%,#7d9dd4);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:6px}.login-sub{color:var(--text-dim);font-size:.9rem;margin-bottom:28px}
-.btn-primary{background:linear-gradient(135deg,#7c3aed 0%,#a78bfa 100%);color:#fff;border:none;padding:13px 30px;border-radius:12px;font-size:.95rem;font-weight:700;cursor:pointer;box-shadow:0 6px 24px rgba(167,139,250,.35)}.btn-primary:hover{filter:brightness(1.08);transform:translateY(-1px)}
-.btn-ghost{background:rgba(255,255,255,.04);color:var(--text-dim);border:1px solid var(--border);padding:8px 16px;border-radius:10px;font-size:.85rem;cursor:pointer;transition:all .15s;font-family:inherit}.btn-ghost:hover{color:#fff;border-color:var(--border-strong);background:rgba(255,255,255,.08)}
-.steps{display:flex;flex-direction:column;gap:6px}.step{display:flex;align-items:center;gap:10px;text-align:left;padding:4px 0;font-size:.9rem}.step .n{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;background:var(--accent);color:#fff;border-radius:50%;font-size:.72rem;font-weight:700;flex-shrink:0}
-.code-box{font-family:ui-monospace,Menlo,monospace;font-size:1.75rem;font-weight:800;letter-spacing:6px;color:#a8c0e8;background:rgba(90,120,180,.12);border:1px solid rgba(140,170,220,.35);border-radius:14px;padding:14px;margin:14px 0;user-select:all;text-align:center}
-.qr-box{background:#fff;border-radius:14px;padding:10px;display:inline-block;margin:6px 0 14px}.qr-box img{border-radius:8px}
-.status{display:inline-flex;align-items:center;gap:8px;font-size:.88rem;padding:8px 16px;border-radius:20px;color:var(--text-dim);background:var(--surface-2)}.status.success{color:#4ade80;background:rgba(74,222,128,.1)}.status.error{color:#e05560;background:rgba(224,85,96,.12)}
-.pulse{display:inline-block;width:8px;height:8px;background:#7d9dd4;border-radius:50%;animation:pulse 1.4s ease-in-out infinite}
-@keyframes pulse{0%,100%{opacity:.35;transform:scale(.85)}50%{opacity:1;transform:scale(1.15)}}
-.err-box{background:rgba(224,85,96,.10);border:1px solid rgba(224,85,96,.28);border-radius:12px;padding:14px;text-align:left;margin-bottom:14px}.err-title{font-weight:600;color:#e05560;margin-bottom:4px;font-size:.92rem}.err{color:#e8a3ab;font-size:.85rem}.err-detail{font-family:ui-monospace,Menlo,monospace;font-size:.72rem;color:var(--text-dim);background:#000;padding:8px 10px;border-radius:6px;margin-top:8px;white-space:pre-wrap;word-break:break-all;max-height:120px;overflow:auto}.hint{color:var(--text-dim);font-size:.82rem;margin-top:6px}
-.log-details{margin-top:18px;text-align:left}.log-details summary{cursor:pointer;font-size:.76rem;color:var(--text-dim);padding:4px 0;user-select:none}.log-box{font-family:ui-monospace,Menlo,monospace;font-size:.7rem;color:var(--text-dim);background:#000;border:1px solid var(--border);border-radius:8px;padding:10px;max-height:160px;overflow:auto;margin-top:6px;line-height:1.6}
-.hero{display:flex;justify-content:space-between;align-items:center;padding:calc(20px + env(safe-area-inset-top)) 0 20px;gap:16px}.hero-left{display:flex;align-items:center;gap:12px;min-width:0}
-.hero-avatar{width:50px;height:50px;border-radius:50%;overflow:hidden;flex-shrink:0;background:var(--surface-2);border:2px solid rgba(167,139,250,.5);box-shadow:0 0 0 3px rgba(167,139,250,.12),0 4px 20px rgba(0,0,0,.5)}.hero-avatar img{width:100%;height:100%;object-fit:cover;display:block}
-.hero-avatar-ph{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:1.25rem;background:linear-gradient(135deg,#1a2233,#2a3a55)}
-.hero-text{min-width:0;flex:1;display:flex;flex-direction:column;align-items:flex-start;gap:1px}
-.hero-name{font-size:1.45rem;font-weight:800;letter-spacing:-.4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:linear-gradient(135deg,#fff 20%,#c4b5fd 90%);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
-.updated-at{font-size:.72rem;color:var(--text-mute);font-weight:400;letter-spacing:.2px;transition:color .4s ease}.updated-at:empty{display:none}.updated-at.flash{animation:updatedFlash 1.1s ease-out}
-@keyframes updatedFlash{0%{color:var(--accent-2)}100%{color:var(--text-mute)}}
-.hero-actions{display:flex;gap:8px;flex-shrink:0}
-.btn-action{display:inline-flex;align-items:center;gap:6px;background:rgba(255,255,255,.04);color:var(--text-dim);border:1px solid var(--border);padding:8px 14px;border-radius:10px;font-size:.82rem;font-weight:600;cursor:pointer;font-family:inherit;transition:all .18s ease;-webkit-tap-highlight-color:transparent}
-.btn-action svg{flex-shrink:0;transition:transform .25s ease}.btn-action:hover{color:#fff;border-color:var(--border-strong);background:rgba(167,139,250,.10);box-shadow:0 4px 16px rgba(167,139,250,.18)}.btn-action:hover svg{transform:rotate(180deg)}.btn-action:active{transform:scale(.97)}.btn-action:last-child:hover{background:rgba(224,85,96,.10);border-color:rgba(224,85,96,.35);box-shadow:0 4px 16px rgba(224,85,96,.15)}.btn-action:last-child:hover svg{transform:translateX(2px)}
-@media (max-width:420px){.btn-action span{display:none}.btn-action{padding:9px}.hero-actions{gap:6px}}
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;background:linear-gradient(165deg,#16161a 0%,#0e0e10 100%);border:1px solid var(--border);border-radius:var(--radius-lg);padding:18px 10px;margin-bottom:24px;box-shadow:var(--shadow-card),inset 0 1px 0 rgba(255,255,255,.04);position:relative;overflow:hidden}
-.stats::before{content:'';position:absolute;top:0;left:10%;right:10%;height:1px;background:linear-gradient(90deg,transparent,rgba(167,139,250,.35),transparent)}
-.stat{position:relative;text-align:center;display:flex;flex-direction:column;align-items:center;gap:2px;padding:6px 2px;border-radius:12px;transition:background .2s ease}.stat:hover{background:rgba(255,255,255,.025)}
-.stat+.stat::before{content:'';position:absolute;left:-4px;top:18%;bottom:18%;width:1px;background:linear-gradient(180deg,transparent,rgba(255,255,255,.08),transparent)}
-.stat-icon{width:30px;height:30px;border-radius:9px;display:flex;align-items:center;justify-content:center;margin-bottom:4px;transition:transform .25s ease,box-shadow .25s ease}.stat:hover .stat-icon{transform:translateY(-1px) scale(1.06)}
-.stat-movie .stat-icon{background:linear-gradient(135deg,rgba(167,139,250,.18),rgba(167,139,250,.06));color:#c4b5fd;box-shadow:0 4px 14px rgba(167,139,250,.18),inset 0 0 0 1px rgba(167,139,250,.18)}
-.stat-show .stat-icon{background:linear-gradient(135deg,rgba(96,165,250,.18),rgba(96,165,250,.06));color:#93c5fd;box-shadow:0 4px 14px rgba(96,165,250,.18),inset 0 0 0 1px rgba(96,165,250,.18)}
-.stat-episode .stat-icon{background:linear-gradient(135deg,rgba(52,211,153,.18),rgba(52,211,153,.06));color:#6ee7b7;box-shadow:0 4px 14px rgba(52,211,153,.18),inset 0 0 0 1px rgba(52,211,153,.18)}
-.stat-hours .stat-icon{background:linear-gradient(135deg,rgba(251,191,36,.18),rgba(251,191,36,.06));color:#fcd34d;box-shadow:0 4px 14px rgba(251,191,36,.18),inset 0 0 0 1px rgba(251,191,36,.18)}
-.stat-num{font-size:1.35rem;font-weight:800;letter-spacing:-.6px;line-height:1.15;background:linear-gradient(180deg,#fff 0%,#c4b5fd 100%);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
-.stat-label{font-size:.7rem;color:var(--text-mute);font-weight:500}
-.tabs{display:flex;gap:4px;margin-bottom:22px;position:sticky;top:0;z-index:10}
-.tab{flex:1 1 0;min-width:0;background:transparent;border:none;color:var(--text-dim);padding:9px 2px;border-radius:999px;font-size:.75rem;font-weight:600;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:center;transition:color .2s ease,background .2s ease;font-family:inherit;outline:none!important}
-.tab:hover{color:var(--text);background:rgba(255,255,255,.06)}.tab.active{background:linear-gradient(135deg,#7c3aed 0%,#a78bfa 100%);color:#fff;font-weight:700}
-.pane{display:none}.pane.active{display:block;animation:fadeIn .3s ease}@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
-.grid{display:flex;flex-direction:column;gap:10px}
-.item{position:relative;display:flex;gap:14px;background:linear-gradient(160deg,#141416 0%,#0e0e10 100%);border:1px solid var(--border);border-radius:var(--radius-lg);padding:12px;transition:transform .2s ease,border-color .2s,box-shadow .2s;animation:fadeInUp .4s ease backwards;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.35),inset 0 1px 0 rgba(255,255,255,.03);text-decoration:none;color:inherit}
-.item.clickable{cursor:pointer}.item.clickable:active{transform:scale(.985);background:var(--surface-2)}
-@keyframes fadeInUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
-.item:hover{border-color:rgba(167,139,250,.25);box-shadow:0 8px 28px rgba(0,0,0,.45),0 0 0 1px rgba(167,139,250,.08);transform:translateY(-1px)}
-.wl-remove,.wl-watched,.wl-unwatch{position:absolute;top:6px;right:6px;width:26px;height:26px;border-radius:50%;background:rgba(0,0,0,.65);line-height:1;cursor:pointer;z-index:3;display:flex;align-items:center;justify-content:center;padding:0;font-family:inherit;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);transition:background .15s,transform .15s,opacity .15s,color .15s}
-.wl-remove{color:#fff;border:1px solid rgba(255,255,255,.22);font-size:1rem;font-weight:400;opacity:.88}.wl-remove:hover{background:rgba(200,70,80,.92);opacity:1;transform:scale(1.06)}
-.wl-watched{color:#4ade80;border:1px solid rgba(74,222,128,.45);font-size:.85rem;font-weight:700;opacity:.9}.wl-watched:hover{background:rgba(74,222,128,.95);color:#000;opacity:1;transform:scale(1.06)}
-.wl-unwatch{color:#ffb84d;border:1px solid rgba(255,184,77,.45);font-size:.9rem;font-weight:700;opacity:.9}.wl-unwatch:hover{background:rgba(255,184,77,.95);color:#000;opacity:1;transform:scale(1.06)}
-.wl-remove:disabled,.wl-watched:disabled,.wl-unwatch:disabled{opacity:.5;cursor:wait}
-.wl-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-bottom:14px}.wl-sort-label{display:inline-flex;align-items:center;gap:8px;font-size:.82rem;color:var(--text-dim)}
-.wl-sort{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:7px 12px;border-radius:8px;font-size:.82rem;font-family:inherit;cursor:pointer;outline:none;transition:border-color .15s}.wl-sort:hover{border-color:#2a3345}.wl-sort:focus{border-color:#7d9dd4}
-.poster{width:76px;height:114px;border-radius:10px;overflow:hidden;flex-shrink:0;background:var(--surface-2);position:relative}.poster img{width:100%;height:100%;object-fit:cover}
-.poster-ph{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:1.8rem;background:linear-gradient(135deg,var(--surface-2),#1a2233);color:var(--text-dim)}
-.info{flex:1;min-width:0;display:flex;flex-direction:column;justify-content:center;gap:4px}
-.name-row{display:flex;align-items:baseline;gap:0;overflow:hidden;white-space:nowrap;line-height:1.3;letter-spacing:-.2px}
-.name{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:1rem;font-weight:700;color:var(--text)}
-.tag{flex:0 0 auto;font-size:inherit;font-weight:inherit;letter-spacing:0;white-space:nowrap}.tag.upcoming{color:#ffb84d}
-.overview{font-size:.8rem;color:var(--text-dim);overflow:hidden;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;line-height:1.45;margin-top:4px}
-.meta{font-size:.8rem;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.meta.dim{color:#7a8394;font-size:.78rem;margin-top:2px}
-.bar{height:3px;background:rgba(255,255,255,.06);border-radius:99px;overflow:hidden;margin-top:8px}.bar-fill{height:100%;background:linear-gradient(90deg,#7c3aed,#c4b5fd);border-radius:99px;box-shadow:0 0 10px rgba(167,139,250,.5)}
-.cal-open-btn{align-self:flex-start;margin-top:8px;background:rgba(90,120,180,.14);border:1px solid rgba(140,170,220,.35);color:#9db5e0;padding:5px 12px;border-radius:8px;font-size:.74rem;font-weight:600;cursor:pointer;font-family:inherit;transition:all .15s;display:inline-flex;align-items:center;gap:5px}
-.cal-open-btn:hover{background:rgba(120,150,210,.28);color:#c2d4f0;border-color:rgba(140,170,220,.65)}.cal-open-btn svg{flex-shrink:0}
-.cal-open-btn.wl-added{background:rgba(74,222,128,.14)!important;border-color:rgba(74,222,128,.38)!important;color:#4ade80!important;cursor:default!important}
-.search-bar{margin-bottom:16px}
-.search-input{width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:12px 16px;border-radius:12px;font-size:.95rem;font-family:inherit;outline:none;transition:border-color .15s,background .15s;-webkit-appearance:none;appearance:none}
-.search-input:focus{border-color:var(--accent);background:var(--surface-2);box-shadow:0 0 0 3px var(--accent-soft)}.search-input::placeholder{color:var(--text-mute)}
-.trending-head{display:flex;align-items:center;gap:8px;font-size:.88rem;font-weight:700;color:var(--text);margin:4px 0 14px;padding-left:2px;letter-spacing:.2px}
-.trending-head::before{content:'';width:3px;height:14px;border-radius:2px;background:linear-gradient(180deg,#f97316,#ef4444)}
-.show-cal-modal{position:fixed;inset:0;z-index:130;display:none}.show-cal-modal.open{display:block}
-.show-cal-backdrop{position:absolute;inset:0;background:rgba(2,4,8,.78);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);animation:fadeIn .2s ease}
-.show-cal-panel{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:min(92vw,440px);max-height:90vh;overflow-y:auto;background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:20px;box-shadow:0 30px 80px rgba(0,0,0,.8);animation:modalIn .25s cubic-bezier(.2,.9,.3,1)}
-.show-cal-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}
-.show-cal-name{font-size:.95rem;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
-.show-cal-close{width:32px;height:32px;flex-shrink:0;background:rgba(255,255,255,.04);border:1px solid var(--border);color:var(--text-dim);border-radius:50%;cursor:pointer;font-size:1.1rem;line-height:1;display:flex;align-items:center;justify-content:center;transition:all .15s;font-family:inherit}.show-cal-close:hover{color:var(--text);border-color:#3a4a68}
-.show-cal-info{font-size:.72rem;color:var(--text-dim);margin-bottom:12px;line-height:1.4}
-.show-cal-nav{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;font-size:.88rem;color:var(--text);font-weight:600}
-.show-cal-nav button{width:30px;height:30px;background:rgba(255,255,255,.04);border:1px solid var(--border);color:var(--text-dim);border-radius:8px;cursor:pointer;font-size:1rem;line-height:1;display:flex;align-items:center;justify-content:center;transition:all .15s;font-family:inherit}.show-cal-nav button:hover{color:var(--text);border-color:#3a4a68}
-.show-cal-weekdays{display:grid;grid-template-columns:repeat(7,1fr);text-align:center;font-size:.7rem;color:var(--text-dim);margin-bottom:6px}
-.show-cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:4px}
-.sc-day{position:relative;aspect-ratio:1;display:flex;align-items:center;justify-content:center;border-radius:8px;font-size:.8rem;color:var(--text-dim);cursor:default;border:1px solid transparent;transition:background .15s,border-color .15s}.sc-day.sc-has{cursor:pointer;font-weight:700}
-.sc-day.sc-past{background:rgba(90,120,180,.22);color:#9db0d0;border-color:rgba(120,150,210,.5)}.sc-day.sc-past:hover{background:rgba(120,150,210,.4);color:#d0dcf0}
-.sc-day.sc-today-day{background:#4a6db8;color:#fff;border-color:#7d9dd4;box-shadow:0 0 14px rgba(125,157,212,.7)}.sc-day.sc-today-day:hover{background:#5b7fc4}
-.sc-day.sc-future{background:rgba(255,184,77,.18);color:#ffd693;border-color:rgba(255,184,77,.55)}.sc-day.sc-future:hover{background:rgba(255,184,77,.4);color:#fff0d0}
-.sc-day.sc-active{outline:2px solid #fff;outline-offset:-2px}.sc-day.sc-empty{visibility:hidden}
-.sc-badge{position:absolute;top:2px;right:2px;min-width:14px;height:14px;padding:0 3px;border-radius:7px;background:#4a6db8;color:#fff;font-size:.6rem;font-weight:700;line-height:14px;text-align:center}.sc-day.sc-future .sc-badge{background:#d99a3a}
-.show-cal-legend{display:flex;flex-wrap:wrap;gap:12px;justify-content:center;margin-top:14px;font-size:.7rem;color:var(--text-dim)}.legend-item{display:inline-flex;align-items:center;gap:5px}.legend-dot{display:inline-block;width:10px;height:10px;border-radius:3px}
-.legend-past{background:rgba(90,120,180,.5);border:1px solid rgba(140,170,220,.8)}.legend-today{background:#4a6db8;border:1px solid #7d9dd4}.legend-future{background:rgba(255,184,77,.4);border:1px solid rgba(255,184,77,.8)}
-.show-cal-detail{margin-top:14px;border-top:1px solid var(--border);padding-top:12px;min-height:20px}
-.sc-ep{display:flex;gap:10px;align-items:baseline;padding:6px 0;font-size:.82rem}.sc-ep-tag{font-family:ui-monospace,Menlo,monospace;font-size:.72rem;font-weight:700;color:#7d9dd4;flex-shrink:0}.sc-ep-title{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.ext-rating{display:inline-flex;align-items:center;gap:6px;padding:4px 10px 4px 8px;border-radius:8px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);line-height:1;font-size:.82rem;color:var(--text);white-space:nowrap;text-decoration:none;transition:background .15s,border-color .15s,transform .12s}
-.ext-rating:hover{background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.16)}
-.ext-logo{display:block;flex-shrink:0;border-radius:2px}
-.ext-score{font-weight:800;letter-spacing:.2px;font-variant-numeric:tabular-nums}
-.ext-rating.ext-imdb{background:rgba(245,197,24,.14);border-color:rgba(245,197,24,.35);color:#f5c518}
-.ext-rating.ext-imdb .ext-score{color:#f5c518}
-.ext-rating.ext-rt{background:rgba(250,50,10,.12);border-color:rgba(250,50,10,.32);color:#ff7666}
-.ext-rating.ext-rt .ext-score{color:#ff7666}
-.ext-rating.ext-mc{background:rgba(255,255,255,.05);border-color:rgba(255,255,255,.12);color:var(--text)}
-.ext-rating.ext-trakt{background:rgba(237,28,36,.12);border-color:rgba(237,28,36,.32);color:#ff6b70}
-.ext-rating.ext-trakt .ext-score{color:#ff6b70}
-.ext-rating.ext-tmdb{background:rgba(1,180,228,.12);border-color:rgba(1,180,228,.32);color:#4dd0e1}
-.ext-rating.ext-tmdb .ext-score{color:#4dd0e1}
-.ext-rating.ext-douban{background:rgba(46,150,61,.12);border-color:rgba(46,150,61,.38);color:#4ecb71}
-.ext-rating.ext-douban:hover{background:rgba(46,150,61,.22);border-color:rgba(46,150,61,.6);color:#6fe089}
-.detail-ext-ratings{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:8px;align-items:center}
-@media (min-width:600px){.container{padding-left:20px;padding-right:20px}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}.item{border-radius:14px}.poster{width:72px;height:108px}}
-@media (min-width:768px){.container{max-width:1000px;padding:0 28px calc(88px + env(safe-area-inset-bottom))}.hero{padding:28px 0 22px;gap:12px}.hero-avatar{width:56px;height:56px}.hero-name{font-size:1.55rem}.stats{gap:10px;padding:18px 12px;margin-bottom:24px}.stat-num{font-size:1.5rem}.stat-label{font-size:.76rem}.stat-icon{width:34px;height:34px;border-radius:10px}.tabs{position:static}.tab{flex:0 0 auto;padding:9px 18px;font-size:.87rem}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:16px}.item{display:flex;flex-direction:column;gap:0;padding:0;border-radius:12px;background:transparent;border:none;overflow:visible}.item:hover{background:transparent;border:none}.item.clickable:active{transform:none;background:transparent}.poster{width:100%;height:auto;aspect-ratio:2/3;border-radius:12px;transition:transform .25s ease,box-shadow .25s ease;box-shadow:0 4px 16px rgba(0,0,0,.5)}.item:hover .poster{transform:translateY(-4px);box-shadow:0 12px 32px rgba(91,124,250,.3),0 4px 16px rgba(0,0,0,.6)}.info{display:block;padding:10px 2px 0;flex:none;justify-content:flex-start}.name{font-size:.88rem}.overview{-webkit-line-clamp:2;font-size:.74rem;margin-top:4px}.meta{font-size:.76rem;margin-top:3px}.meta.dim{font-size:.72rem}.bar{margin-top:8px}.wl-remove,.wl-watched,.wl-unwatch{top:8px;right:8px;width:28px;height:28px}.day-num{font-size:1.6rem}}
-@media (min-width:1024px){.container{max-width:1120px;padding:0 32px 100px}.hero{padding:36px 0 26px}.hero-name{font-size:1.7rem}.stats{gap:12px;padding:20px 14px;margin-bottom:28px}.stat-num{font-size:1.7rem}.stat-label{font-size:.78rem}.stat-icon{width:36px;height:36px}.grid{grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:20px}.name{font-size:.9rem}.overview{-webkit-line-clamp:3;font-size:.76rem}.wl-remove,.wl-watched,.wl-unwatch{top:10px;right:10px;width:30px;height:30px}.wl-watched,.wl-unwatch{font-size:.95rem}}
-@media (min-width:1280px){.container{max-width:1280px;padding:0 40px 110px}.grid{grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:22px}.hero-name{font-size:1.85rem}}
-@media (min-width:1600px){.container{max-width:1440px}.grid{grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:24px}}
-.day{margin-bottom:26px}.day-head{display:flex;align-items:center;gap:12px;margin-bottom:12px;padding-left:2px}.day-num{font-size:1.8rem;font-weight:800;color:#7d9dd4;line-height:1;letter-spacing:-1px}.day-mon{font-size:.75rem;color:var(--text-dim)}.day-wd{font-size:.85rem;font-weight:600;color:var(--text)}.today{background:var(--accent);color:#fff;font-size:.68rem;padding:3px 9px;border-radius:999px;font-weight:700;margin-left:auto}
-.empty{text-align:center;padding:80px 20px;color:var(--text-dim)}.empty p{margin-top:14px;font-size:.92rem}
-@media (min-width:700px){.empty{padding:120px 20px}}
-.modal{position:fixed;inset:0;z-index:100;display:none}.modal.open{display:block}
-.modal-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.75);backdrop-filter:blur(12px) saturate(1.1);-webkit-backdrop-filter:blur(12px) saturate(1.1);animation:fadeIn .2s ease}
-.modal-panel{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:12px;padding-top:calc(12px + env(safe-area-inset-top));padding-bottom:calc(12px + env(safe-area-inset-bottom));pointer-events:none}
-.modal-body{pointer-events:auto;position:relative;width:100%;max-width:min(880px,100%);max-height:100%;overflow-y:auto;overflow-x:hidden;background:#000;border:1px solid var(--border);border-radius:18px;box-shadow:0 40px 100px rgba(0,0,0,.85);animation:modalIn .28s cubic-bezier(.2,.9,.3,1);-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
-@media (max-width:599px){.modal-panel{padding:0;align-items:stretch;justify-content:flex-start}.modal-body{position:absolute;left:0;right:0;top:calc(10px + env(safe-area-inset-top));bottom:0;max-width:100%;max-height:none;width:100%;border-radius:16px 16px 0 0;border:none;border-top:1px solid var(--border);padding-bottom:env(safe-area-inset-bottom)}.modal-close{top:calc(14px + env(safe-area-inset-top));right:max(14px,env(safe-area-inset-right));width:44px;height:44px}.modal-close::before{inset:-12px}.detail-inner{padding-top:16px}.detail-body{padding-bottom:calc(28px + env(safe-area-inset-bottom))}}
-@media (min-width:768px) and (max-width:1023px){.modal-body{max-width:min(720px,92vw)}}
-@keyframes modalIn{from{opacity:0;transform:translateY(14px) scale(.98)}to{opacity:1;transform:translateY(0) scale(1)}}
-.modal-close{position:fixed;top:max(14px,env(safe-area-inset-top));right:max(14px,env(safe-area-inset-right));z-index:130;width:44px;height:44px;border-radius:50%;background:rgba(13,16,23,.92);border:1px solid rgba(255,255,255,.18);color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);transition:background .15s,transform .15s,border-color .15s;padding:0;box-shadow:0 4px 16px rgba(0,0,0,.55);touch-action:manipulation;-webkit-tap-highlight-color:transparent}
-.modal-close::before{content:'';position:absolute;inset:-10px;border-radius:50%}.modal-close:hover{background:rgba(30,38,58,.95);transform:scale(1.05);border-color:rgba(255,255,255,.28)}.modal-close:active{transform:scale(.94);background:rgba(50,60,88,.95)}
-.modal-loading{padding:100px 20px;text-align:center}.modal-error{padding:80px 20px;text-align:center;color:#9db5e0;font-size:.9rem}
-@media (min-width:700px){.modal-panel{padding:40px 24px}}
-.detail-hero{position:relative;overflow:hidden;background:var(--surface);border-radius:18px 18px 0 0}.detail-bg{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:blur(30px) saturate(1.2) brightness(.5);transform:scale(1.15);z-index:0}.detail-hero::after{content:'';position:absolute;inset:0;z-index:1;background:linear-gradient(180deg,rgba(10,14,24,.6),rgba(10,14,24,.95))}
-.detail-inner{position:relative;z-index:2;display:flex;flex-direction:column;align-items:center;text-align:center;gap:16px;padding:24px 20px 24px}
-.detail-poster{width:min(48vw,200px);height:auto;aspect-ratio:2/3;border-radius:14px;object-fit:cover;flex-shrink:0;box-shadow:0 16px 40px rgba(0,0,0,.75);margin:0 auto}.detail-poster-ph{display:flex;align-items:center;justify-content:center;background:var(--surface-2);font-size:2.8rem;color:var(--text-dim);width:min(48vw,200px);aspect-ratio:2/3}
-.detail-info{flex:1;min-width:0;display:flex;flex-direction:column;gap:8px;align-items:center;width:100%}.detail-title{font-size:1.45rem;font-weight:800;letter-spacing:-.4px;line-height:1.25}.detail-tagline{font-size:.85rem;color:var(--text-dim);font-style:italic}.detail-meta{display:flex;flex-wrap:wrap;gap:10px;font-size:.85rem;color:var(--text-dim);justify-content:center}.detail-genres{font-size:.82rem;color:var(--text-dim)}.detail-overview{font-size:.88rem;color:#c0c8d6;line-height:1.55;margin-top:4px;display:-webkit-box;-webkit-line-clamp:5;-webkit-box-orient:vertical;overflow:hidden;text-align:center}
-.d-status{display:flex;gap:12px;align-items:center;background:linear-gradient(135deg,#16161a,#0e0e10);border:1px solid var(--border);border-radius:14px;padding:12px 14px;margin-top:8px;width:100%;justify-content:flex-start}.d-status.done{border-color:rgba(74,222,128,.3);background:rgba(74,222,128,.06)}.d-status-progress{flex-direction:column;align-items:stretch;gap:10px}.d-status-row{display:flex;gap:12px;align-items:center;width:100%}
-.d-status-icon{width:32px;height:32px;border-radius:50%;background:var(--surface-2);color:var(--text-dim);display:flex;align-items:center;justify-content:center;font-weight:700;flex-shrink:0;font-size:.95rem}.d-status.done .d-status-icon{background:rgba(74,222,128,.15);color:#4ade80}
-.d-status-body{flex:1;min-width:0;text-align:left}.d-status-title{font-size:.88rem;font-weight:600}.d-status-sub{font-size:.76rem;color:var(--text-dim);margin-top:2px}
-.d-mark-btn{flex-shrink:0;background:rgba(52,211,153,.12);border:1px solid rgba(52,211,153,.35);color:#6ee7b7;padding:8px 14px;border-radius:10px;font-size:.78rem;font-weight:700;cursor:pointer;font-family:inherit;transition:all .15s;white-space:nowrap}.d-mark-btn:hover{background:rgba(52,211,153,.25);color:#a7f3d0}.d-mark-btn:disabled{opacity:.6;cursor:wait}.d-mark-btn.done{background:rgba(52,211,153,.2);color:#34d399;cursor:default}.d-mark-btn.unwatch{background:rgba(255,184,77,.12);border-color:rgba(255,184,77,.35);color:#ffb84d}.d-mark-btn.unwatch:hover{background:rgba(255,184,77,.25);color:#ffd693}
-.d-action-bar{display:inline-flex;align-items:center;gap:2px;margin-top:16px;padding:4px;background:linear-gradient(165deg,rgba(255,255,255,.09) 0%,rgba(255,255,255,.04) 100%);border:1px solid rgba(255,255,255,.12);border-radius:999px;box-shadow:0 8px 28px rgba(0,0,0,.45),inset 0 1px 0 rgba(255,255,255,.06);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}
-.d-act{display:inline-flex;align-items:center;justify-content:center;width:44px;height:44px;border-radius:50%;border:none;background:transparent;color:rgba(255,255,255,.55);cursor:pointer;padding:0;font-family:inherit;transition:background .18s ease,color .18s ease,transform .12s ease,box-shadow .18s ease;-webkit-tap-highlight-color:transparent;text-decoration:none;flex-shrink:0;position:relative}
-.d-act svg{display:block;pointer-events:none}
-.d-act:hover{background:rgba(255,255,255,.1);color:#fff}
-.d-act:active{transform:scale(.9)}
-.d-act:disabled{opacity:.5;cursor:default;pointer-events:none}
-.d-act-watched.active{background:linear-gradient(145deg,#8b5cf6 0%,#a78bfa 55%,#c4b5fd 100%);color:#fff;box-shadow:0 4px 16px rgba(139,92,246,.5),inset 0 1px 0 rgba(255,255,255,.25)}
-.d-act-watched.active:hover{filter:brightness(1.1);color:#fff}
-.d-act-wl.active{color:#c4b5fd;background:rgba(167,139,250,.12)}
-.d-act-wl.active:hover{background:rgba(167,139,250,.2);color:#ddd6fe}
-.d-act-play{color:rgba(255,255,255,.7)}
-.d-act-play:hover{background:rgba(167,139,250,.15);color:#ddd6fe}
-
-.detail-body{padding:20px 22px 24px}.d-section{margin-top:8px;margin-bottom:26px}.d-section:last-child{margin-bottom:0}.d-section-title{font-size:1rem;font-weight:700;letter-spacing:.2px;margin-bottom:14px;color:var(--text);display:flex;align-items:center;gap:8px}.d-section-title::before{content:'';width:3px;height:16px;border-radius:2px;background:#7d9dd4}
-.cast-scroll{display:flex;gap:14px;overflow-x:auto;padding-bottom:8px;scrollbar-width:none}.cast-scroll::-webkit-scrollbar{display:none}.cast{flex-shrink:0;width:84px;text-align:center}.cast-img{width:84px;height:84px;border-radius:50%;object-fit:cover;background:var(--surface-2)}.cast-ph{display:flex;align-items:center;justify-content:center;color:var(--text-dim);font-size:1.6rem;font-weight:600;background:linear-gradient(135deg,var(--surface-2),#1a2233)}.cast-name{font-size:.75rem;font-weight:600;margin-top:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.cast-role{font-size:.68rem;color:var(--text-dim);margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.seasons{display:flex;flex-direction:column;gap:8px}.season-item{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;transition:border-color .15s}.season-item.open{border-color:#2a3345}
-.season-head{width:100%;background:none;border:none;color:inherit;display:flex;align-items:center;gap:10px;padding:14px 16px;cursor:pointer;font-family:inherit;text-align:left;transition:background .15s}.season-head:hover{background:var(--surface-2)}
-.season-title{font-weight:600;font-size:.9rem;flex:1}.season-meta{font-size:.76rem;color:var(--text-dim)}
-.chev{width:16px;height:16px;color:var(--text-dim);transition:transform .2s ease;flex-shrink:0}.season-item.open .chev{transform:rotate(180deg)}
-.season-body{display:none;border-top:1px solid var(--border)}.season-item.open .season-body{display:block}.ep-empty{padding:20px;text-align:center;color:var(--text-dim);font-size:.85rem}
-.episode{display:flex;gap:12px;padding:12px 16px;border-bottom:1px solid var(--border);align-items:flex-start;transition:background .15s}.episode:last-child{border-bottom:none}.episode.clickable{cursor:pointer}.episode.clickable:hover{background:var(--surface-2)}.episode.clickable:active{background:#1a2233}.episode.clickable:hover .ep-title{color:#7d9dd4}.episode.watched .ep-title{color:var(--text-dim)}.episode.watched.clickable:hover .ep-title{color:#7d9dd4}
-.ep-num{font-family:ui-monospace,Menlo,monospace;font-size:.76rem;color:var(--text-dim);font-weight:700;flex-shrink:0;padding-top:3px;width:32px;letter-spacing:.5px}.ep-body{flex:1;min-width:0}.ep-title{font-size:.86rem;font-weight:600;line-height:1.3}.ep-overview{font-size:.76rem;color:var(--text-dim);margin-top:4px;line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ep-check{color:#4ade80;font-weight:700;flex-shrink:0;font-size:.9rem;padding-top:2px}
-.ep-actions{flex-shrink:0;display:flex;align-items:center}.ep-watch-btn{background:rgba(52,211,153,.12);border:1px solid rgba(52,211,153,.35);color:#6ee7b7;padding:3px 9px;border-radius:7px;font-size:.7rem;font-weight:700;cursor:pointer;font-family:inherit;transition:all .15s}.ep-watch-btn:hover{background:rgba(52,211,153,.25);color:#a7f3d0}.ep-watch-btn:disabled{opacity:.6;cursor:wait}.ep-watch-btn.done{background:rgba(52,211,153,.2);color:#34d399;cursor:default}
-.modal-body .grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:16px}
-@media (min-width:700px){.detail-inner{flex-direction:row;align-items:flex-start;text-align:left;padding:30px;gap:26px}.detail-poster{width:180px;height:auto;aspect-ratio:2/3;margin:0}.detail-info{align-items:flex-start}.detail-meta{justify-content:flex-start}.detail-overview{text-align:left}.detail-title{font-size:1.85rem}.detail-overview{font-size:.92rem;-webkit-line-clamp:6}.detail-body{padding:26px 30px 30px}.cast{width:96px}.cast-img{width:96px;height:96px}.modal-body .grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:18px}.detail-ext-ratings{justify-content:flex-start}.d-action-bar{align-self:flex-start}}
-.confirm-modal{position:fixed;inset:0;z-index:200;display:none}.confirm-modal.open{display:block}
-.confirm-backdrop{position:absolute;inset:0;background:rgba(2,4,8,.7);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);animation:fadeIn .18s ease}
-.confirm-panel{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:min(88vw,340px);background:linear-gradient(165deg,#16161a 0%,#0e0e10 100%);border:1px solid var(--border-strong);border-radius:18px;padding:24px 22px 18px;box-shadow:0 30px 80px rgba(0,0,0,.8);text-align:center;animation:confirmIn .22s cubic-bezier(.2,.9,.3,1)}
-@keyframes confirmIn{from{opacity:0;transform:translate(-50%,-48%) scale(.95)}to{opacity:1;transform:translate(-50%,-50%) scale(1)}}
-.confirm-icon{width:48px;height:48px;margin:0 auto 12px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:1.4rem;background:var(--accent-soft);color:var(--accent-2)}.confirm-icon.danger{background:rgba(224,85,96,.14);color:#ff7b85}.confirm-icon.warn{background:rgba(255,184,77,.14);color:#ffb84d}.confirm-icon.success{background:rgba(52,211,153,.14);color:#34d399}
-.confirm-title{font-size:1.02rem;font-weight:700;margin-bottom:6px;color:var(--text)}.confirm-msg{font-size:.84rem;color:var(--text-dim);line-height:1.55;word-break:break-word}.confirm-actions{display:flex;gap:10px;margin-top:20px}
-.confirm-btn{flex:1;padding:11px 14px;border-radius:12px;font-size:.88rem;font-weight:700;font-family:inherit;cursor:pointer;border:1px solid transparent;transition:all .15s;-webkit-tap-highlight-color:transparent}
-.confirm-cancel{background:rgba(255,255,255,.05);border-color:var(--border);color:var(--text-dim)}.confirm-cancel:hover{background:rgba(255,255,255,.09);color:#fff}
-.confirm-ok{background:linear-gradient(135deg,#7c3aed 0%,#a78bfa 100%);color:#fff;box-shadow:0 6px 20px rgba(167,139,250,.3)}.confirm-ok:hover{filter:brightness(1.08)}.confirm-ok.danger{background:linear-gradient(135deg,#dc2626 0%,#f87171 100%);box-shadow:0 6px 20px rgba(248,113,113,.28)}.confirm-ok:disabled,.confirm-cancel:disabled{opacity:.6;cursor:wait}
-
-.hero-avatar{border:2px solid rgba(167,139,250,.5);padding:0;cursor:pointer;font:inherit;color:inherit}
-.hero-avatar:hover{box-shadow:0 0 0 3px rgba(167,139,250,.28),0 4px 20px rgba(0,0,0,.5);transform:scale(1.03)}
-.hero-avatar:active{transform:scale(.97)}
-.summary-modal{position:fixed;inset:0;z-index:160;display:none}
-.summary-modal.open{display:block}
-.summary-backdrop{position:absolute;inset:0;background:rgba(2,4,8,.78);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
-.summary-panel{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:min(94vw,480px);max-height:88vh;display:flex;flex-direction:column;background:linear-gradient(165deg,#16161a 0%,#0e0e10 100%);border:1px solid var(--border-strong);border-radius:18px;box-shadow:0 30px 80px rgba(0,0,0,.85);overflow:hidden}
-.summary-head{display:flex;align-items:center;justify-content:space-between;padding:16px 18px 10px;border-bottom:1px solid var(--border);flex-shrink:0}
-.summary-title{font-size:1.05rem;font-weight:700}
-.summary-close{width:36px;height:36px;border-radius:50%;border:1px solid var(--border);background:rgba(255,255,255,.04);color:var(--text-dim);font-size:1.2rem;cursor:pointer;font-family:inherit;line-height:1}
-.summary-close:hover{color:#fff;border-color:var(--border-strong)}
-.summary-body{overflow-y:auto;padding:12px 16px 20px;-webkit-overflow-scrolling:touch}
-@media (max-width:599px){
-  .summary-panel{top:auto;bottom:0;left:0;right:0;transform:none;width:100%;max-height:92vh;border-radius:18px 18px 0 0}
-}
-
-/* ── 小结 Summary ── */
-.sum-wrap{padding:4px 0 24px}
-.sum-nav{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:18px}
-.sum-nav-btn{width:36px;height:36px;border-radius:10px;border:1px solid var(--border);background:rgba(255,255,255,.04);color:var(--text-dim);font-size:1.2rem;cursor:pointer;font-family:inherit;transition:all .15s}
-.sum-nav-btn:hover{color:#fff;border-color:var(--border-strong);background:rgba(167,139,250,.12)}
-.sum-nav-center{flex:1;text-align:center;min-width:0}
-.sum-period-tabs{display:inline-flex;gap:4px;background:rgba(255,255,255,.04);border:1px solid var(--border);border-radius:999px;padding:3px;margin-bottom:8px}
-.sum-period-btn{border:none;background:transparent;color:var(--text-dim);padding:6px 14px;border-radius:999px;font-size:.8rem;font-weight:600;cursor:pointer;font-family:inherit}
-.sum-period-btn.active{background:linear-gradient(135deg,#7c3aed 0%,#a78bfa 100%);color:#fff}
-.sum-label{font-size:1.05rem;font-weight:700;letter-spacing:.2px}
-.sum-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px}
-.sum-stat{text-align:center;background:linear-gradient(165deg,#16161a 0%,#0e0e10 100%);border:1px solid var(--border);border-radius:14px;padding:14px 6px}
-.sum-stat-num{font-size:1.35rem;font-weight:800;letter-spacing:-.5px;background:linear-gradient(180deg,#fff 0%,#c4b5fd 100%);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
-.sum-stat-label{font-size:.7rem;color:var(--text-mute);margin-top:2px}
-.sum-chip{display:inline-flex;align-items:center;gap:6px;padding:8px 12px;border-radius:10px;background:rgba(167,139,250,.1);border:1px solid rgba(167,139,250,.25);color:var(--text-dim);font-size:.82rem;margin-bottom:12px}
-.sum-chip strong{color:#ddd6fe}
-.sum-muted{font-size:.8rem;color:var(--text-mute);margin:6px 0 12px}
-.sum-block{margin-top:18px}
-.sum-h3{font-size:.92rem;font-weight:700;margin-bottom:10px;display:flex;align-items:center;gap:8px}
-.sum-h3::before{content:'';width:3px;height:14px;border-radius:2px;background:linear-gradient(180deg,#a78bfa,#7c3aed)}
-.sum-heat{display:flex;flex-wrap:wrap;gap:4px}
-.sum-heat-cell{width:12px;height:12px;border-radius:3px;background:rgba(255,255,255,.06)}
-.sum-heat-cell.lv1{background:rgba(167,139,250,.25)}
-.sum-heat-cell.lv2{background:rgba(167,139,250,.45)}
-.sum-heat-cell.lv3{background:rgba(167,139,250,.7)}
-.sum-heat-cell.lv4{background:#a78bfa}
-.sum-list{display:flex;flex-direction:column;gap:8px}
-.sum-row{display:flex;align-items:center;gap:12px;padding:10px 12px;background:linear-gradient(160deg,#141416 0%,#0e0e10 100%);border:1px solid var(--border);border-radius:12px}
-.sum-rank{width:22px;height:22px;border-radius:6px;background:rgba(167,139,250,.15);color:#c4b5fd;font-size:.72rem;font-weight:800;display:flex;align-items:center;justify-content:center;flex-shrink:0}
-.sum-row-body{min-width:0;flex:1}
-.sum-row-title{font-size:.9rem;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.sum-year{font-weight:500;color:var(--text-mute);font-size:.8rem}
-.sum-row-meta{font-size:.75rem;color:var(--text-dim);margin-top:2px}
-@media (max-width:420px){.sum-stats{gap:6px}.sum-stat{padding:12px 4px}.sum-stat-num{font-size:1.15rem}}
-`;
+  return `html,body{background:#000000!important;color:#eef1f7;margin:0;padding:0;min-height:100%;min-height:100dvh}*{box-sizing:border-box;margin:0;padding:0}.splash{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000;background:radial-gradient(circle at 50% 45%,#0a0a0a 0%,#000000 62%);transition:opacity .38s ease;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;-webkit-tap-highlight-color:transparent}.splash.hide{opacity:0;pointer-events:none}.splash-glow{position:absolute;width:340px;height:340px;border-radius:50%;background:radial-gradient(circle,rgba(125,157,212,.25) 0%,rgba(125,157,212,0) 70%);animation:splashPulse 2.4s ease-in-out infinite}.splash-inner{position:relative;z-index:1;display:flex;flex-direction:column;align-items:center;gap:20px}.splash-logo{color:#a8b2c4;animation:splashPop .75s cubic-bezier(.22,1.1,.36,1) both}.splash-logo img{display:block}.splash-name{font-size:1.35rem;font-weight:800;letter-spacing:.4px;background:linear-gradient(135deg,#fff 20%,#7d9dd4);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;animation:splashFadeUp .6s ease .28s both}.splash-bar{width:128px;height:3px;border-radius:99px;background:rgba(255,255,255,.08);overflow:hidden;animation:splashFadeUp .6s ease .45s both}.splash-bar-fill{height:100%;width:42%;border-radius:99px;background:#fff;animation:splashSlide 1.15s cubic-bezier(.65,0,.35,1) infinite}@keyframes splashPulse{0%,100%{transform:scale(.85);opacity:.7}50%{transform:scale(1.12);opacity:1}}@keyframes splashPop{0%{opacity:0;transform:scale(.55) rotate(-8deg)}60%{opacity:1;transform:scale(1.08) rotate(2deg)}100%{opacity:1;transform:scale(1) rotate(0)}}@keyframes splashFadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}@keyframes splashSlide{0%{transform:translateX(-130%)}100%{transform:translateX(330%)}}.spinner{width:30px;height:30px;border:3px solid #212735;border-top-color:#7d9dd4;border-radius:50%;animation:spin .8s linear infinite;margin:4px auto}@keyframes spin{to{transform:rotate(360deg)}}:root{--bg:#050505;--surface:#0e0e10;--surface-2:#16161a;--surface-3:#1c1c22;--border:rgba(255,255,255,0.08);--border-strong:rgba(255,255,255,0.14);--text:#f4f4f5;--text-dim:#a1a1aa;--text-mute:#71717a;--accent:#a78bfa;--accent-2:#c4b5fd;--accent-soft:rgba(167,139,250,0.12);--accent-glow:rgba(167,139,250,0.28);--success:#34d399;--blue:#c4b5fd;--radius-sm:10px;--radius-md:14px;--radius-lg:18px;--radius-xl:22px;--shadow-card:0 8px 32px rgba(0,0,0,0.55)}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;background:radial-gradient(ellipse 120% 70% at 50% -20%,#1a1528 0%,transparent 50%),radial-gradient(ellipse 50% 40% at 100% 0%,rgba(167,139,250,0.08) 0%,transparent 45%),radial-gradient(ellipse 40% 30% at 0% 100%,rgba(52,211,153,0.04) 0%,transparent 40%),#050505;background-attachment:fixed;color:var(--text);-webkit-font-smoothing:antialiased;line-height:1.5;overflow-x:hidden;overscroll-behavior-y:none}a{color:var(--accent-2);text-decoration:none;transition:color .15s}a:hover{color:#ddd6fe}img{display:block;max-width:100%}.container{max-width:1200px;margin:0 auto;padding:0 16px calc(80px + env(safe-area-inset-bottom))}.pane-loading{padding:60px 20px;text-align:center}.load-more-wrap{text-align:center;margin-top:24px}.load-more{background:var(--surface-2);border:1px solid var(--border);color:var(--text);padding:11px 32px;border-radius:var(--radius-md);font-size:.9rem;font-weight:600;cursor:pointer;transition:all .2s;font-family:inherit}.load-more:hover:not(:disabled){border-color:rgba(91,124,250,.45);color:var(--accent-2);box-shadow:0 4px 20px var(--accent-glow);background:var(--surface-3)}.load-more:disabled{cursor:not-allowed}.login-wrap{min-height:100vh;min-height:100dvh;display:flex;align-items:center;justify-content:center;padding:20px}.login-card{width:100%;max-width:440px;background:linear-gradient(165deg,#16161a 0%,#0e0e10 100%);border:1px solid var(--border-strong);border-radius:24px;padding:44px 32px;text-align:center;box-shadow:0 24px 64px rgba(0,0,0,.7),inset 0 1px 0 rgba(255,255,255,.05)}.login-logo{color:#a8b2c4;margin-bottom:16px}.login-title{font-size:1.75rem;font-weight:800;letter-spacing:-.5px;background:linear-gradient(135deg,#fff 20%,#7d9dd4);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:6px}.login-sub{color:var(--text-dim);font-size:.9rem;margin-bottom:28px}.btn-primary{background:linear-gradient(135deg,#7c3aed 0%,#a78bfa 100%);color:#fff;border:none;padding:13px 30px;border-radius:12px;font-size:.95rem;font-weight:700;cursor:pointer;box-shadow:0 6px 24px rgba(167,139,250,.35)}.btn-primary:hover{filter:brightness(1.08);transform:translateY(-1px)}.btn-ghost{background:rgba(255,255,255,.04);color:var(--text-dim);border:1px solid var(--border);padding:8px 16px;border-radius:10px;font-size:.85rem;cursor:pointer;transition:all .15s;font-family:inherit}.btn-ghost:hover{color:#fff;border-color:var(--border-strong);background:rgba(255,255,255,.08)}.steps{display:flex;flex-direction:column;gap:6px}.step{display:flex;align-items:center;gap:10px;text-align:left;padding:4px 0;font-size:.9rem}.step .n{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;background:var(--accent);color:#fff;border-radius:50%;font-size:.72rem;font-weight:700;flex-shrink:0}.code-box{font-family:ui-monospace,Menlo,monospace;font-size:1.75rem;font-weight:800;letter-spacing:6px;color:#a8c0e8;background:rgba(90,120,180,.12);border:1px solid rgba(140,170,220,.35);border-radius:14px;padding:14px;margin:14px 0;user-select:all;text-align:center}.qr-box{background:#fff;border-radius:14px;padding:10px;display:inline-block;margin:6px 0 14px}.qr-box img{border-radius:8px}.status{display:inline-flex;align-items:center;gap:8px;font-size:.88rem;padding:8px 16px;border-radius:20px;color:var(--text-dim);background:var(--surface-2)}.status.success{color:#4ade80;background:rgba(74,222,128,.1)}.status.error{color:#e05560;background:rgba(224,85,96,.12)}.pulse{display:inline-block;width:8px;height:8px;background:#7d9dd4;border-radius:50%;animation:pulse 1.4s ease-in-out infinite}@keyframes pulse{0%,100%{opacity:.35;transform:scale(.85)}50%{opacity:1;transform:scale(1.15)}}.err-box{background:rgba(224,85,96,.10);border:1px solid rgba(224,85,96,.28);border-radius:12px;padding:14px;text-align:left;margin-bottom:14px}.err-title{font-weight:600;color:#e05560;margin-bottom:4px;font-size:.92rem}.err{color:#e8a3ab;font-size:.85rem}.err-detail{font-family:ui-monospace,Menlo,monospace;font-size:.72rem;color:var(--text-dim);background:#000;padding:8px 10px;border-radius:6px;margin-top:8px;white-space:pre-wrap;word-break:break-all;max-height:120px;overflow:auto}.hint{color:var(--text-dim);font-size:.82rem;margin-top:6px}.log-details{margin-top:18px;text-align:left}.log-details summary{cursor:pointer;font-size:.76rem;color:var(--text-dim);padding:4px 0;user-select:none}.log-box{font-family:ui-monospace,Menlo,monospace;font-size:.7rem;color:var(--text-dim);background:#000;border:1px solid var(--border);border-radius:8px;padding:10px;max-height:160px;overflow:auto;margin-top:6px;line-height:1.6}.hero{display:flex;justify-content:space-between;align-items:center;padding:calc(20px + env(safe-area-inset-top)) 0 20px;gap:16px}.hero-left{display:flex;align-items:center;gap:12px;min-width:0}.hero-avatar{width:50px;height:50px;border-radius:50%;overflow:hidden;flex-shrink:0;background:var(--surface-2);border:2px solid rgba(167,139,250,.5);box-shadow:0 0 0 3px rgba(167,139,250,.12),0 4px 20px rgba(0,0,0,.5)}.hero-avatar img{width:100%;height:100%;object-fit:cover;display:block}.hero-avatar-ph{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:1.25rem;background:linear-gradient(135deg,#1a2233,#2a3a55)}.hero-text{min-width:0;flex:1;display:flex;flex-direction:column;align-items:flex-start;gap:1px}.hero-name{font-size:1.45rem;font-weight:800;letter-spacing:-.4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:linear-gradient(135deg,#fff 20%,#c4b5fd 90%);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}.updated-at{font-size:.72rem;color:var(--text-mute);font-weight:400;letter-spacing:.2px;transition:color .4s ease}.updated-at:empty{display:none}.updated-at.flash{animation:updatedFlash 1.1s ease-out}@keyframes updatedFlash{0%{color:var(--accent-2)}100%{color:var(--text-mute)}}.hero-actions{display:flex;gap:8px;flex-shrink:0}.btn-action{display:inline-flex;align-items:center;gap:6px;background:rgba(255,255,255,.04);color:var(--text-dim);border:1px solid var(--border);padding:8px 14px;border-radius:10px;font-size:.82rem;font-weight:600;cursor:pointer;font-family:inherit;transition:all .18s ease;-webkit-tap-highlight-color:transparent}.btn-action svg{flex-shrink:0;transition:transform .25s ease}.btn-action:hover{color:#fff;border-color:var(--border-strong);background:rgba(167,139,250,.10);box-shadow:0 4px 16px rgba(167,139,250,.18)}.btn-action:hover svg{transform:rotate(180deg)}.btn-action:active{transform:scale(.97)}.btn-action:last-child:hover{background:rgba(224,85,96,.10);border-color:rgba(224,85,96,.35);box-shadow:0 4px 16px rgba(224,85,96,.15)}.btn-action:last-child:hover svg{transform:translateX(2px)}@media (max-width:420px){.btn-action span{display:none}.btn-action{padding:9px}.hero-actions{gap:6px}}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;background:linear-gradient(165deg,#16161a 0%,#0e0e10 100%);border:1px solid var(--border);border-radius:var(--radius-lg);padding:18px 10px;margin-bottom:24px;box-shadow:var(--shadow-card),inset 0 1px 0 rgba(255,255,255,.04);position:relative;overflow:hidden}.stats::before{content:'';position:absolute;top:0;left:10%;right:10%;height:1px;background:linear-gradient(90deg,transparent,rgba(167,139,250,.35),transparent)}.stat{position:relative;text-align:center;display:flex;flex-direction:column;align-items:center;gap:2px;padding:6px 2px;border-radius:12px;transition:background .2s ease}.stat:hover{background:rgba(255,255,255,.025)}.stat+.stat::before{content:'';position:absolute;left:-4px;top:18%;bottom:18%;width:1px;background:linear-gradient(180deg,transparent,rgba(255,255,255,.08),transparent)}.stat-icon{width:30px;height:30px;border-radius:9px;display:flex;align-items:center;justify-content:center;margin-bottom:4px;transition:transform .25s ease,box-shadow .25s ease}.stat:hover .stat-icon{transform:translateY(-1px) scale(1.06)}.stat-movie .stat-icon{background:linear-gradient(135deg,rgba(167,139,250,.18),rgba(167,139,250,.06));color:#c4b5fd;box-shadow:0 4px 14px rgba(167,139,250,.18),inset 0 0 0 1px rgba(167,139,250,.18)}.stat-show .stat-icon{background:linear-gradient(135deg,rgba(96,165,250,.18),rgba(96,165,250,.06));color:#93c5fd;box-shadow:0 4px 14px rgba(96,165,250,.18),inset 0 0 0 1px rgba(96,165,250,.18)}.stat-episode .stat-icon{background:linear-gradient(135deg,rgba(52,211,153,.18),rgba(52,211,153,.06));color:#6ee7b7;box-shadow:0 4px 14px rgba(52,211,153,.18),inset 0 0 0 1px rgba(52,211,153,.18)}.stat-hours .stat-icon{background:linear-gradient(135deg,rgba(251,191,36,.18),rgba(251,191,36,.06));color:#fcd34d;box-shadow:0 4px 14px rgba(251,191,36,.18),inset 0 0 0 1px rgba(251,191,36,.18)}.stat-num{font-size:1.35rem;font-weight:800;letter-spacing:-.6px;line-height:1.15;background:linear-gradient(180deg,#fff 0%,#c4b5fd 100%);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}.stat-label{font-size:.7rem;color:var(--text-mute);font-weight:500}.tabs{display:flex;gap:4px;margin-bottom:22px;position:sticky;top:0;z-index:10}.tab{flex:1 1 0;min-width:0;background:transparent;border:none;color:var(--text-dim);padding:9px 2px;border-radius:999px;font-size:.75rem;font-weight:600;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:center;transition:color .2s ease,background .2s ease;font-family:inherit;outline:none!important}.tab:hover{color:var(--text);background:rgba(255,255,255,.06)}.tab.active{background:linear-gradient(135deg,#7c3aed 0%,#a78bfa 100%);color:#fff;font-weight:700}.pane{display:none}.pane.active{display:block;animation:fadeIn .3s ease}@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}.grid{display:flex;flex-direction:column;gap:10px}.item{position:relative;display:flex;gap:14px;background:linear-gradient(160deg,#141416 0%,#0e0e10 100%);border:1px solid var(--border);border-radius:var(--radius-lg);padding:12px;transition:transform .2s ease,border-color .2s,box-shadow .2s;animation:fadeInUp .4s ease backwards;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.35),inset 0 1px 0 rgba(255,255,255,.03);text-decoration:none;color:inherit}.item.clickable{cursor:pointer}.item.clickable:active{transform:scale(.985);background:var(--surface-2)}@keyframes fadeInUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}.item:hover{border-color:rgba(167,139,250,.25);box-shadow:0 8px 28px rgba(0,0,0,.45),0 0 0 1px rgba(167,139,250,.08);transform:translateY(-1px)}.wl-remove,.wl-watched,.wl-unwatch{position:absolute;top:6px;right:6px;width:26px;height:26px;border-radius:50%;background:rgba(0,0,0,.65);line-height:1;cursor:pointer;z-index:3;display:flex;align-items:center;justify-content:center;padding:0;font-family:inherit;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);transition:background .15s,transform .15s,opacity .15s,color .15s}.wl-remove{color:#fff;border:1px solid rgba(255,255,255,.22);font-size:1rem;font-weight:400;opacity:.88}.wl-remove:hover{background:rgba(200,70,80,.92);opacity:1;transform:scale(1.06)}.wl-watched{color:#4ade80;border:1px solid rgba(74,222,128,.45);font-size:.85rem;font-weight:700;opacity:.9}.wl-watched:hover{background:rgba(74,222,128,.95);color:#000;opacity:1;transform:scale(1.06)}.wl-unwatch{color:#ffb84d;border:1px solid rgba(255,184,77,.45);font-size:.9rem;font-weight:700;opacity:.9}.wl-unwatch:hover{background:rgba(255,184,77,.95);color:#000;opacity:1;transform:scale(1.06)}.wl-remove:disabled,.wl-watched:disabled,.wl-unwatch:disabled{opacity:.5;cursor:wait}.wl-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-bottom:14px}.wl-sort-label{display:inline-flex;align-items:center;gap:8px;font-size:.82rem;color:var(--text-dim)}.wl-sort{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:7px 12px;border-radius:8px;font-size:.82rem;font-family:inherit;cursor:pointer;outline:none;transition:border-color .15s}.wl-sort:hover{border-color:#2a3345}.wl-sort:focus{border-color:#7d9dd4}.poster{width:76px;height:114px;border-radius:10px;overflow:hidden;flex-shrink:0;background:var(--surface-2);position:relative}.poster img{width:100%;height:100%;object-fit:cover}.poster-ph{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:1.8rem;background:linear-gradient(135deg,var(--surface-2),#1a2233);color:var(--text-dim)}.info{flex:1;min-width:0;display:flex;flex-direction:column;justify-content:center;gap:4px}.name-row{display:flex;align-items:baseline;gap:0;overflow:hidden;white-space:nowrap;line-height:1.3;letter-spacing:-.2px}.name{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:1rem;font-weight:700;color:var(--text)}.tag{flex:0 0 auto;font-size:inherit;font-weight:inherit;letter-spacing:0;white-space:nowrap}.tag.upcoming{color:#ffb84d}.overview{font-size:.8rem;color:var(--text-dim);overflow:hidden;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;line-height:1.45;margin-top:4px}.meta{font-size:.8rem;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.meta.dim{color:#7a8394;font-size:.78rem;margin-top:2px}.bar{height:3px;background:rgba(255,255,255,.06);border-radius:99px;overflow:hidden;margin-top:8px}.bar-fill{height:100%;background:linear-gradient(90deg,#7c3aed,#c4b5fd);border-radius:99px;box-shadow:0 0 10px rgba(167,139,250,.5)}.cal-open-btn{align-self:flex-start;margin-top:8px;background:rgba(90,120,180,.14);border:1px solid rgba(140,170,220,.35);color:#9db5e0;padding:5px 12px;border-radius:8px;font-size:.74rem;font-weight:600;cursor:pointer;font-family:inherit;transition:all .15s;display:inline-flex;align-items:center;gap:5px}.cal-open-btn:hover{background:rgba(120,150,210,.28);color:#c2d4f0;border-color:rgba(140,170,220,.65)}.cal-open-btn svg{flex-shrink:0}.cal-open-btn.wl-added{background:rgba(74,222,128,.14)!important;border-color:rgba(74,222,128,.38)!important;color:#4ade80!important;cursor:default!important}.search-bar{margin-bottom:16px}.search-input{width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:12px 16px;border-radius:12px;font-size:.95rem;font-family:inherit;outline:none;transition:border-color .15s,background .15s;-webkit-appearance:none;appearance:none}.search-input:focus{border-color:var(--accent);background:var(--surface-2);box-shadow:0 0 0 3px var(--accent-soft)}.search-input::placeholder{color:var(--text-mute)}.trending-head{display:flex;align-items:center;gap:8px;font-size:.88rem;font-weight:700;color:var(--text);margin:4px 0 14px;padding-left:2px;letter-spacing:.2px}.trending-head::before{content:'';width:3px;height:14px;border-radius:2px;background:linear-gradient(180deg,#f97316,#ef4444)}.show-cal-modal{position:fixed;inset:0;z-index:130;display:none}.show-cal-modal.open{display:block}.show-cal-backdrop{position:absolute;inset:0;background:rgba(2,4,8,.78);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);animation:fadeIn .2s ease}.show-cal-panel{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:min(92vw,440px);max-height:90vh;overflow-y:auto;background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:20px;box-shadow:0 30px 80px rgba(0,0,0,.8);animation:modalIn .25s cubic-bezier(.2,.9,.3,1)}.show-cal-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}.show-cal-name{font-size:.95rem;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}.show-cal-close{width:32px;height:32px;flex-shrink:0;background:rgba(255,255,255,.04);border:1px solid var(--border);color:var(--text-dim);border-radius:50%;cursor:pointer;font-size:1.1rem;line-height:1;display:flex;align-items:center;justify-content:center;transition:all .15s;font-family:inherit}.show-cal-close:hover{color:var(--text);border-color:#3a4a68}.show-cal-info{font-size:.72rem;color:var(--text-dim);margin-bottom:12px;line-height:1.4}.show-cal-nav{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;font-size:.88rem;color:var(--text);font-weight:600}.show-cal-nav button{width:30px;height:30px;background:rgba(255,255,255,.04);border:1px solid var(--border);color:var(--text-dim);border-radius:8px;cursor:pointer;font-size:1rem;line-height:1;display:flex;align-items:center;justify-content:center;transition:all .15s;font-family:inherit}.show-cal-nav button:hover{color:var(--text);border-color:#3a4a68}.show-cal-weekdays{display:grid;grid-template-columns:repeat(7,1fr);text-align:center;font-size:.7rem;color:var(--text-dim);margin-bottom:6px}.show-cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:4px}.sc-day{position:relative;aspect-ratio:1;display:flex;align-items:center;justify-content:center;border-radius:8px;font-size:.8rem;color:var(--text-dim);cursor:default;border:1px solid transparent;transition:background .15s,border-color .15s}.sc-day.sc-has{cursor:pointer;font-weight:700}.sc-day.sc-past{background:rgba(90,120,180,.22);color:#9db0d0;border-color:rgba(120,150,210,.5)}.sc-day.sc-past:hover{background:rgba(120,150,210,.4);color:#d0dcf0}.sc-day.sc-today-day{background:#4a6db8;color:#fff;border-color:#7d9dd4;box-shadow:0 0 14px rgba(125,157,212,.7)}.sc-day.sc-today-day:hover{background:#5b7fc4}.sc-day.sc-future{background:rgba(255,184,77,.18);color:#ffd693;border-color:rgba(255,184,77,.55)}.sc-day.sc-future:hover{background:rgba(255,184,77,.4);color:#fff0d0}.sc-day.sc-active{outline:2px solid #fff;outline-offset:-2px}.sc-day.sc-empty{visibility:hidden}.sc-badge{position:absolute;top:2px;right:2px;min-width:14px;height:14px;padding:0 3px;border-radius:7px;background:#4a6db8;color:#fff;font-size:.6rem;font-weight:700;line-height:14px;text-align:center}.sc-day.sc-future .sc-badge{background:#d99a3a}.show-cal-legend{display:flex;flex-wrap:wrap;gap:12px;justify-content:center;margin-top:14px;font-size:.7rem;color:var(--text-dim)}.legend-item{display:inline-flex;align-items:center;gap:5px}.legend-dot{display:inline-block;width:10px;height:10px;border-radius:3px}.legend-past{background:rgba(90,120,180,.5);border:1px solid rgba(140,170,220,.8)}.legend-today{background:#4a6db8;border:1px solid #7d9dd4}.legend-future{background:rgba(255,184,77,.4);border:1px solid rgba(255,184,77,.8)}.show-cal-detail{margin-top:14px;border-top:1px solid var(--border);padding-top:12px;min-height:20px}.sc-ep{display:flex;gap:10px;align-items:baseline;padding:6px 0;font-size:.82rem}.sc-ep-tag{font-family:ui-monospace,Menlo,monospace;font-size:.72rem;font-weight:700;color:#7d9dd4;flex-shrink:0}.sc-ep-title{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ext-rating{display:inline-flex;align-items:center;gap:6px;padding:4px 10px 4px 8px;border-radius:8px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);line-height:1;font-size:.82rem;color:var(--text);white-space:nowrap;text-decoration:none;transition:background .15s,border-color .15s,transform .12s}.ext-rating:hover{background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.16)}.ext-logo{display:block;flex-shrink:0;border-radius:2px}.ext-score{font-weight:800;letter-spacing:.2px;font-variant-numeric:tabular-nums}.ext-rating.ext-imdb{background:rgba(245,197,24,.14);border-color:rgba(245,197,24,.35);color:#f5c518}.ext-rating.ext-imdb .ext-score{color:#f5c518}.ext-rating.ext-rt{background:rgba(250,50,10,.12);border-color:rgba(250,50,10,.32);color:#ff7666}.ext-rating.ext-rt .ext-score{color:#ff7666}.ext-rating.ext-mc{background:rgba(255,255,255,.05);border-color:rgba(255,255,255,.12);color:var(--text)}.ext-rating.ext-trakt{background:rgba(237,28,36,.12);border-color:rgba(237,28,36,.32);color:#ff6b70}.ext-rating.ext-trakt .ext-score{color:#ff6b70}.ext-rating.ext-tmdb{background:rgba(1,180,228,.12);border-color:rgba(1,180,228,.32);color:#4dd0e1}.ext-rating.ext-tmdb .ext-score{color:#4dd0e1}.ext-rating.ext-douban{background:rgba(46,150,61,.12);border-color:rgba(46,150,61,.38);color:#4ecb71}.ext-rating.ext-douban:hover{background:rgba(46,150,61,.22);border-color:rgba(46,150,61,.6);color:#6fe089}.detail-ext-ratings{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:8px;align-items:center}@media (min-width:600px){.container{padding-left:20px;padding-right:20px}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}.item{border-radius:14px}.poster{width:72px;height:108px}}@media (min-width:768px){.container{max-width:1000px;padding:0 28px calc(88px + env(safe-area-inset-bottom))}.hero{padding:28px 0 22px;gap:12px}.hero-avatar{width:56px;height:56px}.hero-name{font-size:1.55rem}.stats{gap:10px;padding:18px 12px;margin-bottom:24px}.stat-num{font-size:1.5rem}.stat-label{font-size:.76rem}.stat-icon{width:34px;height:34px;border-radius:10px}.tabs{position:static}.tab{flex:0 0 auto;padding:9px 18px;font-size:.87rem}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:16px}.item{display:flex;flex-direction:column;gap:0;padding:0;border-radius:12px;background:transparent;border:none;overflow:visible}.item:hover{background:transparent;border:none}.item.clickable:active{transform:none;background:transparent}.poster{width:100%;height:auto;aspect-ratio:2/3;border-radius:12px;transition:transform .25s ease,box-shadow .25s ease;box-shadow:0 4px 16px rgba(0,0,0,.5)}.item:hover .poster{transform:translateY(-4px);box-shadow:0 12px 32px rgba(91,124,250,.3),0 4px 16px rgba(0,0,0,.6)}.info{display:block;padding:10px 2px 0;flex:none;justify-content:flex-start}.name{font-size:.88rem}.overview{-webkit-line-clamp:2;font-size:.74rem;margin-top:4px}.meta{font-size:.76rem;margin-top:3px}.meta.dim{font-size:.72rem}.bar{margin-top:8px}.wl-remove,.wl-watched,.wl-unwatch{top:8px;right:8px;width:28px;height:28px}.day-num{font-size:1.6rem}}@media (min-width:1024px){.container{max-width:1120px;padding:0 32px 100px}.hero{padding:36px 0 26px}.hero-name{font-size:1.7rem}.stats{gap:12px;padding:20px 14px;margin-bottom:28px}.stat-num{font-size:1.7rem}.stat-label{font-size:.78rem}.stat-icon{width:36px;height:36px}.grid{grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:20px}.name{font-size:.9rem}.overview{-webkit-line-clamp:3;font-size:.76rem}.wl-remove,.wl-watched,.wl-unwatch{top:10px;right:10px;width:30px;height:30px}.wl-watched,.wl-unwatch{font-size:.95rem}}@media (min-width:1280px){.container{max-width:1280px;padding:0 40px 110px}.grid{grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:22px}.hero-name{font-size:1.85rem}}@media (min-width:1600px){.container{max-width:1440px}.grid{grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:24px}}.day{margin-bottom:26px}.day-head{display:flex;align-items:center;gap:12px;margin-bottom:12px;padding-left:2px}.day-num{font-size:1.8rem;font-weight:800;color:#7d9dd4;line-height:1;letter-spacing:-1px}.day-mon{font-size:.75rem;color:var(--text-dim)}.day-wd{font-size:.85rem;font-weight:600;color:var(--text)}.today{background:var(--accent);color:#fff;font-size:.68rem;padding:3px 9px;border-radius:999px;font-weight:700;margin-left:auto}.empty{text-align:center;padding:80px 20px;color:var(--text-dim)}.empty p{margin-top:14px;font-size:.92rem}@media (min-width:700px){.empty{padding:120px 20px}}.modal{position:fixed;inset:0;z-index:100;display:none}.modal.open{display:block}.modal-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.75);backdrop-filter:blur(12px) saturate(1.1);-webkit-backdrop-filter:blur(12px) saturate(1.1);animation:fadeIn .2s ease}.modal-panel{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:12px;padding-top:calc(12px + env(safe-area-inset-top));padding-bottom:calc(12px + env(safe-area-inset-bottom));pointer-events:none}.modal-body{pointer-events:auto;position:relative;width:100%;max-width:min(880px,100%);max-height:100%;overflow-y:auto;overflow-x:hidden;background:#000;border:1px solid var(--border);border-radius:18px;box-shadow:0 40px 100px rgba(0,0,0,.85);animation:modalIn .28s cubic-bezier(.2,.9,.3,1);-webkit-overflow-scrolling:touch;overscroll-behavior:contain}@media (max-width:599px){.modal-panel{padding:0;align-items:stretch;justify-content:flex-start}.modal-body{position:absolute;left:0;right:0;top:calc(10px + env(safe-area-inset-top));bottom:0;max-width:100%;max-height:none;width:100%;border-radius:16px 16px 0 0;border:none;border-top:1px solid var(--border);padding-bottom:env(safe-area-inset-bottom)}.modal-close{top:calc(14px + env(safe-area-inset-top));right:max(14px,env(safe-area-inset-right));width:44px;height:44px}.modal-close::before{inset:-12px}.detail-inner{padding-top:16px}.detail-body{padding-bottom:calc(28px + env(safe-area-inset-bottom))}}@media (min-width:768px) and (max-width:1023px){.modal-body{max-width:min(720px,92vw)}}@keyframes modalIn{from{opacity:0;transform:translateY(14px) scale(.98)}to{opacity:1;transform:translateY(0) scale(1)}}.modal-close{position:fixed;top:max(14px,env(safe-area-inset-top));right:max(14px,env(safe-area-inset-right));z-index:130;width:44px;height:44px;border-radius:50%;background:rgba(13,16,23,.92);border:1px solid rgba(255,255,255,.18);color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);transition:background .15s,transform .15s,border-color .15s;padding:0;box-shadow:0 4px 16px rgba(0,0,0,.55);touch-action:manipulation;-webkit-tap-highlight-color:transparent}.modal-close::before{content:'';position:absolute;inset:-10px;border-radius:50%}.modal-close:hover{background:rgba(30,38,58,.95);transform:scale(1.05);border-color:rgba(255,255,255,.28)}.modal-close:active{transform:scale(.94);background:rgba(50,60,88,.95)}.modal-loading{padding:100px 20px;text-align:center}.modal-error{padding:80px 20px;text-align:center;color:#9db5e0;font-size:.9rem}@media (min-width:700px){.modal-panel{padding:40px 24px}}.detail-hero{position:relative;overflow:hidden;background:var(--surface);border-radius:18px 18px 0 0}.detail-bg{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:blur(30px) saturate(1.2) brightness(.5);transform:scale(1.15);z-index:0}.detail-hero::after{content:'';position:absolute;inset:0;z-index:1;background:linear-gradient(180deg,rgba(10,14,24,.6),rgba(10,14,24,.95))}.detail-inner{position:relative;z-index:2;display:flex;flex-direction:column;align-items:center;text-align:center;gap:16px;padding:24px 20px 24px}.detail-poster{width:min(48vw,200px);height:auto;aspect-ratio:2/3;border-radius:14px;object-fit:cover;flex-shrink:0;box-shadow:0 16px 40px rgba(0,0,0,.75);margin:0 auto}.detail-poster-ph{display:flex;align-items:center;justify-content:center;background:var(--surface-2);font-size:2.8rem;color:var(--text-dim);width:min(48vw,200px);aspect-ratio:2/3}.detail-info{flex:1;min-width:0;display:flex;flex-direction:column;gap:8px;align-items:center;width:100%}.detail-title{font-size:1.45rem;font-weight:800;letter-spacing:-.4px;line-height:1.25}.detail-tagline{font-size:.85rem;color:var(--text-dim);font-style:italic}.detail-meta{display:flex;flex-wrap:wrap;gap:10px;font-size:.85rem;color:var(--text-dim);justify-content:center}.detail-genres{font-size:.82rem;color:var(--text-dim)}.detail-overview{font-size:.88rem;color:#c0c8d6;line-height:1.55;margin-top:4px;display:-webkit-box;-webkit-line-clamp:5;-webkit-box-orient:vertical;overflow:hidden;text-align:center}.d-status{display:flex;gap:12px;align-items:center;background:linear-gradient(135deg,#16161a,#0e0e10);border:1px solid var(--border);border-radius:14px;padding:12px 14px;margin-top:8px;width:100%;justify-content:flex-start}.d-status.done{border-color:rgba(74,222,128,.3);background:rgba(74,222,128,.06)}.d-status-progress{flex-direction:column;align-items:stretch;gap:10px}.d-status-row{display:flex;gap:12px;align-items:center;width:100%}.d-status-icon{width:32px;height:32px;border-radius:50%;background:var(--surface-2);color:var(--text-dim);display:flex;align-items:center;justify-content:center;font-weight:700;flex-shrink:0;font-size:.95rem}.d-status.done .d-status-icon{background:rgba(74,222,128,.15);color:#4ade80}.d-status-body{flex:1;min-width:0;text-align:left}.d-status-title{font-size:.88rem;font-weight:600}.d-status-sub{font-size:.76rem;color:var(--text-dim);margin-top:2px}.d-mark-btn{flex-shrink:0;background:rgba(52,211,153,.12);border:1px solid rgba(52,211,153,.35);color:#6ee7b7;padding:8px 14px;border-radius:10px;font-size:.78rem;font-weight:700;cursor:pointer;font-family:inherit;transition:all .15s;white-space:nowrap}.d-mark-btn:hover{background:rgba(52,211,153,.25);color:#a7f3d0}.d-mark-btn:disabled{opacity:.6;cursor:wait}.d-mark-btn.done{background:rgba(52,211,153,.2);color:#34d399;cursor:default}.d-mark-btn.unwatch{background:rgba(255,184,77,.12);border-color:rgba(255,184,77,.35);color:#ffb84d}.d-mark-btn.unwatch:hover{background:rgba(255,184,77,.25);color:#ffd693}.d-action-bar{display:inline-flex;align-items:center;gap:2px;margin-top:16px;padding:4px;background:linear-gradient(165deg,rgba(255,255,255,.09) 0%,rgba(255,255,255,.04) 100%);border:1px solid rgba(255,255,255,.12);border-radius:999px;box-shadow:0 8px 28px rgba(0,0,0,.45),inset 0 1px 0 rgba(255,255,255,.06);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}.d-act{display:inline-flex;align-items:center;justify-content:center;width:44px;height:44px;border-radius:50%;border:none;background:transparent;color:rgba(255,255,255,.55);cursor:pointer;padding:0;font-family:inherit;transition:background .18s ease,color .18s ease,transform .12s ease,box-shadow .18s ease;-webkit-tap-highlight-color:transparent;text-decoration:none;flex-shrink:0;position:relative}.d-act svg{display:block;pointer-events:none}.d-act:hover{background:rgba(255,255,255,.1);color:#fff}.d-act:active{transform:scale(.9)}.d-act:disabled{opacity:.5;cursor:default;pointer-events:none}.d-act-watched.active{background:linear-gradient(145deg,#8b5cf6 0%,#a78bfa 55%,#c4b5fd 100%);color:#fff;box-shadow:0 4px 16px rgba(139,92,246,.5),inset 0 1px 0 rgba(255,255,255,.25)}.d-act-watched.active:hover{filter:brightness(1.1);color:#fff}.d-act-wl.active{color:#c4b5fd;background:rgba(167,139,250,.12)}.d-act-wl.active:hover{background:rgba(167,139,250,.2);color:#ddd6fe}.d-act-play{color:rgba(255,255,255,.7)}.d-act-play:hover{background:rgba(167,139,250,.15);color:#ddd6fe}.detail-body{padding:20px 22px 24px}.d-section{margin-top:8px;margin-bottom:26px}.d-section:last-child{margin-bottom:0}.d-section-title{font-size:1rem;font-weight:700;letter-spacing:.2px;margin-bottom:14px;color:var(--text);display:flex;align-items:center;gap:8px}.d-section-title::before{content:'';width:3px;height:16px;border-radius:2px;background:#7d9dd4}.cast-scroll{display:flex;gap:14px;overflow-x:auto;padding-bottom:8px;scrollbar-width:none}.cast-scroll::-webkit-scrollbar{display:none}.cast{flex-shrink:0;width:84px;text-align:center}.cast-img{width:84px;height:84px;border-radius:50%;object-fit:cover;background:var(--surface-2)}.cast-ph{display:flex;align-items:center;justify-content:center;color:var(--text-dim);font-size:1.6rem;font-weight:600;background:linear-gradient(135deg,var(--surface-2),#1a2233)}.cast-name{font-size:.75rem;font-weight:600;margin-top:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.cast-role{font-size:.68rem;color:var(--text-dim);margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.seasons{display:flex;flex-direction:column;gap:8px}.season-item{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;transition:border-color .15s}.season-item.open{border-color:#2a3345}.season-head{width:100%;background:none;border:none;color:inherit;display:flex;align-items:center;gap:10px;padding:14px 16px;cursor:pointer;font-family:inherit;text-align:left;transition:background .15s}.season-head:hover{background:var(--surface-2)}.season-title{font-weight:600;font-size:.9rem;flex:1}.season-meta{font-size:.76rem;color:var(--text-dim)}.chev{width:16px;height:16px;color:var(--text-dim);transition:transform .2s ease;flex-shrink:0}.season-item.open .chev{transform:rotate(180deg)}.season-body{display:none;border-top:1px solid var(--border)}.season-item.open .season-body{display:block}.ep-empty{padding:20px;text-align:center;color:var(--text-dim);font-size:.85rem}.episode{display:flex;gap:12px;padding:12px 16px;border-bottom:1px solid var(--border);align-items:flex-start;transition:background .15s}.episode:last-child{border-bottom:none}.episode.clickable{cursor:pointer}.episode.clickable:hover{background:var(--surface-2)}.episode.clickable:active{background:#1a2233}.episode.clickable:hover .ep-title{color:#7d9dd4}.episode.watched .ep-title{color:var(--text-dim)}.episode.watched.clickable:hover .ep-title{color:#7d9dd4}.ep-num{font-family:ui-monospace,Menlo,monospace;font-size:.76rem;color:var(--text-dim);font-weight:700;flex-shrink:0;padding-top:3px;width:32px;letter-spacing:.5px}.ep-body{flex:1;min-width:0}.ep-title{font-size:.86rem;font-weight:600;line-height:1.3}.ep-overview{font-size:.76rem;color:var(--text-dim);margin-top:4px;line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ep-check{color:#4ade80;font-weight:700;flex-shrink:0;font-size:.9rem;padding-top:2px}.ep-actions{flex-shrink:0;display:flex;align-items:center}.ep-watch-btn{background:rgba(52,211,153,.12);border:1px solid rgba(52,211,153,.35);color:#6ee7b7;padding:3px 9px;border-radius:7px;font-size:.7rem;font-weight:700;cursor:pointer;font-family:inherit;transition:all .15s}.ep-watch-btn:hover{background:rgba(52,211,153,.25);color:#a7f3d0}.ep-watch-btn:disabled{opacity:.6;cursor:wait}.ep-watch-btn.done{background:rgba(52,211,153,.2);color:#34d399;cursor:default}.modal-body .grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:16px}@media (min-width:700px){.detail-inner{flex-direction:row;align-items:flex-start;text-align:left;padding:30px;gap:26px}.detail-poster{width:180px;height:auto;aspect-ratio:2/3;margin:0}.detail-info{align-items:flex-start}.detail-meta{justify-content:flex-start}.detail-overview{text-align:left}.detail-title{font-size:1.85rem}.detail-overview{font-size:.92rem;-webkit-line-clamp:6}.detail-body{padding:26px 30px 30px}.cast{width:96px}.cast-img{width:96px;height:96px}.modal-body .grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:18px}.detail-ext-ratings{justify-content:flex-start}.d-action-bar{align-self:flex-start}}.confirm-modal{position:fixed;inset:0;z-index:200;display:none}.confirm-modal.open{display:block}.confirm-backdrop{position:absolute;inset:0;background:rgba(2,4,8,.7);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);animation:fadeIn .18s ease}.confirm-panel{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:min(88vw,340px);background:linear-gradient(165deg,#16161a 0%,#0e0e10 100%);border:1px solid var(--border-strong);border-radius:18px;padding:24px 22px 18px;box-shadow:0 30px 80px rgba(0,0,0,.8);text-align:center;animation:confirmIn .22s cubic-bezier(.2,.9,.3,1)}@keyframes confirmIn{from{opacity:0;transform:translate(-50%,-48%) scale(.95)}to{opacity:1;transform:translate(-50%,-50%) scale(1)}}.confirm-icon{width:48px;height:48px;margin:0 auto 12px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:1.4rem;background:var(--accent-soft);color:var(--accent-2)}.confirm-icon.danger{background:rgba(224,85,96,.14);color:#ff7b85}.confirm-icon.warn{background:rgba(255,184,77,.14);color:#ffb84d}.confirm-icon.success{background:rgba(52,211,153,.14);color:#34d399}.confirm-title{font-size:1.02rem;font-weight:700;margin-bottom:6px;color:var(--text)}.confirm-msg{font-size:.84rem;color:var(--text-dim);line-height:1.55;word-break:break-word}.confirm-actions{display:flex;gap:10px;margin-top:20px}.confirm-btn{flex:1;padding:11px 14px;border-radius:12px;font-size:.88rem;font-weight:700;font-family:inherit;cursor:pointer;border:1px solid transparent;transition:all .15s;-webkit-tap-highlight-color:transparent}.confirm-cancel{background:rgba(255,255,255,.05);border-color:var(--border);color:var(--text-dim)}.confirm-cancel:hover{background:rgba(255,255,255,.09);color:#fff}.confirm-ok{background:linear-gradient(135deg,#7c3aed 0%,#a78bfa 100%);color:#fff;box-shadow:0 6px 20px rgba(167,139,250,.3)}.confirm-ok:hover{filter:brightness(1.08)}.confirm-ok.danger{background:linear-gradient(135deg,#dc2626 0%,#f87171 100%);box-shadow:0 6px 20px rgba(248,113,113,.28)}.confirm-ok:disabled,.confirm-cancel:disabled{opacity:.6;cursor:wait}.hero-avatar{border:2px solid rgba(167,139,250,.5);padding:0;cursor:pointer;font:inherit;color:inherit}.hero-avatar:hover{box-shadow:0 0 0 3px rgba(167,139,250,.28),0 4px 20px rgba(0,0,0,.5);transform:scale(1.03)}.hero-avatar:active{transform:scale(.97)}.summary-modal{position:fixed;inset:0;z-index:160;display:none}.summary-modal.open{display:block}.summary-backdrop{position:absolute;inset:0;background:rgba(2,4,8,.78);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}.summary-panel{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:min(94vw,480px);max-height:88vh;display:flex;flex-direction:column;background:linear-gradient(165deg,#16161a 0%,#0e0e10 100%);border:1px solid var(--border-strong);border-radius:18px;box-shadow:0 30px 80px rgba(0,0,0,.85);overflow:hidden}.summary-head{display:flex;align-items:center;justify-content:space-between;padding:16px 18px 10px;border-bottom:1px solid var(--border);flex-shrink:0}.summary-title{font-size:1.05rem;font-weight:700}.summary-close{width:36px;height:36px;border-radius:50%;border:1px solid var(--border);background:rgba(255,255,255,.04);color:var(--text-dim);font-size:1.2rem;cursor:pointer;font-family:inherit;line-height:1}.summary-close:hover{color:#fff;border-color:var(--border-strong)}.summary-body{overflow-y:auto;padding:12px 16px 20px;-webkit-overflow-scrolling:touch}@media (max-width:599px){.summary-panel{top:auto;bottom:0;left:0;right:0;transform:none;width:100%;max-height:92vh;border-radius:18px 18px 0 0}}.sum-wrap{padding:4px 0 24px}.sum-nav{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:18px}.sum-nav-btn{width:36px;height:36px;border-radius:10px;border:1px solid var(--border);background:rgba(255,255,255,.04);color:var(--text-dim);font-size:1.2rem;cursor:pointer;font-family:inherit;transition:all .15s}.sum-nav-btn:hover{color:#fff;border-color:var(--border-strong);background:rgba(167,139,250,.12)}.sum-nav-center{flex:1;text-align:center;min-width:0}.sum-period-tabs{display:inline-flex;gap:4px;background:rgba(255,255,255,.04);border:1px solid var(--border);border-radius:999px;padding:3px;margin-bottom:8px}.sum-period-btn{border:none;background:transparent;color:var(--text-dim);padding:6px 14px;border-radius:999px;font-size:.8rem;font-weight:600;cursor:pointer;font-family:inherit}.sum-period-btn.active{background:linear-gradient(135deg,#7c3aed 0%,#a78bfa 100%);color:#fff}.sum-label{font-size:1.05rem;font-weight:700;letter-spacing:.2px}.sum-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px}.sum-stat{text-align:center;background:linear-gradient(165deg,#16161a 0%,#0e0e10 100%);border:1px solid var(--border);border-radius:14px;padding:14px 6px}.sum-stat-num{font-size:1.35rem;font-weight:800;letter-spacing:-.5px;background:linear-gradient(180deg,#fff 0%,#c4b5fd 100%);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}.sum-stat-label{font-size:.7rem;color:var(--text-mute);margin-top:2px}.sum-chip{display:inline-flex;align-items:center;gap:6px;padding:8px 12px;border-radius:10px;background:rgba(167,139,250,.1);border:1px solid rgba(167,139,250,.25);color:var(--text-dim);font-size:.82rem;margin-bottom:12px}.sum-chip strong{color:#ddd6fe}.sum-muted{font-size:.8rem;color:var(--text-mute);margin:6px 0 12px}.sum-block{margin-top:18px}.sum-h3{font-size:.92rem;font-weight:700;margin-bottom:10px;display:flex;align-items:center;gap:8px}.sum-h3::before{content:'';width:3px;height:14px;border-radius:2px;background:linear-gradient(180deg,#a78bfa,#7c3aed)}.sum-heat{display:flex;flex-wrap:wrap;gap:4px}.sum-heat-cell{width:12px;height:12px;border-radius:3px;background:rgba(255,255,255,.06)}.sum-heat-cell.lv1{background:rgba(167,139,250,.25)}.sum-heat-cell.lv2{background:rgba(167,139,250,.45)}.sum-heat-cell.lv3{background:rgba(167,139,250,.7)}.sum-heat-cell.lv4{background:#a78bfa}.sum-list{display:flex;flex-direction:column;gap:8px}.sum-row{display:flex;align-items:center;gap:12px;padding:10px 12px;background:linear-gradient(160deg,#141416 0%,#0e0e10 100%);border:1px solid var(--border);border-radius:12px}.sum-rank{width:22px;height:22px;border-radius:6px;background:rgba(167,139,250,.15);color:#c4b5fd;font-size:.72rem;font-weight:800;display:flex;align-items:center;justify-content:center;flex-shrink:0}.sum-row-body{min-width:0;flex:1}.sum-row-title{font-size:.9rem;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sum-year{font-weight:500;color:var(--text-mute);font-size:.8rem}.sum-row-meta{font-size:.75rem;color:var(--text-dim);margin-top:2px}@media (max-width:420px){.sum-stats{gap:6px}.sum-stat{padding:12px 4px}.sum-stat-num{font-size:1.15rem}}`;
 }
