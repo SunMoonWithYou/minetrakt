@@ -53,6 +53,75 @@ const TRAKT_AUTH = "https://auth.trakt.tv",
   GUDUO_API = "https://widget.v2too.top/data/guduo.json";
 
 // PWA 应用元信息
+
+/* -------------------- 本地静态启动页（防白屏） --------------------
+ * 纯静态、无接口、可被 SW 长期缓存。
+ * WAP/PWA 冷启动或网络慢时先画出黑底启动画面，再跳进正式页面。
+ * -------------------------------------------------------------- */
+const LAUNCH_PATH = "/launch.html";
+const LAUNCH_HTML = `<!DOCTYPE html>
+<html lang="zh-CN" style="background:#000">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1,user-scalable=no">
+<meta name="theme-color" content="#050505">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="color-scheme" content="dark">
+<title>MineTrakt</title>
+<style>
+html,body{margin:0;padding:0;min-height:100%;min-height:100dvh;background:#000;color:#a8b2c4;
+  font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+  display:flex;align-items:center;justify-content:center;-webkit-tap-highlight-color:transparent}
+.wrap{text-align:center;padding:24px}
+.logo{width:72px;height:72px;margin:0 auto 16px;border-radius:18px;overflow:hidden;
+  background:#111;box-shadow:0 8px 32px rgba(0,0,0,.55)}
+.logo img{width:100%;height:100%;object-fit:cover;display:block}
+.name{font-size:1.25rem;font-weight:800;letter-spacing:.3px;
+  background:linear-gradient(135deg,#fff 20%,#7d9dd4);-webkit-background-clip:text;
+  background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:10px}
+.bar{width:120px;height:3px;border-radius:99px;background:rgba(255,255,255,.08);margin:0 auto 14px;overflow:hidden}
+.bar>i{display:block;height:100%;width:40%;border-radius:99px;background:#fff;
+  animation:slide 1.1s cubic-bezier(.65,0,.35,1) infinite}
+@keyframes slide{0%{transform:translateX(-120%)}100%{transform:translateX(280%)}}
+.tip{font-size:.8rem;color:#71717a}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="logo"><img src="/assets/icon-192.png" alt="" width="72" height="72"></div>
+  <div class="name">MineTrakt</div>
+  <div class="bar"><i></i></div>
+  <div class="tip" id="tip">正在进入…</div>
+</div>
+<script>
+(function(){
+  var tip=document.getElementById('tip');
+  var target='/';
+  try{
+    var q=new URLSearchParams(location.search||'');
+    var n=q.get('next');
+    if(n&&n.charAt(0)==='/'&&n.indexOf('//')<0&&n.indexOf('/launch')!==0)target=n;
+  }catch(e){}
+  function go(){location.replace(target);}
+  /* 先完成一帧绘制，再跳转，保证用户看到启动页而不是白屏 */
+  if(typeof requestAnimationFrame==='function'){
+    requestAnimationFrame(function(){setTimeout(go,80);});
+  }else{setTimeout(go,80);}
+  /* 兜底：若跳转失败（极端离线），提示手动重试 */
+  setTimeout(function(){
+    if(tip){tip.textContent='网络较慢，仍在尝试…';tip.style.color='#a8b2c4';}
+  },2500);
+  setTimeout(function(){
+    if(tip){
+      tip.innerHTML='仍无法进入，<a href="'+target+'" style="color:#c4b5fd">点此重试</a>';
+    }
+  },8000);
+})();
+</script>
+</body>
+</html>`;
+
 const APP_NAME = "MineTrakt",
   APP_SHORT_NAME = "MineTrakt",
   THEME_COLOR = "#050505";
@@ -105,8 +174,8 @@ const PAGE_SIZE = 20, // 历史记录每页条数
 // 首页自动刷新间隔（分钟）——只读 KV，30 分钟一次即可
 const HOME_AUTO_REFRESH_MINUTES = 30;
 // 前端静态资源版本（改动后 bump 触发缓存失效）
-const APP_JS_VERSION = "84",
-  APP_CSS_VERSION = "87";
+const APP_JS_VERSION = "86",
+  APP_CSS_VERSION = "88";
 
 /* 缓存 key 构造器
  * 统一管理所有 KV / 内存缓存的 key 命名，便于排查和批量失效 */
@@ -731,14 +800,189 @@ async function cachedJSON(
 
 /* -------------------- Service Worker 内容 -------------------- */
 // 前端 SW：静态资源 stale-while-revalidate；/api/ 与导航请求不走缓存
-const SW_JS_CONTENT = String.raw`/* MineTrakt SW v37 */ const VERSION = 'v37'; const RUNTIME_CACHE = 'trakt-static-' + VERSION; self.addEventListener('install', function(){ self.skipWaiting(); }); self.addEventListener('activate', function(e){ e.waitUntil((async function(){ var keys = await caches.keys(); await Promise.all(keys.filter(function(k){ return k !== RUNTIME_CACHE; }).map(function(k){ return caches.delete(k); })); await self.clients.claim(); })()); }); self.addEventListener('fetch', function(event){ var req = event.request; if (req.method !== 'GET') return; var url; try { url = new URL(req.url); } catch(e){ return; } if (url.origin !== self.location.origin) return; if (url.pathname === '/sw.js') return; if (req.mode === 'navigate') return; if (url.pathname.indexOf('/api/') === 0) return; if (url.pathname.indexOf('/auth/') === 0) return; if (url.pathname === '/app.css' || url.pathname === '/app.js' || url.pathname === '/manifest.webmanifest' || url.pathname === '/favicon.ico' || url.pathname.indexOf('/assets/') === 0 || /\.(?:png|jpg|jpeg|svg|webp|ico|woff2?|css|js)$/i.test(url.pathname)) { event.respondWith(staleWhileRevalidate(req)); } }); async function staleWhileRevalidate(req){ var cache = await caches.open(RUNTIME_CACHE); var cached = await cache.match(req); var network = fetch(req).then(function(r){ if (r && r.ok && r.type !== 'opaque') { cache.put(req, r.clone()).catch(function(){}); } return r; }).catch(function(){ return cached; }); return cached || network; }`;
+const SW_JS_CONTENT = String.raw`/* MineTrakt SW __SW_VERSION__ */
+var VERSION = '__SW_VERSION__';
+var RUNTIME_CACHE = 'trakt-static-' + VERSION;
+var SHELL_CACHE = 'trakt-shell-' + VERSION;
+var LAUNCH_PATH = '/launch.html';
+/* 安装时预缓存的启动壳与静态资源（由 Worker 注入） */
+var PRECACHE = __PRECACHE_JSON__;
 
+self.addEventListener('install', function (event) {
+  event.waitUntil(
+    (async function () {
+      try {
+        var cache = await caches.open(SHELL_CACHE);
+        await Promise.all(
+          PRECACHE.map(function (url) {
+            return cache.add(url).catch(function () {});
+          }),
+        );
+      } catch (e) {}
+      await self.skipWaiting();
+    })(),
+  );
+});
+
+self.addEventListener('activate', function (event) {
+  event.waitUntil(
+    (async function () {
+      var keys = await caches.keys();
+      await Promise.all(
+        keys
+          .filter(function (k) {
+            return k !== RUNTIME_CACHE && k !== SHELL_CACHE;
+          })
+          .map(function (k) {
+            return caches.delete(k);
+          }),
+      );
+      await self.clients.claim();
+    })(),
+  );
+});
+
+self.addEventListener('fetch', function (event) {
+  var req = event.request;
+  if (req.method !== 'GET') return;
+  var url;
+  try {
+    url = new URL(req.url);
+  } catch (e) {
+    return;
+  }
+  if (url.origin !== self.location.origin) return;
+  if (url.pathname === '/sw.js') return;
+  /* API / 认证始终走网络，不缓存 */
+  if (url.pathname.indexOf('/api/') === 0) return;
+  if (url.pathname.indexOf('/auth/') === 0) return;
+
+  /* 导航请求：缓存优先，后台更新 —— 避免 WAP/PWA 启动白屏 */
+  if (req.mode === 'navigate' || (req.headers.get('accept') || '').indexOf('text/html') >= 0) {
+    event.respondWith(navigateShell(req));
+    return;
+  }
+
+  /* 静态资源：stale-while-revalidate */
+  if (
+    url.pathname === '/app.css' ||
+    url.pathname === '/app.js' ||
+    url.pathname === '/manifest.webmanifest' ||
+    url.pathname === '/favicon.ico' ||
+    url.pathname.indexOf('/assets/') === 0 ||
+    /\.(?:png|jpg|jpeg|svg|webp|ico|woff2?|css|js)$/i.test(url.pathname)
+  ) {
+    event.respondWith(staleWhileRevalidate(req));
+  }
+});
+
+/**
+ * 导航策略（兼顾防白屏与登录态正确性）：
+ *   1. 网络优先：快速响应时始终用最新 HTML（Cookie/登录态正确）
+ *   2. 超时 (~900ms) 仍无网络：回退本地壳，避免黑/白屏干等
+ *   3. 完全离线：本地壳 → 再不行用内置离线页
+ */
+async function navigateShell(req) {
+  var cache = await caches.open(SHELL_CACHE);
+  var url = new URL(req.url);
+  /* 启动页本身：缓存优先，秒开黑屏启动画面 */
+  if (url.pathname === '/launch.html' || url.pathname === '/launch') {
+    var hit =
+      (await cache.match(LAUNCH_PATH)) ||
+      (await cache.match('/launch.html')) ||
+      (await cache.match(req));
+    var netL = fetch(req)
+      .then(function (res) {
+        if (res && res.ok) cache.put(LAUNCH_PATH, res.clone()).catch(function () {});
+        return res;
+      })
+      .catch(function () {
+        return null;
+      });
+    if (hit) {
+      netL.catch(function () {});
+      return hit;
+    }
+    var got = await netL;
+    if (got) return got;
+  }
+
+  var launchCached =
+    (await cache.match('/launch.html')) || (await cache.match(LAUNCH_PATH));
+  var appCached =
+    (await cache.match(req)) ||
+    (await cache.match(new Request('/'))) ||
+    (await cache.match('/'));
+
+  var networkPromise = fetch(req)
+    .then(function (res) {
+      if (res && res.ok && res.type !== 'opaque') {
+        try {
+          cache.put(req, res.clone());
+          cache.put(new Request('/'), res.clone()).catch(function () {});
+        } catch (e) {}
+      }
+      return res;
+    })
+    .catch(function () {
+      return null;
+    });
+
+  var timeoutMs = 800;
+  var raced = await Promise.race([
+    networkPromise,
+    new Promise(function (resolve) {
+      setTimeout(function () {
+        resolve('timeout');
+      }, timeoutMs);
+    }),
+  ]);
+
+  if (raced && raced !== 'timeout') return raced;
+  /* 超时：优先静态启动页（无登录态问题），再退应用壳 */
+  if (launchCached) return launchCached;
+  if (appCached) return appCached;
+
+  var net = await networkPromise;
+  if (net) return net;
+
+  return new Response(
+    '<!DOCTYPE html><html lang="zh-CN" style="background:#000"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#050505"><title>MineTrakt</title><style>html,body{margin:0;background:#000;color:#a8b2c4;min-height:100%;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif}</style></head><body><div style="text-align:center"><div style="font-weight:700;margin-bottom:8px">MineTrakt</div><div style="font-size:13px;opacity:.7">网络不可用，请检查后重试</div></div></body></html>',
+    {
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store',
+      },
+    },
+  );
+}
+
+async function staleWhileRevalidate(req) {
+  var cache = await caches.open(RUNTIME_CACHE);
+  var cached = await cache.match(req);
+  var network = fetch(req)
+    .then(function (r) {
+      if (r && r.ok && r.type !== 'opaque') {
+        cache.put(req, r.clone()).catch(function () {});
+      }
+      return r;
+    })
+    .catch(function () {
+      return cached;
+    });
+  return cached || network;
+}
+`;
 /* -------------------- 主入口路由 -------------------- */
 /** Cloudflare Worker 入口：按 path 分发静态资源 / 认证 / API / 首页 */
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url),
       path = url.pathname;
+
+    // 静态启动页（可被 SW 本地缓存，代替白屏）
+    if (path === LAUNCH_PATH || path === "/launch")
+      return handleLaunchPage();
 
     // 静态资源
     if (path.startsWith("/assets/")) return handleAsset(path, ctx);
@@ -855,7 +1099,7 @@ function handleManifest() {
       name: APP_NAME,
       short_name: APP_SHORT_NAME,
       description: "首页 · 待看列表 · 追剧日历 · 观看记录",
-      start_url: "/",
+      start_url: LAUNCH_PATH,
       scope: "/",
       display: "standalone",
       orientation: "portrait",
@@ -882,9 +1126,40 @@ function handleManifest() {
   );
 }
 
-/** Service Worker 脚本，禁止缓存 */
+/**
+ * Service Worker 脚本。
+ * 注入预缓存列表（启动壳 + 静态资源），实现 WAP/PWA 本地启动、减少白屏。
+ * sw.js 本身 no-store，确保能拿到最新 SW 版本。
+ */
+
+/** 返回可长期缓存的静态启动页（无 Cookie、无接口） */
+function handleLaunchPage() {
+  return new Response(LAUNCH_HTML, {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800",
+    },
+  });
+}
+
 function handleServiceWorker() {
-  return new Response(SW_JS_CONTENT, {
+  const swVersion = `v${APP_JS_VERSION}`;
+  const precache = [
+    LAUNCH_PATH,
+    "/",
+    `/app.css?v=${APP_CSS_VERSION}`,
+    `/app.js?v=${APP_JS_VERSION}`,
+    "/manifest.webmanifest",
+    FAVICON_URL,
+    ICON_192,
+    ICON_512,
+    SPLASH_LOGO,
+  ];
+  const body = SW_JS_CONTENT.replaceAll("__SW_VERSION__", swVersion).replace(
+    "__PRECACHE_JSON__",
+    JSON.stringify(precache),
+  );
+  return new Response(body, {
     headers: {
       "Content-Type": "application/javascript; charset=utf-8",
       "Cache-Control": "no-cache, no-store, must-revalidate",
