@@ -53,75 +53,6 @@ const TRAKT_AUTH = "https://auth.trakt.tv",
   GUDUO_API = "https://widget.v2too.top/data/guduo.json";
 
 // PWA 应用元信息
-
-/* -------------------- 本地静态启动页（防白屏） --------------------
- * 纯静态、无接口、可被 SW 长期缓存。
- * WAP/PWA 冷启动或网络慢时先画出黑底启动画面，再跳进正式页面。
- * -------------------------------------------------------------- */
-const LAUNCH_PATH = "/launch.html";
-const LAUNCH_HTML = `<!DOCTYPE html>
-<html lang="zh-CN" style="background:#000">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1,user-scalable=no">
-<meta name="theme-color" content="#050505">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="color-scheme" content="dark">
-<title>MineTrakt</title>
-<style>
-html,body{margin:0;padding:0;min-height:100%;min-height:100dvh;background:#000;color:#a8b2c4;
-  font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
-  display:flex;align-items:center;justify-content:center;-webkit-tap-highlight-color:transparent}
-.wrap{text-align:center;padding:24px}
-.logo{width:72px;height:72px;margin:0 auto 16px;border-radius:18px;overflow:hidden;
-  background:#111;box-shadow:0 8px 32px rgba(0,0,0,.55)}
-.logo img{width:100%;height:100%;object-fit:cover;display:block}
-.name{font-size:1.25rem;font-weight:800;letter-spacing:.3px;
-  background:linear-gradient(135deg,#fff 20%,#7d9dd4);-webkit-background-clip:text;
-  background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:10px}
-.bar{width:120px;height:3px;border-radius:99px;background:rgba(255,255,255,.08);margin:0 auto 14px;overflow:hidden}
-.bar>i{display:block;height:100%;width:40%;border-radius:99px;background:#fff;
-  animation:slide 1.1s cubic-bezier(.65,0,.35,1) infinite}
-@keyframes slide{0%{transform:translateX(-120%)}100%{transform:translateX(280%)}}
-.tip{font-size:.8rem;color:#71717a}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="logo"><img src="/assets/icon-192.png" alt="" width="72" height="72"></div>
-  <div class="name">MineTrakt</div>
-  <div class="bar"><i></i></div>
-  <div class="tip" id="tip">正在进入…</div>
-</div>
-<script>
-(function(){
-  var tip=document.getElementById('tip');
-  var target='/';
-  try{
-    var q=new URLSearchParams(location.search||'');
-    var n=q.get('next');
-    if(n&&n.charAt(0)==='/'&&n.indexOf('//')<0&&n.indexOf('/launch')!==0)target=n;
-  }catch(e){}
-  function go(){location.replace(target);}
-  /* 先完成一帧绘制，再跳转，保证用户看到启动页而不是白屏 */
-  if(typeof requestAnimationFrame==='function'){
-    requestAnimationFrame(function(){setTimeout(go,80);});
-  }else{setTimeout(go,80);}
-  /* 兜底：若跳转失败（极端离线），提示手动重试 */
-  setTimeout(function(){
-    if(tip){tip.textContent='网络较慢，仍在尝试…';tip.style.color='#a8b2c4';}
-  },2500);
-  setTimeout(function(){
-    if(tip){
-      tip.innerHTML='仍无法进入，<a href="'+target+'" style="color:#c4b5fd">点此重试</a>';
-    }
-  },8000);
-})();
-</script>
-</body>
-</html>`;
-
 const APP_NAME = "MineTrakt",
   APP_SHORT_NAME = "MineTrakt",
   THEME_COLOR = "#050505";
@@ -174,8 +105,8 @@ const PAGE_SIZE = 20, // 历史记录每页条数
 // 首页自动刷新间隔（分钟）——只读 KV，30 分钟一次即可
 const HOME_AUTO_REFRESH_MINUTES = 30;
 // 前端静态资源版本（改动后 bump 触发缓存失效）
-const APP_JS_VERSION = "86",
-  APP_CSS_VERSION = "88";
+const APP_JS_VERSION = "100",
+  APP_CSS_VERSION = "100";
 
 /* 缓存 key 构造器
  * 统一管理所有 KV / 内存缓存的 key 命名，便于排查和批量失效 */
@@ -199,6 +130,7 @@ const CK = {
   douban: "douban:v1:all", // 豆瓣（全局）
   theater: "theater:v1:all", // 剧场（全局）
   guduo: "guduo:v1:all", // 骨朵热榜（全局）
+  platform: (id, page, media) => `plat:${id}:${media}:p${page}`, // 平台筛选
   uidRt: (rt) => `uid:rt:${rt}`, // refresh_token → uid
   uidAt: (at) => `uid:at:${at}`, // access_token → uid
 };
@@ -800,189 +732,14 @@ async function cachedJSON(
 
 /* -------------------- Service Worker 内容 -------------------- */
 // 前端 SW：静态资源 stale-while-revalidate；/api/ 与导航请求不走缓存
-const SW_JS_CONTENT = String.raw`/* MineTrakt SW __SW_VERSION__ */
-var VERSION = '__SW_VERSION__';
-var RUNTIME_CACHE = 'trakt-static-' + VERSION;
-var SHELL_CACHE = 'trakt-shell-' + VERSION;
-var LAUNCH_PATH = '/launch.html';
-/* 安装时预缓存的启动壳与静态资源（由 Worker 注入） */
-var PRECACHE = __PRECACHE_JSON__;
+const SW_JS_CONTENT = String.raw`/* MineTrakt SW v37 */ const VERSION = 'v37'; const RUNTIME_CACHE = 'trakt-static-' + VERSION; self.addEventListener('install', function(){ self.skipWaiting(); }); self.addEventListener('activate', function(e){ e.waitUntil((async function(){ var keys = await caches.keys(); await Promise.all(keys.filter(function(k){ return k !== RUNTIME_CACHE; }).map(function(k){ return caches.delete(k); })); await self.clients.claim(); })()); }); self.addEventListener('fetch', function(event){ var req = event.request; if (req.method !== 'GET') return; var url; try { url = new URL(req.url); } catch(e){ return; } if (url.origin !== self.location.origin) return; if (url.pathname === '/sw.js') return; if (req.mode === 'navigate') return; if (url.pathname.indexOf('/api/') === 0) return; if (url.pathname.indexOf('/auth/') === 0) return; if (url.pathname === '/app.css' || url.pathname === '/app.js' || url.pathname === '/manifest.webmanifest' || url.pathname === '/favicon.ico' || url.pathname.indexOf('/assets/') === 0 || /\.(?:png|jpg|jpeg|svg|webp|ico|woff2?|css|js)$/i.test(url.pathname)) { event.respondWith(staleWhileRevalidate(req)); } }); async function staleWhileRevalidate(req){ var cache = await caches.open(RUNTIME_CACHE); var cached = await cache.match(req); var network = fetch(req).then(function(r){ if (r && r.ok && r.type !== 'opaque') { cache.put(req, r.clone()).catch(function(){}); } return r; }).catch(function(){ return cached; }); return cached || network; }`;
 
-self.addEventListener('install', function (event) {
-  event.waitUntil(
-    (async function () {
-      try {
-        var cache = await caches.open(SHELL_CACHE);
-        await Promise.all(
-          PRECACHE.map(function (url) {
-            return cache.add(url).catch(function () {});
-          }),
-        );
-      } catch (e) {}
-      await self.skipWaiting();
-    })(),
-  );
-});
-
-self.addEventListener('activate', function (event) {
-  event.waitUntil(
-    (async function () {
-      var keys = await caches.keys();
-      await Promise.all(
-        keys
-          .filter(function (k) {
-            return k !== RUNTIME_CACHE && k !== SHELL_CACHE;
-          })
-          .map(function (k) {
-            return caches.delete(k);
-          }),
-      );
-      await self.clients.claim();
-    })(),
-  );
-});
-
-self.addEventListener('fetch', function (event) {
-  var req = event.request;
-  if (req.method !== 'GET') return;
-  var url;
-  try {
-    url = new URL(req.url);
-  } catch (e) {
-    return;
-  }
-  if (url.origin !== self.location.origin) return;
-  if (url.pathname === '/sw.js') return;
-  /* API / 认证始终走网络，不缓存 */
-  if (url.pathname.indexOf('/api/') === 0) return;
-  if (url.pathname.indexOf('/auth/') === 0) return;
-
-  /* 导航请求：缓存优先，后台更新 —— 避免 WAP/PWA 启动白屏 */
-  if (req.mode === 'navigate' || (req.headers.get('accept') || '').indexOf('text/html') >= 0) {
-    event.respondWith(navigateShell(req));
-    return;
-  }
-
-  /* 静态资源：stale-while-revalidate */
-  if (
-    url.pathname === '/app.css' ||
-    url.pathname === '/app.js' ||
-    url.pathname === '/manifest.webmanifest' ||
-    url.pathname === '/favicon.ico' ||
-    url.pathname.indexOf('/assets/') === 0 ||
-    /\.(?:png|jpg|jpeg|svg|webp|ico|woff2?|css|js)$/i.test(url.pathname)
-  ) {
-    event.respondWith(staleWhileRevalidate(req));
-  }
-});
-
-/**
- * 导航策略（兼顾防白屏与登录态正确性）：
- *   1. 网络优先：快速响应时始终用最新 HTML（Cookie/登录态正确）
- *   2. 超时 (~900ms) 仍无网络：回退本地壳，避免黑/白屏干等
- *   3. 完全离线：本地壳 → 再不行用内置离线页
- */
-async function navigateShell(req) {
-  var cache = await caches.open(SHELL_CACHE);
-  var url = new URL(req.url);
-  /* 启动页本身：缓存优先，秒开黑屏启动画面 */
-  if (url.pathname === '/launch.html' || url.pathname === '/launch') {
-    var hit =
-      (await cache.match(LAUNCH_PATH)) ||
-      (await cache.match('/launch.html')) ||
-      (await cache.match(req));
-    var netL = fetch(req)
-      .then(function (res) {
-        if (res && res.ok) cache.put(LAUNCH_PATH, res.clone()).catch(function () {});
-        return res;
-      })
-      .catch(function () {
-        return null;
-      });
-    if (hit) {
-      netL.catch(function () {});
-      return hit;
-    }
-    var got = await netL;
-    if (got) return got;
-  }
-
-  var launchCached =
-    (await cache.match('/launch.html')) || (await cache.match(LAUNCH_PATH));
-  var appCached =
-    (await cache.match(req)) ||
-    (await cache.match(new Request('/'))) ||
-    (await cache.match('/'));
-
-  var networkPromise = fetch(req)
-    .then(function (res) {
-      if (res && res.ok && res.type !== 'opaque') {
-        try {
-          cache.put(req, res.clone());
-          cache.put(new Request('/'), res.clone()).catch(function () {});
-        } catch (e) {}
-      }
-      return res;
-    })
-    .catch(function () {
-      return null;
-    });
-
-  var timeoutMs = 800;
-  var raced = await Promise.race([
-    networkPromise,
-    new Promise(function (resolve) {
-      setTimeout(function () {
-        resolve('timeout');
-      }, timeoutMs);
-    }),
-  ]);
-
-  if (raced && raced !== 'timeout') return raced;
-  /* 超时：优先静态启动页（无登录态问题），再退应用壳 */
-  if (launchCached) return launchCached;
-  if (appCached) return appCached;
-
-  var net = await networkPromise;
-  if (net) return net;
-
-  return new Response(
-    '<!DOCTYPE html><html lang="zh-CN" style="background:#000"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#050505"><title>MineTrakt</title><style>html,body{margin:0;background:#000;color:#a8b2c4;min-height:100%;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif}</style></head><body><div style="text-align:center"><div style="font-weight:700;margin-bottom:8px">MineTrakt</div><div style="font-size:13px;opacity:.7">网络不可用，请检查后重试</div></div></body></html>',
-    {
-      headers: {
-        'Content-Type': 'text/html; charset=utf-8',
-        'Cache-Control': 'no-store',
-      },
-    },
-  );
-}
-
-async function staleWhileRevalidate(req) {
-  var cache = await caches.open(RUNTIME_CACHE);
-  var cached = await cache.match(req);
-  var network = fetch(req)
-    .then(function (r) {
-      if (r && r.ok && r.type !== 'opaque') {
-        cache.put(req, r.clone()).catch(function () {});
-      }
-      return r;
-    })
-    .catch(function () {
-      return cached;
-    });
-  return cached || network;
-}
-`;
 /* -------------------- 主入口路由 -------------------- */
 /** Cloudflare Worker 入口：按 path 分发静态资源 / 认证 / API / 首页 */
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url),
       path = url.pathname;
-
-    // 静态启动页（可被 SW 本地缓存，代替白屏）
-    if (path === LAUNCH_PATH || path === "/launch")
-      return handleLaunchPage();
 
     // 静态资源
     if (path.startsWith("/assets/")) return handleAsset(path, ctx);
@@ -1011,6 +768,7 @@ export default {
     if (path === "/api/theater-list") return handleTheaterList(request, env, ctx);
     // 骨朵热榜：分类筛选 + 横向滚动 / 弹窗网格
     if (path === "/api/guduo-list") return handleGuduoList(request, env, ctx);
+    if (path === "/api/platform-list") return handlePlatformList(request, env, ctx);
     if (path === "/api/watchlist/add" && request.method === "POST")
       return handleWatchlistAdd(request, env, ctx);
     if (path === "/api/watchlist/remove" && request.method === "POST")
@@ -1099,7 +857,7 @@ function handleManifest() {
       name: APP_NAME,
       short_name: APP_SHORT_NAME,
       description: "首页 · 待看列表 · 追剧日历 · 观看记录",
-      start_url: LAUNCH_PATH,
+      start_url: "/",
       scope: "/",
       display: "standalone",
       orientation: "portrait",
@@ -1126,40 +884,9 @@ function handleManifest() {
   );
 }
 
-/**
- * Service Worker 脚本。
- * 注入预缓存列表（启动壳 + 静态资源），实现 WAP/PWA 本地启动、减少白屏。
- * sw.js 本身 no-store，确保能拿到最新 SW 版本。
- */
-
-/** 返回可长期缓存的静态启动页（无 Cookie、无接口） */
-function handleLaunchPage() {
-  return new Response(LAUNCH_HTML, {
-    headers: {
-      "Content-Type": "text/html; charset=utf-8",
-      "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800",
-    },
-  });
-}
-
+/** Service Worker 脚本，禁止缓存 */
 function handleServiceWorker() {
-  const swVersion = `v${APP_JS_VERSION}`;
-  const precache = [
-    LAUNCH_PATH,
-    "/",
-    `/app.css?v=${APP_CSS_VERSION}`,
-    `/app.js?v=${APP_JS_VERSION}`,
-    "/manifest.webmanifest",
-    FAVICON_URL,
-    ICON_192,
-    ICON_512,
-    SPLASH_LOGO,
-  ];
-  const body = SW_JS_CONTENT.replaceAll("__SW_VERSION__", swVersion).replace(
-    "__PRECACHE_JSON__",
-    JSON.stringify(precache),
-  );
-  return new Response(body, {
+  return new Response(SW_JS_CONTENT, {
     headers: {
       "Content-Type": "application/javascript; charset=utf-8",
       "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -2121,11 +1848,13 @@ function mapTmdbItem(r, typeHint) {
   const mt = typeHint || r.media_type;
   const isMovie = mt === "movie";
   if (mt !== "movie" && mt !== "tv" && mt !== "show") return null;
+  const dateStr = r.release_date || r.first_air_date || "";
   return {
     type: isMovie ? "movie" : "show",
     tmdbId: r.id,
     title: isMovie ? r.title || r.original_title || "" : r.name || r.original_name || r.title || "",
-    year: (r.release_date || r.first_air_date || "").slice(0, 4),
+    year: dateStr.slice(0, 4),
+    date: dateStr,        // ← 新增：完整日期，用于精确排序
     poster: r.poster_path ? tmdbPoster(r.poster_path) : null,
     overview: r.overview || "",
     popularity: r.popularity || 0,
@@ -2670,6 +2399,297 @@ async function handleGuduoList(request, env, ctx) {
     });
   }
   return new Response(html, { headers: outHeaders });
+}
+
+
+/* -------------------- 流媒体平台筛选（TMDB discover） --------------------
+ * 国外：with_watch_providers + watch_region
+ * 国内：with_networks（播出平台/网络）
+ * API：/api/platform-list?id=netflix&mode=grid|hscroll&page=1&media=all|movie|tv
+ * ---------------------------------------------------- */
+
+const PLATFORMS = {
+  hbomax: {
+    id: "hbomax",
+    name: "HBO Max",
+    region: "国外",
+    logo: "https://picui.ogmua.cn/s1/2026/10/14/6acf1d2eaeb73.webp",
+    kind: "watch",
+    providers: [1899, 384],
+    watchRegion: "US",
+  },
+  netflix: {
+    id: "netflix",
+    name: "Netflix",
+    region: "国外",
+    logo: "https://picui.ogmua.cn/s1/2026/10/14/6acf1d2e2d114.webp",
+    kind: "watch",
+    providers: [8],
+    watchRegion: "US",
+  },
+  disney: {
+    id: "disney",
+    name: "Disney+",
+    region: "国外",
+    logo: "https://picui.ogmua.cn/s1/2026/10/14/6acf1d31c3e92.webp",
+    kind: "watch",
+    providers: [337],
+    watchRegion: "US",
+  },
+  appletv: {
+    id: "appletv",
+    name: "Apple TV+",
+    region: "国外",
+    logo: "https://picui.ogmua.cn/s1/2026/10/14/6acf1d2f8bbd9.webp",
+    kind: "watch",
+    providers: [350],
+    watchRegion: "US",
+  },
+  prime: {
+    id: "prime",
+    name: "Prime Video",
+    region: "国外",
+    logo: "https://picui.ogmua.cn/s1/2026/10/14/6acf1d3007455.webp",
+    kind: "watch",
+    providers: [9, 119],
+    watchRegion: "US",
+  },
+  bilibili: {
+    id: "bilibili",
+    name: "哔哩哔哩",
+    region: "国内",
+    logo: "https://picui.ogmua.cn/s1/2026/10/14/6acf1d2e54fb3.webp",
+    kind: "network",
+    networks: [1605],
+  },
+  iqiyi: {
+    id: "iqiyi",
+    name: "爱奇艺",
+    region: "国内",
+    logo: "https://picui.ogmua.cn/s1/2026/10/14/6acf1d2e05ad8.webp",
+    kind: "network",
+    networks: [1330],
+  },
+  tencent: {
+    id: "tencent",
+    name: "腾讯视频",
+    region: "国内",
+    logo: "https://picui.ogmua.cn/s1/2026/10/14/6acf1d2fefe09.webp",
+    kind: "network",
+    networks: [2007],
+  },
+  youku: {
+    id: "youku",
+    name: "优酷",
+    region: "国内",
+    logo: "https://picui.ogmua.cn/s1/2026/10/14/6acf1d30c04e7.webp",
+    kind: "network",
+    networks: [1419],
+  },
+  mgtv: {
+    id: "mgtv",
+    name: "芒果TV",
+    region: "国内",
+    logo: "https://picui.ogmua.cn/s1/2026/10/14/6acf1d30dabe2.webp",
+    kind: "network",
+    networks: [1631],
+  },
+};
+
+function renderPlatformItems(items) {
+  if (!Array.isArray(items) || !items.length) return "";
+  return items
+    .map((x, i) => {
+      const isMovie = x.type === "movie";
+      return mediaItem({
+        poster: x.poster,
+        tag: isMovie ? "电影" : "剧集",
+        tagClass: isMovie ? "movie" : "episode",
+        title: x.title,
+        overview: x.overview,
+        line1: x.year || "",
+        line2: x.platformName || "",
+        delay: Math.min(i, 24) * 20,
+        detailType: isMovie ? "movie" : "show",
+        detailId: "tmdb-" + x.tmdbId,
+      });
+    })
+    .join("");
+}
+
+/** 从 TMDB discover 拉某平台内容（电影 + 剧集合并） */
+async function fetchPlatformDiscover(plat, media, page, env) {
+  if (!env.TMDB_API_KEY || !plat) return { items: [], totalPages: 1 };
+  const pageNum = Math.max(1, Math.min(20, page || 1));
+  const wantMovie = media === "all" || media === "movie";
+  const wantTv = media === "all" || media === "tv";
+  const jobs = [];
+
+  function baseParams(extra, mediaType) {
+    const today = new Date().toISOString().slice(0, 10);
+    const isMovie = mediaType === "movie";
+    const sortBy = isMovie ? "primary_release_date.desc" : "first_air_date.desc";
+    const dateLte = isMovie ? "primary_release_date.lte" : "first_air_date.lte";
+    return {
+      language: "zh-CN",
+      sort_by: sortBy,
+      include_adult: "false",
+      page: String(pageNum),
+      [dateLte]: today,
+      ...extra,
+    };
+  }
+
+  if (plat.kind === "watch") {
+    const providerStr = (plat.providers || []).join("|");
+    const region = plat.watchRegion || "US";
+    if (wantMovie && providerStr) {
+      jobs.push(
+        tmdbGet(
+          tmdbUrl("/discover/movie", env, baseParams({
+            with_watch_providers: providerStr,
+            watch_region: region,
+            with_watch_monetization_types: "flatrate",
+          }, "movie")),
+        ).then((d) => ({ media: "movie", data: d })),
+      );
+    }
+    if (wantTv && providerStr) {
+      jobs.push(
+        tmdbGet(
+          tmdbUrl("/discover/tv", env, baseParams({
+            with_watch_providers: providerStr,
+            watch_region: region,
+            with_watch_monetization_types: "flatrate",
+          }, "tv")),
+        ).then((d) => ({ media: "tv", data: d })),
+      );
+    }
+  } else if (plat.kind === "network") {
+    const netStr = (plat.networks || []).join("|");
+    if (wantTv && netStr) {
+      jobs.push(
+        tmdbGet(
+          tmdbUrl("/discover/tv", env, baseParams({ with_networks: netStr }, "tv")),
+        ).then((d) => ({ media: "tv", data: d })),
+      );
+    }
+  }
+
+  const results = await Promise.all(jobs);
+  const seen = new Set();
+  const out = [];
+  let maxPages = 1;
+  for (const r of results) {
+    if (!r || !r.data) continue;
+    const tp = Number(r.data.total_pages) || 1;
+    if (tp > maxPages) maxPages = tp;
+    if (!Array.isArray(r.data.results)) continue;
+    for (const row of r.data.results) {
+      const item = mapTmdbItem(row, r.media === "movie" ? "movie" : "tv");
+      if (!item || !item.tmdbId || seen.has(item.type + ":" + item.tmdbId)) continue;
+      seen.add(item.type + ":" + item.tmdbId);
+      item.platformName = plat.name;
+      out.push(item);
+    }
+  }
+  // 按上映时间新老排序（新的在前，无日期的排最后）
+  out.sort((a, b) => {
+    const da = a.date || "";
+    const db = b.date || "";
+    if (!da && !db) return (b.popularity || 0) - (a.popularity || 0);
+    if (!da) return 1;
+    if (!db) return -1;
+    return db.localeCompare(da);
+  });
+  return { items: out, totalPages: Math.min(20, maxPages) };
+}
+
+async function handlePlatformList(request, env, ctx) {
+  const url = new URL(request.url);
+  const id = (url.searchParams.get("id") || "").trim().toLowerCase();
+  const mode = url.searchParams.get("mode") || "grid";
+  const media = url.searchParams.get("media") || "all";
+  const page = Math.max(1, Math.min(20, parseInt(url.searchParams.get("page") || "1", 10) || 1));
+  const plat = PLATFORMS[id];
+  const outHeadersHtml = {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "public, max-age=1800, stale-while-revalidate=600",
+  };
+  const outHeadersJson = {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "public, max-age=1800, stale-while-revalidate=600",
+  };
+
+  if (!plat) {
+    if (mode === "json" || mode === "preview")
+      return new Response(JSON.stringify({ error: "unknown", items: [] }), { headers: outHeadersJson });
+    return new Response('<div class="empty"><p>未知平台</p></div>', { headers: outHeadersHtml });
+  }
+  if (!env.TMDB_API_KEY) {
+    if (mode === "json" || mode === "preview")
+      return new Response(JSON.stringify({ error: "no tmdb", items: [] }), { headers: outHeadersJson });
+    return new Response('<div class="empty"><p>未配置 TMDB</p></div>', { headers: outHeadersHtml });
+  }
+
+  // preview：首页卡片叠海报，固定取第一页少量
+  const cacheMedia = mode === "preview" ? "preview" : media;
+  const cachePage = mode === "preview" ? 1 : page;
+  const data = await cachedJSON(
+    env,
+    ctx,
+    CK.platform(id, cachePage, cacheMedia),
+    async () => {
+      if (mode === "preview") {
+        const r = await fetchPlatformDiscover(plat, "all", 1, env);
+        const posters = (r.items || [])
+          .filter((x) => x.poster)
+          .slice(0, 5)
+          .map((x) => x.poster.replace("/w185", "/w342"));
+        return { items: posters, totalPages: 1, name: plat.name };
+      }
+      return fetchPlatformDiscover(plat, media, page, env);
+    },
+    { ttl: TREND_KV_TTL, missTtl: 600, swr: 3600, jitter: 300, edgeTtl: 900 },
+  );
+
+  if (mode === "preview") {
+    const posters = data && Array.isArray(data.items) ? data.items : [];
+    return new Response(JSON.stringify({ id, name: plat.name, posters }), { headers: outHeadersJson });
+  }
+
+  const list = data && Array.isArray(data.items) ? data.items : Array.isArray(data) ? data : [];
+  const totalPages = (data && data.totalPages) || 1;
+
+  if (mode === "json") {
+    return new Response(
+      JSON.stringify({
+        id,
+        name: plat.name,
+        page,
+        totalPages,
+        hasMore: page < totalPages,
+        items: list,
+      }),
+      { headers: outHeadersJson },
+    );
+  }
+
+  const html = renderPlatformItems(list);
+  if (mode === "hscroll") {
+    if (!html)
+      return new Response('<div class="h-scroll-empty"><span class="spinner"></span></div>', {
+        headers: outHeadersHtml,
+      });
+    return new Response(`<div class="h-scroll">${html}</div>`, { headers: outHeadersHtml });
+  }
+
+  // grid：附带分页元信息，方便前端加载更多
+  const wrap =
+    `<div class="platform-result" data-page="${page}" data-total-pages="${totalPages}" data-has-more="${page < totalPages ? "1" : "0"}">` +
+    (html || '<div class="empty"><p>暂无该平台内容</p></div>') +
+    `</div>`;
+  return new Response(wrap, { headers: outHeadersHtml });
 }
 
 /* -------------------- Trakt ID 解析 / 同步载荷 -------------------- */
@@ -4379,7 +4399,7 @@ function renderHomeSkeleton(initialDetail, profileHint) {
   const section = (id, title, extraHtml) =>
     `<div class="home-section"><div class="home-section-head"><h2 class="home-section-title">${title}</h2><button class="home-more-btn" type="button" onclick="openListModal('${id}')"><span>查看更多</span><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg></button></div>${extraHtml || ""}<div class="h-scroll-wrap"><div class="h-scroll" id="${id}-hscroll"><div class="pane-loading"><div class="spinner"></div></div></div></div></div>`;
 
-  return `<div class="container"><!-- 吸顶栏：头像 / 统计 / 主导航，滚动时固定在顶部 --><div class="top-sticky"><header class="hero"><div class="hero-left"><button type="button" class="hero-avatar" id="hero-avatar" title="观看小结" aria-label="打开观看小结">${heroAvatarHtml}</button><div class="hero-text"><h1 class="hero-name" id="hero-name">${heroName}</h1><p class="updated-at" id="updated-at"></p></div></div><div class="hero-actions"><button class="btn-action" id="btn-refresh" onclick="forceRefresh()" title="刷新数据"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg><span>刷新</span></button><button class="btn-action" onclick="logout()" title="退出登录"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg><span>退出</span></button></div></header><div class="stats" id="stats-box">${renderStatsHtml(null)}</div><nav class="tabs"><button class="tab active" data-tab="playback">首页</button><button class="tab" data-tab="watchlist">待看列表</button><button class="tab" data-tab="calendar">追剧日历</button><button class="tab" data-tab="history">观看记录</button><button class="tab" data-tab="search">搜索</button></nav></div><section id="playback" class="pane active">${section("playback", "继续观看")}${section("guduo", "骨朵热榜", '<div class="theater-home-tabs" id="guduo-home-tabs" style="display:none"></div>')}${section("theater", "平台剧场", '<div class="theater-home-tabs" id="theater-home-tabs" style="display:none"></div>')}${section("douban-domestic", "豆瓣热播国产剧")}${section("douban-hktw", "豆瓣热播港台剧")}${section("douban-jpkr", "豆瓣热播日韩剧")}${section("douban-western", "豆瓣热播欧美剧")}</section><section id="watchlist" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="calendar" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="history" class="pane"><div class="grid"></div><div id="history-more"></div></section><section id="search" class="pane"><div class="search-bar"><input id="search-input" class="search-input" type="search" placeholder="搜索电影 / 剧集" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></div><div id="search-results" class="grid"></div></section></div><div id="list-modal" class="list-modal"><div class="list-modal-backdrop" onclick="closeListModal()"></div><div class="list-modal-panel"><div class="list-modal-head"><h3 class="list-modal-title" id="list-modal-title"></h3><button type="button" class="list-modal-close" onclick="closeListModal()" aria-label="关闭">×</button></div><div class="list-modal-body" id="list-modal-body"></div></div></div><div id="summary-modal" class="summary-modal" style="display:none" role="dialog" aria-modal="true" aria-label="观看小结"><div class="summary-backdrop" onclick="window.__closeSummary()"></div><div class="summary-panel"><div class="summary-head"><h2 class="summary-title">观看小结</h2><button type="button" class="summary-close" onclick="window.__closeSummary()" aria-label="关闭">×</button></div><div id="summary-modal-body" class="summary-body"><div class="pane-loading"><div class="spinner"></div></div></div></div></div><div id="person-modal" class="person-modal"><div class="person-backdrop" onclick="closePerson()"></div><div class="person-panel"><div class="person-panel-head"><div class="person-panel-name" id="person-modal-name"></div><button class="person-close" onclick="closePerson()" aria-label="关闭">×</button></div><div class="person-panel-body" id="person-modal-body"></div></div></div><div id="confirm-modal" class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title" style="display:none"><div class="confirm-backdrop"></div><div class="confirm-panel"><div class="confirm-icon" id="confirm-icon">?</div><div class="confirm-title" id="confirm-title"></div><div class="confirm-msg" id="confirm-msg"></div><div class="confirm-actions"><button class="confirm-btn confirm-cancel" id="confirm-cancel" type="button">取消</button><button class="confirm-btn confirm-ok" id="confirm-ok" type="button">确定</button></div></div></div><div id="modal" class="modal"><div class="modal-backdrop" onclick="closeDetail()"></div><div class="modal-panel"><div class="modal-shell"><button class="modal-close" onclick="closeDetail()" aria-label="关闭"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button><div class="modal-body" id="modal-body"></div></div></div></div><div id="show-cal-modal" class="show-cal-modal"><div class="show-cal-backdrop" onclick="closeShowCal()"></div><div class="show-cal-panel"><div class="show-cal-head"><div class="show-cal-name" id="show-cal-name"></div><button class="show-cal-close" onclick="closeShowCal()" aria-label="关闭">×</button></div><div class="show-cal-info" id="show-cal-info"></div><div class="show-cal-nav"><button onclick="calShiftMonth(-1)" aria-label="上个月">‹</button><div id="show-cal-month">—</div><button onclick="calShiftMonth(1)" aria-label="下个月">›</button></div><div class="show-cal-weekdays"><span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span></div><div class="show-cal-grid" id="show-cal-grid"></div><div class="show-cal-legend"><span class="legend-item"><i class="legend-dot legend-past"></i>已播出</span><span class="legend-item"><i class="legend-dot legend-today"></i>今天</span><span class="legend-item"><i class="legend-dot legend-future"></i>待播出</span></div><div class="show-cal-detail" id="show-cal-detail"></div></div></div><script src="/app.js?v=${APP_JS_VERSION}" defer><\/script>${boot}`;
+  return `<div class="container"><!-- 吸顶栏：头像 / 统计 / 主导航，滚动时固定在顶部 --><div class="top-sticky"><header class="hero"><div class="hero-left"><button type="button" class="hero-avatar" id="hero-avatar" title="观看小结" aria-label="打开观看小结">${heroAvatarHtml}</button><div class="hero-text"><h1 class="hero-name" id="hero-name">${heroName}</h1><p class="updated-at" id="updated-at"></p></div></div><div class="hero-actions"><button class="btn-action" id="btn-refresh" onclick="forceRefresh()" title="刷新数据"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg><span>刷新</span></button><button class="btn-action" onclick="logout()" title="退出登录"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg><span>退出</span></button></div></header><div class="stats" id="stats-box">${renderStatsHtml(null)}</div><nav class="tabs"><button class="tab active" data-tab="playback">首页</button><button class="tab" data-tab="watchlist">待看列表</button><button class="tab" data-tab="calendar">追剧日历</button><button class="tab" data-tab="history">观看记录</button><button class="tab" data-tab="search">搜索</button></nav></div><section id="playback" class="pane active">${section("playback", "继续观看")}<div class="home-section platform-section"><div class="home-section-head"><h2 class="home-section-title">流媒体平台</h2></div><div class="platform-rows"><div class="platform-row"><div class="platform-cards"><button type="button" class="platform-card" data-platform="hbomax" title="HBO Max"><div class="platform-card-left"><img class="platform-card-logo" src="https://picui.ogmua.cn/s1/2026/10/14/6acf1d2eaeb73.webp" alt="" loading="lazy"><span class="platform-card-name">HBO Max</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="hbomax"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button><button type="button" class="platform-card" data-platform="netflix" title="Netflix"><div class="platform-card-left"><img class="platform-card-logo" src="https://picui.ogmua.cn/s1/2026/10/14/6acf1d2e2d114.webp" alt="" loading="lazy"><span class="platform-card-name">Netflix</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="netflix"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button><button type="button" class="platform-card" data-platform="disney" title="Disney+"><div class="platform-card-left"><img class="platform-card-logo" src="https://picui.ogmua.cn/s1/2026/10/14/6acf1d31c3e92.webp" alt="" loading="lazy"><span class="platform-card-name">Disney+</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="disney"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button><button type="button" class="platform-card" data-platform="appletv" title="Apple TV+"><div class="platform-card-left"><img class="platform-card-logo" src="https://picui.ogmua.cn/s1/2026/10/14/6acf1d2f8bbd9.webp" alt="" loading="lazy"><span class="platform-card-name">Apple TV+</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="appletv"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button><button type="button" class="platform-card" data-platform="prime" title="Prime Video"><div class="platform-card-left"><img class="platform-card-logo" src="https://picui.ogmua.cn/s1/2026/10/14/6acf1d3007455.webp" alt="" loading="lazy"><span class="platform-card-name">Prime Video</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="prime"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button></div></div><div class="platform-row"><div class="platform-cards"><button type="button" class="platform-card" data-platform="bilibili" title="哔哩哔哩"><div class="platform-card-left"><img class="platform-card-logo" src="https://picui.ogmua.cn/s1/2026/10/14/6acf1d2e54fb3.webp" alt="" loading="lazy"><span class="platform-card-name">哔哩哔哩</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="bilibili"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button><button type="button" class="platform-card" data-platform="iqiyi" title="爱奇艺"><div class="platform-card-left"><img class="platform-card-logo" src="https://picui.ogmua.cn/s1/2026/10/14/6acf1d2e05ad8.webp" alt="" loading="lazy"><span class="platform-card-name">爱奇艺</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="iqiyi"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button><button type="button" class="platform-card" data-platform="tencent" title="腾讯视频"><div class="platform-card-left"><img class="platform-card-logo" src="https://picui.ogmua.cn/s1/2026/10/14/6acf1d2fefe09.webp" alt="" loading="lazy"><span class="platform-card-name">腾讯视频</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="tencent"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button><button type="button" class="platform-card" data-platform="youku" title="优酷"><div class="platform-card-left"><img class="platform-card-logo" src="https://picui.ogmua.cn/s1/2026/10/14/6acf1d30c04e7.webp" alt="" loading="lazy"><span class="platform-card-name">优酷</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="youku"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button><button type="button" class="platform-card" data-platform="mgtv" title="芒果TV"><div class="platform-card-left"><img class="platform-card-logo" src="https://picui.ogmua.cn/s1/2026/10/14/6acf1d30dabe2.webp" alt="" loading="lazy"><span class="platform-card-name">芒果TV</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="mgtv"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button></div></div></div></div>${section("guduo", "骨朵热榜", '<div class="theater-home-tabs" id="guduo-home-tabs" style="display:none"></div>')}${section("theater", "平台剧场", '<div class="theater-home-tabs" id="theater-home-tabs" style="display:none"></div>')}${section("douban-domestic", "豆瓣热播国产剧")}${section("douban-hktw", "豆瓣热播港台剧")}${section("douban-jpkr", "豆瓣热播日韩剧")}${section("douban-western", "豆瓣热播欧美剧")}</section><section id="watchlist" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="calendar" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="history" class="pane"><div class="grid"></div><div id="history-more"></div></section><section id="search" class="pane"><div class="search-bar"><input id="search-input" class="search-input" type="search" placeholder="搜索电影 / 剧集" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></div><div id="search-results" class="grid"></div></section></div><div id="list-modal" class="list-modal"><div class="list-modal-backdrop" onclick="closeListModal()"></div><div class="list-modal-panel"><div class="list-modal-head"><h3 class="list-modal-title" id="list-modal-title"></h3><button type="button" class="list-modal-close" onclick="closeListModal()" aria-label="关闭">×</button></div><div class="list-modal-body" id="list-modal-body"></div></div></div><div id="summary-modal" class="summary-modal" style="display:none" role="dialog" aria-modal="true" aria-label="观看小结"><div class="summary-backdrop" onclick="window.__closeSummary()"></div><div class="summary-panel"><div class="summary-head"><h2 class="summary-title">观看小结</h2><button type="button" class="summary-close" onclick="window.__closeSummary()" aria-label="关闭">×</button></div><div id="summary-modal-body" class="summary-body"><div class="pane-loading"><div class="spinner"></div></div></div></div></div><div id="person-modal" class="person-modal"><div class="person-backdrop" onclick="closePerson()"></div><div class="person-panel"><div class="person-panel-head"><div class="person-panel-name" id="person-modal-name"></div><button class="person-close" onclick="closePerson()" aria-label="关闭">×</button></div><div class="person-panel-body" id="person-modal-body"></div></div></div><div id="confirm-modal" class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title" style="display:none"><div class="confirm-backdrop"></div><div class="confirm-panel"><div class="confirm-icon" id="confirm-icon">?</div><div class="confirm-title" id="confirm-title"></div><div class="confirm-msg" id="confirm-msg"></div><div class="confirm-actions"><button class="confirm-btn confirm-cancel" id="confirm-cancel" type="button">取消</button><button class="confirm-btn confirm-ok" id="confirm-ok" type="button">确定</button></div></div></div><div id="modal" class="modal"><div class="modal-backdrop" onclick="closeDetail()"></div><div class="modal-panel"><div class="modal-shell"><button class="modal-close" onclick="closeDetail()" aria-label="关闭"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button><div class="modal-body" id="modal-body"></div></div></div></div><div id="show-cal-modal" class="show-cal-modal"><div class="show-cal-backdrop" onclick="closeShowCal()"></div><div class="show-cal-panel"><div class="show-cal-head"><div class="show-cal-name" id="show-cal-name"></div><button class="show-cal-close" onclick="closeShowCal()" aria-label="关闭">×</button></div><div class="show-cal-info" id="show-cal-info"></div><div class="show-cal-nav"><button onclick="calShiftMonth(-1)" aria-label="上个月">‹</button><div id="show-cal-month">—</div><button onclick="calShiftMonth(1)" aria-label="下个月">›</button></div><div class="show-cal-weekdays"><span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span></div><div class="show-cal-grid" id="show-cal-grid"></div><div class="show-cal-legend"><span class="legend-item"><i class="legend-dot legend-past"></i>已播出</span><span class="legend-item"><i class="legend-dot legend-today"></i>今天</span><span class="legend-item"><i class="legend-dot legend-future"></i>待播出</span></div><div class="show-cal-detail" id="show-cal-detail"></div></div></div><script src="/app.js?v=${APP_JS_VERSION}" defer><\/script>${boot}`;
 }
 
 /* -------------------- 详情扩展（懒加载演员/推荐/预告片/评分） -------------------- */
@@ -6010,18 +6030,6 @@ async function handleMore(request, env, ctx) {
 /* -------------------- 登录页 -------------------- */
 
 /**
- * 渲染登录页。
- *
- * 状态气泡（#status）显示策略：
- *   · 初始隐藏：style="display:none"
- *   · 202/网络错误/429/5xx → 静默重试，不动气泡
- *   · 403/410 → 显示气泡提示，停止轮询
- *   · 200 → 显示"✓ 授权成功"
- *
- * startLogin 里的 429：
- *   · 显示倒计时，N 秒后自动启用"立即重试"按钮
- */
-/**
  * 登录页：设备码授权 + 轮询。
  * 支持「换一个验证码」（__loginGen 取消旧轮询）；
  * 410/403 时高亮换码按钮。
@@ -6031,7 +6039,6 @@ function renderLoginPage() {
     `<div class="login-wrap"><div class="login-card"><div class="login-logo"><img src="${ICON_192}" alt="MineTrakt" width="64" height="64" style="display:block;margin:0 auto"></div><h1 class="login-title">MineTrakt</h1><p class="login-sub">首页 · 待看列表 · 追剧日历 · 观看记录</p><div id="login-area" class="login-area"><button class="btn-primary" onclick="startLogin()">使用 Trakt 登录</button></div></div></div><script>async function startLogin(){const area=document.getElementById('login-area');window.__loginGen=(window.__loginGen||0)+1;const gen=window.__loginGen;area.innerHTML='<div class="spinner"></div>';let r;try{r=await fetch('/auth/device');}catch(e){if(gen!==window.__loginGen)return;area.innerHTML='<div class="err-box"><p class="err-title">网络错误</p><p class="err">'+String(e)+'</p></div><button class="btn-primary" onclick="startLogin()">重试</button>';return;}if(gen!==window.__loginGen)return;if(!r.ok){const err=await r.json().catch(()=>({}));if(gen!==window.__loginGen)return;if(r.status===429||err.rateLimited){var wait=Number(err.retryAfter)||30;area.innerHTML='<div class="err-box" style="background:rgba(255,184,77,.10);border-color:rgba(255,184,77,.28)"><p class="err-title" style="color:#ffb84d">请求过于频繁</p><p class="err" style="color:#ffd693">Trakt 限流了，请 <span id="rl-count">'+wait+'</span> 秒后再试</p></div><button class="btn-primary" id="rl-btn" disabled style="opacity:.5;cursor:not-allowed">请稍候…</button>';var cnt=document.getElementById('rl-count'),btn=document.getElementById('rl-btn'),left=wait;var t=setInterval(function(){if(gen!==window.__loginGen){clearInterval(t);return;}left--;if(cnt)cnt.textContent=String(left);if(left<=0){clearInterval(t);if(btn){btn.disabled=false;btn.style.opacity='';btn.style.cursor='';btn.textContent='立即重试';btn.onclick=function(){startLogin();};}}},1000);return;}area.innerHTML='<div class="err-box"><p class="err-title">获取设备码失败</p><p class="err">'+(err.error||('HTTP '+r.status))+'</p>'+(err.hint?'<p class="hint">'+err.hint+'</p>':'')+'</div><button class="btn-primary" onclick="startLogin()">重试</button>';return;}const d=await r.json();if(gen!==window.__loginGen)return;const activateUrl='https://trakt.tv/activate',qr='https://api.qrserver.com/v1/create-qr-code/?size=220x220&color=4a6db8&bgcolor=ffffff&data='+encodeURIComponent(activateUrl);area.innerHTML='<div class="device-flow"><div class="steps"><div class="step"><span class="n">1</span><span>打开 <a href="'+activateUrl+'" target="_blank" rel="noopener">trakt.tv/activate</a></span></div><div class="step"><span class="n">2</span><span>输入下方代码</span></div></div><div class="code-box">'+d.user_code+'</div><button type="button" class="btn-ghost" id="refresh-code-btn" onclick="startLogin()" style="margin:4px 0 10px">换一个验证码</button><div class="step"><span class="n">3</span><span>在 Trakt 页面点击授权</span></div><div class="qr-box"><img src="'+qr+'" alt="QR"></div><p id="status" class="status" style="display:none"></p></div><details class="log-details"><summary>调试日志</summary><div id="log" class="log-box"></div></details>';let interval=(d.interval||5)*1000,attempt=0;const logEl=document.getElementById('log'),log=(s)=>{if(logEl)logEl.innerHTML+='<div>['+new Date().toLocaleTimeString()+'] '+s+'</div>';};const tick=async()=>{if(gen!==window.__loginGen)return;attempt++;let r2;try{r2=await fetch('/auth/poll',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({state:d.state})});}catch(e){if(gen!==window.__loginGen)return;log('网络错误');setTimeout(tick,interval);return;}if(gen!==window.__loginGen)return;if(r2.status===200){try{const st=document.getElementById('status');if(st){st.innerHTML='✓ 授权成功，正在刷新…';st.className='status success';st.style.display='';}}catch(e){}setTimeout(()=>location.reload(),400);return;}let text='';try{text=await r2.text();}catch{}let data={};try{data=JSON.parse(text);}catch{}log('HTTP '+r2.status+' · '+(data.status||data.message||'未知'));if(r2.status===202){if(data.status==='slow_down')interval+=2000;setTimeout(tick,interval);return;}if(r2.status===429){setTimeout(tick,Math.max(interval,5000));return;}if(r2.status===502||r2.status===503||r2.status===504){setTimeout(tick,Math.max(interval,3000));return;}if(r2.status===403){try{const st=document.getElementById('status');if(st){st.textContent=data.message||'你拒绝了授权，请换一个验证码重试';st.className='status error';st.style.display='';}const rb=document.getElementById('refresh-code-btn');if(rb){rb.style.borderColor='rgba(224,85,96,.45)';rb.style.color='#ff8a8a';}}catch(e){}return;}if(r2.status===410){try{const st=document.getElementById('status');if(st){st.textContent=data.message||'验证码无效或已过期，请换一个重试';st.className='status error';st.style.display='';}const rb=document.getElementById('refresh-code-btn');if(rb){rb.style.borderColor='rgba(224,85,96,.45)';rb.style.color='#ff8a8a';rb.focus();}}catch(e){}return;}setTimeout(tick,interval);};setTimeout(tick,1000);}<\/script><script>(function(){try{var msg=sessionStorage.getItem('mt:relogin');if(!msg)return;sessionStorage.removeItem('mt:relogin');var area=document.getElementById('login-area');if(!area)return;var p=document.createElement('p');p.className='err';p.style.cssText='margin-bottom:14px;text-align:center';p.textContent=msg;area.parentNode.insertBefore(p,area);}catch(e){}})();<\/script>`,
   );
 }
-
 /* ============================================================
  * 段落 6 / 6：
  * 页面基础 HTML / 启动脚本 / 客户端脚本 / 样式
@@ -6153,10 +6160,6 @@ function startHomeData(){loadHomeData({silent:false});}if(document.readyState===
 /* -------------------- 客户端主体脚本 -------------------- */
 
 /**
- * 客户端完整脚本（bootstrap + 事件处理 + UI 逻辑）。
- * __apiJson 支持 relogin 识别。
- */
-/**
  * 浏览器端主脚本：拼到 /app.js。
  * 含交互、详情、watchlist、骨朵/剧场/豆瓣横向列表、小结等。
  * 修改后请 bump APP_JS_VERSION。
@@ -6198,6 +6201,120 @@ window.__loadTrending=__loadTrending;
 document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-wl-add-detail]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.wlAddDetailType,tmdbId=btn.dataset.wlAddDetail;if(!type||!tmdbId)return;const nameEl=document.querySelector('.detail-title');const name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'＋',title:'加入待看',message:'确定要把「'+(name||'该条目')+'」加入待看列表吗？',okText:'加入',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{const r=await fetch('/api/watchlist/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type,tmdbId})});let errMsg='';if(!r.ok){try{const j=await r.json();errMsg=(j&&(j.error||j.message))||('HTTP '+r.status);}catch(e){errMsg='HTTP '+r.status;}throw new Error(errMsg);}const span=document.createElement('span');span.className='d-watchlist-badge';span.textContent='✓ 已在待看';btn.replaceWith(span);__toast('已加入待看列表',{type:'success'});if(document.getElementById('watchlist-grid')&&typeof onWatchlistSortChange==='function'){const sort=(document.getElementById('wl-sort')&&document.getElementById('wl-sort').value)||'added';onWatchlistSortChange(sort);}if(window.__refreshStats)window.__refreshStats();}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('加入失败',err);}},true);
 var __listModalSections={playback:{title:'继续观看'},guduo:{title:'骨朵热榜',section:'guduo'},theater:{title:'平台剧场',section:'theater'},'douban-domestic':{title:'豆瓣热播国产剧',section:'domestic'},'douban-hktw':{title:'豆瓣热播港台剧',section:'hktw'},'douban-jpkr':{title:'豆瓣热播日韩剧',section:'jpkr'},'douban-western':{title:'豆瓣热播欧美剧',section:'western'}};
 window.openListModal=function(id){var cfg=__listModalSections[id];if(!cfg)return;var modal=document.getElementById('list-modal');var title=document.getElementById('list-modal-title');var body=document.getElementById('list-modal-body');if(!modal||!title||!body)return;title.textContent=cfg.title||'';body.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';modal.classList.add('open');document.body.style.overflow='hidden';if(id==='playback'){fetch('/api/more?type=playback&page=1&limit=60&mode=grid').then(function(r){return r.ok?r.text():'';}).then(function(html){if(html)body.innerHTML='<div class="grid">'+html+'</div>';else body.innerHTML='<div class="empty"><p>暂无内容</p></div>';if(window.__scheduleEnrich)window.__scheduleEnrich();}).catch(function(){body.innerHTML='<div class="empty"><p>加载失败</p></div>';});return;}if(id==='guduo'){body.innerHTML='<div id="guduo-filter-tabs" class="douban-filter-tabs" style="display:none"></div><div id="guduo-grid" class="grid"><div class="pane-loading"><div class="spinner"></div></div></div>';var ggrid=document.getElementById('guduo-grid'),gtabs=document.getElementById('guduo-filter-tabs');function loadGuduoGrid(cat){ggrid.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';fetch('/api/guduo-list?category='+encodeURIComponent(cat)+'&mode=grid').then(function(r){return r.ok?r.text():'';}).then(function(html){ggrid.innerHTML=html||'<div class="empty"><p>暂无内容</p></div>';if(window.__scheduleEnrich)window.__scheduleEnrich();}).catch(function(){ggrid.innerHTML='<div class="empty"><p>加载失败</p></div>';});}loadGuduoGrid('all');fetch('/api/guduo-list?mode=categories').then(function(r){return r.ok?r.json():{categories:[]};}).then(function(d){var cats=(d&&d.categories)||[];if(!cats.length)return;var html='<button class="douban-filter-tab active" data-category="all">全部</button>';cats.forEach(function(p){html+='<button class="douban-filter-tab" data-category="'+__esc(p)+'">'+__esc(p)+'</button>';});gtabs.innerHTML=html;gtabs.style.display='';gtabs.querySelectorAll('.douban-filter-tab').forEach(function(btn){btn.addEventListener('click',function(){gtabs.querySelectorAll('.douban-filter-tab').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');loadGuduoGrid(btn.getAttribute('data-category')||'all');});});}).catch(function(){});return;}if(id==='theater'){body.innerHTML='<div id="theater-filter-tabs" class="douban-filter-tabs" style="display:none"></div><div id="theater-grid" class="grid"><div class="pane-loading"><div class="spinner"></div></div></div>';var tgrid=document.getElementById('theater-grid'),tabsBox=document.getElementById('theater-filter-tabs');function loadTheater(platform){tgrid.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';fetch('/api/theater-list?platform='+encodeURIComponent(platform)+'&mode=grid').then(function(r){return r.ok?r.text():'';}).then(function(html){tgrid.innerHTML=html||'<div class="empty"><p>暂无内容</p></div>';if(window.__scheduleEnrich)window.__scheduleEnrich();}).catch(function(){tgrid.innerHTML='<div class="empty"><p>加载失败</p></div>';});}loadTheater('all');fetch('/api/theater-list?mode=platforms').then(function(r){return r.ok?r.json():{platforms:[]};}).then(function(d){var platforms=(d&&d.platforms)||[];if(!platforms.length)return;var html='<button class="douban-filter-tab active" data-platform="all">全部</button>';platforms.forEach(function(p){html+='<button class="douban-filter-tab" data-platform="'+__esc(p)+'">'+__esc(p)+'</button>';});tabsBox.innerHTML=html;tabsBox.style.display='';tabsBox.querySelectorAll('.douban-filter-tab').forEach(function(btn){btn.addEventListener('click',function(){tabsBox.querySelectorAll('.douban-filter-tab').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');loadTheater(btn.dataset.platform);});});}).catch(function(){});return;}var section=cfg.section;body.innerHTML='<div id="douban-modal-grid" class="grid"><div class="pane-loading"><div class="spinner"></div></div></div>';var grid=document.getElementById('douban-modal-grid');fetch('/api/douban-list?section='+encodeURIComponent(section)+'&mode=grid').then(function(r){return r.ok?r.text():'';}).then(function(html){if(html)grid.innerHTML=html;else grid.innerHTML='<div class="empty"><p>暂无内容</p></div>';if(window.__scheduleEnrich)window.__scheduleEnrich();}).catch(function(){grid.innerHTML='<div class="empty"><p>加载失败</p></div>';});};
+window.__platformNames={hbomax:"HBO Max",netflix:"Netflix",disney:"Disney+",appletv:"Apple TV+",prime:"Prime Video",bilibili:"哔哩哔哩",iqiyi:"爱奇艺",tencent:"腾讯视频",youku:"优酷",mgtv:"芒果TV"};
+window.__platformState={id:null,media:"all",page:1,loading:false,hasMore:false};
+window.openPlatformList=function(platformId){
+  var name=window.__platformNames[platformId]||platformId;
+  var modal=document.getElementById("list-modal");
+  var title=document.getElementById("list-modal-title");
+  var body=document.getElementById("list-modal-body");
+  if(!modal||!title||!body)return;
+  title.textContent=name;
+  window.__platformState={id:platformId,media:"all",page:1,loading:false,hasMore:false};
+  body.innerHTML='<div class="douban-filter-tabs" id="platform-media-tabs"><button class="douban-filter-tab active" data-media="all">全部</button><button class="douban-filter-tab" data-media="movie">电影</button><button class="douban-filter-tab" data-media="tv">剧集</button></div><div id="platform-grid" class="grid"><div class="pane-loading"><div class="spinner"></div></div></div><div class="load-more-wrap" id="platform-more-wrap" style="display:none"><button type="button" class="load-more" id="platform-load-more">加载更多</button></div>';
+  modal.classList.add("open");
+  document.body.style.overflow="hidden";
+  function setLoading(on){
+    var btn=document.getElementById("platform-load-more");
+    if(btn){btn.disabled=!!on;btn.textContent=on?"加载中…":"加载更多";}
+    window.__platformState.loading=!!on;
+  }
+  function load(media,page,append){
+    var st=window.__platformState;
+    if(st.loading)return;
+    st.media=media||st.media||"all";
+    st.page=page||1;
+    var grid=document.getElementById("platform-grid");
+    var moreWrap=document.getElementById("platform-more-wrap");
+    if(!grid)return;
+    if(!append)grid.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';
+    setLoading(true);
+    fetch("/api/platform-list?id="+encodeURIComponent(st.id)+"&media="+encodeURIComponent(st.media)+"&page="+encodeURIComponent(st.page)+"&mode=grid")
+      .then(function(r){return r.ok?r.text():"";})
+      .then(function(html){
+        setLoading(false);
+        var tmp=document.createElement("div");
+        tmp.innerHTML=html||"";
+        var wrap=tmp.querySelector(".platform-result");
+        var inner=wrap?wrap.innerHTML:(html||"");
+        var hasMore=wrap&&wrap.getAttribute("data-has-more")==="1";
+        var totalPages=wrap?parseInt(wrap.getAttribute("data-total-pages")||"1",10):1;
+        st.hasMore=!!hasMore;
+        st.page=wrap?parseInt(wrap.getAttribute("data-page")||String(st.page),10):st.page;
+        if(append){
+          var empty=grid.querySelector(".empty,.pane-loading");
+          if(empty)empty.remove();
+          grid.insertAdjacentHTML("beforeend",inner);
+        }else{
+          grid.innerHTML=inner||'<div class="empty"><p>暂无该平台内容</p></div>';
+        }
+        if(moreWrap)moreWrap.style.display=st.hasMore?"block":"none";
+        if(window.__scheduleEnrich)window.__scheduleEnrich();
+      })
+      .catch(function(){
+        setLoading(false);
+        if(!append)grid.innerHTML='<div class="empty"><p>加载失败</p></div>';
+      });
+  }
+  load("all",1,false);
+  var tabs=document.getElementById("platform-media-tabs");
+  if(tabs){
+    tabs.addEventListener("click",function(e){
+      var btn=e.target.closest(".douban-filter-tab");
+      if(!btn)return;
+      tabs.querySelectorAll(".douban-filter-tab").forEach(function(b){b.classList.remove("active");});
+      btn.classList.add("active");
+      load(btn.getAttribute("data-media")||"all",1,false);
+    });
+  }
+  var moreBtn=document.getElementById("platform-load-more");
+  if(moreBtn){
+    moreBtn.addEventListener("click",function(){
+      var st=window.__platformState;
+      if(!st.hasMore||st.loading)return;
+      load(st.media,st.page+1,true);
+    });
+  }
+};
+document.addEventListener("click",function(e){
+  var btn=e.target&&e.target.closest&&e.target.closest("[data-platform]");
+  if(!btn)return;
+  e.preventDefault();
+  var id=btn.getAttribute("data-platform");
+  if(id)window.openPlatformList(id);
+});
+(function loadPlatformPreviews(){
+  function run(){
+    var nodes=document.querySelectorAll("[data-plat-posters]");
+    if(!nodes.length)return;
+    nodes.forEach(function(el){
+      var id=el.getAttribute("data-plat-posters");
+      if(!id||el.dataset.loaded==="1")return;
+      el.dataset.loaded="1";
+      fetch("/api/platform-list?id="+encodeURIComponent(id)+"&mode=preview")
+        .then(function(r){return r.ok?r.json():null;})
+        .then(function(d){
+          var posters=(d&&d.posters)||[];
+          if(!posters.length)return;
+          var html="";
+          for(var i=0;i<4;i++){
+            if(posters[i]){
+              html+='<img class="platform-card-poster p'+i+'" src="'+posters[i]+'" alt="" loading="lazy">';
+            }else{
+              html+='<span class="platform-card-poster p'+i+' platform-card-poster-ph"></span>';
+            }
+          }
+          el.innerHTML=html;
+        })
+        .catch(function(){});
+    });
+  }
+  if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",run);
+  else run();
+  // 首页数据回填后可能重绘，延迟再扫一次
+  setTimeout(run,1200);
+  setTimeout(run,3000);
+})();
 window.closeListModal=function(){var modal=document.getElementById('list-modal');if(!modal)return;modal.classList.remove('open');document.body.style.overflow='';};
 document.addEventListener('keydown',function(e){if(e.key==='Escape'){var m=document.getElementById('list-modal');if(m&&m.classList.contains('open')){window.closeListModal();return;}}});
 async function loadGuduoHScroll(category){category=category||'all';var el=document.getElementById('guduo-hscroll');if(!el)return;el.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';try{var r=await fetch('/api/guduo-list?mode=hscroll&category='+encodeURIComponent(category));var html=r.ok?await r.text():'';var tmp=document.createElement('div');tmp.innerHTML=html;var inner=tmp.querySelector('.h-scroll');if(inner)el.innerHTML=inner.innerHTML;else if(html)el.innerHTML=html;else el.innerHTML='<div class="h-scroll-empty"><span class="spinner"></span></div>';if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){el.innerHTML='<div class="h-scroll-empty"><p>加载失败</p></div>';}}async function loadGuduoHomeTabs(){var tabsBox=document.getElementById('guduo-home-tabs');if(!tabsBox||tabsBox.dataset.loaded==='1')return;try{var r=await fetch('/api/guduo-list?mode=categories');var d=r.ok?await r.json():{categories:[]};var cats=(d&&d.categories)||[];if(!cats.length){/* 无数据也给固定四类 */}cats=cats.length?cats:['剧集','电影','动漫','综艺'];var html='<button class="theater-filter-tab active" data-category="all">全部</button>';for(var i=0;i<cats.length;i++){var p=cats[i];html+='<button class="theater-filter-tab" data-category="'+__esc(p)+'">'+__esc(p)+'</button>';}tabsBox.innerHTML=html;tabsBox.style.display='';tabsBox.dataset.loaded='1';tabsBox.addEventListener('click',function(e){var btn=e.target.closest('.theater-filter-tab');if(!btn)return;tabsBox.querySelectorAll('.theater-filter-tab').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');loadGuduoHScroll(btn.getAttribute('data-category')||'all');});}catch(e){}}async function loadTheaterHScroll(platform){platform=platform||'all';var el=document.getElementById('theater-hscroll');if(!el)return;el.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';try{var r=await fetch('/api/theater-list?mode=hscroll&platform='+encodeURIComponent(platform));var html=r.ok?await r.text():'';var tmp=document.createElement('div');tmp.innerHTML=html;var inner=tmp.querySelector('.h-scroll');if(inner)el.innerHTML=inner.innerHTML;else if(html)el.innerHTML=html;else el.innerHTML='<div class="h-scroll-empty"><span class="spinner"></span></div>';if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){el.innerHTML='<div class="h-scroll-empty"><p>加载失败</p></div>';}}
@@ -6258,7 +6375,6 @@ document.addEventListener('click',function(e){const card=e.target.closest('.trai
 window.addEventListener('load',()=>{setTimeout(__runEnrich,200);});`
   );
 }
-
 /* ============================================================
  * pageStyles —— 完整样式（模板字符串，已格式化便于维护）
  * 含：启动页 / 登录 / 首页吸顶 / 列表卡片 / 详情模态 / 小结 等
@@ -6438,10 +6554,7 @@ body {
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC",
     "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-  background: radial-gradient(ellipse 120% 70% at 50% -20%, #1a1528 0%, transparent 50%),
-    radial-gradient(ellipse 50% 40% at 100% 0%, rgba(167, 139, 250, 0.08) 0%, transparent 45%),
-    radial-gradient(ellipse 40% 30% at 0% 100%, rgba(52, 211, 153, 0.04) 0%, transparent 40%),
-    #050505;
+  background: #000000;
   background-attachment: fixed;
   color: var(--text);
   -webkit-font-smoothing: antialiased;
@@ -7532,6 +7645,173 @@ img {
 }
 .home-more-btn svg {
   transition: transform 0.2s ease;
+}
+.platform-section {
+  margin-bottom: 24px;
+}
+.platform-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.platform-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.platform-cards {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  padding: 4px 2px 10px;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  flex: 1;
+  min-width: 0;
+  scroll-snap-type: x proximity;
+}
+.platform-cards::-webkit-scrollbar {
+  display: none;
+}
+/* 平台卡片：深色卡片 + 左侧品牌 + 右侧扇形海报墙 */
+.platform-card {
+  flex: 0 0 auto;
+  width: min(86vw, 320px);
+  height: 118px;
+  border: none;
+  border-radius: 22px;
+  background: linear-gradient(145deg, #1a1a1a 0%, #0a0a0a 100%);
+  box-shadow:
+    0 10px 28px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  display: flex;
+  align-items: stretch;
+  padding: 0;
+  cursor: pointer;
+  overflow: hidden;
+  position: relative;
+  scroll-snap-align: start;
+  transition: transform 0.18s ease, box-shadow 0.18s ease;
+  -webkit-tap-highlight-color: transparent;
+  font: inherit;
+  color: #fff;
+}
+.platform-card:hover {
+  transform: translateY(-3px);
+  box-shadow:
+    0 16px 36px rgba(0, 0, 0, 0.65),
+    inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+.platform-card:active {
+  transform: scale(0.985);
+}
+.platform-card-left {
+  flex: 0 0 42%;
+  max-width: 42%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  padding: 12px 8px 12px 14px;
+  z-index: 2;
+  position: relative;
+}
+.platform-card-logo {
+  width: 64px;
+  height: 64px;
+  border-radius: 0;
+  object-fit: contain;
+  object-position: center;
+  flex-shrink: 0;
+  box-shadow: none;
+  background: transparent;
+  padding: 0;
+  box-sizing: border-box;
+  display: block;
+}
+.platform-card-name {
+  display: none;
+}
+.platform-card-right {
+  flex: 1;
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+}
+.platform-card-posters {
+  position: absolute;
+  right: -6px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 160px;
+  height: 108px;
+}
+.platform-card-poster {
+  position: absolute;
+  width: 58px;
+  height: 86px;
+  border-radius: 10px;
+  object-fit: cover;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.28);
+  border: 1.5px solid rgba(255, 255, 255, 0.95);
+  background: #c5c9d0;
+  top: 50%;
+  margin-top: -43px;
+}
+.platform-card-poster-ph {
+  background: linear-gradient(145deg, #d0d4db 0%, #b8bec8 100%);
+}
+.platform-card-poster.p0 {
+  right: 8px;
+  z-index: 5;
+  transform: rotate(8deg);
+}
+.platform-card-poster.p1 {
+  right: 36px;
+  z-index: 4;
+  transform: rotate(3deg);
+}
+.platform-card-poster.p2 {
+  right: 64px;
+  z-index: 3;
+  transform: rotate(-4deg);
+}
+.platform-card-poster.p3 {
+  right: 92px;
+  z-index: 2;
+  transform: rotate(-10deg);
+}
+@media (min-width: 768px) {
+  .platform-card {
+    width: 340px;
+    height: 128px;
+    border-radius: 24px;
+  }
+  .platform-card-logo {
+    width: 72px;
+    height: 72px;
+    border-radius: 0;
+    padding: 0;
+  }
+  .platform-card-posters {
+    width: 180px;
+    height: 116px;
+  }
+  .platform-card-poster {
+    width: 64px;
+    height: 96px;
+    margin-top: -48px;
+    border-radius: 11px;
+  }
+  .platform-card-poster.p0 { right: 10px; }
+  .platform-card-poster.p1 { right: 40px; }
+  .platform-card-poster.p2 { right: 70px; }
+  .platform-card-poster.p3 { right: 100px; }
+  .platform-cards {
+    gap: 14px;
+  }
 }
 .h-scroll-wrap {
   margin: 0 -16px;
