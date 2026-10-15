@@ -23,7 +23,7 @@ https://trakt.yx1314.ccwu.cc
 
 点击下方按钮即可观看 Demo：
 
-[▶️ 点击观看演示视频](https://img.helo.de5.net/1791276235250.mp4)
+[▶️ 点击观看演示视频](https://yourimageshare.com/ib/QyuHyTRdUv.mp4)
 
 ### ✨ 项目功能
 
