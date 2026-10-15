@@ -1,65 +1,49 @@
 /* ============================================================
- * MineTrakt Worker —— Cloudflare Workers 完整单文件
- * ------------------------------------------------------------
- * 文件结构（按阅读顺序）
- *   1. 常量 / 公共响应头常量 / CK 缓存键 / 基础工具 / Trakt 限流 / KV 与 cachedJSON
- *   2. 路由入口 · 静态资源 · Service Worker · 鉴权 · 设备码登录
- *   3. 外部数据：TMDB / 豆瓣 / 平台剧场 / 骨朵热榜 / OMDB
- *   4. 用户写操作：watchlist · 标记已看 · 弃剧 · 日历 · 小结
- *   5. 首页 shell · home-data 分片 · 详情 / 季 / 演员
- *   6. 卡片与列表 HTML 渲染 · 登录页 · 启动页 · 页面骨架
- *   7. 内联 CSS（pageStyles）· 内联客户端 JS（getClientSideScripts）
- *
- * 路由总览
- *   · /            启动页（服务端读 Cookie 定跳转，展示 ~400ms 后 replace 到 /home 或 /login）
- *   · /login       登录页（已登录 302 → /home）
- *   · /home        首页（未登录 302 → /login；/detail/ 深链同样走首页 shell）
- *   · /api/*       数据接口（含 /api/app-version 版本对账、/api/auth-status 轻量登录态）
- *   · /app.js      客户端脚本（?v=版本号，immutable 缓存）
- *   · /app.css     样式（同上）
- *   · /sw.js       Service Worker（no-store，字节比对触发更新）
- *
- * PWA 更新机制（防止 Web App 模式停留在旧代码）
- *   · SW：install 即 skipWaiting，activate 清旧缓存 + clients.claim
- *   · 页面：load 后 1.2s 注册 SW 并立即 update()
- *   · 版本对账：pageshow（bfcache/快照恢复）与 visibilitychange（回前台）时
- *     fetch /api/app-version，与页面内嵌版本不一致 → 自动 location.reload()
- *
- * 架构概览
- *   · 认证：Trakt OAuth 设备码 → Cookie(trakt_auth) 存 token + trakt_id
- *   · 数据：Trakt / TMDB / OMDB / 豆瓣 / 剧场 / 骨朵 → 统一走 cachedJSON
- *   · 缓存：进程内存 Map → Cloudflare KV(TMDB_CACHE) → stale 回退
- *   · 前端：/app.js + /app.css 静态；首页数据 /api/home-data JSON+HTML 片段
- *   · 公共助手：jsonResp()（统一 JSON 响应）· commonHeadMeta()（公共 head 片段）
- *     · 响应头常量：CC_API / CC_NO_STORE / CT_JSON / CT_HTML（新代码统一引用）
- *   · 环境变量：TRAKT_CLIENT_ID · TMDB_API_KEY · OMDB_API_KEY（可选）
- *   · 绑定：TMDB_CACHE（KV）
- *
- * 缓存与上游策略（重要）
- *   · 非 force：优先读 KV/内存；未逻辑过期不打 Trakt；过期或冷启动才请求
- *   · force=1（点刷新）：绕过缓存打上游；失败绝不写脏数据，回退旧 KV
- *   · 限流 429：标记 per-user 冷却，后续短时间短路，前端可停止后续 part
- *   · strict 鉴权：拿不到稳定身份 → 401 + 清 Cookie + relogin，回登录页
- *
- * 性能要点
- *   · 非 force 任务并行、无人为间隔；force 串行 + 动态间隔防 429
- *   · Cookie 固化 trakt_id，避免每次 authed 打 /users/me
- *   · Watchlist movies/shows 并行拉取
- *   · 首页吸顶栏（.top-sticky）：整栏（头像+统计+Tab）固定顶部，不折叠
- *   · 启动页：服务端预判跳转零请求 + preload 预热 /app.js 与 /app.css
- *
- * 维护提示
- *   · 改前端逻辑：同步 bump APP_JS_VERSION
- *   · 改样式：同步 bump APP_CSS_VERSION
- *   · 两处版本与 SW 内嵌版本（SW_JS_CONTENT 的 vXXX）保持一致
- *   · 大段 HTML/CSS/客户端脚本在模板字符串内，避免破坏转义
- *   · 新增 JSON 接口请用 jsonResp()，勿再手写 new Response(JSON.stringify(...))
+ * MineTrakt —— Cloudflare Workers 单文件应用（影视追踪 PWA）
  * ============================================================
  *
- * 段落 1 / 4：常量 + 基础工具 + KV 缓存层 + cachedJSON
+ * 【这是什么】
+ *   基于 Trakt 的个人追剧面板：继续观看 / 待看 / 日历 / 记录 / 搜索，
+ *   叠加 TMDB 评分、OMDB 评分、豆瓣榜单、平台剧场、骨朵热榜等增强数据。
+ *   一个文件包含全部后端路由 + HTML/CSS/客户端 JS，直接部署到 Workers。
+ *
+ * 【环境配置】
+ *   变量：TRAKT_CLIENT_ID（必填）· TMDB_API_KEY · OMDB_API_KEY（可选）
+ *   绑定：KV 命名空间 TMDB_CACHE
+ *
+ * 【路由表】
+ *   /                  启动页：读 Cookie 判断登录态，~400ms 后跳 /home 或 /login
+ *   /login             登录页（Trakt 设备码流程；已登录 302 → /home）
+ *   /home              首页（未登录 302 → /login）
+ *   /api/home-data     首页数据分片（playback/meta/watchlist/calendar/history）
+ *   /api/*             其余数据接口：详情/季/演员/搜索/趋势/榜单/写操作等
+ *   /api/app-version   版本对账（前端回前台时比对，不一致自动 reload）
+ *   /app.js /app.css   前端静态资源（immutable 长缓存，版本号破缓存）
+ *   /sw.js             Service Worker（静态资源 stale-while-revalidate）
+ *   /auth/*            登录 / 登出 / 轮询
+ *
+ * 【认证】
+ *   Trakt OAuth 设备码 → Cookie(trakt_auth) 存 token + trakt_id（90 天）。
+ *   trakt_id 固化进 Cookie 后，请求不再重复打 /users/me。
+ *
+ * 【缓存】
+ *   三级：进程内存 Map → KV(TMDB_CACHE) → 上游。统一走 cachedJSON()：
+ *   · 常规请求：命中未过期缓存就不打上游；过期或冷启动才请求
+ *   · force=1（用户点刷新）：绕过缓存；失败回退旧 KV，绝不写脏数据
+ *   · 上游 429：按用户标记冷却期，冷却内直接短路返回缓存
+ *
+ * 【主题】
+ *   三态 dark / light / system（跟随系统），localStorage 键 mt:theme。
+ *   THEME_BOOT_SCRIPT 内联在 <head> 最前同步执行，防首帧闪烁；
+ *   CSS 变量：:root 为深色默认，html[data-theme="light"] 及
+ *   @media(prefers-color-scheme: light) 下的 [data-theme="system"] 覆盖为浅色。
+ *
+ * 【改版须知】
+ *   改客户端 JS → bump APP_JS_VERSION；改样式 → bump APP_CSS_VERSION；
+ *   SW 内嵌版本（SW_JS_CONTENT 的 vXXX）同步；版本号触发用户端缓存更新。
+ *   页面模板全是反引号字符串：内容里的 </script> 必须写成 <\/script>。
  * ============================================================ */
 
-/* -------------------- 常量定义 -------------------- */
 // Trakt / TMDB / OMDB / 豆瓣 / 剧场 等外部服务端点
 const TRAKT_AUTH = "https://auth.trakt.tv",
   TRAKT_API = "https://api.trakt.tv",
@@ -71,20 +55,27 @@ const TRAKT_AUTH = "https://auth.trakt.tv",
   DOUBAN_API = "https://widget.v2too.top/data/douban.json",
   THEATER_API = "https://widget.v2too.top/data/theater.json",
   GUDUO_API = "https://widget.v2too.top/data/guduo.json";
-
-// PWA 应用元信息
 const APP_NAME = "MineTrakt",
   APP_SHORT_NAME = "MineTrakt",
-  THEME_COLOR = "#050505";
+  THEME_COLOR = "#050505"; // 深色主题色（默认）
 
-// 静态资源路径
+// 主题系统：三态（dark / light / system），客户端 localStorage 持久化
+const THEME_STORAGE_KEY = "mt:theme",
+  THEME_COLOR_DARK = "#050505",
+  THEME_COLOR_LIGHT = "#ffffff";
+
+/**
+ * 主题启动脚本 —— 必须内联在 <head> 最前面、同步执行。
+ * 作用：读 localStorage → 立刻给 <html> 打 data-theme → 同步 meta 与底色，
+ * 从而在任何首帧渲染之前就确定主题，彻底避免 FOUC（黑→白闪烁）。
+ * 注意：用裸 localStorage（不走 lsGet 的 TTL 包装），否则读到 {data:...} 解析失败。
+ */
+const THEME_BOOT_SCRIPT = `<script>(function(){try{var K=${JSON.stringify(THEME_STORAGE_KEY)};var t=localStorage.getItem(K);if(t!=='light'&&t!=='dark'&&t!=='system')t='dark';var d=document.documentElement;d.setAttribute('data-theme',t);var dark=(t==='dark')||(t==='system'&&(!window.matchMedia||matchMedia('(prefers-color-scheme: dark)').matches));var c=dark?${JSON.stringify(THEME_COLOR_DARK)}:${JSON.stringify(THEME_COLOR_LIGHT)};var tc=document.querySelector('meta[name="theme-color"]');if(tc)tc.setAttribute('content',c);var cs=document.querySelector('meta[name="color-scheme"]');if(cs)cs.setAttribute('content',dark?'dark':'light');var sb=document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]');if(sb)sb.setAttribute('content',dark?'black-translucent':'default');d.style.backgroundColor=c;})();<\/script>`;
 const FAVICON_URL = "/assets/favicon.ico",
   ICON_192 = "/assets/icon-192.png",
   ICON_512 = "/assets/icon-512.png",
   APPLE_ICON = "/assets/icon-512.png",
   SPLASH_LOGO = "/assets/logo.png";
-
-// 静态资源远程回源地址（首次请求时缓存到边缘）
 const ASSET_ORIGINS = {
   "/assets/favicon.ico": [
     "https://i.ibb.co/s9tgxVhb/Mine-Trakt-icon-32x32.png",
@@ -103,8 +94,6 @@ const ASSET_ORIGINS = {
     "image/png",
   ],
 };
-
-// 请求头 & Cookie 名称
 const TRAKT_UA = "MineTrakt/1.0";
 const JSON_HEADERS = {
   "Content-Type": "application/json",
@@ -114,8 +103,6 @@ const JSON_HEADERS = {
 const COOKIE_NAME = "trakt_auth", // 认证 Cookie 名
   COOKIE_MAX_AGE = 60 * 60 * 24 * 90, // 90 天
   PROFILE_COOKIE = "trakt_profile"; // 昵称/头像提示 Cookie（非敏感）
-
-// 分页与缓存 TTL（秒）
 const PAGE_SIZE = 20, // 历史记录每页条数
   TMDB_KV_TTL = 86400 * 7, // TMDB 详情：7 天
   OMDB_KV_TTL = 86400 * 7, // OMDB 评分：7 天
@@ -133,14 +120,10 @@ const PAGE_SIZE = 20, // 历史记录每页条数
   DOUBAN_KV_TTL = 21600, // 豆瓣列表：6 小时
   THEATER_KV_TTL = 21600, // 平台剧场：6 小时
   GUDUO_KV_TTL = 21600; // 骨朵热榜：6 小时
-
-// 首页自动刷新间隔（分钟）——只读 KV，30 分钟一次即可
 const HOME_AUTO_REFRESH_MINUTES = 30;
-// 前端静态资源版本（改动后 bump 触发缓存失效）
-const APP_JS_VERSION = "115",
-  APP_CSS_VERSION = "115";
+const APP_JS_VERSION = "121",
+  APP_CSS_VERSION = "121";
 
-/* 公共响应头常量 —— 统一管理，避免多处硬编码漂移 */
 const CC_API = "public, max-age=1800, stale-while-revalidate=600"; // API 数据：本地 30 分钟 + SWR 后台刷新
 const CC_NO_STORE = "no-store"; // 敏感/实时数据：禁止缓存
 const CT_JSON = "application/json; charset=utf-8";
@@ -183,7 +166,6 @@ const CK = {
   uidAt: (at) => `uid:at:${at}`, // access_token → uid
 };
 
-/* -------------------- 基础工具 -------------------- */
 
 /**
  * 带超时的 fetch。
@@ -202,11 +184,7 @@ async function fetchT(url, opts = {}, ms = 8000) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const backoff = (i, base = 500, jitter = 500) =>
   sleep(base * (i + 1) + Math.random() * jitter);
-
-/* -------------------- Trakt 限流管理 -------------------- */
-// 单次 429 冷却时长（毫秒）
 const TRAKT_RATE_LIMIT_COOLDOWN = 20000;
-// userKey → 冷却截止时间戳
 const __traktRateLimitByUser = new Map();
 
 /** 判断指定用户是否处于限流冷却期 */
@@ -229,7 +207,6 @@ function markTraktRateLimited(ms, userKey) {
   const until = Date.now() + (ms || TRAKT_RATE_LIMIT_COOLDOWN);
   const cur = __traktRateLimitByUser.get(k) || 0;
   if (until > cur) __traktRateLimitByUser.set(k, until);
-  // 简单 LRU：清理过期项
   if (__traktRateLimitByUser.size > 500) {
     const now = Date.now();
     for (const [key, v] of __traktRateLimitByUser) {
@@ -268,8 +245,6 @@ async function traktFetch(
   } = {},
 ) {
   const errShape = wantPageCount ? { __pageCount: 1 } : {};
-
-  // 冷却期内直接短路，不发请求
   if (isTraktRateLimited(userKey)) {
     return {
       __error: "429 rate limited",
@@ -282,8 +257,6 @@ async function traktFetch(
   for (let i = 0; i <= retries; i++) {
     try {
       const r = await fetchT(url, { headers }, timeout);
-
-      // 429：标记冷却并返回
       if (r.status === 429) {
         consumeRetryAfter(r, userKey);
         return {
@@ -292,8 +265,6 @@ async function traktFetch(
           ...errShape,
         };
       }
-
-      // 404：资源不存在，返回空
       if (r.status === 404) {
         return wantPageCount
           ? Object.defineProperty([], "__pageCount", {
@@ -302,21 +273,15 @@ async function traktFetch(
             })
           : null;
       }
-
-      // 403：权限问题，不重试
       if (r.status === 403) {
         return { __error: "HTTP 403", ...errShape };
       }
-
-      // 其它非 2xx：重试
       if (!r.ok) {
         lastErr = `HTTP ${r.status}`;
         if (i === retries) return { __error: lastErr, ...errShape };
         await backoff(i, backoffBase, 500);
         continue;
       }
-
-      // 成功：解析 JSON
       const data = await r.json();
       if (wantPageCount && Array.isArray(data)) {
         Object.defineProperty(data, "__pageCount", {
@@ -336,17 +301,12 @@ async function traktFetch(
 
 const traktGet = (url, headers, retries = 2, userKey) =>
   traktFetch(url, headers, { retries, timeout: 12000, userKey });
-
-/* -------------------- KV 内存 + edge 缓存层 -------------------- */
-// 内存缓存默认 TTL（30 分钟）；KV edge 缓存 30 分钟
 const KV_MEM_TTL = 1800000,
   KV_EDGE_TTL = 1800,
   KV_MISS = Symbol("kv-miss"), // 表示 KV 明确返回空
   KV_ERR = Symbol("kv-err"), // 表示 KV 读取异常
   KV_MIN_PUT_TTL = 30, // 小于该 TTL（秒）不写 KV
   KV_DOWN_COOLDOWN_MS = 30000; // KV 异常后冷却 30s 不再尝试
-
-// 同一 key 的最小写入间隔（1 小时），避免频繁写 KV 浪费额度
 const KV_MIN_PUT_INTERVAL_MS = 3600000;
 const __KV_LASTPUT_MAX = 5000;
 
@@ -379,8 +339,6 @@ function kvMemStaleGet(key) {
   }
   return e.data;
 }
-
-// KV 健康状态：异常时进入 30 秒冷却，避免频繁失败
 let __kvDownUntil = 0;
 function kvIsDown() {
   return Date.now() < __kvDownUntil;
@@ -455,7 +413,6 @@ async function kvGetJSON(env, key, memOnly, edgeTtl) {
     });
     kvMarkUp();
     const result = v === null || v === undefined ? KV_MISS : v;
-    // 用 payload._ttl 计算内存缓存时长
     const memMs =
       result && result !== KV_MISS && result._ttl
         ? Math.min(KV_MEM_TTL, Math.max(5000, result._ttl * 1000))
@@ -497,7 +454,6 @@ function kvPutJSON(env, ctx, key, payload, ttl, memOnly, force) {
     }
   }
   const logicalTtl = ttl || 60;
-  // KV 实际 TTL = 逻辑 TTL + stale 保留期，保证过期后还能读一次兜底
   const staleRetention = Math.min(86400 * 7, Math.max(logicalTtl * 6, 1800));
   const body =
     payload && typeof payload === "object"
@@ -518,7 +474,6 @@ function __isErrorPayload(d) {
   if (d === null || d === undefined || d === false) return true;
   if (typeof d === "object" && d) {
     if (d.__error) return true;
-    // 仅有冷却标记、无业务数据的限流响应也视为错误
     if (d.__cooling != null && d.data === undefined && !Array.isArray(d))
       return true;
   }
@@ -555,11 +510,8 @@ async function cachedJSON(
     revalidate = true,
   } = {},
 ) {
-  // TTL 加随机抖动，避免缓存集体过期
   const jitterSec = jitter != null ? jitter : Math.floor(Math.random() * 90);
   const effectiveTtl = ttl + jitterSec;
-
-  // 软过期阈值（swr）
   const softAge =
     swr === true ? Math.floor(ttl * 0.5) : typeof swr === "number" ? swr : 0;
 
@@ -591,8 +543,6 @@ async function cachedJSON(
           : 0;
     }
   }
-
-  // 内存 stale 回退（第一道）
   function tryOldNormal() {
     const mem = kvMemGet(key);
     if (mem !== undefined && mem !== KV_MISS && !mem.miss) {
@@ -624,8 +574,6 @@ async function cachedJSON(
       }
       // 统一把带 __error / 限流的结果视为失败，禁止入库
       if (data && (data.__error || data.__cooling != null)) data = null;
-
-      // 成功：只有干净数据才允许写 KV（force=true 覆盖旧值）
       if (!__isErrorPayload(data)) {
         kvPutJSON(env, ctx, key, { data }, effectiveTtl, memOnly, true);
         kvMemStaleSet(key, data);
@@ -633,12 +581,9 @@ async function cachedJSON(
         return unwrap ? data : { data };
       }
 
-      // —— 以下全部是刷新失败路径：只读、不写 ——
-
       // 失败①：内存 stale / 当前 mem
       const old = tryOldNormal();
       if (old.found) {
-        // 把 stale 回填进正常 mem，方便后续非 force 请求继续命中
         if (old.raw && old.raw !== KV_MISS) {
           kvMemSet(key, old.raw, KV_MEM_TTL);
         } else if (old.val != null) {
@@ -647,15 +592,12 @@ async function cachedJSON(
         }
         return unwrap ? old.val : { data: old.val };
       }
-
-      // 失败②：KV 兜底（只读不写，即使 memOnly 也允许读）
       if (env.TMDB_CACHE && !kvIsDown()) {
         try {
           const stale = await env.TMDB_CACHE.get(key, { type: "json" });
           if (stale && !stale.miss) {
             const v = stale.data !== undefined ? stale.data : stale;
             if (!__isErrorPayload(v)) {
-              // 回填 mem，仍不写 KV（避免用 force 失败路径去改 expiration）
               const memPayload =
                 stale && typeof stale === "object" && stale.data !== undefined
                   ? stale
@@ -668,8 +610,6 @@ async function cachedJSON(
           }
         } catch {}
       }
-
-      // 失败③：彻底无缓存可展示
       markSource(null, null);
       return null;
     });
@@ -708,15 +648,12 @@ async function cachedJSON(
       }),
     );
   }
-
-  // 内存命中
   const mem = kvMemGet(key);
   if (mem !== undefined) {
     if (mem === KV_MISS) {
       markSource(null, null);
       return null;
     }
-    // revalidate=false：哪怕逻辑过期也直接返回，不后台打 API
     if (revalidate && needRefresh(mem)) scheduleRefresh();
     markSource(true, mem);
     if (unwrap) return unwrapVal(mem);
@@ -729,28 +666,22 @@ async function cachedJSON(
     if (cached !== undefined && cached !== KV_MISS && cached !== KV_ERR) {
       // 有 KV：默认直接返回。仅 revalidate=true 且逻辑过期时才后台/同步刷新
       if (revalidate && needRefresh(cached)) {
-        // 软过期：SWR 后台刷新；硬过期且无 swr：下面会走 fetcher
         if (softAge > 0 && ageSec(cached) <= effectiveTtl) {
           scheduleRefresh();
           markSource(true, cached);
           if (unwrap) return unwrapVal(cached);
           return cached;
         }
-        // 硬过期且 revalidate：继续往下打上游
       } else {
-        // revalidate=false 或未过期：纯读缓存
         markSource(true, cached);
         if (unwrap) return unwrapVal(cached);
         return cached;
       }
-      // revalidate + 硬过期：先记下 stale，失败可回退
       if (!__isErrorPayload(unwrapVal(cached))) {
         kvMemStaleSet(key, unwrapVal(cached));
       }
     }
     const kvBroken = cached === KV_ERR || cached === undefined;
-    // revalidate=false 且没有任何缓存：仍允许冷启动拉一次（否则首屏永远空）
-    // 若明确要求绝不打上游，调用方应传 bypass 以外的只读包装
     let data = null;
     try {
       data = await fetcher();
@@ -772,7 +703,10 @@ async function cachedJSON(
   });
 }
 /* ============================================================
- * 段落 2 / 4：认证 / 路由 / 静态资源 / 设备码登录 / 登出
+ * 第二部分：路由分发 · 静态资源 · Service Worker · 认证与设备码登录
+ * ------------------------------------------------------------
+ * Cookie trakt_auth = b64url({ access_token, refresh_token, expires_at,
+ *   code_verifier, trakt_id })；由 buildCookie() 生成，readAuth() 解析。
  * ------------------------------------------------------------
  * Cookie trakt_auth = b64url({
  *   access_token,
@@ -788,13 +722,11 @@ async function cachedJSON(
  *   · 公共数据接口不开 strict，限流时仍可用
  * ============================================================ */
 
-/* -------------------- Service Worker 内容 -------------------- */
 // 前端 SW：静态资源 stale-while-revalidate；/api/ 与导航请求不走缓存
-const SW_JS_CONTENT = String.raw`/* MineTrakt SW v115 */
-const VERSION = "v115";
+const SW_JS_CONTENT = String.raw`/* MineTrakt SW v121 */
+const VERSION = "v121";
 const RUNTIME_CACHE = "trakt-static-" + VERSION;
 const NAV_CACHE = "trakt-nav-" + VERSION;
-/* 导航请求网络超时阈值：超过则回退缓存（弱网兜底，避免长时间白屏） */
 const NAV_TIMEOUT = 2500;
 
 self.addEventListener("install", function () {
@@ -805,7 +737,6 @@ self.addEventListener("activate", function (e) {
   e.waitUntil(
     (async function () {
       var keys = await caches.keys();
-      // 清掉所有非当前版本的缓存（含旧 nav 缓存）
       await Promise.all(
         keys
           .filter(function (k) {
@@ -842,12 +773,8 @@ self.addEventListener("fetch", function (event) {
     );
     return;
   }
-
-  // 接口与鉴权：完全不走 SW 缓存
   if (url.pathname.indexOf("/api/") === 0) return;
   if (url.pathname.indexOf("/auth/") === 0) return;
-
-  // 静态资源：stale-while-revalidate
   if (
     url.pathname === "/app.css" ||
     url.pathname === "/app.js" ||
@@ -881,7 +808,6 @@ async function navigateLaunchSwr(req) {
   var cache = await getCache(NAV_CACHE);
   var cached = await cache.match(req);
   if (cached) {
-    // 后台刷新，不阻塞本次响应
     fetch(req)
       .then(function (r) {
         if (r && r.ok) cache.put(req, r.clone()).catch(function () {});
@@ -904,12 +830,21 @@ async function navigateLaunchSwr(req) {
  */
 async function navigateNetworkFirst(req) {
   var ctrl = new AbortController();
-  var timer = setTimeout(function () {
-    ctrl.abort();
-  }, NAV_TIMEOUT);
+  var timer = setTimeout(function () { ctrl.abort(); }, NAV_TIMEOUT);
   try {
-    // fetch 立即发起，不等任何缓存操作，冷启动零额外延迟
     return await fetch(req, { signal: ctrl.signal });
+  } catch (e) {
+    // 超时/断网兜底：先试缓存（含旧版本导航缓存），否则返回轻量占位页
+    try {
+      var cache = await getCache(NAV_CACHE);
+      var cached = await cache.match(req);
+      if (cached) return cached;
+    } catch (_) {}
+    return new Response(
+      '<meta http-equiv="refresh" content="3">' +
+      '<p style="font-family:sans-serif">网络较慢，正在重试…</p>',
+      { headers: { "Content-Type": "text/html; charset=utf-8" } }
+    );
   } finally {
     clearTimeout(timer);
   }
@@ -933,7 +868,6 @@ async function staleWhileRevalidate(req) {
     }
     return r;
   });
-  // 有缓存时后台刷新失败不应产生未处理的 rejection
   networkP.catch(function () {});
   var cached = await cacheP
     .then(function (c) {
@@ -945,29 +879,22 @@ async function staleWhileRevalidate(req) {
   return cached || networkP;
 }`;
 
-/* -------------------- 主入口路由 -------------------- */
 /** Cloudflare Worker 入口：按 path 分发静态资源 / 认证 / API / 首页 */
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url),
       path = url.pathname;
-
-    // 静态资源
     if (path.startsWith("/assets/")) return handleAsset(path, ctx);
     if (path === "/app.css") return handleAppCss();
     if (path === "/app.js") return handleAppJs(request);
     if (path === "/favicon.ico") return Response.redirect(FAVICON_URL, 302);
     if (path === "/manifest.webmanifest") return handleManifest();
     if (path === "/sw.js") return handleServiceWorker();
-
-    // 认证入口
     if (path === "/auth/device") return handleDevice(env);
     if (path === "/auth/poll" && request.method === "POST")
       return handlePoll(request, env, ctx);
     if (path === "/auth/logout" && request.method === "POST")
       return handleLogout(request, env, ctx);
-
-    // 数据 API
     if (path === "/api/more") return handleMore(request, env, ctx);
     if (path === "/api/season") return handleSeason(request, env, ctx);
     if (path === "/api/detail") return handleApiDetail(request, env, ctx);
@@ -1014,7 +941,6 @@ export default {
   },
 };
 
-/* -------------------- 静态资源 / 清单 / SW -------------------- */
 
 /**
  * 静态资源处理：回源到 ASSET_ORIGINS 指定的 URL，
@@ -1133,7 +1059,6 @@ function handleServiceWorker() {
   });
 }
 
-/* -------------------- 鉴权 -------------------- */
 
 /**
  * 基础认证检查。
@@ -1192,8 +1117,6 @@ async function authed(
   const userKey = await getStableUserId(a.auth, a.headers, env, ctx, {
     strict,
   });
-
-  // strict 模式：拿不到稳定身份 → 视为登录失败
   if (strict && !userKey) {
     const limited = isTraktRateLimited(
       a.auth.refresh_token
@@ -1397,7 +1320,6 @@ async function traktSyncAction(
   return authJson(auth, needsCookieUpdate, { ok: true, result });
 }
 
-/* -------------------- 设备码 / 轮询 / 登出 -------------------- */
 
 /**
  * 设备码授权：第一步
@@ -1435,8 +1357,6 @@ async function handleDevice(env) {
 
   if (!res.ok) {
     const errText = await res.text();
-
-    // 429：Trakt 限流，让前端等一下再试
     if (res.status === 429) {
       const ra = parseInt(res.headers.get("Retry-After") || "", 10);
       const waitSec = Number.isFinite(ra) && ra > 0 ? Math.min(ra, 180) : 30;
@@ -1449,8 +1369,6 @@ async function handleDevice(env) {
         { status: 429, headers: { "Retry-After": String(waitSec) } },
       );
     }
-
-    // 403：CLIENT_ID 配错
     if (res.status === 403) {
       return Response.json(
         {
@@ -1460,8 +1378,6 @@ async function handleDevice(env) {
         { status: 502 },
       );
     }
-
-    // 其它：上游异常
     return Response.json(
       { error: "Trakt 服务暂时不可用，请稍后重试" },
       { status: 502 },
@@ -1546,14 +1462,10 @@ async function handlePoll(request, env, ctx) {
       code_verifier: decoded.code_verifier,
       trakt_id: null,
     };
-
-    /* ---------- 尝试获取稳定身份 ---------- */
-    // 登录后必须拿到 trakt_id 或 slug，否则视为登录失败
     let traktId = null;
     let meStatus = 0;
     try {
       const headers = makeTraktHeaders(env, auth);
-      // 登录后只取 ids，不需要 extended=full
       const meRes = await fetchT(`${TRAKT_API}/users/me`, { headers }, 8000);
       meStatus = meRes.status;
       if (meRes.ok) {
@@ -1563,8 +1475,6 @@ async function handlePoll(request, env, ctx) {
         else if (ids.slug) traktId = "s:" + String(ids.slug);
       }
     } catch {}
-
-    // 拿不到 → 不下发 Cookie，返回失败让前端重试
     if (!traktId) {
       const limited = meStatus === 429;
       return Response.json(
@@ -1579,13 +1489,11 @@ async function handlePoll(request, env, ctx) {
       );
     }
 
-    /* ---------- 成功：固化 trakt_id 到 Cookie + KV ---------- */
     if (traktId) {
       auth.trakt_id = traktId;
       const rt = auth.refresh_token ? String(auth.refresh_token) : "";
       const at = auth.access_token ? String(auth.access_token) : "";
       const puts = [];
-      // 把 token → uid 映射写 KV（90 天），后续可用于跨节点一致性
       if (env && env.TMDB_CACHE) {
         if (rt)
           puts.push(
@@ -1606,7 +1514,6 @@ async function handlePoll(request, env, ctx) {
       }
       if (ctx && typeof ctx.waitUntil === "function")
         ctx.waitUntil(Promise.all(puts));
-      // 同时写内存
       if (rt) kvMemSet(CK.uidRt(rt.slice(0, 32)), traktId, KV_MEM_TTL);
       if (at) kvMemSet(CK.uidAt(at.slice(0, 24)), traktId, KV_MEM_TTL);
     }
@@ -1633,29 +1540,21 @@ async function handlePoll(request, env, ctx) {
   try {
     err = JSON.parse(rawText).error;
   } catch {}
-
-  // 202：仍在等待用户授权（正常流程，继续轮询）
   if (err === "authorization_pending" || err === "slow_down") {
     return Response.json({ status: err }, { status: 202 });
   }
-
-  // 403：用户主动拒绝授权（停止轮询，需重新扫码）
   if (err === "access_denied") {
     return Response.json(
       { status: "denied", message: "你拒绝了授权，请重新登录" },
       { status: 403 },
     );
   }
-
-  // 410：设备码过期或已被使用（停止轮询，需重新获取）
   if (err === "expired_token" || err === "already_used") {
     return Response.json(
       { status: "expired", message: "授权码已过期，请重新获取" },
       { status: 410 },
     );
   }
-
-  // 429：Trakt 限流（前端稍后自动重试）
   if (res.status === 429) {
     return Response.json(
       { status: "rate_limited", message: "请求过于频繁，请稍后再试" },
@@ -1708,7 +1607,6 @@ async function handleLogout(request, env, ctx) {
       }
     }
   } catch {
-    // 忽略清理失败
   }
   return new Response(null, {
     status: 204,
@@ -1716,7 +1614,6 @@ async function handleLogout(request, env, ctx) {
   });
 }
 
-/* -------------------- Cookie 读写 / token 刷新 -------------------- */
 
 /** 构造认证 Cookie：b64url(JSON) + HttpOnly + Secure + SameSite=Lax */
 function buildCookie(auth, traktId) {
@@ -1821,19 +1718,14 @@ async function getStableUserId(
   { strict = false } = {},
 ) {
   if (!auth) return strict ? null : "anon";
-  // 最高优先级：Cookie 内已固化（登录成功时写入，避免每次打 API）
   if (auth.trakt_id) return String(auth.trakt_id);
 
   const rt = auth.refresh_token ? String(auth.refresh_token) : "";
   const at = auth.access_token ? String(auth.access_token) : "";
   const memKey = rt ? CK.uidRt(rt.slice(0, 32)) : CK.uidAt(at.slice(0, 24));
-
-  // 内存
   const memCached = kvMemGet(memKey);
   if (memCached !== undefined && memCached !== KV_MISS && memCached)
     return String(memCached);
-
-  // KV 映射
   if (env && env.TMDB_CACHE) {
     try {
       const raw = await env.TMDB_CACHE.get(memKey, {
@@ -1859,8 +1751,6 @@ async function getStableUserId(
   if (isTraktRateLimited(rt || at)) {
     if (strict) return null;
   }
-
-  // Trakt API 拉稳定 ID（无需 extended=full，减小响应）
   try {
     const r = await fetchT(`${TRAKT_API}/users/me`, { headers }, 8000);
     if (r.ok) {
@@ -1890,8 +1780,6 @@ async function getStableUserId(
       if (strict) return null;
     }
   } catch {}
-
-  // 最终降级
   if (strict) return null;
   const userId = rt
     ? "r" + rt.slice(0, 20)
@@ -1915,14 +1803,12 @@ function rememberTraktUserId(auth, traktId) {
   if (at) kvMemSet(CK.uidAt(at.slice(0, 24)), id, KV_MEM_TTL);
 }
 /* ============================================================
- * 段落 3 / 4：外部数据源 + 用户同步写操作
+ * 第三部分：外部数据源（TMDB · 豆瓣 · 剧场 · 骨朵 · OMDB）+ 用户写操作
  * ------------------------------------------------------------
- * · 公共数据（TMDB / 豆瓣 / 剧场）走长 TTL 缓存
- * · 写操作（watchlist / history / drop）后必须 bust 用户缓存
- * · 用户数据（summary / calendar）走 strict 鉴权
+ * 公共数据走长 TTL 缓存；写操作（watchlist / history / drop）后必须
+ * bust 该用户缓存；用户数据接口一律 strict 鉴权（401 + relogin）。
  * ============================================================ */
 
-/* -------------------- 用户缓存清理 -------------------- */
 
 /** 清 Cookie 的响应头 */
 function clearCookieHeader() {
@@ -2110,7 +1996,6 @@ async function runLimited(taskFns, concurrency = 2, delayMs = 150) {
   await Promise.all(workers);
 }
 
-/* -------------------- TMDB 辅助 -------------------- */
 
 /** 带异常的 TMDB GET（失败返回 null） */
 async function tmdbGet(url) {
@@ -2171,14 +2056,13 @@ function mapTmdbItem(r, typeHint) {
       ? r.title || r.original_title || ""
       : r.name || r.original_name || r.title || "",
     year: dateStr.slice(0, 4),
-    date: dateStr, // ← 新增：完整日期，用于精确排序
+    date: dateStr, // 完整日期（精确排序用）
     poster: r.poster_path ? tmdbPoster(r.poster_path) : null,
     overview: r.overview || "",
     popularity: r.popularity || 0,
   };
 }
 
-/* -------------------- 豆瓣数据 -------------------- */
 
 /** 拉豆瓣列表（走 6 小时缓存） */
 async function getDoubanRaw(env, ctx) {
@@ -2333,22 +2217,10 @@ async function handleDoubanList(request, env, ctx) {
     "Content-Type": CT_HTML,
     "Cache-Control": CC_API,
   };
-  if (mode === "hscroll") {
-    if (!html)
-      return new Response(
-        '<div class="h-scroll-empty"><span class="spinner"></span></div>',
-        {
-          headers: outHeaders,
-        },
-      );
-    return new Response(`<div class="h-scroll">${html}</div>`, {
-      headers: outHeaders,
-    });
-  }
+  return listResp(html, mode, outHeaders);
   return new Response(html, { headers: outHeaders });
 }
 
-/* -------------------- 平台剧场 -------------------- */
 
 /** 拉剧场列表（走 6 小时缓存） */
 async function getTheaterRaw(env, ctx) {
@@ -2515,6 +2387,17 @@ function renderTheaterItems(items) {
  * mode=platforms 返回平台列表 JSON
  * mode=debug     返回数据结构摘要（排查用）
  */
+/** 列表响应：hscroll 模式包横向滚动壳，空内容给占位；其余原样输出 */
+function listResp(html, mode, headers) {
+  if (mode !== "hscroll") return new Response(html, { headers });
+  if (!html)
+    return new Response(
+      '<div class="h-scroll-empty"><span class="spinner"></span></div>',
+      { headers },
+    );
+  return new Response(`<div class="h-scroll">${html}</div>`, { headers });
+}
+
 async function handleTheaterList(request, env, ctx) {
   const url = new URL(request.url);
   const mode = url.searchParams.get("mode") || "grid";
@@ -2561,18 +2444,7 @@ async function handleTheaterList(request, env, ctx) {
     );
   }
   const html = renderTheaterItems(pickTheaterSection(data, platform));
-  if (mode === "hscroll") {
-    if (!html)
-      return new Response(
-        '<div class="h-scroll-empty"><span class="spinner"></span></div>',
-        {
-          headers: outHeaders,
-        },
-      );
-    return new Response(`<div class="h-scroll">${html}</div>`, {
-      headers: outHeaders,
-    });
-  }
+  return listResp(html, mode, outHeaders);
   return new Response(html, { headers: outHeaders });
 }
 
@@ -2652,7 +2524,6 @@ function pickGuduoSection(data, category) {
     for (const name of GUDUO_CATEGORIES) {
       if (pushList(cats[name])) break;
     }
-    // 兜底：未知分类也并入
     if (out.length < MAX && cats && typeof cats === "object") {
       for (const k of Object.keys(cats)) {
         if (GUDUO_CATEGORIES.includes(k)) continue;
@@ -2738,18 +2609,7 @@ async function handleGuduoList(request, env, ctx) {
     });
   }
   const html = renderGuduoItems(pickGuduoSection(data, category));
-  if (mode === "hscroll") {
-    if (!html)
-      return new Response(
-        '<div class="h-scroll-empty"><span class="spinner"></span></div>',
-        {
-          headers: outHeaders,
-        },
-      );
-    return new Response(`<div class="h-scroll">${html}</div>`, {
-      headers: outHeaders,
-    });
-  }
+  return listResp(html, mode, outHeaders);
   return new Response(html, { headers: outHeaders });
 }
 
@@ -2965,7 +2825,6 @@ async function fetchPlatformDiscover(plat, media, page, env) {
       out.push(item);
     }
   }
-  // 按上映时间新老排序（新的在前，无日期的排最后）
   out.sort((a, b) => {
     const da = a.date || "";
     const db = b.date || "";
@@ -3014,8 +2873,6 @@ async function handlePlatformList(request, env, ctx) {
       headers: outHeadersHtml,
     });
   }
-
-  // preview：首页卡片叠海报，固定取第一页少量
   const cacheMedia = mode === "preview" ? "preview" : media;
   const cachePage = mode === "preview" ? 1 : page;
   const data = await cachedJSON(
@@ -3066,20 +2923,7 @@ async function handlePlatformList(request, env, ctx) {
   }
 
   const html = renderPlatformItems(list);
-  if (mode === "hscroll") {
-    if (!html)
-      return new Response(
-        '<div class="h-scroll-empty"><span class="spinner"></span></div>',
-        {
-          headers: outHeadersHtml,
-        },
-      );
-    return new Response(`<div class="h-scroll">${html}</div>`, {
-      headers: outHeadersHtml,
-    });
-  }
-
-  // grid：附带分页元信息，方便前端加载更多
+  return listResp(html, mode, outHeadersHtml);
   const wrap =
     `<div class="platform-result" data-page="${page}" data-total-pages="${totalPages}" data-has-more="${page < totalPages ? "1" : "0"}">` +
     (html || '<div class="empty"><p>暂无该平台内容</p></div>') +
@@ -3087,7 +2931,6 @@ async function handlePlatformList(request, env, ctx) {
   return new Response(wrap, { headers: outHeadersHtml });
 }
 
-/* -------------------- Trakt ID 解析 / 同步载荷 -------------------- */
 
 /** 构造 Trakt sync 请求体 */
 function traktSyncPayload(kind, id) {
@@ -3142,7 +2985,6 @@ async function resolveTraktIdFromTmdb(tmdbId, type, headers, userKey) {
   return await tryOnce(null);
 }
 
-/* -------------------- OMDB / 预告片 -------------------- */
 
 /** 拉 OMDB 评分（IMDb / RT / Metacritic） */
 async function fetchOmdbRatings(imdbId, env, ctx) {
@@ -3229,9 +3071,6 @@ function mcColor(n) {
   if (n >= 40) return "#ffcc33";
   return "#ff0000";
 }
-
-/* -------------------- 评分 Logo（SVG）-------------------- */
-// 每个评分平台的品牌 SVG（内联，无外部依赖）
 const RATING_LOGOS = {
   tmdb: `<svg class="ext-logo" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="#01B4E4" d="M6.62 12a2.291 2.291 0 0 1 2.292-2.295h-.013A2.291 2.291 0 0 1 11.189 12a2.291 2.291 0 0 1-2.29 2.291h.013A2.291 2.291 0 0 1 6.62 12zm10.72-4.062h4.266a2.291 2.291 0 0 0 2.29-2.291 2.291 2.291 0 0 0-2.29-2.296H17.34a2.291 2.291 0 0 0-2.291 2.296 2.291 2.291 0 0 0 2.29 2.29zM2.688 20.645h8.285a2.291 2.291 0 0 0 2.291-2.292 2.291 2.291 0 0 0-2.29-2.295H2.687a2.291 2.291 0 0 0-2.291 2.295 2.291 2.291 0 0 0 2.29 2.292zm10.881-6.354h.81l1.894-4.586H15.19l-1.154 3.008h-.013l-1.135-3.008h-1.154zm4.208 0h1.011V9.705h-1.011zm2.878 0h3.235v-.93h-2.223v-.933h1.99v-.934h-1.99v-.855h2.107v-.934h-3.112zM1.31 7.941h1.01V4.247h1.31v-.895H0v.895h1.31zm3.747 0h1.011V5.959h1.958v1.984h1.011v-4.59h-1.01v1.711H6.061V3.351H5.057zm5.348 0h3.242v-.933H11.41v-.934h1.99v-.933h-1.99v-.856h2.107v-.934h-3.112zM.162 14.296h1.005v-3.52h.013l1.167 3.52h.765l1.206-3.52h.013v3.52h1.011v-4.59H3.82L2.755 12.7h-.013L1.686 9.705H.156zm14.534 6.353h1.641a3.188 3.188 0 0 0 .98-.149 2.531 2.531 0 0 0 .824-.437 2.123 2.123 0 0 0 .567-.713 2.193 2.193 0 0 0 .223-.983 2.399 2.399 0 0 0-.218-1.07 1.958 1.958 0 0 0-.586-.716 2.405 2.405 0 0 0-.873-.392 4.349 4.349 0 0 0-1.046-.13h-1.519zm1.013-3.656h.596a2.26 2.26 0 0 1 .606.08 1.514 1.514 0 0 1 .503.244 1.167 1.167 0 0 1 .34.412 1.28 1.28 0 0 1 .13.587 1.546 1.546 0 0 1-.13.658 1.127 1.127 0 0 1-.347.433 1.41 1.41 0 0 1-.518.238 2.797 2.797 0 0 1-.649.07h-.538zm4.686 3.656h1.88a2.997 2.997 0 0 0 .613-.064 1.735 1.735 0 0 0 .554-.214 1.221 1.221 0 0 0 .402-.39 1.105 1.105 0 0 0 .155-.606 1.188 1.188 0 0 0-.071-.415 1.01 1.01 0 0 0-.204-.34 1.087 1.087 0 0 0-.317-.24 1.297 1.297 0 0 0-.413-.13v-.012a1.203 1.203 0 0 0 .575-.366.962.962 0 0 0 .216-.648 1.081 1.081 0 0 0-.149-.603 1.022 1.022 0 0 0-.389-.354 1.673 1.673 0 0 0-.54-.169 4.463 4.463 0 0 0-.6-.041h-1.712zm1.011-3.734h.687a1.4 1.4 0 0 1 .24.022.748.748 0 0 1 .22.075.432.432 0 0 1 .16.147.418.418 0 0 1 .061.236.47.47 0 0 1-.055.233.433.433 0 0 1-.146.156.62.62 0 0 1-.204.084 1.058 1.058 0 0 1-.23.026h-.745zm0 1.835h.765a1.96 1.96 0 0 1 .266.02 1.015 1.015 0 0 1 .26.07.519.519 0 0 1 .204.152.406.406 0 0 1 .08.26.481.481 0 0 1-.06.253.519.519 0 0 1-.16.168.62.62 0 0 1-.217.09 1.155 1.155 0 0 1-.237.027H21.4z"/></svg>`,
   imdb: `<svg class="ext-logo" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="#F5C518" d="M22.3781 0H1.6218C.7411.0583.0587.7437.0018 1.5953l-.001 20.783c.0585.8761.7125 1.543 1.5559 1.6191A.337.337 0 0 0 1.6016 24h20.7971a.4579.4579 0 0 0 .0437-.002c.8727-.0768 1.5568-.8271 1.5568-1.7085V1.7098c0-.8914-.696-1.6416-1.584-1.7078A.3294.3294 0 0 0 22.3781 0zm0 .496a1.2144 1.2144 0 0 1 1.1252 1.2139v20.5797c0 .6377-.4875 1.1602-1.1045 1.2145H1.6016c-.5967-.0543-1.0645-.5297-1.1053-1.1258V1.6284C.5371 1.0185 1.0184.5364 1.6217.496h20.7564zM4.7954 8.2603v7.3636H2.8899V8.2603h1.9055zm6.5367 0v7.3636H9.6707v-4.9704l-.6711 4.9704H7.813l-.6986-4.8618-.0066 4.8618h-1.668V8.2603h2.468c.0748.4476.1492.9694.2307 1.5734l.2712 1.8713.4407-3.4447h2.4817zm2.9772 1.3289c.0742.0404.122.108.1417.2034.0279.0953.0345.3118.0345.6442v2.8548c0 .4881-.0345.7867-.0955.8954-.0609.1152-.2304.1695-.5018.1695V9.5211c.204 0 .3457.0205.4211.0681zm-.0211 6.0347c.4543 0 .8006-.0265 1.0245-.0742.2304-.0477.4204-.1357.5694-.2648.1556-.1218.2642-.298.3251-.5219.0611-.2238.1021-.6648.1021-1.3224v-2.5832c0-.6986-.0271-1.1668-.0742-1.4039-.041-.237-.1431-.4543-.3126-.6437-.1695-.1973-.4198-.3324-.7456-.421-.3191-.0808-.8542-.1285-1.7694-.1285h-1.4244v7.3636h2.3051zm5.14-1.7827c0 .3523-.0199.5762-.0544.6708-.033.0947-.1894.1424-.3046.1424-.1086 0-.19-.0477-.2238-.1351-.041-.0887-.0609-.2986-.0609-.6238v-1.9469c0-.3324.0199-.5423.0543-.6237.0338-.0808.1086-.122.2171-.122.1153 0 .2709.0412.3114.1425.041.0947.0609.2986.0609.6032v1.8926zm-2.4747-5.5809v7.3636h1.7157l.1152-.4675c.1556.1894.3251.3324.5152.4271.1828.0881.4608.1357.678.1357.3047 0 .5629-.0748.7802-.237.2165-.1562.3589-.3462.4198-.5628.0543-.2173.0887-.543.0887-.9841v-2.0675c0-.4409-.0139-.7324-.0344-.8681-.0199-.1357-.0742-.2781-.1695-.4204-.1021-.1425-.2437-.251-.4272-.3325-.1834-.0742-.3999-.1152-.6576-.1152-.2172 0-.4952.0477-.6846.1285-.1835.0887-.353.2238-.5086.4007V8.2603h-1.8309z"/></svg>`,
@@ -3279,7 +3118,6 @@ function renderExtRatings(r, opts = {}) {
   return out.join("");
 }
 
-/* -------------------- Watchlist -------------------- */
 
 /**
  * 直接从 Trakt 拉 watchlist（不分页，一次拉全）。
@@ -3362,7 +3200,6 @@ async function getWatchlistTmdbIds(headers, env, ctx, userKey, type) {
   return ids;
 }
 
-/* -------------------- 搜索 / 趋势 -------------------- */
 
 /**
  * 搜索 API：TMDB 搜索 movie + tv，合并按 popularity 排序。
@@ -3458,7 +3295,6 @@ async function handleTrending(request, env, ctx) {
   });
 }
 
-/* -------------------- Watchlist 增删 -------------------- */
 
 /**
  * 加入待看。
@@ -3565,7 +3401,6 @@ async function handleUnmarkWatched(request, env, ctx) {
   });
 }
 
-/* -------------------- 标记整季已看 -------------------- */
 
 /**
  * 把某季所有已播出集数标记为已看。
@@ -3587,8 +3422,6 @@ async function handleMarkSeasonWatched(request, env, ctx) {
   if (!Number.isFinite(showId) || showId <= 0 || !Number.isFinite(season)) {
     return authJson(auth, needsCookieUpdate, { error: "参数无效" }, 400);
   }
-
-  // 1) 尝试从缓存拿季数据
   let seasonData = await cachedJSON(
     env,
     ctx,
@@ -3604,8 +3437,6 @@ async function handleMarkSeasonWatched(request, env, ctx) {
     },
     { ttl: SEASON_KV_TTL, missTtl: 60, swr: 3600, edgeTtl: 1800, jitter: 300 },
   );
-
-  // 2) 缓存拿不到，直接打 Trakt
   if (!seasonData || !Array.isArray(seasonData.episodes)) {
     try {
       const r = await traktFetch(
@@ -3630,8 +3461,6 @@ async function handleMarkSeasonWatched(request, env, ctx) {
       }
     } catch {}
   }
-
-  // 3) 还拿不到，从整剧的 seasons 中找
   if (!seasonData || !Array.isArray(seasonData.episodes)) {
     try {
       const all = await traktFetch(
@@ -3679,8 +3508,6 @@ async function handleMarkSeasonWatched(request, env, ctx) {
       502,
     );
   }
-
-  // 4) 过滤出已播出的集
   const now = Date.now();
   const episodes = seasonData.episodes
     .filter((ep) => ep && ep.number != null && ep.first_aired)
@@ -3695,8 +3522,6 @@ async function handleMarkSeasonWatched(request, env, ctx) {
       message: "本季暂无可标记的已播出集数",
     });
   }
-
-  // 5) 批量标记
   let r;
   try {
     r = await fetchT(
@@ -3738,8 +3563,6 @@ async function handleMarkSeasonWatched(request, env, ctx) {
     );
   }
   const result = await r.json().catch(() => null);
-
-  // 6) bust 用户缓存
   bustHomeUserCaches(userKey, env, ctx);
   const seasonKey = CK.season(showId, season);
   __kvMem.delete(seasonKey);
@@ -3756,7 +3579,6 @@ async function handleMarkSeasonWatched(request, env, ctx) {
   });
 }
 
-/* -------------------- 弃剧 -------------------- */
 
 /**
  * 弃剧：加入 Trakt hidden/dropped + hidden/calendar。
@@ -3802,7 +3624,6 @@ async function handleDropShow(request, env, ctx) {
   } catch (e) {
     return authJson(auth, needsCookieUpdate, { error: String(e) }, 502);
   }
-  // 顺便把日历也隐藏
   try {
     await fetchT(
       `${TRAKT_API}/users/hidden/calendar`,
@@ -3814,8 +3635,6 @@ async function handleDropShow(request, env, ctx) {
       8000,
     );
   } catch {}
-
-  // 本地记录弃剧 ID，用于过滤首页日历
   const today = new Date(Date.now() + 8 * 3600 * 1000)
     .toISOString()
     .slice(0, 10);
@@ -3859,7 +3678,6 @@ async function handleDropShow(request, env, ctx) {
   return authJson(auth, needsCookieUpdate, { ok: true, added, result, showId });
 }
 
-/* -------------------- 剧集播出日历 -------------------- */
 
 /**
  * 单剧播出日历 API。
@@ -3886,8 +3704,6 @@ async function handleShowCalendar(request, env, ctx) {
   );
   if (!Array.isArray(seasons))
     return Response.json({ error: "failed" }, { status: 502 });
-
-  // 尝试用 TMDB 拿中文集标题
   const zhTitles = {};
   let zhShowTitle = "";
   if (tmdbId && /^\d+$/.test(tmdbId) && env.TMDB_API_KEY) {
@@ -3950,7 +3766,6 @@ async function handleShowCalendar(request, env, ctx) {
   );
 }
 
-/* -------------------- 观看小结 -------------------- */
 
 /**
  * 观看小结 API。
@@ -4061,8 +3876,6 @@ async function buildSummary(headers, period, ref, env, ctx, userKey) {
   const dayCount = new Map();
   let totalMinutes = 0,
     episodePlays = 0;
-
-  // 遍历历史，聚合统计
   for (const it of items) {
     if (!it) continue;
     const watchedAt = it.watched_at || "";
@@ -4078,7 +3891,6 @@ async function buildSummary(headers, period, ref, env, ctx, userKey) {
     if (day) dayCount.set(day, (dayCount.get(day) || 0) + 1);
 
     if (it.type === "movie" || it.movie) {
-      // 电影
       const m = it.movie || {};
       const traktId = m.ids && m.ids.trakt;
       const tmdbId = m.ids && m.ids.tmdb;
@@ -4101,7 +3913,6 @@ async function buildSummary(headers, period, ref, env, ctx, userKey) {
       totalMinutes += runtime;
       moviePlays.set(key, prev);
     } else if (it.type === "episode" || it.episode || it.show) {
-      // 剧集
       const s = it.show || {},
         e = it.episode || {};
       const traktId = s.ids && s.ids.trakt,
@@ -4133,14 +3944,10 @@ async function buildSummary(headers, period, ref, env, ctx, userKey) {
       showEpisodes.set(key, prev);
     }
   }
-
-  // 最忙一天
   let busiest = null;
   for (const [d, n] of dayCount) {
     if (!busiest || n > busiest.count) busiest = { date: d, count: n };
   }
-
-  // 排序 TOP8
   let topMovies = [...moviePlays.values()]
     .sort((a, b) => b.plays - a.plays || b.minutes - a.minutes)
     .slice(0, 8);
@@ -4156,8 +3963,6 @@ async function buildSummary(headers, period, ref, env, ctx, userKey) {
     }))
     .sort((a, b) => b.episodes - a.episodes || b.plays - a.plays)
     .slice(0, 8);
-
-  // 通过 TMDB 补中文标题
   async function zhTitle(kind, item) {
     const fallback = item.title || "";
     if (!env || !env.TMDB_API_KEY) return fallback;
@@ -4195,8 +4000,6 @@ async function buildSummary(headers, period, ref, env, ctx, userKey) {
       topShows[i] = { ...s, title: await zhTitle("tv", s) };
     }),
   ]);
-
-  // 输出格式统一
   topMovies = topMovies.map((m) => ({
     title: m.title,
     year: m.year,
@@ -4218,8 +4021,6 @@ async function buildSummary(headers, period, ref, env, ctx, userKey) {
   const days = [...dayCount.entries()]
     .sort((a, b) => a[0].localeCompare(b[0]))
     .map(([date, count]) => ({ date, count }));
-
-  // 前后周期
   let prevRef = null,
     nextRef = null;
   if (period === "month") {
@@ -4259,13 +4060,9 @@ async function buildSummary(headers, period, ref, env, ctx, userKey) {
   };
 }
 /* ============================================================
- * 段落 4 / 4：
- * handleHomeData（含 strict 鉴权）
- * 首页 shell / 骨架 HTML
- * 详情 API / 演员 API / 季 API
+ * 第四部分：首页数据分片（handleHomeData）· 首页壳与骨架 · 详情/季/演员 API
  * ============================================================ */
 
-/* -------------------- 首页 shell / 数据聚合 -------------------- */
 
 /** 首页路由：/home 需要登录；未登录重定向到 /login */
 async function handleHome(request, env, ctx) {
@@ -4361,13 +4158,12 @@ function streamHomeShell(initialDetail, profileHint) {
       try {
         controller.enqueue(
           enc.encode(
-            `<!DOCTYPE html><html lang="zh-CN" style="background:#000000"><head>${commonHeadMeta()}<link rel="preload" href="/app.css?v=${APP_CSS_VERSION}" as="style"><link rel="modulepreload" href="/app.js?v=${APP_JS_VERSION}"><link rel="stylesheet" href="/app.css?v=${APP_CSS_VERSION}"><style>${splashCriticalCss()}</style><script>window.__splashT0=Date.now();window.__splashHidden=false;window.__primaryBootP=null;try{window.__primaryBootP=fetch('/api/home-data?part=playback',{credentials:'same-origin',cache:'no-store'}).then(function(r){if(r.status===401){location.href='/login';return null;}if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){window.__primaryBoot=d;return d;}).catch(function(){return null;});}catch(e){}</script></head><body style="background:#000000;margin:0;min-height:100vh;min-height:100dvh">${renderSplash()}`,
+            `<!DOCTYPE html><html lang="zh-CN" data-theme="dark"><head>${commonHeadMeta()}<link rel="preload" href="/app.css?v=${APP_CSS_VERSION}" as="style"><link rel="modulepreload" href="/app.js?v=${APP_JS_VERSION}"><link rel="stylesheet" href="/app.css?v=${APP_CSS_VERSION}"><style>${splashCriticalCss()}</style><script>window.__splashT0=Date.now();window.__splashHidden=false;window.__primaryBootP=null;try{window.__primaryBootP=fetch('/api/home-data?part=playback',{credentials:'same-origin',cache:'no-store'}).then(function(r){if(r.status===401){location.href='/login';return null;}if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){window.__primaryBoot=d;return d;}).catch(function(){return null;});}catch(e){}</script></head><body style="background:var(--bg-solid,#000000);margin:0;min-height:100vh;min-height:100dvh">${renderSplash()}`,
           ),
         );
         controller.enqueue(
           enc.encode(renderHomeSkeleton(initialDetail, profileHint)),
         );
-        // 回访秒开：localStorage 回填进度条
         controller.enqueue(
           enc.encode(
             `<script>(function(){try{var v=localStorage.getItem('mt:pb');if(!v)return;var o=JSON.parse(v);if(!o||(o._exp&&o._exp<Date.now()))return;var d=o.data||o;var html=d&&d.playbackHScrollHtml;if(!html)return;var el=document.getElementById('playback-hscroll');if(el){el.innerHTML=html;window.__earlyPbApplied=1;}}catch(e){}})();<\/script>`,
@@ -4584,8 +4380,6 @@ async function handleHomeData(request, env, ctx) {
     .slice(0, 10);
   const part = url.searchParams.get("part") || "all";
   const force = url.searchParams.get("force") === "1";
-
-  // force 时少重试，失败尽快回退 KV
   const fetchJson = (u, retries = 1) =>
     traktFetch(u, headers, {
       retries,
@@ -4607,8 +4401,6 @@ async function handleHomeData(request, env, ctx) {
   const wantWatchlist = part === "watchlist" || part === "all";
   const wantCalendar = part === "calendar" || part === "all";
   const wantHistory = part === "history" || part === "all";
-
-  // 并行启动活动签名查询
   const actSigP =
     wantMeta || wantWatchlist || wantHistory
       ? getUserActivitySig(headers, env, ctx, userKey)
@@ -4625,14 +4417,10 @@ async function handleHomeData(request, env, ctx) {
 
   const playbackSrc = { fromCache: true, age: 0 };
   const metaSrc = { fromCache: null, age: 0 };
-
-  // force：bypass；非 force：只读 KV，未过期绝不打 API
   const opts = (o) =>
     force
       ? { ...o, bypass: true, revalidate: true }
       : { ...o, swr: false, revalidate: true };
-
-  // 继续观看
   if (wantPlayback) {
     taskFns.push(async () => {
       playback = await cachedJSON(
@@ -4666,8 +4454,6 @@ async function handleHomeData(request, env, ctx) {
       );
     });
   }
-
-  // 观看历史（第一页）
   if (wantHistory) {
     taskFns.push(async () => {
       history = await cachedJSON(
@@ -4705,8 +4491,6 @@ async function handleHomeData(request, env, ctx) {
       );
     });
   }
-
-  // 追剧日历
   if (wantCalendar) {
     taskFns.push(async () => {
       calendar = await getCalendarCached(
@@ -4719,8 +4503,6 @@ async function handleHomeData(request, env, ctx) {
       );
     });
   }
-
-  // 待看列表
   if (wantWatchlist) {
     taskFns.push(async () => {
       try {
@@ -4737,8 +4519,6 @@ async function handleHomeData(request, env, ctx) {
       }
     });
   }
-
-  // 用户资料 + 统计
   if (wantMeta) {
     taskFns.push(async () => {
       profile = await cachedJSON(
@@ -4780,16 +4560,12 @@ async function handleHomeData(request, env, ctx) {
       );
     });
   }
-
-  // force：串行 + 短间隔防 429；非 force：高并行
   const concurrency = force ? 1 : Math.min(6, Math.max(1, taskFns.length));
   const gapMs = force ? 300 : 0;
   await runLimited(taskFns, concurrency, gapMs);
   const actSig = await actSigP.catch(() => null);
   if (actSig && actSig.sig)
     kvMemSet(`act:${userKey}:last`, actSig.sig, KV_MEM_TTL);
-
-  // 回传限流状态给前端
   if (isTraktRateLimited(userKey)) {
     result.rateLimited = true;
     result.cooling = traktRateLimitedRemaining(userKey);
@@ -4797,8 +4573,6 @@ async function handleHomeData(request, env, ctx) {
     result.rateLimited = false;
     result.cooling = 0;
   }
-
-  // 组装 playback HTML
   if (wantPlayback) {
     const pbList = Array.isArray(playback) ? playback : [];
     try {
@@ -4815,8 +4589,6 @@ async function handleHomeData(request, env, ctx) {
           : "";
     result.playbackAgeSec = playbackSrc.age || 0;
   }
-
-  // 组装 meta（用户资料 + 统计）
   if (wantMeta) {
     if (profile && !profile.__error && profile.ids && profile.ids.trakt) {
       rememberTraktUserId(auth, profile.ids.trakt);
@@ -4857,8 +4629,6 @@ async function handleHomeData(request, env, ctx) {
           ? "live"
           : "";
     result.metaAgeSec = metaSrc.age || 0;
-
-    // 写 profile hint Cookie
     try {
       const pname = displayName || "";
       const pavatar = avatarUrl || "";
@@ -4872,8 +4642,6 @@ async function handleHomeData(request, env, ctx) {
       }
     } catch {}
   }
-
-  // 组装 history
   if (wantHistory) {
     try {
       const historyItems = Array.isArray(history)
@@ -4898,8 +4666,6 @@ async function handleHomeData(request, env, ctx) {
       result.historyMoreHtml = "";
     }
   }
-
-  // 组装 calendar（过滤弃剧）
   if (wantCalendar) {
     try {
       let calFiltered = calendar;
@@ -4917,8 +4683,6 @@ async function handleHomeData(request, env, ctx) {
       result.calendarHtml = emptyPaneHtml("暂时无法加载追剧日历");
     }
   }
-
-  // 组装 watchlist
   if (wantWatchlist) {
     try {
       if (!Array.isArray(watchlist)) {
@@ -4934,7 +4698,6 @@ async function handleHomeData(request, env, ctx) {
             ? `<div class="load-more-wrap"><button class="load-more" data-page="2" data-sort="added" onclick="loadMoreWatchlist(this)">加载更多</button></div>`
             : "";
         result.watchlistHtml =
-          watchlistToolbarHtml("added") +
           `<div id="watchlist-grid" class="grid">${cardsHtml}</div>` +
           moreHtml;
       }
@@ -4946,7 +4709,6 @@ async function handleHomeData(request, env, ctx) {
   return new Response(JSON.stringify(result), { headers: outHeaders });
 }
 
-/* -------------------- 骨架 & 基础 HTML -------------------- */
 
 /** 非流式渲染首页 shell（保留兼容） */
 function renderHomeShell(initialDetail, profileHint) {
@@ -4961,6 +4723,17 @@ function renderHomeShell(initialDetail, profileHint) {
     `<script>window.__HOME_CONFIG__=${JSON.stringify(cfg).replace(/</g, "\\u003c")};<\/script>` +
     pageTail()
   );
+}
+
+/** 首页平台卡（数据取自 PLATFORMS，两行分组展示） */
+function renderPlatformRows() {
+  const card = (p) =>
+    `<button type="button" class="platform-card" data-platform="${p.id}" title="${p.name}"><div class="platform-card-left"><img class="platform-card-logo" src="${p.logo}" alt="" loading="lazy"><span class="platform-card-name">${p.name}</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="${p.id}"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button>`;
+  const row = (list) =>
+    `<div class="platform-row"><div class="platform-cards">${list.map(card).join("")}</div></div>`;
+  const ids = ["netflix", "disney", "hbomax", "appletv", "prime", "iqiyi", "youku", "tencent", "mgtv", "bilibili"];
+  const cards = ids.map((id) => PLATFORMS[id]).filter(Boolean);
+  return `<div class="platform-rows">${row(cards.slice(0, 5))}${row(cards.slice(5))}</div>`;
 }
 
 /** 首页骨架 HTML（含所有模态框容器） */
@@ -4978,10 +4751,9 @@ function renderHomeSkeleton(initialDetail, profileHint) {
   const section = (id, title, extraHtml) =>
     `<div class="home-section"><div class="home-section-head"><h2 class="home-section-title">${title}</h2><button class="home-more-btn" type="button" onclick="openListModal('${id}')"><span>查看更多</span><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg></button></div>${extraHtml || ""}<div class="h-scroll-wrap"><div class="h-scroll" id="${id}-hscroll"><div class="pane-loading"><div class="spinner"></div></div></div></div></div>`;
 
-  return `<div class="container"><!-- 吸顶栏：头像 / 统计 / 主导航，滚动时固定在顶部 --><div class="top-sticky"><header class="hero"><div class="hero-left"><button type="button" class="hero-avatar" id="hero-avatar" title="观看小结" aria-label="打开观看小结">${heroAvatarHtml}</button><div class="hero-text"><h1 class="hero-name" id="hero-name">${heroName}</h1><p class="updated-at" id="updated-at"></p></div></div><div class="hero-actions"><button class="btn-action" id="btn-refresh" onclick="forceRefresh()" title="刷新数据"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg><span>刷新</span></button><button class="btn-action" onclick="logout()" title="退出登录"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg><span>退出</span></button></div></header><div class="stats" id="stats-box">${renderStatsHtml(null)}</div><nav class="tabs"><button class="tab active" data-tab="playback"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9.5 21v-6h5v6"/></svg><span>首页</span></button><button class="tab" data-tab="watchlist"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg><span>待看</span></button><button class="tab" data-tab="calendar"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg><span>日历</span></button><button class="tab" data-tab="history"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/></svg><span>记录</span></button><button class="tab" data-tab="search"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg><span>搜索</span></button></nav></div><section id="playback" class="pane active">${section("playback", "继续观看")}<div class="home-section platform-section"><div class="home-section-head"><h2 class="home-section-title">流媒体平台</h2></div><div class="platform-rows"><div class="platform-row"><div class="platform-cards"><button type="button" class="platform-card" data-platform="netflix" title="Netflix"><div class="platform-card-left"><img class="platform-card-logo" src="https://picui.ogmua.cn/s1/2026/10/14/6acf1d2e2d114.webp" alt="" loading="lazy"><span class="platform-card-name">Netflix</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="netflix"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button><button type="button" class="platform-card" data-platform="disney" title="Disney+"><div class="platform-card-left"><img class="platform-card-logo" src="https://picui.ogmua.cn/s1/2026/10/14/6acf1d31c3e92.webp" alt="" loading="lazy"><span class="platform-card-name">Disney+</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="disney"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button><button type="button" class="platform-card" data-platform="hbomax" title="HBO Max"><div class="platform-card-left"><img class="platform-card-logo" src="https://picui.ogmua.cn/s1/2026/10/14/6acf1d2eaeb73.webp" alt="" loading="lazy"><span class="platform-card-name">HBO Max</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="hbomax"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button><button type="button" class="platform-card" data-platform="appletv" title="Apple TV+"><div class="platform-card-left"><img class="platform-card-logo" src="https://picui.ogmua.cn/s1/2026/10/14/6acf1d2f8bbd9.webp" alt="" loading="lazy"><span class="platform-card-name">Apple TV+</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="appletv"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button><button type="button" class="platform-card" data-platform="prime" title="Prime Video"><div class="platform-card-left"><img class="platform-card-logo" src="https://picui.ogmua.cn/s1/2026/10/14/6acf1d3007455.webp" alt="" loading="lazy"><span class="platform-card-name">Prime Video</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="prime"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button></div></div><div class="platform-row"><div class="platform-cards"><button type="button" class="platform-card" data-platform="iqiyi" title="爱奇艺"><div class="platform-card-left"><img class="platform-card-logo" src="https://picui.ogmua.cn/s1/2026/10/14/6acf1d2e05ad8.webp" alt="" loading="lazy"><span class="platform-card-name">爱奇艺</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="iqiyi"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button><button type="button" class="platform-card" data-platform="youku" title="优酷"><div class="platform-card-left"><img class="platform-card-logo" src="https://picui.ogmua.cn/s1/2026/10/14/6acf1d30c04e7.webp" alt="" loading="lazy"><span class="platform-card-name">优酷</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="youku"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button><button type="button" class="platform-card" data-platform="tencent" title="腾讯视频"><div class="platform-card-left"><img class="platform-card-logo" src="https://picui.ogmua.cn/s1/2026/10/14/6acf1d2fefe09.webp" alt="" loading="lazy"><span class="platform-card-name">腾讯视频</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="tencent"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button><button type="button" class="platform-card" data-platform="mgtv" title="芒果TV"><div class="platform-card-left"><img class="platform-card-logo" src="https://picui.ogmua.cn/s1/2026/10/14/6acf1d30dabe2.webp" alt="" loading="lazy"><span class="platform-card-name">芒果TV</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="mgtv"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button><button type="button" class="platform-card" data-platform="bilibili" title="哔哩哔哩"><div class="platform-card-left"><img class="platform-card-logo" src="https://picui.ogmua.cn/s1/2026/10/14/6acf1d2e54fb3.webp" alt="" loading="lazy"><span class="platform-card-name">哔哩哔哩</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="bilibili"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button></div></div></div></div>${section("guduo", "骨朵热榜", '<div class="theater-home-tabs" id="guduo-home-tabs" style="display:none"></div>')}${section("theater", "平台剧场", '<div class="theater-home-tabs" id="theater-home-tabs" style="display:none"></div>')}${section("douban-domestic", "豆瓣热播国产剧")}${section("douban-hktw", "豆瓣热播港台剧")}${section("douban-jpkr", "豆瓣热播日韩剧")}${section("douban-western", "豆瓣热播欧美剧")}</section><section id="watchlist" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="calendar" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="history" class="pane"><div class="grid"></div><div id="history-more"></div></section><section id="search" class="pane"><div class="search-bar"><input id="search-input" class="search-input" type="search" placeholder="搜索电影 / 剧集" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></div><div id="search-results" class="grid"></div></section></div><div id="list-modal" class="list-modal"><div class="list-modal-backdrop" onclick="closeListModal()"></div><div class="list-modal-panel"><div class="list-modal-head"><h3 class="list-modal-title" id="list-modal-title"></h3><button type="button" class="list-modal-close" onclick="closeListModal()" aria-label="关闭">×</button></div><div class="list-modal-body" id="list-modal-body"></div></div></div><div id="summary-modal" class="summary-modal" style="display:none" role="dialog" aria-modal="true" aria-label="观看小结"><div class="summary-backdrop" onclick="window.__closeSummary()"></div><div class="summary-panel"><div class="summary-head"><h2 class="summary-title">观看小结</h2><button type="button" class="summary-close" onclick="window.__closeSummary()" aria-label="关闭">×</button></div><div id="summary-modal-body" class="summary-body"><div class="pane-loading"><div class="spinner"></div></div></div></div></div><div id="person-modal" class="person-modal"><div class="person-backdrop" onclick="closePerson()"></div><div class="person-panel"><div class="person-panel-head"><div class="person-panel-name" id="person-modal-name"></div><button class="person-close" onclick="closePerson()" aria-label="关闭">×</button></div><div class="person-panel-body" id="person-modal-body"></div></div></div><div id="confirm-modal" class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title" style="display:none"><div class="confirm-backdrop"></div><div class="confirm-panel"><div class="confirm-icon" id="confirm-icon">?</div><div class="confirm-title" id="confirm-title"></div><div class="confirm-msg" id="confirm-msg"></div><div class="confirm-actions"><button class="confirm-btn confirm-cancel" id="confirm-cancel" type="button">取消</button><button class="confirm-btn confirm-ok" id="confirm-ok" type="button">确定</button></div></div></div><div id="modal" class="modal"><div class="modal-backdrop" onclick="closeDetail()"></div><div class="modal-panel"><div class="modal-shell"><button class="modal-close" onclick="closeDetail()" aria-label="关闭"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button><div class="modal-body" id="modal-body"></div></div></div></div><div id="show-cal-modal" class="show-cal-modal"><div class="show-cal-backdrop" onclick="closeShowCal()"></div><div class="show-cal-panel"><div class="show-cal-head"><div class="show-cal-name" id="show-cal-name"></div><button class="show-cal-close" onclick="closeShowCal()" aria-label="关闭">×</button></div><div class="show-cal-info" id="show-cal-info"></div><div class="show-cal-nav"><button onclick="calShiftMonth(-1)" aria-label="上个月">‹</button><div id="show-cal-month">—</div><button onclick="calShiftMonth(1)" aria-label="下个月">›</button></div><div class="show-cal-weekdays"><span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span></div><div class="show-cal-grid" id="show-cal-grid"></div><div class="show-cal-legend"><span class="legend-item"><i class="legend-dot legend-past"></i>已播出</span><span class="legend-item"><i class="legend-dot legend-today"></i>今天</span><span class="legend-item"><i class="legend-dot legend-future"></i>待播出</span></div><div class="show-cal-detail" id="show-cal-detail"></div></div></div><script src="/app.js?v=${APP_JS_VERSION}" defer><\/script>${boot}`;
+  return `<div class="container"><!-- 吸顶栏：头像 / 统计 / 主导航，滚动时固定在顶部 --><div class="top-sticky"><header class="hero"><div class="hero-left"><button type="button" class="hero-avatar" id="hero-avatar" title="观看小结" aria-label="打开观看小结">${heroAvatarHtml}</button><div class="hero-text"><h1 class="hero-name" id="hero-name">${heroName}</h1><p class="updated-at" id="updated-at"></p></div></div><div class="hero-actions"><button class="btn-action" id="btn-refresh" onclick="forceRefresh()" title="刷新数据"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg><span>刷新</span></button><button class="btn-action" id="btn-theme" onclick="cycleTheme()" title="主题：深色" aria-label="切换主题：深色"><span class="theme-icon" id="theme-icon"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></span><span>主题</span></button><button class="btn-action" id="btn-logout" onclick="logout()" title="退出登录"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg><span>退出</span></button></div></header><div class="stats" id="stats-box">${renderStatsHtml(null)}</div><nav class="tabs"><button class="tab active" data-tab="playback"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9.5 21v-6h5v6"/></svg><span>首页</span></button><button class="tab" data-tab="watchlist"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg><span>待看</span></button><button class="tab" data-tab="calendar"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg><span>日历</span></button><button class="tab" data-tab="history"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/></svg><span>记录</span></button><button class="tab" data-tab="search"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg><span>搜索</span></button></nav></div><section id="playback" class="pane active">${section("playback", "继续观看")}<div class="home-section platform-section"><div class="home-section-head"><h2 class="home-section-title">流媒体平台</h2></div>${renderPlatformRows()}${section("guduo", "骨朵热榜", '<div class="theater-home-tabs" id="guduo-home-tabs" style="display:none"></div>')}${section("theater", "平台剧场", '<div class="theater-home-tabs" id="theater-home-tabs" style="display:none"></div>')}${section("douban-domestic", "豆瓣热播国产剧")}${section("douban-hktw", "豆瓣热播港台剧")}${section("douban-jpkr", "豆瓣热播日韩剧")}${section("douban-western", "豆瓣热播欧美剧")}</section><section id="watchlist" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="calendar" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="history" class="pane"><div class="grid"></div><div id="history-more"></div></section><section id="search" class="pane"><div class="search-bar"><input id="search-input" class="search-input" type="search" placeholder="搜索电影 / 剧集" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></div><div id="search-results" class="grid"></div></section><div class="app-version">MineTrakt v${APP_JS_VERSION}</div></div><div id="list-modal" class="list-modal"><div class="list-modal-backdrop" onclick="closeListModal()"></div><div class="list-modal-panel"><div class="list-modal-head"><h3 class="list-modal-title" id="list-modal-title"></h3><button type="button" class="list-modal-close" onclick="closeListModal()" aria-label="关闭">×</button></div><div class="list-modal-body" id="list-modal-body"></div></div></div><div id="summary-modal" class="summary-modal" style="display:none" role="dialog" aria-modal="true" aria-label="观看小结"><div class="summary-backdrop" onclick="window.__closeSummary()"></div><div class="summary-panel"><div class="summary-head"><h2 class="summary-title">观看小结</h2><button type="button" class="summary-close" onclick="window.__closeSummary()" aria-label="关闭">×</button></div><div id="summary-modal-body" class="summary-body"><div class="pane-loading"><div class="spinner"></div></div></div></div></div><div id="person-modal" class="person-modal"><div class="person-backdrop" onclick="closePerson()"></div><div class="person-panel"><div class="person-panel-head"><div class="person-panel-name" id="person-modal-name"></div><button class="person-close" onclick="closePerson()" aria-label="关闭">×</button></div><div class="person-panel-body" id="person-modal-body"></div></div></div><div id="confirm-modal" class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title" style="display:none"><div class="confirm-backdrop"></div><div class="confirm-panel"><div class="confirm-icon" id="confirm-icon">?</div><div class="confirm-title" id="confirm-title"></div><div class="confirm-msg" id="confirm-msg"></div><div class="confirm-actions"><button class="confirm-btn confirm-cancel" id="confirm-cancel" type="button">取消</button><button class="confirm-btn confirm-ok" id="confirm-ok" type="button">确定</button></div></div></div><div id="modal" class="modal"><div class="modal-backdrop" onclick="closeDetail()"></div><div class="modal-panel"><div class="modal-shell"><button class="modal-close" onclick="closeDetail()" aria-label="关闭"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button><div class="modal-body" id="modal-body"></div></div></div></div><div id="show-cal-modal" class="show-cal-modal"><div class="show-cal-backdrop" onclick="closeShowCal()"></div><div class="show-cal-panel"><div class="show-cal-head"><div class="show-cal-name" id="show-cal-name"></div><button class="show-cal-close" onclick="closeShowCal()" aria-label="关闭">×</button></div><div class="show-cal-info" id="show-cal-info"></div><div class="show-cal-nav"><button onclick="calShiftMonth(-1)" aria-label="上个月">‹</button><div id="show-cal-month">—</div><button onclick="calShiftMonth(1)" aria-label="下个月">›</button></div><div class="show-cal-weekdays"><span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span></div><div class="show-cal-grid" id="show-cal-grid"></div><div class="show-cal-legend"><span class="legend-item"><i class="legend-dot legend-past"></i>已播出</span><span class="legend-item"><i class="legend-dot legend-today"></i>今天</span><span class="legend-item"><i class="legend-dot legend-future"></i>待播出</span></div><div class="show-cal-detail" id="show-cal-detail"></div></div></div><script src="/app.js?v=${APP_JS_VERSION}" defer><\/script>${boot}`;
 }
 
-/* -------------------- 详情扩展（懒加载演员/推荐/预告片/评分） -------------------- */
 
 /**
  * 详情扩展 API。
@@ -5134,7 +4906,6 @@ async function handleDetailExtras(request, env, ctx) {
   );
 }
 
-/* -------------------- 演员详情 -------------------- */
 
 /** 演员详情页（公共数据，不 strict） */
 async function handlePerson(request, env, ctx) {
@@ -5243,7 +5014,6 @@ async function handlePerson(request, env, ctx) {
   });
 }
 
-/* -------------------- 季剧集 -------------------- */
 
 /**
  * 季剧集 API。
@@ -5333,7 +5103,6 @@ async function handleSeason(request, env, ctx) {
   );
 }
 
-/* -------------------- 详情主渲染 API -------------------- */
 
 /**
  * 详情 API。
@@ -5480,8 +5249,6 @@ async function handleApiDetail(request, env, ctx) {
         502,
       );
     }
-
-    // 没有 Trakt 实体时用 TMDB 兜底构造
     if (!entity) {
       const genres =
         tmdbBasic && Array.isArray(tmdbBasic.genres)
@@ -5536,8 +5303,6 @@ async function handleApiDetail(request, env, ctx) {
         inWatchlist = ids.includes(wlTmdbId);
       } catch {}
     }
-
-    // 计算初始季
     let initialSeasonNum = null;
     if (type === "show" && userProgress) {
       if (userProgress.next_episode && userProgress.next_episode.season)
@@ -5618,11 +5383,9 @@ async function handleApiDetail(request, env, ctx) {
   }
 }
 /* ============================================================
- * 段落 5 / 6：
- * 页面渲染函数 + 富化 + handleMore + 工具函数
+ * 第五部分：列表/卡片 HTML 渲染 · 详情富化 · handleMore 分页
  * ============================================================ */
 
-/* -------------------- 列表项基础解析 -------------------- */
 
 /** 从 Trakt 实体的 images.poster 中提取海报 URL */
 function posterOfTrakt(obj) {
@@ -5660,7 +5423,6 @@ function buildBaseItem(traktItem) {
     else if (traktItem.show) kind = "show";
   }
   if (kind === "movie" || traktItem.movie) {
-    // 电影
     const m = traktItem.movie || {};
     base.tag = "电影";
     base.tagClass = "movie";
@@ -5686,7 +5448,6 @@ function buildBaseItem(traktItem) {
     kind === "show" ||
     (traktItem.show && traktItem.episode)
   ) {
-    // 剧集
     const e = traktItem.episode || {},
       s = traktItem.show || {};
     base.tag = "剧集";
@@ -5842,7 +5603,6 @@ async function handleEnrich(request, env, ctx) {
   });
 }
 
-/* -------------------- 单个媒体卡片渲染 -------------------- */
 
 /**
  * 渲染单个媒体卡片（.item）。
@@ -5899,7 +5659,6 @@ function mediaItem(opts) {
   return `<div class="item${clickable}"${dataAttrs}${enrichAttrs}${style}>${removeHtml}${watchedHtml}${unwatchHtml}<div class="poster">${opts.poster ? `<img src="${opts.poster}" loading="lazy" alt="">` : `<div class="poster-ph"><span>${opts.tagClass === "movie" ? "🎬" : "📺"}</span></div>`}${playHtml}${dropHtml}</div><div class="info"><div class="name-row"><span class="name">${esc(opts.title)}</span>${tagHtml}</div>${opts.line1 ? `<div class="meta">${esc(opts.line1)}</div>` : ""}${opts.overview ? `<div class="overview">${esc(opts.overview)}</div>` : ""}${opts.line2 ? `<div class="meta dim">${esc(opts.line2)}</div>` : ""}${bar}${calendarBtnHtml}</div></div>`;
 }
 
-/* -------------------- 观看记录渲染 -------------------- */
 
 /**
  * 渲染观看记录列表。
@@ -5945,24 +5704,8 @@ function renderHistoryPage(items, env, isFragment) {
     .join("");
 }
 
-/* -------------------- Watchlist 渲染 -------------------- */
 
 /** watchlist 排序工具栏 */
-function watchlistToolbarHtml(currentSort) {
-  const opts = [
-      ["added", "按添加时间"],
-      ["released", "按发行年份"],
-      ["title", "按标题"],
-    ],
-    options = opts
-      .map(
-        ([v, t]) =>
-          `<option value="${v}"${v === currentSort ? " selected" : ""}>${t}</option>`,
-      )
-      .join("");
-  return `<div class="wl-toolbar"><label class="wl-sort-label">排序<select id="wl-sort" class="wl-sort" onchange="onWatchlistSortChange(this.value)">${options}</select></label></div>`;
-}
-
 /** watchlist 空状态 */
 function emptyWatchlistHtml() {
   return `<div class="empty"><svg viewBox="0 0 24 24" width="56" height="56" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.25"><circle cx="12" cy="12" r="10"/><path d="M12 8v8M8 12h8"/></svg><p>待看列表是空的</p><p style="font-size:0.82rem;color:#5a6474;margin-top:10px;line-height:1.6;text-align:center">去 Trakt 上把想看的电影 / 剧集加入 watchlist，这里就会显示</p></div>`;
@@ -6001,7 +5744,6 @@ function renderWatchlistItems(items, env) {
     .join("");
 }
 
-/* -------------------- 继续观看渲染 -------------------- */
 
 /** 构造 Infuse 深链 */
 function buildInfuseHrefForContinue(item) {
@@ -6142,7 +5884,6 @@ function renderContinueItems(upNext, mode = "grid") {
   return `<div class="grid">${parts.join("")}</div>`;
 }
 
-/* -------------------- 追剧日历渲染 -------------------- */
 
 /**
  * 渲染追剧日历。
@@ -6211,7 +5952,6 @@ function renderCalendarPage(calendar, env, zhTitles) {
   return out.join("");
 }
 
-/* -------------------- 未看集数推导 -------------------- */
 
 /** 从用户进度中推导第一个未看的集数 */
 function firstUnwatchedEpisode(userProgress) {
@@ -6234,7 +5974,6 @@ function firstUnwatchedEpisode(userProgress) {
   return null;
 }
 
-/* -------------------- 详情主渲染 -------------------- */
 
 /**
  * 渲染详情页主 HTML 片段。
@@ -6305,8 +6044,6 @@ function renderDetailFragment(d) {
       (tmdb.imdb_id || (tmdb.external_ids && tmdb.external_ids.imdb_id))) ||
     (entity.ids && entity.ids.imdb) ||
     null;
-
-  // 状态块
   let statusHtml = "";
   if (isMovie) {
     if (movieWatched) {
@@ -6321,8 +6058,6 @@ function renderDetailFragment(d) {
   } else if (!isMovie) {
     statusHtml = `<div class="d-status"><div class="d-status-icon">○</div><div class="d-status-body"><div class="d-status-title">尚未观看</div><div class="d-status-sub">还没有观看记录</div></div></div>`;
   }
-
-  // 图标
   const iconCheck =
     '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="5 12.5 10 17.5 19 7"/></svg>';
   const iconBm =
@@ -6331,8 +6066,6 @@ function renderDetailFragment(d) {
     '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" stroke="none"><path d="M7 3h10a1 1 0 0 1 1 1v16l-6-3.5L6 20V4a1 1 0 0 1 1-1z"/></svg>';
   const iconPlay =
     '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" stroke="none"><path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11.04-6.86a1 1 0 0 0 0-1.72L9.5 4.28A1 1 0 0 0 8 5.14z"/></svg>';
-
-  // 操作按钮
   let barBtns = "";
   if (isMovie && traktId) {
     if (movieWatched)
@@ -6387,8 +6120,6 @@ function renderDetailFragment(d) {
   const actionsHtml = barBtns
     ? `<div class="d-action-bar">${barBtns}</div>`
     : "";
-
-  // 演员
   const cast = (credits && credits.cast ? credits.cast : []).slice(0, 20);
   const castInner = cast
     .map((c) => {
@@ -6418,8 +6149,6 @@ function renderDetailFragment(d) {
       }),
     )
     .join("");
-
-  // 延迟加载区块（deferExtras）
   let castSectionHtml = "";
   if (deferExtras) {
     castSectionHtml = `<section class="d-section" data-defer-parent="cast"><h2 class="d-section-title">演员</h2><div class="cast-scroll" data-defer-section="cast"><div class="pane-loading" style="padding:16px 0"><div class="spinner"></div></div></div></section>`;
@@ -6453,8 +6182,6 @@ function renderDetailFragment(d) {
   ) {
     ratingsSectionHtml = `<div class="detail-ext-ratings">${renderExtRatings(thirdParty, { trakt: traktRating, tmdb: tmdbRating, doubanUrl })}</div>`;
   }
-
-  // 季列表
   let seasonsHtml = "";
   if (!isMovie && tmdb && tmdb.seasons && tmdb.seasons.length) {
     const progressSeasons = new Map();
@@ -6492,7 +6219,6 @@ function renderDetailFragment(d) {
   return `<div class="detail-wrap"${rootAttrs}><div class="detail-hero">${backdrop ? `<img class="detail-bg" src="${backdrop}" alt="">` : ""}<div class="detail-inner">${poster ? `<img class="detail-poster" src="${poster}" alt="">` : `<div class="detail-poster detail-poster-ph">${isMovie ? "🎬" : "📺"}</div>`}<div class="detail-info"><h1 class="detail-title">${esc(title)}</h1>${tagline ? `<div class="detail-tagline">${esc(tagline)}</div>` : ""}<div class="detail-meta">${year ? `<span>${esc(year)}</span>` : ""}${runtimeStr ? `<span>${esc(runtimeStr)}</span>` : ""}</div>${ratingsSectionHtml}${genres ? `<div class="detail-genres">${esc(genres)}</div>` : ""}${overview ? `<p class="detail-overview">${esc(overview)}</p>` : ""}${statusHtml}${actionsHtml}</div></div></div><div class="detail-body">${castSectionHtml}${trailersSectionHtml}${seasonsHtml}${recsSectionHtml}</div></div>`;
 }
 
-/* -------------------- 季剧集列表渲染 -------------------- */
 
 /** 渲染某一季的集数列表 */
 function renderSeasonEpisodes(
@@ -6543,7 +6269,6 @@ function renderSeasonEpisodes(
     .join("");
 }
 
-/* -------------------- 空状态 -------------------- */
 
 /** 空视图（通用或错误） */
 function emptyView(opts) {
@@ -6559,7 +6284,6 @@ function emptyPaneHtml(text) {
   return `<div class="empty" style="padding:70px 20px"><p style="margin:0;font-size:.95rem">${esc(text)}</p><p style="font-size:.82rem;color:#7a8394;margin-top:10px">稍后重试即可恢复</p></div>`;
 }
 
-/* -------------------- 工具函数 -------------------- */
 
 /** 生成指定长度的随机串（PKCE verifier 用） */
 function randomString(len) {
@@ -6659,7 +6383,6 @@ function html(body) {
   });
 }
 
-/* -------------------- 更多加载（strict 鉴权） -------------------- */
 
 /**
  * 加载更多 API。
@@ -6777,7 +6500,6 @@ async function handleMore(request, env, ctx) {
   return new Response("", { status: 400 });
 }
 
-/* -------------------- 登录页 -------------------- */
 
 /**
  * 登录页：设备码授权 + 轮询。
@@ -6790,15 +6512,13 @@ function renderLoginPage() {
   );
 }
 /* ============================================================
- * 段落 6 / 6：
- * 页面基础 HTML / 启动脚本 / 客户端脚本 / 样式
+ * 第六部分：页面壳 HTML · 启动脚本 · 客户端脚本 · 全量样式
  * ============================================================ */
 
-/* -------------------- 启动页 / 骨架 -------------------- */
 
 /** 启动页 splash（黑底 + logo + 进度条） */
 function renderSplash() {
-  return `<div id="splash" class="splash" style="position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000;background:radial-gradient(circle at 50% 45%,#0a0a0a 0%,#000000 62%)"><div class="splash-glow"></div><div class="splash-inner"><div class="splash-logo"><img src="${SPLASH_LOGO}" alt="" width="96" height="96" loading="eager" decoding="async" style="display:block;filter:drop-shadow(0 0 22px rgba(125,157,212,.55))"></div><div class="splash-name">MineTrakt</div><div class="splash-bar"><div class="splash-bar-fill"></div></div></div></div>`;
+  return `<div id="splash" class="splash" style="position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;overflow:hidden;background:var(--splash-bg,#000)"><div class="splash-glow"></div><div class="splash-inner"><div class="splash-logo"><img src="${SPLASH_LOGO}" alt="" width="96" height="96" loading="eager" decoding="async" style="display:block;filter:drop-shadow(0 0 22px var(--splash-glow-color,rgba(125,157,212,.55)))"></div><div class="splash-name">MineTrakt</div><div class="splash-bar"><div class="splash-bar-fill"></div></div></div></div>`;
 }
 
 /**
@@ -6822,7 +6542,6 @@ function launchLogoSvg() {
     `<defs><linearGradient id="mtg" x1="0" y1="0" x2="1" y2="1">` +
     `<stop offset="0" stop-color="#a78bfa"/><stop offset="1" stop-color="#7d9dd4"/>` +
     `</linearGradient></defs>` +
-    // 圆角底 + 播放三角（与站内品牌观感一致）
     `<rect x="8" y="8" width="80" height="80" rx="22" fill="url(#mtg)" opacity="0.16"/>` +
     `<rect x="8.75" y="8.75" width="78.5" height="78.5" rx="21.25" fill="none" stroke="url(#mtg)" stroke-width="1.5" opacity="0.65"/>` +
     `<path d="M40 33.5v29l25-14.5-25-14.5z" fill="url(#mtg)"/>` +
@@ -6838,23 +6557,18 @@ function launchLogoSvg() {
 function launchCriticalCss() {
   const B = "box-sizing:border-box";
   return (
-    `html,body{background:#000!important;color:#eef1f7;margin:0;padding:0;min-height:100%;min-height:100dvh}` +
+    `html,body{background:var(--bg-solid,#000);color:var(--text,#eef1f7);margin:0;padding:0;min-height:100%;min-height:100dvh}` +
     `*{${B}}` +
-    // 容器与布局
     `.splash{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;overflow:hidden}` +
     `.splash-inner{position:relative;z-index:1;display:flex;flex-direction:column;align-items:center;gap:16px}` +
-    // 美术背景：底部紫 + 顶部蓝 + 中心辉光
-    `.splash-persist{background:radial-gradient(120% 90% at 50% 108%,rgba(124,58,237,.30) 0%,rgba(124,58,237,0) 55%),radial-gradient(110% 85% at 50% -12%,rgba(56,97,190,.25) 0%,rgba(0,0,0,0) 55%),#000}` +
-    `.splash-glow{position:absolute;left:50%;top:44%;width:420px;height:420px;transform:translate(-50%,-50%);border-radius:50%;background:radial-gradient(circle,rgba(124,58,237,.18) 0%,rgba(124,58,237,0) 62%);filter:blur(8px)}` +
-    // Logo：直接撑满盒子，避免"图片未到→白框"
+    `.splash-persist{background:var(--launch-splash-bg,radial-gradient(120% 90% at 50% 108%,rgba(124,58,237,.30) 0%,rgba(124,58,237,0) 55%),radial-gradient(110% 85% at 50% -12%,rgba(56,97,190,.25) 0%,rgba(0,0,0,0) 55%),#000)}` +
+    `.splash-glow{position:absolute;left:50%;top:44%;width:420px;height:420px;transform:translate(-50%,-50%);border-radius:50%;background:radial-gradient(circle,var(--launch-glow,rgba(124,58,237,.18)) 0%,rgba(124,58,237,0) 62%);filter:blur(8px)}` +
     `.splash-logo{width:96px;height:96px;display:flex;align-items:center;justify-content:center;animation:lpUp .28s ease both,lpBreath 2.6s ease-in-out .3s infinite}` +
     `.splash-logo img{width:96px;height:96px;display:block;object-fit:contain;animation:lpGlow 2.6s ease-in-out infinite}` +
-    // 文案与进度条
-    `.splash-name{font-size:1.5rem;letter-spacing:3px;color:#f2f4fa;font-weight:800;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;text-shadow:0 0 26px rgba(167,139,250,.4);animation:lpUp .28s ease .07s both}` +
-    `.splash-bar{width:150px;height:3px;border-radius:99px;background:rgba(255,255,255,.08);overflow:hidden;box-shadow:0 0 14px rgba(167,139,250,.25);animation:lpUp .28s ease .12s both}` +
-    `.splash-bar-fill{width:40%;height:100%;border-radius:99px;background:linear-gradient(90deg,#7c3aed,#a78bfa,#7d9dd4);box-shadow:0 0 10px rgba(167,139,250,.65);animation:splashBar 1.1s ease-in-out infinite}` +
-    `.splash-tag{font-size:.72rem;letter-spacing:4px;color:#6b7383;animation:lpUp .28s ease .18s both;padding-left:4px}` +
-    // 动画
+    `.splash-name{font-size:1.5rem;letter-spacing:3px;color:var(--text,#f2f4fa);font-weight:800;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;text-shadow:0 0 26px var(--accent-glow,rgba(167,139,250,.4));animation:lpUp .28s ease .07s both}` +
+    `.splash-bar{width:150px;height:3px;border-radius:99px;background:var(--bar-track,rgba(255,255,255,.08));overflow:hidden;box-shadow:0 0 14px var(--accent-soft,rgba(167,139,250,.25));animation:lpUp .28s ease .12s both}` +
+    `.splash-bar-fill{width:40%;height:100%;border-radius:99px;background:var(--splash-bar-fill,linear-gradient(90deg,#7c3aed,#a78bfa,#7d9dd4));box-shadow:0 0 10px var(--accent-glow,rgba(167,139,250,.65));animation:splashBar 1.1s ease-in-out infinite}` +
+    `.splash-tag{font-size:.72rem;letter-spacing:4px;color:var(--text-mute,#6b7383);animation:lpUp .28s ease .18s both;padding-left:4px}` +
     `@keyframes lpUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}` +
     `@keyframes lpGlow{0%,100%{filter:drop-shadow(0 0 18px rgba(125,157,212,.45))}50%{filter:drop-shadow(0 0 36px rgba(167,139,250,.8))}}` +
     `@keyframes lpBreath{0%,100%{transform:scale(1)}50%{transform:scale(1.05)}}` +
@@ -6880,16 +6594,15 @@ function renderLaunchPage(request) {
     "var t=" +
     JSON.stringify(target) +
     ";" +
-    // 注入"正在进入"小字（仅启动页有，不影响首页骨架）
     'try{var inner=document.querySelector(".splash-inner");if(inner){var tg=document.createElement("div");tg.className="splash-tag";tg.textContent="正在进入";inner.appendChild(tg);}}catch(e){}' +
-    // 展示约 400ms 保证启动页可见，再跳转（资源已并行预热）
     "setTimeout(function(){ location.replace(t); },400);" +
     "})();<\/script>";
   return (
-    '<!DOCTYPE html><html lang="zh-CN" style="background:#000000"><head>' +
+    '<!DOCTYPE html><html lang="zh-CN" data-theme="dark"><head>' +
     '<meta charset="utf-8">' +
+    THEME_BOOT_SCRIPT +
     '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1,user-scalable=no">' +
-    '<meta name="color-scheme" content="dark">' +
+    '<meta name="color-scheme" content="dark light">' +
     '<meta name="theme-color" content="' +
     THEME_COLOR +
     '">' +
@@ -6909,7 +6622,7 @@ function renderLaunchPage(request) {
     "<style>" +
     launchCriticalCss() +
     "</style>" +
-    '</head><body style="background:#000000;margin:0;min-height:100vh;min-height:100dvh">' +
+    '</head><body style="background:var(--bg-solid,#000000);margin:0;min-height:100vh;min-height:100dvh">' +
     renderSplash()
       .replace('class="splash"', 'class="splash splash-persist"')
       .replace(SPLASH_LOGO_IMG_RE, launchLogoSvg()) +
@@ -6918,7 +6631,6 @@ function renderLaunchPage(request) {
   );
 }
 
-/* -------------------- 统计块渲染 -------------------- */
 
 /** 渲染顶部 4 格统计（电影/剧集/集数/小时） */
 function renderStatsHtml(s) {
@@ -6960,16 +6672,14 @@ function renderStatsHtml(s) {
     .join("");
 }
 
-/* -------------------- 页面头 / 尾 -------------------- */
 
-/** 页面 <head> 早期部分（包含 splash 和关键 CSS） */
 /** 公共 <head> 片段：meta / 图标 / manifest / API 预连接 —— 各页面壳共用，避免重复维护 */
 function commonHeadMeta() {
-  return `<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1,user-scalable=no"><meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"><meta http-equiv="Pragma" content="no-cache"><meta name="color-scheme" content="dark"><meta name="theme-color" content="${THEME_COLOR}"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="${APP_SHORT_NAME}"><meta name="mobile-web-app-capable" content="yes"><meta name="format-detection" content="telephone=no"><title>${APP_NAME}</title><link rel="icon" href="${FAVICON_URL}" type="image/png"><link rel="apple-touch-icon" href="${APPLE_ICON}"><link rel="manifest" href="/manifest.webmanifest"><link rel="preconnect" href="https://api.trakt.tv" crossorigin><link rel="preconnect" href="https://api.themoviedb.org" crossorigin><link rel="preconnect" href="https://image.tmdb.org" crossorigin>`;
+  return `<meta charset="utf-8">${THEME_BOOT_SCRIPT}<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1,user-scalable=no"><meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"><meta http-equiv="Pragma" content="no-cache"><meta name="color-scheme" content="dark light"><meta name="theme-color" content="${THEME_COLOR}"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="${APP_SHORT_NAME}"><meta name="mobile-web-app-capable" content="yes"><meta name="format-detection" content="telephone=no"><title>${APP_NAME}</title><link rel="icon" href="${FAVICON_URL}" type="image/png"><link rel="apple-touch-icon" href="${APPLE_ICON}"><link rel="manifest" href="/manifest.webmanifest"><link rel="preconnect" href="https://api.trakt.tv" crossorigin><link rel="preconnect" href="https://api.themoviedb.org" crossorigin><link rel="preconnect" href="https://image.tmdb.org" crossorigin>`;
 }
 
 function pageHeadEarly() {
-  return `<!DOCTYPE html><html lang="zh-CN" style="background:#000000"><head>${commonHeadMeta()}<link rel="preload" as="script" href="/app.js?v=${APP_JS_VERSION}"><link rel="preload" href="/app.css?v=${APP_CSS_VERSION}" as="style"><link rel="stylesheet" href="/app.css?v=${APP_CSS_VERSION}"><style>${splashCriticalCss()}</style></head><body style="background:#000000;margin:0;min-height:100vh;min-height:100dvh">${renderSplash()}`;
+  return `<!DOCTYPE html><html lang="zh-CN" data-theme="dark"><head>${commonHeadMeta()}<link rel="preload" as="script" href="/app.js?v=${APP_JS_VERSION}"><link rel="preload" href="/app.css?v=${APP_CSS_VERSION}" as="style"><link rel="stylesheet" href="/app.css?v=${APP_CSS_VERSION}"><style>${splashCriticalCss()}</style></head><body style="background:var(--bg-solid,#000000);margin:0;min-height:100vh;min-height:100dvh">${renderSplash()}`;
 }
 
 /** 页面 </body> 前脚本（隐藏 splash + 注册 SW + 版本对账自动刷新） */
@@ -6981,7 +6691,6 @@ function pageTail() {
   if(window.__swRegistered)return;window.__swRegistered=true;
   function regSW(){navigator.serviceWorker.register('/sw.js',{scope:'/',updateViaCache:'none'}).then(function(r){try{r.update();}catch(e){}}).catch(function(){});}
   if(document.readyState==='complete'){setTimeout(regSW,1200);}else{window.addEventListener('load',function(){setTimeout(regSW,1200);});}
-  /* ---- 版本对账：PWA 回前台 / bfcache 恢复时检查服务端版本，不一致自动刷新 ---- */
   var checking=false;
   function checkVersion(){
     if(checking)return;checking=true;
@@ -7007,41 +6716,39 @@ function pageShell(body) {
   return pageHeadEarly() + body + pageTail();
 }
 
-/* -------------------- 启动页关键 CSS -------------------- */
 
 /** 关键路径 CSS（内联到 <head>，避免首屏闪烁） */
 function splashCriticalCss() {
-  return `html,body{background:#000!important;color:#eef1f7;margin:0;padding:0;min-height:100%;min-height:100dvh}
+  return `html,body{background:var(--bg-solid,#000);color:var(--text,#eef1f7);margin:0;padding:0;min-height:100%;min-height:100dvh}
 *{box-sizing:border-box}
-.splash{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000;transition:opacity .18s ease;animation:splashAutoHide .18s ease .35s forwards}
+.splash{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;overflow:hidden;background:var(--splash-bg,#000);transition:opacity .18s ease;animation:splashAutoHide .18s ease .35s forwards}
 .splash.hide{opacity:0;pointer-events:none;animation:none}
 @keyframes splashAutoHide{to{opacity:0;visibility:hidden;pointer-events:none}}
-/* 独立启动页：常驻显示，不自动淡出（由跳转逻辑接管） */
 .splash.splash-persist{animation:none!important;opacity:1;visibility:visible;pointer-events:auto}
 .splash-logo img{width:96px;height:96px}
-.splash-bar{width:132px;height:3px;border-radius:3px;background:rgba(255,255,255,.10);overflow:hidden}
-.splash-bar-fill{width:40%;height:100%;border-radius:3px;background:linear-gradient(90deg,#7d9dd4,#a78bfa);animation:splashBar 1.1s ease-in-out infinite}
+.splash-bar{width:132px;height:3px;border-radius:3px;background:var(--bar-track,rgba(255,255,255,.10));overflow:hidden}
+.splash-bar-fill{width:40%;height:100%;border-radius:3px;background:var(--splash-bar-fill,linear-gradient(90deg,#7d9dd4,#a78bfa));animation:splashBar 1.1s ease-in-out infinite}
 @keyframes splashBar{0%{margin-left:-40%}100%{margin-left:100%}}
 .splash-inner{position:relative;z-index:1;display:flex;flex-direction:column;align-items:center;gap:16px}
-.splash-name{color:#a8b2c4;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:1.25rem;font-weight:800}
-.spinner{width:28px;height:28px;border:3px solid #212735;border-top-color:#7d9dd4;border-radius:50%;animation:spin .8s linear infinite;margin:4px auto}
+.splash-name{color:var(--splash-name-b,#a8b2c4);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:1.25rem;font-weight:800}
+.spinner{width:28px;height:28px;border:3px solid var(--spinner-track,#212735);border-top-color:var(--spinner-active,#7d9dd4);border-radius:50%;animation:spin .8s linear infinite;margin:4px auto}
 @keyframes spin{to{transform:rotate(360deg)}}
 .container{max-width:none;width:100%;margin:0 auto;padding:0 16px calc(80px + env(safe-area-inset-bottom))}
 .hero{display:flex;justify-content:space-between;align-items:center;padding:calc(16px + env(safe-area-inset-top)) 0 16px;gap:12px}
 .hero-left{display:flex;align-items:center;gap:12px;min-width:0}
-.hero-avatar{width:48px;height:48px;border-radius:50%;overflow:hidden;flex-shrink:0;background:#16161a;border:2px solid rgba(167,139,250,.45)}
-.hero-name{font-size:1.3rem;font-weight:800;color:#f4f4f5;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.updated-at{font-size:.72rem;color:#71717a;margin:0}
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;background:#0e0e10;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:14px 8px;margin-bottom:20px;min-height:88px}
+.hero-avatar{width:48px;height:48px;border-radius:50%;overflow:hidden;flex-shrink:0;background:var(--surface-2,#16161a);border:2px solid var(--avatar-ring,rgba(167,139,250,.45))}
+.hero-name{font-size:1.3rem;font-weight:800;color:var(--text,#f4f4f5);margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.updated-at{font-size:.72rem;color:var(--text-mute,#71717a);margin:0}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;background:var(--surface,#0e0e10);border:1px solid var(--border,rgba(255,255,255,.08));border-radius:16px;padding:14px 8px;margin-bottom:20px;min-height:88px}
 .tabs{display:flex;gap:4px;margin-bottom:18px}
-.tab{flex:1;background:transparent;border:none;color:#a1a1aa;padding:9px 2px;border-radius:999px;font-size:.75rem;font-weight:600;display:flex;align-items:center;justify-content:center;gap:5px}
-.tab.active{background:linear-gradient(135deg,#7c3aed,#a78bfa);color:#fff}
+.tab{flex:1;background:transparent;border:none;color:var(--text-dim,#a1a1aa);padding:9px 2px;border-radius:999px;font-size:.75rem;font-weight:600;display:flex;align-items:center;justify-content:center;gap:5px}
+.tab.active{background:var(--brand-grad,linear-gradient(135deg,#7c3aed,#a78bfa));color:#fff}
 .pane{display:none}.pane.active{display:block}
 .home-section{margin-bottom:20px}
-.home-section-title{font-size:.95rem;font-weight:700;color:#f4f4f5;margin:0 0 10px}
+.home-section-title{font-size:.95rem;font-weight:700;color:var(--text,#f4f4f5);margin:0 0 10px}
 .h-scroll{display:flex;gap:12px;overflow-x:auto;padding:4px 0 10px;-webkit-overflow-scrolling:touch}
 .pane-loading{padding:40px 20px;text-align:center}
-.btn-action{display:inline-flex;align-items:center;gap:6px;background:rgba(255,255,255,.04);color:#a1a1aa;border:1px solid rgba(255,255,255,.08);padding:8px 12px;border-radius:10px;font-size:.8rem}
+.btn-action{display:inline-flex;align-items:center;gap:6px;background:var(--hover-bg,rgba(255,255,255,.04));color:var(--text-dim,#a1a1aa);border:1px solid var(--border,rgba(255,255,255,.08));padding:8px 12px;border-radius:10px;font-size:.8rem}
 `;
 }
 
@@ -7054,13 +6761,11 @@ function splashCriticalCss() {
  * ============================================================ */
 function getBootstrapScript() {
   return `(function(){var __CFG=window.__HOME_CONFIG__||{};if(!__CFG.loggedIn)return;window.__HOME_CONFIG__=null;if(__CFG.initialDetail)window.__initialDetail=__CFG.initialDetail;if(!window.__splashT0)window.__splashT0=Date.now();window.__splashHidden=false;window.__hideSplash=function(force){try{if(window.__splashHidden)return;window.__splashHidden=true;var el=document.getElementById('splash');if(!el)return;var wait=force?0:Math.max(0,120-(Date.now()-(window.__splashT0||Date.now())));setTimeout(function(){try{el.classList.add('hide');setTimeout(function(){try{if(el&&el.parentNode)el.parentNode.removeChild(el);}catch(e){}},280);}catch(e){}},wait);}catch(e){}};setTimeout(function(){if(window.__hideSplash)window.__hideSplash();},80);function lsGet(k){try{var v=localStorage.getItem(k);if(!v)return null;var o=JSON.parse(v);if(o&&o._exp&&o._exp<Date.now()){try{localStorage.removeItem(k);}catch(e){}return null;}return o&&o.data?o.data:null;}catch(e){return null;}}function lsSet(k,d,ttlSec){try{localStorage.setItem(k,JSON.stringify({data:d,_exp:Date.now()+ttlSec*1000}));}catch(e){try{localStorage.removeItem(k);}catch(e2){}}}window.__lsGet=lsGet;window.__lsSet=lsSet;function setHTML(sel,html){var el=typeof sel==='string'?document.querySelector(sel):sel;if(el)el.innerHTML=html||'';}window.__setHTML=setHTML;function applyAvatar(url){if(!url)return;var av=document.getElementById('hero-avatar');if(!av)return;var img=document.createElement('img');img.src=url;img.alt='';img.width=56;img.height=56;img.decoding='async';img.onerror=function(){av.innerHTML='<span class="hero-avatar-ph">👤</span>';};av.innerHTML='';av.appendChild(img);}function __setUpdatedAt(source){var el=document.getElementById('updated-at');if(!el)return;var d=new Date(),p=function(n){return(n<10?'0':'')+n;};var label='更新于 '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());if(source==='live')label+=' · 实时';else if(source==='cache')label+=' · 缓存';el.textContent=label;el.classList.remove('flash','src-live','src-cache');void el.offsetWidth;el.classList.add('flash');if(source==='live')el.classList.add('src-live');else if(source==='cache')el.classList.add('src-cache');}function applyPlayback(d,isCache){if(!d)return;if(d.playbackHScrollHtml)setHTML('#playback-hscroll',d.playbackHScrollHtml);var src=isCache?'cache':(d.playbackSource||'');__setUpdatedAt(src);if(window.__scheduleEnrich)window.__scheduleEnrich();}window.__applyPlayback=applyPlayback;function applyMeta(d,isCache){if(!d)return;var n=document.getElementById('hero-name');if(n&&d.name)n.textContent=d.name;applyAvatar(d.avatar);if(d.statsHtml)setHTML('#stats-box',d.statsHtml);if(!isCache)try{lsSet('mt:meta',d,1800);}catch(e){}}window.__applyMeta=applyMeta;var __homeDataLoading=false;
-/* fetchPart：401 时读 relogin 跳登录页 */
 function fetchPart(part,force){return fetch('/api/home-data?part='+encodeURIComponent(part)+(force?'&force=1':''),{credentials:'same-origin',cache:'no-store'}).then(function(r){if(r.status===401){return r.json().catch(function(){return{};}).then(function(d){var msg=(d&&d.error)||'登录已失效，请重新登录';try{sessionStorage.setItem('mt:relogin',msg);}catch(e){}if(window.__toast)window.__toast(msg,{type:'warn',duration:2200});setTimeout(function(){location.href='/login';},1000);return null;});}if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){if(!d)return null;if(d.login){location.href='/login';return null;}return d;});}window.__fetchPart=fetchPart;var __loadedParts={};function loadPartOnce(part){if(__loadedParts[part])return Promise.resolve(__loadedParts[part]);return fetchPart(part).then(function(d){__loadedParts[part]=d;return d;});}window.__loadPartOnce=loadPartOnce;window.__loadedParts=__loadedParts;function loadHomeData(opts){opts=opts||{};var silent=!!opts.silent;if(__homeDataLoading&&!silent)return;__homeDataLoading=true;__lastRefreshAt=Date.now();function onPlayback(d,isCache){if(!d)return;applyPlayback(d,isCache);if(!isCache){try{lsSet('mt:pb',d,900);}catch(e){}if(!silent&&window.__initialDetail){var s=window.__initialDetail,idx=s.indexOf('/');if(idx>0&&window.openDetail)openDetail(s.slice(0,idx),s.slice(idx+1),false);window.__initialDetail=null;}}if(!silent&&window.__hideSplash)window.__hideSplash(true);}if(!silent){var cachedPb=lsGet('mt:pb');if(cachedPb){try{onPlayback(cachedPb,true);}catch(e){}}else if(window.__earlyPbApplied&&window.__hideSplash){window.__hideSplash(true);}}var pPlayback;if(!silent&&window.__primaryBootP){pPlayback=window.__primaryBootP.then(function(d){window.__primaryBootP=null;if(d){onPlayback(d,false);return d;}return fetchPart('playback').then(function(x){onPlayback(x,false);return x;});}).catch(function(){return fetchPart('playback').then(function(x){onPlayback(x,false);return x;});});}else{pPlayback=fetchPart('playback').then(function(x){onPlayback(x,false);return x;});}pPlayback=pPlayback.catch(function(){if(!silent){setHTML('#playback-hscroll','<div class="empty"><p>请求过于频繁或网络异常，请稍后重试</p><p style="margin-top:12px"><button class="btn-ghost" onclick="location.reload()">重试</button></p></div>');if(window.__hideSplash)window.__hideSplash(true);}});Promise.resolve(pPlayback).then(function(){__homeDataLoading=false;if(!silent){var cachedMeta=lsGet('mt:meta');if(cachedMeta)setTimeout(function(){try{applyMeta(cachedMeta,true);}catch(e){}},0);}var runMeta=function(){fetchPart('meta').then(function(d){applyMeta(d,false);}).catch(function(){});};if(window.requestIdleCallback)requestIdleCallback(runMeta,{timeout:800});else setTimeout(runMeta,80);});}var __refreshTick=0;function silentRefresh(){if(document.hidden)return;var __m=document.getElementById('modal');if(__m&&__m.classList.contains('open'))return;__refreshTick++;__lastRefreshAt=Date.now();fetchPart('playback').then(function(d){applyPlayback(d);try{lsSet('mt:pb',d,900);}catch(e){}}).catch(function(){});if(__refreshTick%4===0)fetchPart('meta').then(function(d){applyMeta(d,false);}).catch(function(){});}window.__refreshStats=silentRefresh;
 window.forceRefresh=async function(){if(window.__forceRefreshing)return;window.__forceRefreshing=true;try{localStorage.removeItem('mt:pb');localStorage.removeItem('mt:meta');}catch(e){}var btn=document.getElementById('btn-refresh');var span=btn&&btn.querySelector('span');var oldText=span?span.textContent:'刷新';if(btn)btn.classList.add('loading');if(span)span.textContent='刷新中';var okCount=0,cacheCount=0,failCount=0,cooling=0,hitLimit=false;var GAP_OK=300,GAP_LIMIT=1000;try{var wanted=['playback','meta'];var loaded=window.__loadedParts||{};['history'].forEach(function(p){if(loaded[p])wanted.push(p);});for(var i=0;i<wanted.length;i++){if(hitLimit)break;var part=wanted[i];if(i>0){var gap=cooling>0?GAP_LIMIT:GAP_OK;await new Promise(function(r){setTimeout(r,gap);});}var d=null;try{d=await fetchPart(part,true);}catch(e){d=null;}if(!d){failCount++;continue;}var isCache=false;if(part==='playback'&&d.playbackSource==='cache')isCache=true;if(part==='meta'&&d.metaSource==='cache')isCache=true;if(isCache)cacheCount++;else okCount++;if(part==='playback'){applyPlayback(d);try{lsSet('mt:pb',d,900);}catch(e){}}else if(part==='meta'){applyMeta(d,false);}else if(part==='watchlist'&&d.watchlistHtml){__setHTML('#watchlist',d.watchlistHtml);}else if(part==='calendar'&&d.calendarHtml){__setHTML('#calendar',d.calendarHtml);}else if(part==='history'){if(d.historyHtml)__setHTML('#history .grid',d.historyHtml);if(d.historyMoreHtml!=null)__setHTML('#history-more',d.historyMoreHtml);}window.__loadedParts[part]=d;if(d.rateLimited||(d.cooling&&d.cooling>0)){hitLimit=true;cooling=Math.max(cooling,Number(d.cooling)||0);}else if(isCache&&(part==='playback'||part==='meta')){hitLimit=true;}}if(failCount&&!okCount&&!cacheCount){__errToast('刷新失败',new Error('Trakt 或网络不可用'));}else if(hitLimit){var msg=cooling>0?('Trakt 限流，已展示缓存（约 '+cooling+' 秒后再试）'):'已用缓存数据（上游暂不可用）';__toast(msg,{type:'warn',duration:2200});}else if(failCount||cacheCount){__toast('已刷新（部分数据来自缓存）',{type:'warn',duration:1800});}else{__toast('已刷新',{type:'success',duration:1200});}if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){__errToast('刷新失败',e);}finally{if(btn)btn.classList.remove('loading');if(span)span.textContent=oldText;window.__forceRefreshing=false;}};
 function startHomeData(){loadHomeData({silent:false});}if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',startHomeData);}else{startHomeData();}var REFRESH_MS=${HOME_AUTO_REFRESH_MINUTES}*60*1000;var __lastRefreshAt=Date.now();if(REFRESH_MS>0){setInterval(silentRefresh,REFRESH_MS);document.addEventListener('visibilitychange',function(){if(document.hidden)return;if(Date.now()-__lastRefreshAt>=REFRESH_MS)silentRefresh();});}})();`;
 }
 
-/* -------------------- 客户端主体脚本 -------------------- */
 
 /**
  * 浏览器端主脚本：拼到 /app.js。
@@ -7074,8 +6779,24 @@ function getClientSideScripts() {
     `
 function __esc(s){s=String(s==null?'':s);return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 function __toast(message,opts){opts=opts||{};if(!message)return;var type=opts.type||'info';var duration=opts.duration||2600;var container=document.getElementById('toast-container');if(!container){container=document.createElement('div');container.id='toast-container';document.body.appendChild(container);}var toast=document.createElement('div');toast.className='toast toast-'+type;var icons={success:'✓',error:'✕',warn:'!',info:'i'};toast.innerHTML='<span class="toast-icon">'+(icons[type]||icons.info)+'</span><span class="toast-msg">'+__esc(message)+'</span>';container.appendChild(toast);requestAnimationFrame(function(){toast.classList.add('toast-in');});var remove=function(){if(!toast.parentNode)return;toast.classList.remove('toast-in');toast.classList.add('toast-out');setTimeout(function(){if(toast.parentNode)toast.parentNode.removeChild(toast);},260);};var timer=setTimeout(remove,duration);toast.addEventListener('click',function(){clearTimeout(timer);remove();});}window.__toast=__toast;
+/* ==================== 主题切换（dark / light / system） ====================
+ * 与 <head> 内的 THEME_BOOT_SCRIPT 共用 localStorage 键 mt:theme。
+ * 该脚本负责"切换 + 图标同步 + 系统色变化响应"，启动脚本负责"首帧防闪"。
+ * 注意：模板字符串内所有反引号与 </script> 均已转义，勿改为多行反引号。
+ */
+var __THEME_KEY='mt:theme',__THEME_CYCLE=['dark','light','system'];
+var __THEME_LABEL={dark:'深色',light:'浅色',system:'跟随系统'};
+var __THEME_ICONS={
+dark:'<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>',
+light:'<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4"/></svg>',
+system:'<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none"/></svg>'};
+function __getTheme(){try{var t=localStorage.getItem(__THEME_KEY);return __THEME_CYCLE.indexOf(t)>=0?t:'dark';}catch(e){return 'dark';}}
+function __resolveDark(t){if(t==='system'){try{return !window.matchMedia||matchMedia('(prefers-color-scheme: dark)').matches;}catch(e){return true;}}return t!=='light';}
+function __applyTheme(t){var dark=__resolveDark(t);var d=document.documentElement;d.setAttribute('data-theme',t);d.style.backgroundColor=dark?'#050505':'#ffffff';var tc=document.querySelector('meta[name="theme-color"]');if(tc)tc.setAttribute('content',dark?'#050505':'#ffffff');var cs=document.querySelector('meta[name="color-scheme"]');if(cs)cs.setAttribute('content',dark?'dark':'light');var sb=document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]');if(sb)sb.setAttribute('content',dark?'black-translucent':'default');var icon=document.getElementById('theme-icon');if(icon)icon.innerHTML=__THEME_ICONS[t]||__THEME_ICONS.dark;var btn=document.getElementById('btn-theme');if(btn){btn.setAttribute('aria-label','切换主题：'+__THEME_LABEL[t]);btn.setAttribute('title','主题：'+__THEME_LABEL[t]);}}
+window.__applyTheme=__applyTheme;window.__getTheme=__getTheme;
+window.cycleTheme=function(){var cur=__getTheme();var next=__THEME_CYCLE[(__THEME_CYCLE.indexOf(cur)+1)%__THEME_CYCLE.length];try{localStorage.setItem(__THEME_KEY,next);}catch(e){}__applyTheme(next);if(window.__toast)__toast('主题：'+__THEME_LABEL[next],{type:'info',duration:1500});};
+(function(){__applyTheme(__getTheme());try{var mq=matchMedia('(prefers-color-scheme: dark)');var onChange=function(){if(__getTheme()==='system')__applyTheme('system');};if(mq.addEventListener)mq.addEventListener('change',onChange);else if(mq.addListener)mq.addListener(onChange);}catch(e){}})();
 function __humanizeClientError(msg,cooling){msg=String(msg||'').trim();if(!msg)return'操作失败，请稍后重试';if(msg.indexOf('登录已过期')>=0||msg.indexOf('unauthorized')>=0)return'登录已过期，请重新登录';if(/限流|过于频繁|429/.test(msg)){if(cooling&&cooling>0)return'Trakt 请求过于频繁，请约 '+cooling+' 秒后再试';return'Trakt 请求过于频繁，请稍后再试';}if(/网络|timeout|abort|Failed to fetch/i.test(msg))return'网络连接失败，请检查网络后重试';if(/^HTTP\\s*5\\d{2}/i.test(msg))return'服务暂时不可用，请稍后重试';if(/^HTTP\\s*404/i.test(msg))return'未找到对应内容';if(/^HTTP\\s*403/i.test(msg))return'没有权限执行此操作';if(/^HTTP\\s*401/i.test(msg))return'登录已过期，请重新登录';if(/^HTTP\\s*\\d+/i.test(msg))return'请求失败，请稍后重试';if(/[\\u4e00-\\u9fff]/.test(msg))return msg;return msg;}function __errToast(prefix,err){var msg=(err&&err.message)?err.message:String(err||'未知错误');var cooling=err&&err.cooling;msg=__humanizeClientError(msg,cooling);var t='error';if(msg.indexOf('429')>=0||msg.indexOf('限流')>=0||msg.indexOf('频繁')>=0||msg.indexOf('冷却')>=0)t='warn';if(msg.indexOf('网络')>=0||msg.indexOf('暂时不可用')>=0)t='warn';__toast((prefix?prefix+'：':'')+msg,{type:t,duration:t==='warn'?3600:2800});}window.__errToast=__errToast;
-/* __apiJson：401 relogin 时跳登录页 */
 async function __apiJson(r){var data=null;try{data=await r.json();}catch(e){data=null;}if(!r.ok){if(r.status===401&&data&&data.relogin){var msg=data.error||'登录已失效，请重新登录';try{sessionStorage.setItem('mt:relogin',msg);}catch(e){}__toast(msg,{type:'warn',duration:2200});setTimeout(function(){location.href='/login';},1000);var err=new Error(msg);err.relogin=true;throw err;}var msg2=(data&&data.error)||('HTTP '+r.status);var err2=new Error(__humanizeClientError(msg2,data&&data.cooling));if(data&&data.cooling!=null)err2.cooling=data.cooling;throw err2;}return data;}window.__apiJson=__apiJson;
 function __confirm(opts){opts=opts||{};return new Promise(function(resolve){var modal=document.getElementById('confirm-modal');if(!modal){resolve(window.confirm(opts.message||opts.title||'确认操作'));return;}var iconEl=document.getElementById('confirm-icon'),titleEl=document.getElementById('confirm-title'),msgEl=document.getElementById('confirm-msg'),okBtn=document.getElementById('confirm-ok'),cancelBtn=document.getElementById('confirm-cancel'),backdrop=modal.querySelector('.confirm-backdrop');iconEl.className='confirm-icon'+(opts.tone?' '+opts.tone:'');iconEl.textContent=opts.icon||'?';titleEl.textContent=opts.title||'确认操作';msgEl.textContent=opts.message||'';msgEl.style.display=opts.message?'':'none';okBtn.textContent=opts.okText||'确定';cancelBtn.textContent=opts.cancelText||'取消';okBtn.className='confirm-btn confirm-ok'+(opts.tone==='danger'?' danger':'');var settled=false;function cleanup(){okBtn.removeEventListener('click',onOk);cancelBtn.removeEventListener('click',onCancel);backdrop.removeEventListener('click',onCancel);document.removeEventListener('keydown',onKey,true);modal.classList.remove('open');modal.style.display='none';}function finish(v){if(settled)return;settled=true;cleanup();resolve(v);}function onOk(){finish(true);}function onCancel(){finish(false);}function onKey(e){if(e.key==='Escape'){e.preventDefault();e.stopPropagation();finish(false);}}okBtn.addEventListener('click',onOk);cancelBtn.addEventListener('click',onCancel);backdrop.addEventListener('click',onCancel);document.addEventListener('keydown',onKey,true);modal.style.display='block';modal.classList.add('open');setTimeout(function(){try{okBtn.focus();}catch(err){}},40);});}window.__confirm=__confirm;
 function __fadeRemoveCard(card){if(!card)return;card.style.transition='opacity 0.25s ease, transform 0.25s ease';card.style.opacity='0';card.style.transform='scale(0.96)';setTimeout(function(){var day=card.closest('.day'),pane=card.closest('.pane');card.remove();if(day&&!day.querySelector('.item')){day.style.transition='opacity 0.2s ease';day.style.opacity='0';setTimeout(function(){if(day.parentNode)day.remove();__maybeShowEmpty(pane);if(window.__refreshStats)window.__refreshStats();},200);return;}__maybeShowEmpty(pane);if(window.__refreshStats)window.__refreshStats();},260);}
@@ -7083,13 +6804,14 @@ function __maybeShowEmpty(pane){if(!pane)return;setTimeout(function(){if(pane.qu
 document.querySelectorAll('.tab').forEach(t=>{t.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.pane').forEach(x=>x.classList.remove('active'));t.classList.add('active');var tabName=t.dataset.tab,pane=document.getElementById(tabName);if(pane)pane.classList.add('active');if(tabName==='search'){setTimeout(function(){var inp=document.getElementById('search-input');if(inp)inp.focus();if(inp&&!inp.value.trim()&&window.__loadTrending)window.__loadTrending();},60);return;}if(tabName==='playback')return;var partMap={watchlist:'watchlist',calendar:'calendar',history:'history'};var part=partMap[tabName];if(!part)return;var loaded=window.__loadedParts||{};if(loaded[part])return;window.__loadPartOnce(part).then(function(d){if(!d)return;if(part==='watchlist'){if(d.watchlistHtml)__setHTML('#watchlist',d.watchlistHtml);}else if(part==='calendar'){if(d.calendarHtml){__setHTML('#calendar',d.calendarHtml);try{var dropped=JSON.parse(localStorage.getItem('mt:dropped')||'[]');if(Array.isArray(dropped)&&dropped.length){var cal=document.getElementById('calendar');if(cal)dropped.forEach(function(did){cal.querySelectorAll('[data-drop-show-id="'+did+'"]').forEach(function(b){var card=b.closest('.item');if(card){var day=card.closest('.day');card.remove();if(day&&!day.querySelector('.item'))day.remove();}});});}}catch(e){}}}else if(part==='history'){if(d.historyHtml)__setHTML('#history .grid',d.historyHtml);if(d.historyMoreHtml!=null)__setHTML('#history-more',d.historyMoreHtml);}if(window.__scheduleEnrich)window.__scheduleEnrich();}).catch(function(){var p=document.getElementById(tabName);if(p)p.innerHTML='<div class="empty"><p>加载失败，请稍后重试</p></div>';});});});
 async function logout(){if(!(await __confirm({icon:'🚪',title:'退出登录',message:'确定要退出当前 Trakt 账号吗？',okText:'退出',cancelText:'取消',tone:'warn'})))return;try{localStorage.removeItem('mt:pb');localStorage.removeItem('mt:meta');}catch(e){}await fetch('/auth/logout',{method:'POST'});location.href='/login';}
 window.logout=logout;
-async function loadMoreHistory(btn){const page=parseInt(btn.dataset.page||'2');btn.disabled=true;btn.textContent='加载中…';try{const r=await fetch('/api/more?type=history&page='+page);if(!r.ok)throw new Error('HTTP '+r.status);const htmlText=await r.text();document.querySelector('#history .grid').insertAdjacentHTML('beforeend',htmlText);if(window.__scheduleEnrich)window.__scheduleEnrich();const hasMore=r.headers.get('X-Has-More')==='true';if(hasMore){btn.dataset.page=page+1;btn.disabled=false;btn.textContent='加载更多';}else{btn.textContent='已经到底啦';btn.disabled=true;btn.style.opacity='0.5';btn.style.cursor='default';}}catch(e){btn.textContent='加载失败，点击重试';btn.disabled=false;}}
+async function loadMoreHistory(btn){return __loadMore(btn,'#history .grid','/api/more?type=history&page='+parseInt(btn.dataset.page||'2'));}
 window.loadMoreHistory=loadMoreHistory;
 async function onWatchlistSortChange(sort){const grid=document.getElementById('watchlist-grid'),pane=document.getElementById('watchlist');if(grid)grid.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';const oldMore=pane?pane.querySelector('.load-more-wrap'):null;if(oldMore)oldMore.remove();try{const r=await fetch('/api/more?type=watchlist&page=1&sort='+encodeURIComponent(sort));if(!r.ok)throw new Error('HTTP '+r.status);const htmlText=await r.text();if(grid)grid.innerHTML=htmlText||emptyWatchlistInner();const hasMore=r.headers.get('X-Has-More')==='true';if(hasMore&&pane&&grid){const wrap=document.createElement('div');wrap.className='load-more-wrap';wrap.innerHTML='<button class="load-more" data-page="2" data-sort="'+sort+'" onclick="loadMoreWatchlist(this)">加载更多</button>';pane.appendChild(wrap);}if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){if(grid)grid.innerHTML='<div class="empty"><p>加载失败</p></div>';}}
 window.onWatchlistSortChange=onWatchlistSortChange;
 function emptyWatchlistInner(){return '<div class="empty"><p>待看列表是空的</p></div>';}
-async function loadMoreWatchlist(btn){const page=parseInt(btn.dataset.page||'2'),sort=btn.dataset.sort||(document.getElementById('wl-sort')&&document.getElementById('wl-sort').value)||'added';btn.disabled=true;btn.textContent='加载中…';try{const r=await fetch('/api/more?type=watchlist&page='+page+'&sort='+encodeURIComponent(sort));if(!r.ok)throw new Error('HTTP '+r.status);const htmlText=await r.text();const grid=document.getElementById('watchlist-grid');if(grid)grid.insertAdjacentHTML('beforeend',htmlText);if(window.__scheduleEnrich)window.__scheduleEnrich();const hasMore=r.headers.get('X-Has-More')==='true';if(hasMore){btn.dataset.page=page+1;btn.disabled=false;btn.textContent='加载更多';}else{btn.textContent='已经到底啦';btn.disabled=true;btn.style.opacity='0.5';btn.style.cursor='default';}}catch(e){btn.textContent='加载失败，点击重试';btn.disabled=false;}}
+async function loadMoreWatchlist(btn){return __loadMore(btn,'#watchlist-grid','/api/more?type=watchlist&page='+parseInt(btn.dataset.page||'2')+'&sort='+encodeURIComponent(btn.dataset.sort||'added'));}
 window.loadMoreWatchlist=loadMoreWatchlist;
+async function __loadMore(btn,gridSel,url){btn.disabled=true;btn.textContent='加载中…';try{const r=await fetch(url);if(!r.ok)throw new Error('HTTP '+r.status);const html=await r.text();const grid=document.querySelector(gridSel);if(grid)grid.insertAdjacentHTML('beforeend',html);if(window.__scheduleEnrich)window.__scheduleEnrich();if(r.headers.get('X-Has-More')==='true'){btn.dataset.page=parseInt(btn.dataset.page||'2')+1;btn.disabled=false;btn.textContent='加载更多';}else{btn.textContent='已经到底啦';btn.disabled=true;btn.style.opacity='0.5';btn.style.cursor='default';}}catch(e){btn.textContent='加载失败，点击重试';btn.disabled=false;}}
 document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-wl-remove-id]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.wlRemoveType,id=btn.dataset.wlRemoveId;if(!type||!id)return;const item=btn.closest('.item'),nameEl=item?item.querySelector('.name'):null,name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'🗑',title:'移除待看',message:'确定要把「'+(name||'该条目')+'」从待看列表移除吗？',okText:'移除',tone:'danger'})))return;const prevText=btn.textContent;btn.disabled=true;btn.textContent='…';try{const r=await fetch('/api/watchlist/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type,id})});if(!r.ok)throw new Error('HTTP '+r.status);__fadeRemoveCard(btn.closest('.item'));__toast('已从待看列表移除',{type:'success'});}catch(err){btn.disabled=false;btn.textContent=prevText;__errToast('移除失败',err);}},true);
 document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-drop-show-id]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const id=btn.dataset.dropShowId;if(!id)return;const item=btn.closest('.item'),nameEl=item?item.querySelector('.name'):null,name=nameEl?nameEl.textContent.trim():'';if(!(await __confirm({icon:'🗑',title:'弃看剧集',message:'确定要弃看「'+(name||'该剧')+'」吗？它将从追剧日历和继续观看中移除，观看历史会保留。',okText:'弃看',tone:'danger'})))return;btn.disabled=true;btn.style.opacity='0.5';try{const r=await fetch('/api/drop-show',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:Number(id)})});if(!r.ok){const t=await r.text().catch(()=>'');throw new Error('HTTP '+r.status+(t?' '+t:''));}try{var ds=JSON.parse(localStorage.getItem('mt:dropped')||'[]');if(!Array.isArray(ds))ds=[];if(ds.indexOf(String(id))<0)ds.push(String(id));localStorage.setItem('mt:dropped',JSON.stringify(ds.slice(-200)));}catch(e){}const pane=document.getElementById('calendar')||document;const cards=pane.querySelectorAll('[data-drop-show-id="'+id+'"]');cards.forEach(function(b){const card=b.closest('.item');if(card)__fadeRemoveCard(card);});__toast('已弃看该剧集',{type:'success'});if(window.__loadedParts){delete window.__loadedParts.calendar;delete window.__loadedParts.playback;delete window.__loadedParts.all;}try{fetch('/api/home-data?part=calendar',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.json():null;}).then(function(d){if(!d||!d.calendarHtml)return;var cal=document.getElementById('calendar');if(!cal)return;cal.innerHTML=d.calendarHtml;try{var dropped=JSON.parse(localStorage.getItem('mt:dropped')||'[]');if(Array.isArray(dropped)&&dropped.length){dropped.forEach(function(did){cal.querySelectorAll('[data-drop-show-id="'+did+'"]').forEach(function(b){var card=b.closest('.item');if(card){var day=card.closest('.day');card.remove();if(day&&!day.querySelector('.item'))day.remove();}});});}}catch(e){}if(window.__scheduleEnrich)window.__scheduleEnrich();}).catch(function(){});}catch(e){}}catch(err){btn.disabled=false;btn.style.opacity='';__errToast('弃看失败',err);}},true);
 document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-watched-id]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.watchedType,id=btn.dataset.watchedId;if(!type||!id)return;const item=btn.closest('.item'),nameEl=item?item.querySelector('.name'):null,name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'✓',title:'标记为已观看',message:'确定要把「'+(name||'该条目')+'」标记为已观看吗？',okText:'标记',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{const r=await fetch('/api/mark-watched',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type,id})});if(!r.ok)throw new Error('HTTP '+r.status);__fadeRemoveCard(btn.closest('.item'));__toast('已标记为已观看',{type:'success'});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('标记失败',err);}},true);
@@ -7101,7 +6823,7 @@ var __trendingLoaded=false;
 async function __loadTrending(force){var box=document.getElementById('search-results');if(!box)return;var inp=document.getElementById('search-input');if(inp&&inp.value.trim())return;if(box.querySelector('.trending-head')&&!force)return;box.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';try{var r=await fetch('/api/trending');if(!r.ok)throw new Error('HTTP '+r.status);var data=await r.json();var items=(data&&data.items)||[];if(!items.length){box.innerHTML='<div class="empty"><p>暂无趋势内容</p></div>';return;}__trendingLoaded=true;box.innerHTML='<div class="trending-head">TMDB 今日趋势</div>'+items.map(__renderSearchItem).join('');}catch(err){box.innerHTML='<div class="empty"><p>趋势加载失败：'+__esc(err.message)+'</p></div>';}}
 window.__loadTrending=__loadTrending;
 (function(){var inp=document.getElementById('search-input');if(!inp)return;inp.addEventListener('input',function(){if(__searchTimer)clearTimeout(__searchTimer);var q=inp.value.trim();if(!q){__loadTrending();return;}__searchTimer=setTimeout(function(){__doSearch(q);},380);});inp.addEventListener('keydown',function(e){if(e.key==='Enter'){if(__searchTimer)clearTimeout(__searchTimer);var q=inp.value.trim();if(q)__doSearch(q);else __loadTrending(true);}});})();
-document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-wl-add-detail]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.wlAddDetailType,tmdbId=btn.dataset.wlAddDetail;if(!type||!tmdbId)return;const nameEl=document.querySelector('.detail-title');const name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'＋',title:'加入待看',message:'确定要把「'+(name||'该条目')+'」加入待看列表吗？',okText:'加入',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{const r=await fetch('/api/watchlist/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type,tmdbId})});let errMsg='';if(!r.ok){try{const j=await r.json();errMsg=(j&&(j.error||j.message))||('HTTP '+r.status);}catch(e){errMsg='HTTP '+r.status;}throw new Error(errMsg);}const span=document.createElement('span');span.className='d-watchlist-badge';span.textContent='✓ 已在待看';btn.replaceWith(span);__toast('已加入待看列表',{type:'success'});if(document.getElementById('watchlist-grid')&&typeof onWatchlistSortChange==='function'){const sort=(document.getElementById('wl-sort')&&document.getElementById('wl-sort').value)||'added';onWatchlistSortChange(sort);}if(window.__refreshStats)window.__refreshStats();}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('加入失败',err);}},true);
+document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-wl-add-detail]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.wlAddDetailType,tmdbId=btn.dataset.wlAddDetail;if(!type||!tmdbId)return;const nameEl=document.querySelector('.detail-title');const name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'＋',title:'加入待看',message:'确定要把「'+(name||'该条目')+'」加入待看列表吗？',okText:'加入',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{const r=await fetch('/api/watchlist/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type,tmdbId})});let errMsg='';if(!r.ok){try{const j=await r.json();errMsg=(j&&(j.error||j.message))||('HTTP '+r.status);}catch(e){errMsg='HTTP '+r.status;}throw new Error(errMsg);}const span=document.createElement('span');span.className='d-watchlist-badge';span.textContent='✓ 已在待看';btn.replaceWith(span);__toast('已加入待看列表',{type:'success'});if(document.getElementById('watchlist-grid')&&typeof onWatchlistSortChange==='function'){onWatchlistSortChange('added');}if(window.__refreshStats)window.__refreshStats();}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('加入失败',err);}},true);
 var __listModalSections={playback:{title:'继续观看'},guduo:{title:'骨朵热榜',section:'guduo'},theater:{title:'平台剧场',section:'theater'},'douban-domestic':{title:'豆瓣热播国产剧',section:'domestic'},'douban-hktw':{title:'豆瓣热播港台剧',section:'hktw'},'douban-jpkr':{title:'豆瓣热播日韩剧',section:'jpkr'},'douban-western':{title:'豆瓣热播欧美剧',section:'western'}};
 window.openListModal=function(id){var cfg=__listModalSections[id];if(!cfg)return;var modal=document.getElementById('list-modal');var title=document.getElementById('list-modal-title');var body=document.getElementById('list-modal-body');if(!modal||!title||!body)return;title.textContent=cfg.title||'';body.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';modal.classList.add('open');document.body.style.overflow='hidden';if(id==='playback'){fetch('/api/more?type=playback&page=1&limit=60&mode=grid').then(function(r){return r.ok?r.text():'';}).then(function(html){if(html)body.innerHTML='<div class="grid">'+html+'</div>';else body.innerHTML='<div class="empty"><p>暂无内容</p></div>';if(window.__scheduleEnrich)window.__scheduleEnrich();}).catch(function(){body.innerHTML='<div class="empty"><p>加载失败</p></div>';});return;}if(id==='guduo'){body.innerHTML='<div id="guduo-filter-tabs" class="douban-filter-tabs" style="display:none"></div><div id="guduo-grid" class="grid"><div class="pane-loading"><div class="spinner"></div></div></div>';var ggrid=document.getElementById('guduo-grid'),gtabs=document.getElementById('guduo-filter-tabs');function loadGuduoGrid(cat){ggrid.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';fetch('/api/guduo-list?category='+encodeURIComponent(cat)+'&mode=grid').then(function(r){return r.ok?r.text():'';}).then(function(html){ggrid.innerHTML=html||'<div class="empty"><p>暂无内容</p></div>';if(window.__scheduleEnrich)window.__scheduleEnrich();}).catch(function(){ggrid.innerHTML='<div class="empty"><p>加载失败</p></div>';});}loadGuduoGrid('all');fetch('/api/guduo-list?mode=categories').then(function(r){return r.ok?r.json():{categories:[]};}).then(function(d){var cats=(d&&d.categories)||[];if(!cats.length)return;var html='<button class="douban-filter-tab active" data-category="all">全部</button>';cats.forEach(function(p){html+='<button class="douban-filter-tab" data-category="'+__esc(p)+'">'+__esc(p)+'</button>';});gtabs.innerHTML=html;gtabs.style.display='';gtabs.querySelectorAll('.douban-filter-tab').forEach(function(btn){btn.addEventListener('click',function(){gtabs.querySelectorAll('.douban-filter-tab').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');loadGuduoGrid(btn.getAttribute('data-category')||'all');});});}).catch(function(){});return;}if(id==='theater'){body.innerHTML='<div id="theater-filter-tabs" class="douban-filter-tabs" style="display:none"></div><div id="theater-grid" class="grid"><div class="pane-loading"><div class="spinner"></div></div></div>';var tgrid=document.getElementById('theater-grid'),tabsBox=document.getElementById('theater-filter-tabs');function loadTheater(platform){tgrid.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';fetch('/api/theater-list?platform='+encodeURIComponent(platform)+'&mode=grid').then(function(r){return r.ok?r.text():'';}).then(function(html){tgrid.innerHTML=html||'<div class="empty"><p>暂无内容</p></div>';if(window.__scheduleEnrich)window.__scheduleEnrich();}).catch(function(){tgrid.innerHTML='<div class="empty"><p>加载失败</p></div>';});}loadTheater('all');fetch('/api/theater-list?mode=platforms').then(function(r){return r.ok?r.json():{platforms:[]};}).then(function(d){var platforms=(d&&d.platforms)||[];if(!platforms.length)return;var html='<button class="douban-filter-tab active" data-platform="all">全部</button>';platforms.forEach(function(p){html+='<button class="douban-filter-tab" data-platform="'+__esc(p)+'">'+__esc(p)+'</button>';});tabsBox.innerHTML=html;tabsBox.style.display='';tabsBox.querySelectorAll('.douban-filter-tab').forEach(function(btn){btn.addEventListener('click',function(){tabsBox.querySelectorAll('.douban-filter-tab').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');loadTheater(btn.dataset.platform);});});}).catch(function(){});return;}var section=cfg.section;body.innerHTML='<div id="douban-modal-grid" class="grid"><div class="pane-loading"><div class="spinner"></div></div></div>';var grid=document.getElementById('douban-modal-grid');fetch('/api/douban-list?section='+encodeURIComponent(section)+'&mode=grid').then(function(r){return r.ok?r.text():'';}).then(function(html){if(html)grid.innerHTML=html;else grid.innerHTML='<div class="empty"><p>暂无内容</p></div>';if(window.__scheduleEnrich)window.__scheduleEnrich();}).catch(function(){grid.innerHTML='<div class="empty"><p>加载失败</p></div>';});};
 window.__platformNames={netflix:"Netflix",disney:"Disney+",appletv:"Apple TV+",hbomax:"HBO Max",prime:"Prime Video",iqiyi:"爱奇艺",youku:"优酷",tencent:"腾讯视频",mgtv:"芒果TV",bilibili:"哔哩哔哩"};
@@ -7214,7 +6936,6 @@ document.addEventListener("click",function(e){
   }
   if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",run);
   else run();
-  // 首页数据回填后可能重绘，延迟再扫一次
   setTimeout(run,1200);
   setTimeout(run,3000);
 })();
@@ -7286,14 +7007,26 @@ window.addEventListener('load',()=>{setTimeout(__runEnrich,200);});`
 let __pageStylesCache = null;
 function pageStyles() {
   if (__pageStylesCache) return __pageStylesCache;
-  __pageStylesCache = `html,
+  __pageStylesCache = `html {
+  color-scheme: dark;
+}
+html[data-theme="light"] {
+  color-scheme: light;
+}
+@media (prefers-color-scheme: light) {
+  html[data-theme="system"] {
+    color-scheme: light;
+  }
+}
+html,
 body {
-  background: #000 !important;
-  color: #eef1f7;
+  background: var(--bg-solid);
+  color: var(--text);
   margin: 0;
   padding: 0;
   min-height: 100%;
   min-height: 100dvh;
+  transition: background-color 0.2s ease, color 0.2s ease;
 }
 * {
   box-sizing: border-box;
@@ -7308,8 +7041,7 @@ body {
   align-items: center;
   justify-content: center;
   overflow: hidden;
-  background: #000;
-  background: radial-gradient(circle at 50% 45%, #0a0a0a 0%, #000 62%);
+  background: var(--splash-bg);
   transition: opacity 0.22s ease;
   font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
   -webkit-tap-highlight-color: transparent;
@@ -7332,7 +7064,7 @@ body {
   width: 340px;
   height: 340px;
   border-radius: 50%;
-  background: radial-gradient(circle, rgba(125, 157, 212, 0.25) 0%, rgba(125, 157, 212, 0) 70%);
+  background: radial-gradient(circle, var(--splash-glow-color) 0%, rgba(125, 157, 212, 0) 70%);
   animation: splashPulse 2.4s ease-in-out infinite;
 }
 .splash-inner {
@@ -7344,7 +7076,7 @@ body {
   gap: 20px;
 }
 .splash-logo {
-  color: #a8b2c4;
+  color: var(--splash-name-b);
   animation: splashPop 0.75s cubic-bezier(0.22, 1.1, 0.36, 1) both;
 }
 .splash-logo img {
@@ -7354,7 +7086,7 @@ body {
   font-size: 1.35rem;
   font-weight: 800;
   letter-spacing: 0.4px;
-  background: linear-gradient(135deg, #fff 20%, #7d9dd4);
+  background: var(--name-grad);
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
@@ -7364,7 +7096,7 @@ body {
   width: 128px;
   height: 3px;
   border-radius: 99px;
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--bar-track);
   overflow: hidden;
   animation: splashFadeUp 0.6s ease 0.45s both;
 }
@@ -7372,7 +7104,7 @@ body {
   height: 100%;
   width: 42%;
   border-radius: 99px;
-  background: #fff;
+  background: var(--splash-bar-fill);
   animation: splashSlide 1.15s cubic-bezier(0.65, 0, 0.35, 1) infinite;
 }
 @keyframes splashPulse {
@@ -7421,8 +7153,8 @@ body {
 .spinner {
   width: 30px;
   height: 30px;
-  border: 3px solid #212735;
-  border-top-color: #7d9dd4;
+  border: 3px solid var(--spinner-track);
+  border-top-color: var(--spinner-active);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
   margin: 4px auto;
@@ -7453,11 +7185,278 @@ body {
   --radius-lg: 18px;
   --radius-xl: 22px;
   --shadow-card: 0 8px 32px rgba(0, 0, 0, 0.55);
+
+  --bg-solid: #000000;
+  --panel-grad: linear-gradient(165deg, #16161a 0%, #0e0e10 100%);
+  --hover-bg: rgba(255, 255, 255, 0.04);
+  --hover-bg-strong: rgba(255, 255, 255, 0.09);
+  --sticky-bg: rgba(5, 5, 5, 0.88);
+  --sticky-border: rgba(255, 255, 255, 0.06);
+  --sticky-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+  --overlay: rgba(2, 4, 8, 0.78);
+  --overlay-strong: rgba(0, 0, 0, 0.78);
+  --modal-bg: #000000;
+  --toast-bg: rgba(20, 22, 28, 0.96);
+  --toast-text: #ffffff;
+  --bar-track: rgba(255, 255, 255, 0.1);
+  --spinner-track: #212735;
+  --spinner-active: #7d9dd4;
+  --splash-bg: radial-gradient(circle at 50% 45%, #0a0a0a 0%, #000 62%);
+  --launch-splash-bg: radial-gradient(
+      120% 90% at 50% 108%,
+      rgba(124, 58, 237, 0.3) 0%,
+      rgba(124, 58, 237, 0) 55%
+    ),
+    radial-gradient(
+      110% 85% at 50% -12%,
+      rgba(56, 97, 190, 0.25) 0%,
+      rgba(0, 0, 0, 0) 55%
+    ),
+    #000;
+  --launch-glow: rgba(124, 58, 237, 0.18);
+  --splash-glow-color: rgba(125, 157, 212, 0.55);
+  --splash-name-b: #a8b2c4;
+  --splash-bar-fill: linear-gradient(90deg, #7d9dd4, #a78bfa);
+  --name-grad: linear-gradient(135deg, #fff 20%, #c4b5fd 90%);
+  --num-grad: linear-gradient(180deg, #fff 0%, #c4b5fd 100%);
+  --brand-grad: linear-gradient(135deg, #7c3aed 0%, #a78bfa 100%);
+  --brand-grad-hover: linear-gradient(145deg, #8b5cf6, #a78bfa);
+  --avatar-ring: rgba(167, 139, 250, 0.45);
+  --avatar-grad: linear-gradient(135deg, #1a2233, #2a3a55);
+  --soft-card-grad: var(--soft-card-grad);
+  --btn-hover-bg: rgba(167, 139, 250, 0.1);
+  --btn-hover-border: rgba(167, 139, 250, 0.35);
+  --btn-hover-shadow: 0 4px 16px rgba(167, 139, 250, 0.18);
+  --danger-bg: rgba(224, 85, 96, 0.1);
+  --danger-border: rgba(224, 85, 96, 0.35);
+  --danger-shadow: 0 4px 16px rgba(224, 85, 96, 0.15);
+  --poster-ph-bg: rgba(0, 0, 0, 0.65);
+  --shadow-avatar: rgba(0, 0, 0, 0.5);
+  --shadow-login: rgba(0, 0, 0, 0.7);
+  --detail-hero-grad: linear-gradient(180deg, rgba(10, 14, 24, 0.6), rgba(10, 14, 24, 0.95));
+  --detail-bg-filter: brightness(0.5);
+  --chip-bg: rgba(255, 255, 255, 0.05);
+  --chip-bg-hover: rgba(255, 255, 255, 0.09);
+  --chip-fg: #a1a1aa;
+  --chip-fg-hover: #f4f4f5;
+  --chip-border: rgba(255, 255, 255, 0.08);
+  --chip-accent: #a78bfa;
+  --pill-bg: linear-gradient(165deg, rgba(255, 255, 255, 0.09) 0%, rgba(255, 255, 255, 0.04) 100%);
+  --pill-border: rgba(255, 255, 255, 0.12);
+  --pill-shadow: 0 8px 28px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  --pill-fg: rgba(255, 255, 255, 0.55);
+  --pill-act-hover: rgba(255, 255, 255, 0.1);
+  --platform-card-grad: linear-gradient(145deg, #1a1a1a 0%, #0a0a0a 100%);
+  --platform-card-text: #ffffff;
+  --platform-shadow-hover: rgba(0, 0, 0, 0.65);
+  --scrollbar: #2a3345;
+  --link: #c4b5fd;
+  --link-hover: #ddd6fe;
+  --success-fg: #4ade80;
+  --warn-fg: #ffb84d;
+  --danger-fg: #ff8a8a;
+  --cal-accent: #4a6db8;
+  --cal-accent-2: #9db0d0;
+  --cal-accent-3: #7d9dd4;
+  --cal-cell-border: #3a4a68;
+  --cal-soft: rgba(90, 120, 180, 0.22);
+  --cal-soft-border: rgba(140, 170, 220, 0.35);
+}
+/* ============ 浅色主题（纯白清爽风）============
+ * 手动选择 light 时生效；跟随系统时由下方 media query 复用同一组值。
+ * 变量清单见 THEME_LIGHT_CSS_VARS，避免两处手写漂移。 */
+html[data-theme="light"] {
+
+  --danger-fg: #ff7b85;
+  --chip-bg: #18181b;
+  --chip-bg-hover: #3f3f46;
+  --chip-fg: #fafafa;
+  --chip-fg-hover: #ffffff;
+  --chip-border: rgba(255, 255, 255, 0.08);
+  --chip-accent: #e9d5ff;
+  --pill-bg: rgba(24, 24, 27, 0.9);
+  --pill-border: rgba(255, 255, 255, 0.12);
+  --pill-shadow: 0 8px 28px rgba(0, 0, 0, 0.3);
+  --pill-fg: rgba(255, 255, 255, 0.78);
+  --pill-act-hover: rgba(255, 255, 255, 0.16);  --bg: #ffffff;
+  --surface: #ffffff;
+  --surface-2: #f7f7f8;
+  --surface-3: #f1f1f3;
+  --border: rgba(0, 0, 0, 0.08);
+  --border-strong: rgba(0, 0, 0, 0.14);
+  --text: #18181b;
+  --text-dim: #52525b;
+  --text-mute: #71717a;
+  --accent: #7c3aed;
+  --accent-2: #6d28d9;
+  --accent-soft: rgba(124, 58, 237, 0.09);
+  --accent-glow: rgba(124, 58, 237, 0.2);
+  --success: #059669;
+  --blue: #6d28d9;
+  --shadow-card: 0 8px 28px rgba(0, 0, 0, 0.08);
+  --bg-solid: #ffffff;
+  --panel-grad: linear-gradient(165deg, #ffffff 0%, #f7f7f8 100%);
+  --hover-bg: rgba(0, 0, 0, 0.035);
+  --hover-bg-strong: rgba(0, 0, 0, 0.06);
+  --sticky-bg: rgba(243, 243, 245, 0.92);
+  --sticky-border: rgba(0, 0, 0, 0.07);
+  --sticky-shadow: 0 6px 20px rgba(0, 0, 0, 0.1);
+  --overlay: rgba(15, 18, 26, 0.42);
+  --overlay-strong: rgba(15, 18, 26, 0.45);
+  --modal-bg: #ffffff;
+  --toast-bg: rgba(24, 24, 27, 0.94);
+  --toast-text: #ffffff;
+  --bar-track: rgba(0, 0, 0, 0.08);
+  --spinner-track: #e4e4e7;
+  --spinner-active: #7c3aed;
+  --splash-bg: radial-gradient(circle at 50% 45%, #ffffff 0%, #f4f4f6 62%);
+  --launch-splash-bg: radial-gradient(
+      120% 90% at 50% 108%,
+      rgba(124, 58, 237, 0.12) 0%,
+      rgba(124, 58, 237, 0) 55%
+    ),
+    radial-gradient(
+      110% 85% at 50% -12%,
+      rgba(56, 97, 190, 0.1) 0%,
+      rgba(255, 255, 255, 0) 55%
+    ),
+    #ffffff;
+  --launch-glow: rgba(124, 58, 237, 0.1);
+  --splash-glow-color: rgba(124, 58, 237, 0.22);
+  --splash-name-b: #52525b;
+  --splash-bar-fill: linear-gradient(90deg, #6d28d9, #7c3aed);
+  --name-grad: linear-gradient(135deg, #18181b 20%, #7c3aed 90%);
+  --num-grad: linear-gradient(180deg, #18181b 0%, #7c3aed 100%);
+  --brand-grad: linear-gradient(135deg, #6d28d9 0%, #7c3aed 100%);
+  --brand-grad-hover: linear-gradient(145deg, #7c3aed, #8b5cf6);
+  --avatar-ring: rgba(124, 58, 237, 0.4);
+  --avatar-grad: linear-gradient(135deg, #ede9fe, #ddd6fe);
+  --soft-card-grad: linear-gradient(135deg, #ffffff, #f1f1f3);
+  --btn-hover-bg: #3f3f46;
+  --btn-hover-border: #3f3f46;
+  --btn-hover-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+  --danger-bg: rgba(248, 113, 113, 0.16);
+  --danger-border: rgba(248, 113, 113, 0.5);
+  --danger-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+  --poster-ph-bg: rgba(0, 0, 0, 0.06);
+  --platform-card-grad: linear-gradient(145deg, #f4f4f5 0%, #e9e9ec 100%);
+  --platform-card-text: #3f3f46;
+  --platform-shadow-hover: rgba(0, 0, 0, 0.16);
+  --scrollbar: #d4d4d8;
+  --link: #6d28d9;
+  --link-hover: #5b21b6;
+  --success-fg: #059669;
+  --warn-fg: #b45309;
+  --cal-accent: #4a6db8;
+  --cal-accent-2: #5b6b88;
+  --cal-accent-3: #4a6db8;
+  --cal-cell-border: #d4d9e6;
+  --cal-soft: rgba(74, 109, 184, 0.12);
+  --cal-soft-border: rgba(74, 109, 184, 0.3);
+  --shadow-avatar: rgba(0, 0, 0, 0.12);
+  --shadow-login: rgba(0, 0, 0, 0.1);
+  --detail-hero-grad: linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(247, 247, 248, 0.96));
+  --detail-bg-filter: brightness(1.05) saturate(0.9);
+}
+@media (prefers-color-scheme: light) {
+  html[data-theme="system"] {
+
+    --shadow-avatar: rgba(0, 0, 0, 0.12);
+    --shadow-login: rgba(0, 0, 0, 0.1);
+    --detail-hero-grad: linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(247, 247, 248, 0.96));
+    --detail-bg-filter: brightness(1.05) saturate(0.9);
+    --danger-fg: #ff7b85;
+    --chip-bg: #18181b;
+    --chip-bg-hover: #3f3f46;
+    --chip-fg: #fafafa;
+    --chip-fg-hover: #ffffff;
+    --chip-border: rgba(255, 255, 255, 0.08);
+    --chip-accent: #e9d5ff;
+    --pill-bg: rgba(24, 24, 27, 0.9);
+    --pill-border: rgba(255, 255, 255, 0.12);
+    --pill-shadow: 0 8px 28px rgba(0, 0, 0, 0.3);
+    --pill-fg: rgba(255, 255, 255, 0.78);
+    --pill-act-hover: rgba(255, 255, 255, 0.16);    --bg: #ffffff;
+    --surface: #ffffff;
+    --surface-2: #f7f7f8;
+    --surface-3: #f1f1f3;
+    --border: rgba(0, 0, 0, 0.08);
+    --border-strong: rgba(0, 0, 0, 0.14);
+    --text: #18181b;
+    --text-dim: #52525b;
+    --text-mute: #71717a;
+    --accent: #7c3aed;
+    --accent-2: #6d28d9;
+    --accent-soft: rgba(124, 58, 237, 0.09);
+    --accent-glow: rgba(124, 58, 237, 0.2);
+    --success: #059669;
+    --blue: #6d28d9;
+    --shadow-card: 0 8px 28px rgba(0, 0, 0, 0.08);
+    --bg-solid: #ffffff;
+    --panel-grad: linear-gradient(165deg, #ffffff 0%, #f7f7f8 100%);
+    --hover-bg: rgba(0, 0, 0, 0.035);
+    --hover-bg-strong: rgba(0, 0, 0, 0.06);
+    --sticky-bg: rgba(243, 243, 245, 0.92);
+    --sticky-border: rgba(0, 0, 0, 0.07);
+    --sticky-shadow: 0 6px 20px rgba(0, 0, 0, 0.1);
+    --overlay: rgba(15, 18, 26, 0.42);
+    --overlay-strong: rgba(15, 18, 26, 0.45);
+    --modal-bg: #ffffff;
+    --toast-bg: rgba(24, 24, 27, 0.94);
+    --toast-text: #ffffff;
+    --bar-track: rgba(0, 0, 0, 0.08);
+    --spinner-track: #e4e4e7;
+    --spinner-active: #7c3aed;
+    --splash-bg: radial-gradient(circle at 50% 45%, #ffffff 0%, #f4f4f6 62%);
+    --launch-splash-bg: radial-gradient(
+        120% 90% at 50% 108%,
+        rgba(124, 58, 237, 0.12) 0%,
+        rgba(124, 58, 237, 0) 55%
+      ),
+      radial-gradient(
+        110% 85% at 50% -12%,
+        rgba(56, 97, 190, 0.1) 0%,
+        rgba(255, 255, 255, 0) 55%
+      ),
+      #ffffff;
+    --launch-glow: rgba(124, 58, 237, 0.1);
+    --splash-glow-color: rgba(124, 58, 237, 0.22);
+    --splash-name-b: #52525b;
+    --splash-bar-fill: linear-gradient(90deg, #6d28d9, #7c3aed);
+    --name-grad: linear-gradient(135deg, #18181b 20%, #7c3aed 90%);
+    --num-grad: linear-gradient(180deg, #18181b 0%, #7c3aed 100%);
+    --brand-grad: linear-gradient(135deg, #6d28d9 0%, #7c3aed 100%);
+    --brand-grad-hover: linear-gradient(145deg, #7c3aed, #8b5cf6);
+    --avatar-ring: rgba(124, 58, 237, 0.4);
+    --avatar-grad: linear-gradient(135deg, #ede9fe, #ddd6fe);
+    --soft-card-grad: linear-gradient(135deg, #ffffff, #f1f1f3);
+    --btn-hover-bg: #3f3f46;
+    --btn-hover-border: #3f3f46;
+    --btn-hover-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+    --danger-bg: rgba(248, 113, 113, 0.16);
+    --danger-border: rgba(248, 113, 113, 0.5);
+    --danger-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+    --poster-ph-bg: rgba(0, 0, 0, 0.06);
+    --platform-card-grad: linear-gradient(145deg, #f4f4f5 0%, #e9e9ec 100%);
+    --platform-card-text: #3f3f46;
+    --platform-shadow-hover: rgba(0, 0, 0, 0.16);
+    --scrollbar: #d4d4d8;
+    --link: #6d28d9;
+    --link-hover: #5b21b6;
+    --success-fg: #059669;
+    --warn-fg: #b45309;
+    --cal-accent: #4a6db8;
+    --cal-accent-2: #5b6b88;
+    --cal-accent-3: #4a6db8;
+    --cal-cell-border: #d4d9e6;
+    --cal-soft: rgba(74, 109, 184, 0.12);
+    --cal-soft-border: rgba(74, 109, 184, 0.3);
+  }
 }
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC",
     "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-  background: #000000;
+  background: var(--bg-solid);
   background-attachment: fixed;
   color: var(--text);
   -webkit-font-smoothing: antialiased;
@@ -7478,10 +7477,19 @@ img {
   max-width: 100%;
 }
 .container {
-  max-width: none;
+  max-width: 880px;
   width: 100%;
   margin: 0 auto;
   padding: 0 16px calc(80px + env(safe-area-inset-bottom));
+}
+.app-version {
+  text-align: center;
+  font-size: 0.7rem;
+  color: var(--text-mute);
+  opacity: 0.7;
+  padding: 8px 0 4px;
+  letter-spacing: 0.4px;
+  user-select: none;
 }
 .pane-loading {
   padding: 60px 20px;
@@ -7523,24 +7531,24 @@ img {
 .login-card {
   width: 100%;
   max-width: 440px;
-  background: linear-gradient(165deg, #16161a 0%, #0e0e10 100%);
+  background: var(--panel-grad);
   border: 1px solid var(--border-strong);
   border-radius: 24px;
   padding: 44px 32px;
   text-align: center;
   box-shadow:
-    0 24px 64px rgba(0, 0, 0, 0.7),
-    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    0 24px 64px var(--shadow-login),
+    inset 0 1px 0 var(--hover-bg-strong);
 }
 .login-logo {
-  color: #a8b2c4;
+  color: var(--splash-name-b);
   margin-bottom: 16px;
 }
 .login-title {
   font-size: 1.75rem;
   font-weight: 800;
   letter-spacing: -0.5px;
-  background: linear-gradient(135deg, #fff 20%, #7d9dd4);
+  background: var(--name-grad);
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
@@ -7552,7 +7560,7 @@ img {
   margin-bottom: 28px;
 }
 .btn-primary {
-  background: linear-gradient(135deg, #7c3aed 0%, #a78bfa 100%);
+  background: var(--brand-grad);
   color: #fff;
   border: none;
   padding: 13px 30px;
@@ -7560,16 +7568,16 @@ img {
   font-size: 0.95rem;
   font-weight: 700;
   cursor: pointer;
-  box-shadow: 0 6px 24px rgba(167, 139, 250, 0.35);
+  box-shadow: 0 6px 24px var(--accent-glow);
 }
 .btn-primary:hover {
   filter: brightness(1.08);
   transform: translateY(-1px);
 }
 .btn-ghost {
-  background: rgba(255, 255, 255, 0.04);
-  color: var(--text-dim);
-  border: 1px solid var(--border);
+  background: var(--chip-bg);
+  color: var(--chip-fg);
+  border: 1px solid var(--chip-border);
   padding: 8px 16px;
   border-radius: 10px;
   font-size: 0.85rem;
@@ -7578,9 +7586,9 @@ img {
   font-family: inherit;
 }
 .btn-ghost:hover {
-  color: #fff;
-  border-color: var(--border-strong);
-  background: rgba(255, 255, 255, 0.08);
+  color: var(--chip-fg-hover);
+  border-color: var(--chip-border);
+  background: var(--chip-bg-hover);
 }
 .steps {
   display: flex;
@@ -7691,7 +7699,7 @@ img {
   font-family: ui-monospace, Menlo, monospace;
   font-size: 0.72rem;
   color: var(--text-dim);
-  background: #000;
+  background: var(--surface-3);
   padding: 8px 10px;
   border-radius: 6px;
   margin-top: 8px;
@@ -7720,7 +7728,7 @@ img {
   font-family: ui-monospace, Menlo, monospace;
   font-size: 0.7rem;
   color: var(--text-dim);
-  background: #000;
+  background: var(--surface-3);
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 10px;
@@ -7749,10 +7757,10 @@ img {
   overflow: hidden;
   flex-shrink: 0;
   background: var(--surface-2);
-  border: 2px solid rgba(167, 139, 250, 0.5);
+  border: 2px solid var(--avatar-ring);
   box-shadow:
-    0 0 0 3px rgba(167, 139, 250, 0.12),
-    0 4px 20px rgba(0, 0, 0, 0.5);
+    0 0 0 3px var(--accent-soft),
+    0 4px 20px var(--shadow-avatar);
 }
 .hero-avatar img {
   width: 100%;
@@ -7767,7 +7775,7 @@ img {
   align-items: center;
   justify-content: center;
   font-size: 1.25rem;
-  background: linear-gradient(135deg, #1a2233, #2a3a55);
+  background: var(--avatar-grad);
 }
 .hero-text {
   min-width: 0;
@@ -7784,7 +7792,7 @@ img {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  background: linear-gradient(135deg, #fff 20%, #c4b5fd 90%);
+  background: var(--name-grad);
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
@@ -7825,9 +7833,9 @@ img {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  background: rgba(255, 255, 255, 0.04);
-  color: var(--text-dim);
-  border: 1px solid var(--border);
+  background: var(--chip-bg);
+  color: var(--chip-fg);
+  border: 1px solid var(--chip-border);
   padding: 8px 14px;
   border-radius: 10px;
   font-size: 0.82rem;
@@ -7842,10 +7850,10 @@ img {
   transition: transform 0.25s ease;
 }
 .btn-action:hover {
-  color: #fff;
-  border-color: var(--border-strong);
-  background: rgba(167, 139, 250, 0.1);
-  box-shadow: 0 4px 16px rgba(167, 139, 250, 0.18);
+  color: var(--chip-fg-hover);
+  border-color: var(--btn-hover-border);
+  background: var(--btn-hover-bg);
+  box-shadow: var(--btn-hover-shadow);
 }
 .btn-action:hover svg {
   transform: rotate(180deg);
@@ -7853,13 +7861,29 @@ img {
 .btn-action:active {
   transform: scale(0.97);
 }
-.btn-action:last-child:hover {
-  background: rgba(224, 85, 96, 0.1);
-  border-color: rgba(224, 85, 96, 0.35);
-  box-shadow: 0 4px 16px rgba(224, 85, 96, 0.15);
+#btn-logout:hover {
+  color: var(--danger-fg);
+  background: var(--danger-bg);
+  border-color: var(--danger-border);
+  box-shadow: var(--danger-shadow);
 }
-.btn-action:last-child:hover svg {
+#btn-logout:hover svg {
   transform: translateX(2px);
+}
+#btn-theme:hover {
+  color: var(--chip-accent);
+}
+#btn-theme:hover svg {
+  transform: none;
+}
+#btn-theme svg {
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+#btn-theme .theme-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
 }
 @media (max-width: 420px) {
   .btn-action span {
@@ -7876,7 +7900,7 @@ img {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   gap: 8px;
-  background: linear-gradient(165deg, #16161a 0%, #0e0e10 100%);
+  background: var(--panel-grad);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   padding: 18px 10px;
@@ -7967,7 +7991,7 @@ img {
   font-weight: 800;
   letter-spacing: -0.6px;
   line-height: 1.15;
-  background: linear-gradient(180deg, #fff 0%, #c4b5fd 100%);
+  background: var(--num-grad);
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
@@ -7980,28 +8004,27 @@ img {
 .tabs {
   display: flex;
   gap: 4px;
-  margin-bottom: 12px;
+  margin-bottom: 6px;
 } /* 首页吸顶：头像+统计+Tab 滚动时固定顶部 */
 .top-sticky {
   position: sticky;
   top: 0;
   z-index: 40;
   margin: 0 -16px;
-  padding: 0 16px 6px;
-  background: rgba(5, 5, 5, 0.88);
+  padding: 0 16px 4px;
+  background: var(--sticky-bg);
   backdrop-filter: blur(18px) saturate(1.2);
   -webkit-backdrop-filter: blur(18px) saturate(1.2);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+  border-bottom: 1px solid var(--sticky-border);
+  box-shadow: var(--sticky-shadow);
 }
 .top-sticky .hero {
   padding-top: calc(12px + env(safe-area-inset-top));
-  padding-bottom: 10px;
+  padding-bottom: 6px;
 }
 .top-sticky .stats {
-  margin-bottom: 10px;
+  margin-bottom: 8px;
 }
-/* 吸顶栏整栏固定：头像区 + 统计卡 + Tab 导航滚动时全部常驻，不折叠 */
 @media (min-width: 768px) {
   .top-sticky {
     margin: 0 -28px;
@@ -8058,7 +8081,7 @@ img {
   background: rgba(255, 255, 255, 0.06);
 }
 .tab.active {
-  background: linear-gradient(135deg, #7c3aed 0%, #a78bfa 100%);
+  background: var(--brand-grad);
   color: #fff;
   font-weight: 700;
 }
@@ -8088,7 +8111,7 @@ img {
   position: relative;
   display: flex;
   gap: 14px;
-  background: linear-gradient(160deg, #141416 0%, #0e0e10 100%);
+  background: var(--panel-grad);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   padding: 12px;
@@ -8099,8 +8122,8 @@ img {
   animation: fadeInUp 0.4s ease backwards;
   overflow: hidden;
   box-shadow:
-    0 4px 20px rgba(0, 0, 0, 0.35),
-    inset 0 1px 0 rgba(255, 255, 255, 0.03);
+    0 4px 20px var(--shadow-card),
+    inset 0 1px 0 var(--hover-bg);
   text-decoration: none;
   color: inherit;
 }
@@ -8295,38 +8318,6 @@ img {
   opacity: 0.5;
   cursor: wait;
 }
-.wl-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  margin-bottom: 14px;
-}
-.wl-sort-label {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 0.82rem;
-  color: var(--text-dim);
-}
-.wl-sort {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  color: var(--text);
-  padding: 7px 12px;
-  border-radius: 8px;
-  font-size: 0.82rem;
-  font-family: inherit;
-  cursor: pointer;
-  outline: none;
-  transition: border-color 0.15s;
-}
-.wl-sort:hover {
-  border-color: #2a3345;
-}
-.wl-sort:focus {
-  border-color: #7d9dd4;
-}
 .poster {
   width: 76px;
   height: 114px;
@@ -8348,7 +8339,7 @@ img {
   align-items: center;
   justify-content: center;
   font-size: 1.8rem;
-  background: linear-gradient(135deg, var(--surface-2), #1a2233);
+  background: var(--soft-card-grad);
   color: var(--text-dim);
 }
 .poster-play {
@@ -8590,17 +8581,16 @@ img {
 .platform-cards::-webkit-scrollbar {
   display: none;
 }
-/* 平台卡片：深色卡片 + 左侧品牌 + 右侧扇形海报墙 */
 .platform-card {
   flex: 0 0 auto;
   width: min(46vw, 190px);
   height: 92px;
   border: none;
   border-radius: 18px;
-  background: linear-gradient(145deg, #1a1a1a 0%, #0a0a0a 100%);
+  background: var(--platform-card-grad);
   box-shadow:
-    0 10px 28px rgba(0, 0, 0, 0.55),
-    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    0 10px 28px var(--shadow-card),
+    inset 0 1px 0 var(--hover-bg-strong);
   display: flex;
   align-items: stretch;
   padding: 0;
@@ -8611,13 +8601,13 @@ img {
   transition: transform 0.18s ease, box-shadow 0.18s ease;
   -webkit-tap-highlight-color: transparent;
   font: inherit;
-  color: #fff;
+  color: var(--platform-card-text);
 }
 .platform-card:hover {
   transform: translateY(-3px);
   box-shadow:
-    0 16px 36px rgba(0, 0, 0, 0.65),
-    inset 0 1px 0 rgba(255, 255, 255, 0.12);
+    0 16px 36px var(--platform-shadow-hover),
+    inset 0 1px 0 var(--hover-bg-strong);
 }
 .platform-card:active {
   transform: scale(0.985);
@@ -8864,7 +8854,6 @@ img {
 }
 @media (min-width: 1920px) {
   .container {
-    max-width: none;
     width: 100%;
     padding-left: 48px;
     padding-right: 48px;
@@ -8904,7 +8893,7 @@ img {
   max-height: 88vh;
   display: flex;
   flex-direction: column;
-  background: linear-gradient(165deg, #16161a 0%, #0e0e10 100%);
+  background: var(--panel-grad);
   border: 1px solid var(--border-strong);
   border-radius: 18px;
   box-shadow: 0 30px 80px rgba(0, 0, 0, 0.85);
@@ -8927,9 +8916,9 @@ img {
   width: 40px;
   height: 40px;
   border-radius: 50%;
-  border: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.04);
-  color: var(--text-dim);
+  border: 1px solid var(--chip-border);
+  background: var(--chip-bg);
+  color: var(--chip-fg);
   font-size: 1.2rem;
   cursor: pointer;
   font-family: inherit;
@@ -8956,9 +8945,9 @@ img {
   margin-bottom: 16px;
 }
 .douban-filter-tab {
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid var(--border);
-  color: var(--text-dim);
+  background: var(--chip-bg);
+  border: 1px solid var(--chip-border);
+  color: var(--chip-fg);
   padding: 7px 16px;
   border-radius: 999px;
   font-size: 0.82rem;
@@ -8969,12 +8958,12 @@ img {
   -webkit-tap-highlight-color: transparent;
 }
 .douban-filter-tab:hover {
-  color: var(--text);
-  border-color: var(--border-strong);
-  background: rgba(255, 255, 255, 0.07);
+  color: var(--chip-fg-hover);
+  border-color: var(--chip-border);
+  background: var(--chip-bg-hover);
 }
 .douban-filter-tab.active {
-  background: linear-gradient(135deg, #7c3aed 0%, #a78bfa 100%);
+  background: var(--brand-grad);
   color: #fff;
   border-color: transparent;
   box-shadow: 0 4px 14px rgba(167, 139, 250, 0.3);
@@ -8994,9 +8983,9 @@ img {
 }
 .theater-filter-tab {
   flex-shrink: 0;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid var(--border);
-  color: var(--text-dim);
+  background: var(--chip-bg);
+  border: 1px solid var(--chip-border);
+  color: var(--chip-fg);
   padding: 6px 14px;
   border-radius: 999px;
   font-size: 0.78rem;
@@ -9008,12 +8997,12 @@ img {
   scroll-snap-align: start;
 }
 .theater-filter-tab:hover {
-  color: var(--text);
-  border-color: var(--border-strong);
-  background: rgba(255, 255, 255, 0.07);
+  color: var(--chip-fg-hover);
+  border-color: var(--chip-border);
+  background: var(--chip-bg-hover);
 }
 .theater-filter-tab.active {
-  background: linear-gradient(135deg, #7c3aed 0%, #a78bfa 100%);
+  background: var(--brand-grad);
   color: #fff;
   border-color: transparent;
   box-shadow: 0 4px 14px rgba(167, 139, 250, 0.3);
@@ -9049,7 +9038,7 @@ img {
 .show-cal-backdrop {
   position: absolute;
   inset: 0;
-  background: rgba(2, 4, 8, 0.78);
+  background: var(--overlay);
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
   animation: fadeIn 0.2s ease;
@@ -9089,9 +9078,9 @@ img {
   width: 40px;
   height: 40px;
   flex-shrink: 0;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid var(--border);
-  color: var(--text-dim);
+  background: var(--chip-bg);
+  border: 1px solid var(--chip-border);
+  color: var(--chip-fg);
   border-radius: 50%;
   cursor: pointer;
   font-size: 1.2rem;
@@ -9103,8 +9092,9 @@ img {
   font-family: inherit;
 }
 .show-cal-close:hover {
-  color: var(--text);
-  border-color: #3a4a68;
+  color: var(--chip-fg-hover);
+  border-color: var(--chip-border);
+  background: var(--chip-bg-hover);
 }
 .show-cal-info {
   font-size: 0.72rem;
@@ -9124,9 +9114,9 @@ img {
 .show-cal-nav button {
   width: 30px;
   height: 30px;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid var(--border);
-  color: var(--text-dim);
+  background: var(--chip-bg);
+  border: 1px solid var(--chip-border);
+  color: var(--chip-fg);
   border-radius: 8px;
   cursor: pointer;
   font-size: 1rem;
@@ -9138,8 +9128,9 @@ img {
   font-family: inherit;
 }
 .show-cal-nav button:hover {
-  color: var(--text);
-  border-color: #3a4a68;
+  color: var(--chip-fg-hover);
+  border-color: var(--chip-border);
+  background: var(--chip-bg-hover);
 }
 .show-cal-weekdays {
   display: grid;
@@ -9174,16 +9165,16 @@ img {
   font-weight: 700;
 }
 .sc-day.sc-past {
-  background: rgba(90, 120, 180, 0.22);
-  color: #9db0d0;
+  background: var(--cal-soft);
+  color: var(--cal-accent-2);
   border-color: rgba(120, 150, 210, 0.5);
 }
 .sc-day.sc-past:hover {
-  background: rgba(120, 150, 210, 0.4);
+  background: var(--cal-soft-border);
   color: #d0dcf0;
 }
 .sc-day.sc-today-day {
-  background: #4a6db8;
+  background: var(--cal-accent);
   color: #fff;
   border-color: #7d9dd4;
   box-shadow: 0 0 14px rgba(125, 157, 212, 0.7);
@@ -9215,7 +9206,7 @@ img {
   height: 14px;
   padding: 0 3px;
   border-radius: 7px;
-  background: #4a6db8;
+  background: var(--cal-accent);
   color: #fff;
   font-size: 0.6rem;
   font-weight: 700;
@@ -9246,11 +9237,11 @@ img {
   border-radius: 3px;
 }
 .legend-past {
-  background: rgba(90, 120, 180, 0.5);
+  background: var(--cal-soft-border);
   border: 1px solid rgba(140, 170, 220, 0.8);
 }
 .legend-today {
-  background: #4a6db8;
+  background: var(--cal-accent);
   border: 1px solid #7d9dd4;
 }
 .legend-future {
@@ -9390,7 +9381,6 @@ img {
 }
 @media (min-width: 768px) {
   .container {
-    max-width: none;
     width: 100%;
     padding: 0 28px calc(88px + env(safe-area-inset-bottom));
   }
@@ -9513,7 +9503,6 @@ img {
 }
 @media (min-width: 1024px) {
   .container {
-    max-width: none;
     width: 100%;
     padding: 0 36px 100px;
   }
@@ -9564,7 +9553,6 @@ img {
 }
 @media (min-width: 1280px) {
   .container {
-    max-width: none;
     width: 100%;
     padding: 0 40px 110px;
   }
@@ -9578,7 +9566,6 @@ img {
 }
 @media (min-width: 1600px) {
   .container {
-    max-width: none;
     width: 100%;
   }
   .grid {
@@ -9647,7 +9634,7 @@ img {
 .modal-backdrop {
   position: absolute;
   inset: 0;
-  background: rgba(0, 0, 0, 0.75);
+  background: var(--overlay-strong);
   backdrop-filter: blur(12px) saturate(1.1);
   -webkit-backdrop-filter: blur(12px) saturate(1.1);
   animation: fadeIn 0.2s ease;
@@ -9671,7 +9658,7 @@ img {
   width: 100%;
   max-width: min(1120px, 100%);
   max-height: 100%;
-  background: #000;
+  background: var(--modal-bg);
   border: 1px solid var(--border);
   border-radius: 18px;
   box-shadow: 0 40px 100px rgba(0, 0, 0, 0.85);
@@ -9685,7 +9672,7 @@ img {
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  background: #000;
+  background: var(--modal-bg);
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
 }
@@ -9819,7 +9806,7 @@ img {
   width: 100%;
   height: 100%;
   object-fit: cover;
-  filter: blur(30px) saturate(1.2) brightness(0.5);
+  filter: blur(30px) saturate(1.2) var(--detail-bg-filter, brightness(0.5));
   transform: scale(1.15);
   z-index: 0;
 }
@@ -9828,7 +9815,7 @@ img {
   position: absolute;
   inset: 0;
   z-index: 1;
-  background: linear-gradient(180deg, rgba(10, 14, 24, 0.6), rgba(10, 14, 24, 0.95));
+  background: var(--detail-hero-grad);
 }
 .detail-inner {
   position: relative;
@@ -9847,7 +9834,7 @@ img {
   border-radius: 14px;
   object-fit: cover;
   flex-shrink: 0;
-  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.75);
+  box-shadow: 0 16px 40px var(--shadow-login);
   margin: 0 auto;
 }
 .detail-poster-ph {
@@ -9874,6 +9861,7 @@ img {
   font-weight: 800;
   letter-spacing: -0.4px;
   line-height: 1.25;
+  color: var(--text);
 }
 .detail-tagline {
   font-size: 0.85rem;
@@ -9894,7 +9882,7 @@ img {
 }
 .detail-overview {
   font-size: 0.88rem;
-  color: #c0c8d6;
+  color: var(--text-dim);
   line-height: 1.55;
   margin-top: 4px;
   display: -webkit-box;
@@ -9907,7 +9895,7 @@ img {
   display: flex;
   gap: 12px;
   align-items: center;
-  background: linear-gradient(135deg, #16161a, #0e0e10);
+  background: var(--panel-grad);
   border: 1px solid var(--border);
   border-radius: 14px;
   padding: 12px 14px;
@@ -9967,12 +9955,10 @@ img {
   gap: 2px;
   margin-top: 16px;
   padding: 4px;
-  background: linear-gradient(165deg, rgba(255, 255, 255, 0.09) 0%, rgba(255, 255, 255, 0.04) 100%);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: var(--pill-bg);
+  border: 1px solid var(--pill-border);
   border-radius: 999px;
-  box-shadow:
-    0 8px 28px rgba(0, 0, 0, 0.45),
-    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  box-shadow: var(--pill-shadow);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
 }
@@ -9985,7 +9971,7 @@ img {
   border-radius: 50%;
   border: none;
   background: transparent;
-  color: rgba(255, 255, 255, 0.55);
+  color: var(--pill-fg);
   cursor: pointer;
   padding: 0;
   font-family: inherit;
@@ -10004,7 +9990,7 @@ img {
   pointer-events: none;
 }
 .d-act:hover {
-  background: rgba(255, 255, 255, 0.1);
+  background: var(--pill-act-hover);
   color: #fff;
 }
 .d-act:active {
@@ -10035,7 +10021,7 @@ img {
   color: #ddd6fe;
 }
 .d-act-play {
-  color: rgba(255, 255, 255, 0.7);
+  color: var(--pill-fg);
 }
 .d-act-play:hover {
   background: rgba(167, 139, 250, 0.15);
@@ -10097,7 +10083,7 @@ img {
   color: var(--text-dim);
   font-size: 1.6rem;
   font-weight: 600;
-  background: linear-gradient(135deg, var(--surface-2), #1a2233);
+  background: var(--soft-card-grad);
 }
 .cast-name {
   font-size: 0.75rem;
@@ -10128,7 +10114,7 @@ img {
   transition: border-color 0.15s;
 }
 .season-item.open {
-  border-color: #2a3345;
+  border-color: var(--scrollbar);
 }
 .season-head {
   width: 100%;
@@ -10197,7 +10183,7 @@ img {
   background: var(--surface-2);
 }
 .episode.clickable:active {
-  background: #1a2233;
+  background: var(--surface-3);
 }
 .episode.clickable:hover .ep-title {
   color: #7d9dd4;
@@ -10341,7 +10327,7 @@ img {
 .confirm-backdrop {
   position: absolute;
   inset: 0;
-  background: rgba(2, 4, 8, 0.7);
+  background: var(--overlay);
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
   animation: fadeIn 0.18s ease;
@@ -10352,7 +10338,7 @@ img {
   left: 50%;
   transform: translate(-50%, -50%);
   width: min(88vw, 340px);
-  background: linear-gradient(165deg, #16161a 0%, #0e0e10 100%);
+  background: var(--panel-grad);
   border: 1px solid var(--border-strong);
   border-radius: 18px;
   padding: 24px 22px 18px;
@@ -10424,16 +10410,16 @@ img {
   -webkit-tap-highlight-color: transparent;
 }
 .confirm-cancel {
-  background: rgba(255, 255, 255, 0.05);
-  border-color: var(--border);
-  color: var(--text-dim);
+  background: var(--chip-bg);
+  border-color: var(--chip-border);
+  color: var(--chip-fg);
 }
 .confirm-cancel:hover {
-  background: rgba(255, 255, 255, 0.09);
-  color: #fff;
+  background: var(--chip-bg-hover);
+  color: var(--chip-fg-hover);
 }
 .confirm-ok {
-  background: linear-gradient(135deg, #7c3aed 0%, #a78bfa 100%);
+  background: var(--brand-grad);
   color: #fff;
   box-shadow: 0 6px 20px rgba(167, 139, 250, 0.3);
 }
@@ -10477,7 +10463,7 @@ img {
 .summary-backdrop {
   position: absolute;
   inset: 0;
-  background: rgba(2, 4, 8, 0.78);
+  background: var(--overlay);
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
 }
@@ -10490,7 +10476,7 @@ img {
   max-height: 88vh;
   display: flex;
   flex-direction: column;
-  background: linear-gradient(165deg, #16161a 0%, #0e0e10 100%);
+  background: var(--panel-grad);
   border: 1px solid var(--border-strong);
   border-radius: 18px;
   box-shadow: 0 30px 80px rgba(0, 0, 0, 0.85);
@@ -10512,9 +10498,9 @@ img {
   width: 40px;
   height: 40px;
   border-radius: 50%;
-  border: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.04);
-  color: var(--text-dim);
+  border: 1px solid var(--chip-border);
+  background: var(--chip-bg);
+  color: var(--chip-fg);
   font-size: 1.2rem;
   cursor: pointer;
   font-family: inherit;
@@ -10555,8 +10541,8 @@ img {
   width: 36px;
   height: 36px;
   border-radius: 10px;
-  border: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--chip-border);
+  background: var(--chip-bg);
   color: var(--text-dim);
   font-size: 1.2rem;
   cursor: pointer;
@@ -10576,7 +10562,7 @@ img {
 .sum-period-tabs {
   display: inline-flex;
   gap: 4px;
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--chip-bg);
   border: 1px solid var(--border);
   border-radius: 999px;
   padding: 3px;
@@ -10594,7 +10580,7 @@ img {
   font-family: inherit;
 }
 .sum-period-btn.active {
-  background: linear-gradient(135deg, #7c3aed 0%, #a78bfa 100%);
+  background: var(--brand-grad);
   color: #fff;
 }
 .sum-label {
@@ -10610,7 +10596,7 @@ img {
 }
 .sum-stat {
   text-align: center;
-  background: linear-gradient(165deg, #16161a 0%, #0e0e10 100%);
+  background: var(--panel-grad);
   border: 1px solid var(--border);
   border-radius: 14px;
   padding: 14px 6px;
@@ -10619,7 +10605,7 @@ img {
   font-size: 1.35rem;
   font-weight: 800;
   letter-spacing: -0.5px;
-  background: linear-gradient(180deg, #fff 0%, #c4b5fd 100%);
+  background: var(--num-grad);
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
@@ -10700,7 +10686,7 @@ img {
   align-items: center;
   gap: 12px;
   padding: 10px 12px;
-  background: linear-gradient(160deg, #141416 0%, #0e0e10 100%);
+  background: var(--panel-grad);
   border: 1px solid var(--border);
   border-radius: 12px;
 }
@@ -10771,8 +10757,8 @@ img {
   border-radius: 12px;
   font-size: 0.86rem;
   font-weight: 500;
-  color: #fff;
-  background: rgba(20, 22, 28, 0.96);
+  color: var(--toast-text);
+  background: var(--toast-bg);
   border: 1px solid rgba(255, 255, 255, 0.1);
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
   backdrop-filter: blur(14px);
@@ -10949,7 +10935,7 @@ img {
   inset: 0;
   width: 100%;
   height: 100%;
-  background: #000;
+  background: var(--surface-2);
   z-index: 2;
 }
 .trailer-frame:empty {
@@ -10975,7 +10961,7 @@ img {
 .person-backdrop {
   position: absolute;
   inset: 0;
-  background: rgba(2, 4, 8, 0.78);
+  background: var(--overlay);
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
   animation: fadeIn 0.2s ease;
@@ -10989,7 +10975,7 @@ img {
   max-height: 88vh;
   display: flex;
   flex-direction: column;
-  background: linear-gradient(165deg, #16161a 0%, #0e0e10 100%);
+  background: var(--panel-grad);
   border: 1px solid var(--border-strong);
   border-radius: 18px;
   box-shadow: 0 30px 80px rgba(0, 0, 0, 0.85);
@@ -11018,9 +11004,9 @@ img {
   height: 40px;
   flex-shrink: 0;
   border-radius: 50%;
-  border: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.04);
-  color: var(--text-dim);
+  border: 1px solid var(--chip-border);
+  background: var(--chip-bg);
+  color: var(--chip-fg);
   font-size: 1.2rem;
   cursor: pointer;
   font-family: inherit;
@@ -11072,7 +11058,7 @@ img {
   justify-content: center;
   font-size: 2rem;
   color: var(--text-dim);
-  background: linear-gradient(135deg, var(--surface-2), #1a2233);
+  background: var(--soft-card-grad);
 }
 .person-info {
   flex: 1;
