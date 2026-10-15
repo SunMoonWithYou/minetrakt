@@ -137,8 +137,8 @@ const PAGE_SIZE = 20, // 历史记录每页条数
 // 首页自动刷新间隔（分钟）——只读 KV，30 分钟一次即可
 const HOME_AUTO_REFRESH_MINUTES = 30;
 // 前端静态资源版本（改动后 bump 触发缓存失效）
-const APP_JS_VERSION = "113",
-  APP_CSS_VERSION = "113";
+const APP_JS_VERSION = "115",
+  APP_CSS_VERSION = "115";
 
 /* 公共响应头常量 —— 统一管理，避免多处硬编码漂移 */
 const CC_API = "public, max-age=1800, stale-while-revalidate=600"; // API 数据：本地 30 分钟 + SWR 后台刷新
@@ -790,7 +790,160 @@ async function cachedJSON(
 
 /* -------------------- Service Worker 内容 -------------------- */
 // 前端 SW：静态资源 stale-while-revalidate；/api/ 与导航请求不走缓存
-const SW_JS_CONTENT = String.raw`/* MineTrakt SW v113 */ const VERSION = "v113"; const RUNTIME_CACHE = 'trakt-static-' + VERSION; self.addEventListener('install', function(){ self.skipWaiting(); }); self.addEventListener('activate', function(e){ e.waitUntil((async function(){ var keys = await caches.keys(); await Promise.all(keys.filter(function(k){ return k !== RUNTIME_CACHE; }).map(function(k){ return caches.delete(k); })); await self.clients.claim(); })()); }); self.addEventListener('fetch', function(event){ var req = event.request; if (req.method !== 'GET') return; var url; try { url = new URL(req.url); } catch(e){ return; } if (url.origin !== self.location.origin) return; if (url.pathname === '/sw.js') return; if (req.mode === 'navigate') return; if (url.pathname.indexOf('/api/') === 0) return; if (url.pathname.indexOf('/auth/') === 0) return; if (url.pathname === '/app.css' || url.pathname === '/app.js' || url.pathname === '/manifest.webmanifest' || url.pathname === '/favicon.ico' || url.pathname.indexOf('/assets/') === 0 || /\.(?:png|jpg|jpeg|svg|webp|ico|woff2?|css|js)$/i.test(url.pathname)) { event.respondWith(staleWhileRevalidate(req)); } }); async function staleWhileRevalidate(req){ var cache = await caches.open(RUNTIME_CACHE); var cached = await cache.match(req); var network = fetch(req).then(function(r){ if (r && r.ok && r.type !== 'opaque') { cache.put(req, r.clone()).catch(function(){}); } return r; }).catch(function(){ return cached; }); return cached || network; }`;
+const SW_JS_CONTENT = String.raw`/* MineTrakt SW v115 */
+const VERSION = "v115";
+const RUNTIME_CACHE = "trakt-static-" + VERSION;
+const NAV_CACHE = "trakt-nav-" + VERSION;
+/* 导航请求网络超时阈值：超过则回退缓存（弱网兜底，避免长时间白屏） */
+const NAV_TIMEOUT = 2500;
+
+self.addEventListener("install", function () {
+  self.skipWaiting();
+});
+
+self.addEventListener("activate", function (e) {
+  e.waitUntil(
+    (async function () {
+      var keys = await caches.keys();
+      // 清掉所有非当前版本的缓存（含旧 nav 缓存）
+      await Promise.all(
+        keys
+          .filter(function (k) {
+            return k !== RUNTIME_CACHE && k !== NAV_CACHE;
+          })
+          .map(function (k) {
+            return caches.delete(k);
+          }),
+      );
+      await self.clients.claim();
+    })(),
+  );
+});
+
+self.addEventListener("fetch", function (event) {
+  var req = event.request;
+  if (req.method !== "GET") return;
+
+  var url;
+  try {
+    url = new URL(req.url);
+  } catch (e) {
+    return;
+  }
+  if (url.origin !== self.location.origin) return;
+  if (url.pathname === "/sw.js") return;
+
+  // 导航请求：启动页 "/" 走缓存优先（重复启动瞬时打开），其余 network-first
+  if (req.mode === "navigate") {
+    event.respondWith(
+      new URL(req.url).pathname === "/"
+        ? navigateLaunchSwr(req)
+        : navigateNetworkFirst(req),
+    );
+    return;
+  }
+
+  // 接口与鉴权：完全不走 SW 缓存
+  if (url.pathname.indexOf("/api/") === 0) return;
+  if (url.pathname.indexOf("/auth/") === 0) return;
+
+  // 静态资源：stale-while-revalidate
+  if (
+    url.pathname === "/app.css" ||
+    url.pathname === "/app.js" ||
+    url.pathname === "/manifest.webmanifest" ||
+    url.pathname === "/favicon.ico" ||
+    url.pathname.indexOf("/assets/") === 0 ||
+    /\.(?:png|jpg|jpeg|svg|webp|ico|woff2?|css|js)$/i.test(url.pathname)
+  ) {
+    event.respondWith(staleWhileRevalidate(req));
+  }
+});
+
+/**
+ * 记忆化缓存句柄表：SW 生命周期内每个 Cache 只 open 一次 IndexedDB，
+ * 后续调用直接拿到已 resolved 的 Cache 对象，冷启动不重复付数据库开销。
+ */
+var __cachePs = {};
+function getCache(name) {
+  if (!__cachePs[name]) __cachePs[name] = caches.open(name);
+  return __cachePs[name];
+}
+
+/**
+ * 启动页 "/"：stale-while-revalidate。
+ * · 有缓存：立即返回（重复启动瞬时打开，无白屏），同时后台拉新版刷新缓存
+ * · 无缓存：走网络，成功后写入缓存
+ * 安全性：缓存的启动页只含"跳转目标"，而 /login 与 /home 都会做服务端登录态
+ * 校验并 302 自愈，故缓存不会导致跳错页面；/home 内容始终走网络保持最新。
+ */
+async function navigateLaunchSwr(req) {
+  var cache = await getCache(NAV_CACHE);
+  var cached = await cache.match(req);
+  if (cached) {
+    // 后台刷新，不阻塞本次响应
+    fetch(req)
+      .then(function (r) {
+        if (r && r.ok) cache.put(req, r.clone()).catch(function () {});
+      })
+      .catch(function () {});
+    return cached;
+  }
+  var r = await fetch(req);
+  if (r && r.ok) cache.put(req, r.clone()).catch(function () {});
+  return r;
+}
+
+/**
+ * 非启动页导航（/login、/home 等）：纯 network-first + 超时保护。
+ * · 始终拉最新网络内容：部署新版本后立即生效，不回退旧页面
+ * · 超时/断网直接抛错，由浏览器展示默认错误页（不返回脏数据）
+ * · 不写不读缓存：/login 与 /home 均为个性化页面（服务端按 Cookie 302 分流），
+ *   避免把某个登录态的页面持久化后误导其他用户
+ * 注：启动页 "/" 已由 navigateLaunchSwr 单独处理，不会进入本函数
+ */
+async function navigateNetworkFirst(req) {
+  var ctrl = new AbortController();
+  var timer = setTimeout(function () {
+    ctrl.abort();
+  }, NAV_TIMEOUT);
+  try {
+    // fetch 立即发起，不等任何缓存操作，冷启动零额外延迟
+    return await fetch(req, { signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+/**
+ * 静态资源：stale-while-revalidate。
+ * · 有缓存：立即返回旧版本（秒开），同时后台拉新版写入缓存
+ * · 无缓存：等网络响应，成功后写入缓存
+ * fetch 不等 caches.open()（IndexedDB 会拖慢被 Link 预加载的 app.css/app.js），
+ * 缓存读写全部经记忆化句柄并行进行。
+ */
+async function staleWhileRevalidate(req) {
+  var cacheP = getCache(RUNTIME_CACHE);
+  var networkP = fetch(req).then(function (r) {
+    if (r && r.ok && r.type !== "opaque") {
+      cacheP
+        .then(function (c) {
+          return c.put(req, r.clone());
+        })
+        .catch(function () {});
+    }
+    return r;
+  });
+  // 有缓存时后台刷新失败不应产生未处理的 rejection
+  networkP.catch(function () {});
+  var cached = await cacheP
+    .then(function (c) {
+      return c.match(req);
+    })
+    .catch(function () {
+      return undefined;
+    });
+  return cached || networkP;
+}`;
 
 /* -------------------- 主入口路由 -------------------- */
 /** Cloudflare Worker 入口：按 path 分发静态资源 / 认证 / API / 首页 */
@@ -4130,6 +4283,28 @@ async function handleHome(request, env, ctx) {
 
 /** 启动页路由：/ → splash（服务端分流），约 0.8s 后跳 /home 或 /login */
 /**
+ * 启动页 Link 响应头。
+ * · 始终 preconnect 到 Trakt / TMDB（跳转后要立即打这些接口）
+ * · 已登录（将跳 /home）时额外 preload /app.js 与 /app.css，让首页首屏更快
+ * 注意：HTML 内已有 <link rel="preload">，这里用响应头双保险——响应头在 HTML
+ * 解析前就送达，抓取发起得更早。
+ */
+function launchLinkHeader(request) {
+  const parts = [
+    "<https://api.trakt.tv>; rel=preconnect; crossorigin",
+    "<https://api.themoviedb.org>; rel=preconnect; crossorigin",
+    "<https://image.tmdb.org>; rel=preconnect",
+  ];
+  if (readAuth(request)) {
+    parts.push(
+      `</app.js?v=${APP_JS_VERSION}>; rel=preload; as=script`,
+      `</app.css?v=${APP_CSS_VERSION}>; rel=preload; as=style`,
+    );
+  }
+  return parts.join(", ");
+}
+
+/**
  * 启动页响应（路由 "/"）。
  * 服务端零 I/O、HTML 全内联，响应头额外做两件事：
  *   · Link: rel=preconnect —— 提前建连到 Trakt/TMDB，跳转后的首页数据更快
@@ -4142,11 +4317,7 @@ function handleLaunch(request) {
       "Cache-Control": "no-cache, no-store, must-revalidate",
       Pragma: "no-cache",
       Expires: "0",
-      Link: [
-        "<https://api.trakt.tv>; rel=preconnect; crossorigin",
-        "<https://api.themoviedb.org>; rel=preconnect; crossorigin",
-        "<https://image.tmdb.org>; rel=preconnect",
-      ].join(", "),
+      Link: launchLinkHeader(request),
     },
   });
 }
@@ -6637,7 +6808,8 @@ function renderSplash() {
  * 加速：展示期间预加载目标页的 app.js / app.css（预热 HTTP 缓存与 SW 缓存）。
  */
 /** 匹配 renderSplash() 里的 logo <img> 标签（启动页替换为内联 SVG 用） */
-const SPLASH_LOGO_IMG_RE = /<img src="[^"]*" alt="" width="96" height="96" loading="eager" decoding="async" style="[^"]*">/;
+const SPLASH_LOGO_IMG_RE =
+  /<img src="[^"]*" alt="" width="96" height="96" loading="eager" decoding="async" style="[^"]*">/;
 
 /**
  * 启动页 logo：内联 SVG（品牌图形 + 渐变），无需任何图片请求。
@@ -6714,19 +6886,29 @@ function renderLaunchPage(request) {
     "setTimeout(function(){ location.replace(t); },400);" +
     "})();<\/script>";
   return (
-    "<!DOCTYPE html><html lang=\"zh-CN\" style=\"background:#000000\"><head>" +
+    '<!DOCTYPE html><html lang="zh-CN" style="background:#000000"><head>' +
     '<meta charset="utf-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1,user-scalable=no">' +
     '<meta name="color-scheme" content="dark">' +
-    '<meta name="theme-color" content="' + THEME_COLOR + '">' +
+    '<meta name="theme-color" content="' +
+    THEME_COLOR +
+    '">' +
     '<meta name="apple-mobile-web-app-capable" content="yes">' +
     '<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">' +
-    '<meta name="apple-mobile-web-app-title" content="' + APP_SHORT_NAME + '">' +
+    '<meta name="apple-mobile-web-app-title" content="' +
+    APP_SHORT_NAME +
+    '">' +
     '<meta name="mobile-web-app-capable" content="yes">' +
-    "<title>" + APP_NAME + "</title>" +
-    '<link rel="preload" as="image" href="' + SPLASH_LOGO + '" fetchpriority="high">' +
+    "<title>" +
+    APP_NAME +
+    "</title>" +
+    '<link rel="preload" as="image" href="' +
+    SPLASH_LOGO +
+    '" fetchpriority="high">' +
     warmAssets +
-    "<style>" + launchCriticalCss() + "</style>" +
+    "<style>" +
+    launchCriticalCss() +
+    "</style>" +
     '</head><body style="background:#000000;margin:0;min-height:100vh;min-height:100dvh">' +
     renderSplash()
       .replace('class="splash"', 'class="splash splash-persist"')
