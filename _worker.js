@@ -128,7 +128,7 @@ const PAGE_SIZE = 20, // 历史记录每页条数
 const KV_STALE_RETENTION = 86400 * 7,
   LAST_GOOD_KV_TTL = 86400 * 7;
 const HOME_AUTO_REFRESH_MINUTES = 30;
-const APP_JS_VERSION = "129",
+const APP_JS_VERSION = "130",
   APP_CSS_VERSION = "121";
 
 const CC_API = "public, max-age=1800, stale-while-revalidate=600"; // API 数据：本地 30 分钟 + SWR 后台刷新
@@ -951,8 +951,8 @@ async function cachedJSON(
  * ============================================================ */
 
 // 前端 SW：静态资源 stale-while-revalidate；/api/ 与导航请求不走缓存
-const SW_JS_CONTENT = String.raw`/* MineTrakt SW v129 */
-const VERSION = "v129";
+const SW_JS_CONTENT = String.raw`/* MineTrakt SW v130 */
+const VERSION = "v130";
 const RUNTIME_CACHE = "trakt-static-" + VERSION;
 const NAV_CACHE = "trakt-nav-" + VERSION;
 const NAV_TIMEOUT = 2500;
