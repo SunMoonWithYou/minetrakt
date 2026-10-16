@@ -107,12 +107,12 @@ const PAGE_SIZE = 20, // 历史记录每页条数
   TMDB_KV_TTL = 86400 * 7, // TMDB 详情：7 天
   OMDB_KV_TTL = 86400 * 7, // OMDB 评分：7 天
   WATCHLIST_PAGE_SIZE = 30, // watchlist 每页 30 条
-  WATCHLIST_KV_TTL = 1800, // watchlist：30 分钟
-  CALENDAR_KV_TTL = 1800, // 日历：30 分钟
+  WATCHLIST_KV_TTL = 3600, // watchlist：1 小时（原 30 分钟，配合三层兜底可放宽）
+  CALENDAR_KV_TTL = 3600, // 日历：1 小时（原 30 分钟）
   TREND_KV_TTL = 21600, // 趋势：6 小时
   MISS_KV_TTL = 300, // 空结果：5 分钟（防击穿）
-  HISTORY_KV_TTL = 3600, // 历史记录：1 小时
-  PLAYBACK_KV_TTL = 3600, // 继续观看：1 小时
+  HISTORY_KV_TTL = 5400, // 历史记录：1.5 小时（原 1 小时）
+  PLAYBACK_KV_TTL = 5400, // 继续观看：1.5 小时（原 1 小时）
   STATS_KV_TTL = 3600, // 统计：1 小时
   PROFILE_KV_TTL = 7200, // 用户资料：2 小时
   ENTITY_KV_TTL = 86400, // Trakt 实体：1 天
@@ -120,8 +120,15 @@ const PAGE_SIZE = 20, // 历史记录每页条数
   DOUBAN_KV_TTL = 21600, // 豆瓣列表：6 小时
   THEATER_KV_TTL = 21600, // 平台剧场：6 小时
   GUDUO_KV_TTL = 21600; // 骨朵热榜：6 小时
+/* KV 物理保留策略：
+ * - KV_STALE_RETENTION：写入时额外保留的 stale 时长。固定 7 天，
+ *   避免「待看/日历」这类低频访问分片被 CF 提前物理删除（原来只有 TTL×6）。
+ * - LAST_GOOD_KV_TTL：「最后一次成功数据」兜底副本的 TTL。
+ *   key 不含日期/版本号，用于跨 key 轮换兜底（日历换天、待看换版本号）。 */
+const KV_STALE_RETENTION = 86400 * 7,
+  LAST_GOOD_KV_TTL = 86400 * 7;
 const HOME_AUTO_REFRESH_MINUTES = 30;
-const APP_JS_VERSION = "121",
+const APP_JS_VERSION = "123",
   APP_CSS_VERSION = "121";
 
 const CC_API = "public, max-age=1800, stale-while-revalidate=600"; // API 数据：本地 30 分钟 + SWR 后台刷新
@@ -164,6 +171,19 @@ const CK = {
   platform: (id, page, media) => `plat:${id}:${media}:p${page}`, // 平台筛选
   uidRt: (rt) => `uid:rt:${rt}`, // refresh_token → uid
   uidAt: (at) => `uid:at:${at}`, // access_token → uid
+  moreHistory: (u, p) => `more:hist:${u}:p${p}`, // 观看记录翻页
+  morePlayback: (u, p, l) => `more:pb:${u}:p${p}:l${l}`, // 继续观看翻页
+  /* 「最后一次成功数据」兜底副本（lg: = last good）
+   * 特点：key 不含日期 / 版本号，物理保留 7 天以上。
+   * 用途：主 key 轮换（日历换天、待看换版本号）或 KV 读取失败时回退。 */
+  lastGood: {
+    playback: (u) => `lg:pb:${u}`,
+    stats: (u) => `lg:stats:${u}`,
+    profile: (u) => `lg:prof:${u}`,
+    history: (u, p = 1) => `lg:hist:${u}:p${p}`,
+    calendar: (u) => `lg:cal:${u}`, // 不含日期
+    watchlist: (u, s = "added") => `lg:wl:${u}:${s}`, // 不含版本号
+  },
 };
 
 
@@ -172,6 +192,8 @@ const CK = {
  * 使用 AbortController 在 ms 毫秒后中止请求，避免上游挂死。
  */
 async function fetchT(url, opts = {}, ms = 8000) {
+  // Trakt 请求统一经过出网闸门，削峰避免风控（TMDB / 其他域名不受影响）
+  if (TRAKT_HOST_RE.test(url)) await traktGate();
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), ms);
   try {
@@ -184,8 +206,39 @@ async function fetchT(url, opts = {}, ms = 8000) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const backoff = (i, base = 500, jitter = 500) =>
   sleep(base * (i + 1) + Math.random() * jitter);
-const TRAKT_RATE_LIMIT_COOLDOWN = 20000;
+
+/* ============================================================
+ * Trakt 出网闸门
+ * ------------------------------------------------------------
+ * Trakt 的限流维度是 client_id / IP，而本 Worker 只有一个 client_id，
+ * 所以只要在实例内把 Trakt 请求串行化 + 限最小间隔，就能显著削峰。
+ * 放在 fetchT 而不是 traktFetch：翻页(/api/more)、待看增删、日历、
+ * hidden/dropped 等直接用 fetchT，只有拦在这一层才能全覆盖。
+ * ============================================================ */
+const TRAKT_HOST_RE = /^https?:\/\/api\.trakt\.tv\//i;
+const TRAKT_MIN_GAP_MS = 1000; // 两次 Trakt 请求最小间隔
+const TRAKT_GAP_MAX_WAIT_MS = 10000; // 单请求最多排队等待，超时放行避免拖死
+let __traktTail = Promise.resolve(),
+  __traktLast = 0;
+/** 排队获取一次 Trakt 出网许可（FIFO + 最小间隔） */
+function traktGate() {
+  const prev = __traktTail;
+  let release;
+  __traktTail = new Promise((r) => (release = r));
+  return prev.then(async () => {
+    const wait = __traktLast + TRAKT_MIN_GAP_MS - Date.now();
+    try {
+      if (wait > 0) await sleep(Math.min(wait, TRAKT_GAP_MAX_WAIT_MS));
+    } finally {
+      __traktLast = Date.now();
+      release();
+    }
+  });
+}
+const TRAKT_RATE_LIMIT_COOLDOWN = 60000; // 基础冷却 60s（连续 429 按 2 的幂递增）
+const TRAKT_RATE_LIMIT_MAX_COOLDOWN = 300000; // 冷却封顶 5 分钟
 const __traktRateLimitByUser = new Map();
+const __traktStrikes = new Map(); // userKey → 连续 429 次数（成功即清零）
 
 /** 判断指定用户是否处于限流冷却期 */
 function isTraktRateLimited(userKey) {
@@ -201,10 +254,21 @@ function traktRateLimitedRemaining(userKey) {
   return Math.max(0, Math.ceil((until - Date.now()) / 1000));
 }
 
-/** 标记用户进入限流冷却（ms 毫秒） */
+/** 记录一次 429：冷却时长按连续命中次数指数递增，成功一次即清零 */
 function markTraktRateLimited(ms, userKey) {
   const k = userKey || "__anon__";
-  const until = Date.now() + (ms || TRAKT_RATE_LIMIT_COOLDOWN);
+  const strikes = (__traktStrikes.get(k) || 0) + 1;
+  __traktStrikes.set(k, strikes);
+  // 1→60s, 2→120s, 3→240s, 4+→300s（封顶 5 分钟）
+  const exp = Math.min(
+    TRAKT_RATE_LIMIT_MAX_COOLDOWN,
+    TRAKT_RATE_LIMIT_COOLDOWN * Math.pow(2, strikes - 1),
+  );
+  const wait = Math.max(
+    exp,
+    Math.min(Number(ms) || 0, TRAKT_RATE_LIMIT_MAX_COOLDOWN),
+  );
+  const until = Date.now() + wait;
   const cur = __traktRateLimitByUser.get(k) || 0;
   if (until > cur) __traktRateLimitByUser.set(k, until);
   if (__traktRateLimitByUser.size > 500) {
@@ -213,6 +277,18 @@ function markTraktRateLimited(ms, userKey) {
       if (v < now) __traktRateLimitByUser.delete(key);
     }
   }
+  if (__traktStrikes.size > 500) {
+    for (const key of __traktStrikes.keys()) {
+      if (!__traktRateLimitByUser.has(key)) __traktStrikes.delete(key);
+    }
+  }
+  return wait;
+}
+
+/** Trakt 请求成功 → 清零该用户的连续 429 计数 */
+function clearTraktStrikes(userKey) {
+  const k = userKey || "__anon__";
+  if (__traktStrikes.size && __traktStrikes.has(k)) __traktStrikes.delete(k);
 }
 
 /** 从 429 响应的 Retry-After 头解析冷却时长并标记 */
@@ -220,10 +296,9 @@ function consumeRetryAfter(r, userKey) {
   const ra = parseInt(r.headers.get("Retry-After") || "", 10);
   const waitMs =
     Number.isFinite(ra) && ra > 0
-      ? Math.min(ra * 1000, 180000)
-      : TRAKT_RATE_LIMIT_COOLDOWN;
-  markTraktRateLimited(waitMs, userKey);
-  return waitMs;
+      ? Math.min(ra * 1000, TRAKT_RATE_LIMIT_MAX_COOLDOWN)
+      : 0;
+  return markTraktRateLimited(waitMs, userKey);
 }
 
 /**
@@ -283,6 +358,7 @@ async function traktFetch(
         continue;
       }
       const data = await r.json();
+      clearTraktStrikes(userKey); // 请求成功 → 清零连续 429 计数，冷却逐步回落到基础值
       if (wantPageCount && Array.isArray(data)) {
         Object.defineProperty(data, "__pageCount", {
           value: parseInt(r.headers.get("X-Pagination-Page-Count") || "1") || 1,
@@ -308,6 +384,7 @@ const KV_MEM_TTL = 1800000,
   KV_MIN_PUT_TTL = 30, // 小于该 TTL（秒）不写 KV
   KV_DOWN_COOLDOWN_MS = 30000; // KV 异常后冷却 30s 不再尝试
 const KV_MIN_PUT_INTERVAL_MS = 3600000;
+const DEFAULT_JITTER_SEC = 600; // 未显式指定 jitter 时，按 key 在 0~600s 内确定性错峰
 const __KV_LASTPUT_MAX = 5000;
 
 const __kvLastPut = new Map(); // key → 上次写入时间
@@ -401,7 +478,7 @@ function singleFlight(key, fn) {
 }
 
 /** 读缓存：内存优先，未命中再读 KV；KV 异常时返回 KV_ERR 并短暂标记 down。 */
-async function kvGetJSON(env, key, memOnly, edgeTtl) {
+async function kvGetJSON(env, key, memOnly, edgeTtl, missTtl) {
   const mem = kvMemGet(key);
   if (mem !== undefined) return mem;
   if (memOnly) return undefined;
@@ -413,10 +490,13 @@ async function kvGetJSON(env, key, memOnly, edgeTtl) {
     });
     kvMarkUp();
     const result = v === null || v === undefined ? KV_MISS : v;
+    // KV 明确为空：只在内存里做短时负缓存（missTtl），避免上游一恢复就被之前的空标记挡住
     const memMs =
-      result && result !== KV_MISS && result._ttl
-        ? Math.min(KV_MEM_TTL, Math.max(5000, result._ttl * 1000))
-        : KV_MEM_TTL;
+      result === KV_MISS
+        ? Math.max(5000, (missTtl || MISS_KV_TTL) * 1000)
+        : result && result._ttl
+          ? Math.min(KV_MEM_TTL, Math.max(5000, result._ttl * 1000))
+          : KV_MEM_TTL;
     kvMemSet(key, result, memMs);
     return result;
   } catch {
@@ -454,13 +534,15 @@ function kvPutJSON(env, ctx, key, payload, ttl, memOnly, force) {
     }
   }
   const logicalTtl = ttl || 60;
-  const staleRetention = Math.min(86400 * 7, Math.max(logicalTtl * 6, 1800));
+  // 固定保留 7 天 stale：低频访问的分片（待看/日历）也能在回源失败时兜底
+  const staleRetention = KV_STALE_RETENTION;
   const body =
     payload && typeof payload === "object"
       ? { ...payload, _ttl: logicalTtl }
       : payload;
   const p = env.TMDB_CACHE.put(key, JSON.stringify(body), {
-    expirationTtl: Math.max(60, logicalTtl + staleRetention),
+    // 总 TTL 上限 30 天，防止极端 TTL 配置超出限制
+    expirationTtl: Math.min(86400 * 30, Math.max(60, logicalTtl + staleRetention)),
   })
     .then(() => kvMarkUp())
     .catch(() => {
@@ -478,6 +560,23 @@ function __isErrorPayload(d) {
       return true;
   }
   return false;
+}
+
+/**
+ * 按 key 的确定性抖动（秒）。
+ * 同一 key 永远得到同一个偏移 → 各分片过期时刻稳定且彼此错开；
+ * 相比随机抖动，既避免多分片同时过期打上游，也避免同一分片反复横跳。
+ */
+function stableJitter(key, maxSec) {
+  const m = Math.floor(Number(maxSec) || 0);
+  if (m <= 0) return 0;
+  const s = String(key);
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h % m;
 }
 
 /* ============================================================
@@ -506,11 +605,16 @@ async function cachedJSON(
     userKey,
     bypass = false,
     sourceTracker = null,
+    // lastGoodKey：可选的「最后一次成功数据」兜底副本 key（见 CK.lastGood）。
+    // 主 key 轮换（日历换天 / 待看换版本号）或 KV 读取失败时回退到它。
+    lastGoodKey = null,
     // revalidate=false：有缓存就直接返回（忽略逻辑 TTL / 不后台刷新），仅冷启动 miss 时才打上游
     revalidate = true,
   } = {},
 ) {
-  const jitterSec = jitter != null ? jitter : Math.floor(Math.random() * 90);
+  // 抖动改为「按 key 确定性抖动」：同一分片偏移稳定，不同分片彼此错开，
+  // 避免多个分片在同一时刻集体过期把上游打成突发（原先是随机 0~90s）。
+  const jitterSec = stableJitter(key, jitter != null ? jitter : DEFAULT_JITTER_SEC);
   const effectiveTtl = ttl + jitterSec;
   const softAge =
     swr === true ? Math.floor(ttl * 0.5) : typeof swr === "number" ? swr : 0;
@@ -560,6 +664,76 @@ async function cachedJSON(
     return { found: false };
   }
 
+  /**
+   * 「最后一次成功数据」兜底（异步读 KV）。
+   * key 不含日期 / 版本号，故不受日历换天、待看换版本号影响。
+   */
+  async function tryLastGood() {
+    if (!lastGoodKey || !env || !env.TMDB_CACHE || kvIsDown())
+      return { found: false };
+    try {
+      const lg = await env.TMDB_CACHE.get(lastGoodKey, { type: "json" });
+      if (lg && !lg.miss) {
+        const v = lg.data !== undefined ? lg.data : lg;
+        if (!__isErrorPayload(v)) return { found: true, val: v, raw: lg };
+      }
+    } catch {}
+    return { found: false };
+  }
+
+  /** 把成功数据同步写一份到 last-good 副本（走 1 小时写节流，避免影响 KV 写入配额） */
+  function writeLastGood(data) {
+    if (!lastGoodKey) return;
+    kvPutJSON(env, ctx, lastGoodKey, { data }, LAST_GOOD_KV_TTL, false);
+  }
+
+  /**
+   * 统一的兜底链：内存 stale → 当前 key 的 KV 旧值 → last-good 副本。
+   * 命中后回填内存，保证同一实例后续请求不再重复读 KV。
+   */
+  async function fallbackChain() {
+    const old = tryOldNormal();
+    if (old.found) {
+      if (old.raw && old.raw !== KV_MISS)
+        kvMemSet(key, old.raw, KV_MEM_TTL);
+      else if (old.val != null) {
+        kvMemSet(key, { data: old.val, _ts: Date.now() }, KV_MEM_TTL);
+        kvMemStaleSet(key, old.val);
+      }
+      return { found: true, val: old.val };
+    }
+    if (env && env.TMDB_CACHE && !kvIsDown()) {
+      try {
+        const kvStale = await env.TMDB_CACHE.get(key, { type: "json" });
+        if (kvStale && !kvStale.miss) {
+          const v = kvStale.data !== undefined ? kvStale.data : kvStale;
+          if (!__isErrorPayload(v)) {
+            const memPayload =
+              typeof kvStale === "object" && kvStale.data !== undefined
+                ? kvStale
+                : { data: v, _ts: (kvStale && kvStale._ts) || Date.now() };
+            kvMemSet(key, memPayload, KV_MEM_TTL);
+            kvMemStaleSet(key, v);
+            markSource(true, kvStale);
+            return { found: true, val: v };
+          }
+        }
+      } catch {}
+    }
+    const lg = await tryLastGood();
+    if (lg.found) {
+      const memPayload =
+        lg.raw && typeof lg.raw === "object" && lg.raw.data !== undefined
+          ? lg.raw
+          : { data: lg.val, _ts: (lg.raw && lg.raw._ts) || Date.now() };
+      kvMemSet(key, memPayload, KV_MEM_TTL);
+      kvMemStaleSet(key, lg.val);
+      markSource(true, lg.raw || null);
+      return { found: true, val: lg.val };
+    }
+    return { found: false };
+  }
+
   /* ---------- bypass 分支：强制刷新 ----------
    * 规则：仅在拿到「正确、非错误」数据时才写 KV；
    * API 限流 / 网络失败 / 错误载荷 → 绝不污染 KV，优先回退展示旧缓存。
@@ -577,39 +751,14 @@ async function cachedJSON(
       if (!__isErrorPayload(data)) {
         kvPutJSON(env, ctx, key, { data }, effectiveTtl, memOnly, true);
         kvMemStaleSet(key, data);
+        writeLastGood(data);
         markSource(false, null);
         return unwrap ? data : { data };
       }
 
-      // 失败①：内存 stale / 当前 mem
-      const old = tryOldNormal();
-      if (old.found) {
-        if (old.raw && old.raw !== KV_MISS) {
-          kvMemSet(key, old.raw, KV_MEM_TTL);
-        } else if (old.val != null) {
-          kvMemSet(key, { data: old.val, _ts: Date.now() }, KV_MEM_TTL);
-          kvMemStaleSet(key, old.val);
-        }
-        return unwrap ? old.val : { data: old.val };
-      }
-      if (env.TMDB_CACHE && !kvIsDown()) {
-        try {
-          const stale = await env.TMDB_CACHE.get(key, { type: "json" });
-          if (stale && !stale.miss) {
-            const v = stale.data !== undefined ? stale.data : stale;
-            if (!__isErrorPayload(v)) {
-              const memPayload =
-                stale && typeof stale === "object" && stale.data !== undefined
-                  ? stale
-                  : { data: v, _ts: (stale && stale._ts) || Date.now() };
-              kvMemSet(key, memPayload, KV_MEM_TTL);
-              kvMemStaleSet(key, v);
-              markSource(true, stale);
-              return unwrap ? v : { data: v };
-            }
-          }
-        } catch {}
-      }
+      // 失败兜底链：内存 stale → 当前 key 的 KV 旧值 → last-good 副本
+      const fb = await fallbackChain();
+      if (fb.found) return unwrap ? fb.val : { data: fb.val };
       markSource(null, null);
       return null;
     });
@@ -644,6 +793,7 @@ async function cachedJSON(
         if (!__isErrorPayload(data)) {
           kvPutJSON(env, ctx, key, { data }, effectiveTtl, memOnly || down);
           kvMemStaleSet(key, data);
+          writeLastGood(data);
         }
       }),
     );
@@ -651,6 +801,19 @@ async function cachedJSON(
   const mem = kvMemGet(key);
   if (mem !== undefined) {
     if (mem === KV_MISS) {
+      // 主 key 明确为空（可能已被 CF 物理删除，如日历换天 / 待看换版本号）
+      // → 先试 last-good 副本，仍无则返回 null（负缓存由 missTtl 短时控制）
+      const lg = await tryLastGood();
+      if (lg.found) {
+        kvMemSet(
+          key,
+          { data: lg.val, _ts: (lg.raw && lg.raw._ts) || Date.now() },
+          KV_MEM_TTL,
+        );
+        kvMemStaleSet(key, lg.val);
+        markSource(true, lg.raw || null);
+        return unwrap ? lg.val : { data: lg.val };
+      }
       markSource(null, null);
       return null;
     }
@@ -662,7 +825,7 @@ async function cachedJSON(
 
   // KV 命中 / 拉取
   return singleFlight(key, async () => {
-    const cached = await kvGetJSON(env, key, memOnly, edgeTtl);
+    const cached = await kvGetJSON(env, key, memOnly, edgeTtl, missTtl);
     if (cached !== undefined && cached !== KV_MISS && cached !== KV_ERR) {
       // 有 KV：默认直接返回。仅 revalidate=true 且逻辑过期时才后台/同步刷新
       if (revalidate && needRefresh(cached)) {
@@ -693,11 +856,13 @@ async function cachedJSON(
     if (!__isErrorPayload(data)) {
       kvPutJSON(env, ctx, key, { data }, effectiveTtl, memOnly || kvBroken);
       kvMemStaleSet(key, data);
+      writeLastGood(data);
       markSource(false, null);
       return unwrap ? data : { data };
     }
-    const old = tryOldNormal();
-    if (old.found) return unwrap ? old.val : { data: old.val };
+    // 失败兜底链：内存 stale → 当前 key 的 KV 旧值 → last-good 副本
+    const fb = await fallbackChain();
+    if (fb.found) return unwrap ? fb.val : { data: fb.val };
     markSource(null, null);
     return null;
   });
@@ -723,8 +888,8 @@ async function cachedJSON(
  * ============================================================ */
 
 // 前端 SW：静态资源 stale-while-revalidate；/api/ 与导航请求不走缓存
-const SW_JS_CONTENT = String.raw`/* MineTrakt SW v121 */
-const VERSION = "v121";
+const SW_JS_CONTENT = String.raw`/* MineTrakt SW v123 */
+const VERSION = "v123";
 const RUNTIME_CACHE = "trakt-static-" + VERSION;
 const NAV_CACHE = "trakt-nav-" + VERSION;
 const NAV_TIMEOUT = 2500;
@@ -3166,7 +3331,7 @@ async function fetchWatchlistRaw(headers, sort, userKey) {
  * key 含版本号，写入 watchlist 后 bump 版本号即可让旧缓存自动失效。
  * force=1 时 bypass 缓存直接打 Trakt。
  */
-async function getWatchlist(headers, sort = "added", env, ctx, userKey, force) {
+async function getWatchlist(headers, sort = "added", env, ctx, userKey, force, sourceTracker) {
   if (!env) return fetchWatchlistRaw(headers, sort, userKey);
   const prefix = userKey || "anon";
   const ver = await getWatchlistVersion(env, ctx, prefix);
@@ -3178,11 +3343,13 @@ async function getWatchlist(headers, sort = "added", env, ctx, userKey, force) {
     {
       ttl: WATCHLIST_KV_TTL,
       missTtl: 180,
-      swr: false,
+      swr: true,
       edgeTtl: 300,
-      jitter: 120,
+      jitter: 300,
       bypass: !!force,
       revalidate: true,
+      lastGoodKey: CK.lastGood.watchlist(prefix, sort),
+      ...(sourceTracker ? { sourceTracker } : {}),
     },
   );
   return Array.isArray(data) ? data : null;
@@ -4224,7 +4391,7 @@ async function getUserActivitySig(headers, env, ctx, userKey) {
       ].join("|");
       return { sig };
     },
-    { ttl: 600, missTtl: 120, swr: false, memOnly: true, jitter: 60 },
+    { ttl: 600, missTtl: 120, swr: true, memOnly: true, jitter: 60 },
   );
 
   if (result && result.sig) {
@@ -4293,7 +4460,7 @@ async function getDroppedShowIds(headers, env, ctx, userKey) {
     {
       ttl: 1800,
       missTtl: 120,
-      swr: false,
+      swr: true,
       memOnly: false,
       edgeTtl: 300,
       jitter: 60,
@@ -4317,7 +4484,7 @@ async function getDroppedShowIds(headers, env, ctx, userKey) {
 }
 
 /** 带缓存的追剧日历拉取 */
-async function getCalendarCached(today, headers, env, ctx, userKey, force) {
+async function getCalendarCached(today, headers, env, ctx, userKey, force, sourceTracker) {
   const prefix = userKey || "anon";
   return cachedJSON(
     env,
@@ -4346,11 +4513,13 @@ async function getCalendarCached(today, headers, env, ctx, userKey, force) {
     {
       ttl: CALENDAR_KV_TTL,
       missTtl: 180,
-      swr: false,
+      swr: true,
       edgeTtl: 300,
-      jitter: 120,
+      jitter: 300,
       bypass: !!force,
       revalidate: true,
+      lastGoodKey: CK.lastGood.calendar(prefix),
+      ...(sourceTracker ? { sourceTracker } : {}),
     },
   );
 }
@@ -4417,10 +4586,15 @@ async function handleHomeData(request, env, ctx) {
 
   const playbackSrc = { fromCache: true, age: 0 };
   const metaSrc = { fromCache: null, age: 0 };
+  const watchlistSrc = { fromCache: true, age: 0 };
+  const calendarSrc = { fromCache: true, age: 0 };
+  const historySrc = { fromCache: true, age: 0 };
   const opts = (o) =>
     force
       ? { ...o, bypass: true, revalidate: true }
-      : { ...o, swr: false, revalidate: true };
+      : // 保留各分片自己的 swr 设置：过期先返回旧值 + waitUntil 后台刷新，
+        // 用户请求不再干等 Trakt，上游刷新也天然错峰
+        { ...o, revalidate: true };
   if (wantPlayback) {
     taskFns.push(async () => {
       playback = await cachedJSON(
@@ -4447,9 +4621,10 @@ async function handleHomeData(request, env, ctx) {
             swr: true,
             unwrap: true,
             edgeTtl: 300,
-            jitter: 120,
+            jitter: 300,
           }),
           sourceTracker: playbackSrc,
+          lastGoodKey: CK.lastGood.playback(userKey),
         },
       );
     });
@@ -4486,7 +4661,9 @@ async function handleHomeData(request, env, ctx) {
           swr: true,
           unwrap: true,
           edgeTtl: 300,
-          jitter: 120,
+          jitter: 300,
+          sourceTracker: historySrc,
+          lastGoodKey: CK.lastGood.history(userKey, 1),
         }),
       );
     });
@@ -4500,6 +4677,7 @@ async function handleHomeData(request, env, ctx) {
         ctx,
         userKey,
         force,
+        calendarSrc,
       );
     });
   }
@@ -4513,6 +4691,7 @@ async function handleHomeData(request, env, ctx) {
           ctx,
           userKey,
           force,
+          watchlistSrc,
         );
       } catch (e) {
         watchlist = null;
@@ -4535,9 +4714,10 @@ async function handleHomeData(request, env, ctx) {
             missTtl: 180,
             swr: true,
             edgeTtl: 300,
-            jitter: 200,
+            jitter: 300,
           }),
           sourceTracker: metaSrc,
+          lastGoodKey: CK.lastGood.profile(userKey),
         },
       );
     });
@@ -4555,13 +4735,14 @@ async function handleHomeData(request, env, ctx) {
           missTtl: 180,
           swr: true,
           edgeTtl: 300,
-          jitter: 120,
+          jitter: 300,
+          lastGoodKey: CK.lastGood.stats(userKey),
         }),
       );
     });
   }
-  const concurrency = force ? 1 : Math.min(6, Math.max(1, taskFns.length));
-  const gapMs = force ? 300 : 0;
+  const concurrency = 1;
+  const gapMs = force ? 500 : 400;
   await runLimited(taskFns, concurrency, gapMs);
   const actSig = await actSigP.catch(() => null);
   if (actSig && actSig.sig)
@@ -4704,6 +4885,31 @@ async function handleHomeData(request, env, ctx) {
     } catch {
       result.watchlistHtml = emptyPaneHtml("暂时无法加载待看列表");
     }
+  }
+
+  if (wantWatchlist) {
+    result.watchlistSource =
+      watchlistSrc.fromCache === true
+        ? "cache"
+        : watchlistSrc.fromCache === false
+          ? "live"
+          : "";
+  }
+  if (wantCalendar) {
+    result.calendarSource =
+      calendarSrc.fromCache === true
+        ? "cache"
+        : calendarSrc.fromCache === false
+          ? "live"
+          : "";
+  }
+  if (wantHistory) {
+    result.historySource =
+      historySrc.fromCache === true
+        ? "cache"
+        : historySrc.fromCache === false
+          ? "live"
+          : "";
   }
 
   return new Response(JSON.stringify(result), { headers: outHeaders });
@@ -5048,7 +5254,7 @@ async function handleSeason(request, env, ctx) {
             );
             return r && !r.__error ? r : null;
           },
-          { ttl: 1800, missTtl: 60, swr: false, edgeTtl: 300, jitter: 120 },
+          { ttl: 1800, missTtl: 60, swr: true, edgeTtl: 300, jitter: 180 },
         )
       : Promise.resolve(null),
     validShowId
@@ -5212,7 +5418,7 @@ async function handleApiDetail(request, env, ctx) {
               );
               return r && !r.__error ? r : null;
             },
-            { ttl: 1800, missTtl: 60, swr: false, edgeTtl: 300, jitter: 120 },
+            { ttl: 1800, missTtl: 60, swr: true, edgeTtl: 300, jitter: 180 },
           )
         : Promise.resolve(null);
 
@@ -5231,7 +5437,7 @@ async function handleApiDetail(request, env, ctx) {
               );
               return r && !r.__error ? r : null;
             },
-            { ttl: 1800, missTtl: 60, swr: false, edgeTtl: 300, jitter: 120 },
+            { ttl: 1800, missTtl: 60, swr: true, edgeTtl: 300, jitter: 180 },
           )
         : Promise.resolve(null);
 
@@ -6402,33 +6608,46 @@ async function handleMore(request, env, ctx) {
   const { auth, headers, needsCookieUpdate, userKey } = A;
 
   if (type === "history") {
-    let r;
-    try {
-      for (let i = 0; i < 3; i++) {
-        r = await fetchT(
-          `${TRAKT_API}/users/me/history?limit=${PAGE_SIZE}&page=${page}&extended=full&images=poster`,
-          {
-            headers,
-          },
-          9000,
-        );
-        if (r.status !== 429) break;
-        await backoff(i, 1000, 500);
-      }
-    } catch (e) {
+    // 翻页结果缓存 5 分钟：避免每次「加载更多」都直连 Trakt
+    const data = await cachedJSON(
+      env,
+      ctx,
+      CK.moreHistory(userKey, page),
+      async () => {
+        let r;
+        try {
+          for (let i = 0; i < 3; i++) {
+            r = await fetchT(
+              `${TRAKT_API}/users/me/history?limit=${PAGE_SIZE}&page=${page}&extended=full&images=poster`,
+              { headers },
+              9000,
+            );
+            if (r.status !== 429) break;
+            await backoff(i, 1000, 500);
+          }
+        } catch (e) {
+          return { __error: String(e) };
+        }
+        if (!r || !r.ok) return { __error: "HTTP " + ((r && r.status) || 502) };
+        const items = await r.json();
+        return {
+          items: Array.isArray(items) ? items : [],
+          pageCount:
+            parseInt(r.headers.get("X-Pagination-Page-Count") || "1") || 1,
+        };
+      },
+      { ttl: 300, missTtl: 60, swr: true, edgeTtl: 120, jitter: 120 },
+    );
+    if (!data || !Array.isArray(data.items))
       return new Response("", { status: 502 });
-    }
-    if (!r.ok) return new Response("", { status: r.status });
-    const items = await r.json(),
-      pageCount = parseInt(r.headers.get("X-Pagination-Page-Count") || "1"),
-      hasMore = page < pageCount;
+    const pageCount = data.pageCount || 1;
     return authResp(
       auth,
       needsCookieUpdate,
-      renderHistoryPage(items, env, true),
+      renderHistoryPage(data.items, env, true),
       {
         extra: {
-          "X-Has-More": String(hasMore),
+          "X-Has-More": String(page < pageCount),
           "X-Page": String(page),
           "X-Page-Count": String(pageCount),
         },
@@ -6438,40 +6657,47 @@ async function handleMore(request, env, ctx) {
 
   if (type === "playback") {
     const limit = limitParam > 0 ? Math.min(limitParam, 60) : 20;
-    let r;
-    try {
-      for (let i = 0; i < 3; i++) {
-        r = await fetchT(
-          `${TRAKT_API}/sync/progress/up_next_nitro?extended=full&images=poster&limit=${limit}&page=${page}&intent=continuing`,
-          {
-            headers,
-          },
-          9000,
-        );
-        if (r.status !== 429) break;
-        await backoff(i, 1000, 500);
-      }
-    } catch (e) {
-      return new Response("", { status: 502 });
-    }
-    if (!r || !r.ok)
-      return new Response("", { status: (r && r.status) || 502 });
-    const items = await r.json();
-    const list = Array.isArray(items) ? items : [];
-    const pageCount =
-      parseInt(r.headers.get("X-Pagination-Page-Count") || "0") || 0;
-    const hasMore = pageCount > 0 ? page < pageCount : list.length >= limit;
-    return authResp(
-      auth,
-      needsCookieUpdate,
-      renderContinueItems(list, "fragment"),
-      {
-        extra: {
-          "X-Has-More": String(hasMore),
-          "X-Page": String(page),
-        },
+    // 翻页结果缓存 5 分钟
+    const data = await cachedJSON(
+      env,
+      ctx,
+      CK.morePlayback(userKey, page, limit),
+      async () => {
+        let r;
+        try {
+          for (let i = 0; i < 3; i++) {
+            r = await fetchT(
+              `${TRAKT_API}/sync/progress/up_next_nitro?extended=full&images=poster&limit=${limit}&page=${page}&intent=continuing`,
+              { headers },
+              9000,
+            );
+            if (r.status !== 429) break;
+            await backoff(i, 1000, 500);
+          }
+        } catch (e) {
+          return { __error: String(e) };
+        }
+        if (!r || !r.ok) return { __error: "HTTP " + ((r && r.status) || 502) };
+        const items = await r.json();
+        return {
+          items: Array.isArray(items) ? items : [],
+          pageCount:
+            parseInt(r.headers.get("X-Pagination-Page-Count") || "0") || 0,
+        };
       },
+      { ttl: 300, missTtl: 60, swr: true, edgeTtl: 120, jitter: 150 },
     );
+    if (!data || !Array.isArray(data.items))
+      return new Response("", { status: 502 });
+    const list = data.items;
+    const pageCount = data.pageCount || 0;
+    const hasMore = pageCount > 0 ? page < pageCount : list.length >= limit;
+    return authResp(auth, needsCookieUpdate, renderContinueItems(list, "fragment"), {
+      extra: {
+        "X-Has-More": String(hasMore),
+        "X-Page": String(page),
+      },
+    });
   }
 
   if (type === "watchlist") {
@@ -6762,7 +6988,7 @@ function splashCriticalCss() {
 function getBootstrapScript() {
   return `(function(){var __CFG=window.__HOME_CONFIG__||{};if(!__CFG.loggedIn)return;window.__HOME_CONFIG__=null;if(__CFG.initialDetail)window.__initialDetail=__CFG.initialDetail;if(!window.__splashT0)window.__splashT0=Date.now();window.__splashHidden=false;window.__hideSplash=function(force){try{if(window.__splashHidden)return;window.__splashHidden=true;var el=document.getElementById('splash');if(!el)return;var wait=force?0:Math.max(0,120-(Date.now()-(window.__splashT0||Date.now())));setTimeout(function(){try{el.classList.add('hide');setTimeout(function(){try{if(el&&el.parentNode)el.parentNode.removeChild(el);}catch(e){}},280);}catch(e){}},wait);}catch(e){}};setTimeout(function(){if(window.__hideSplash)window.__hideSplash();},80);function lsGet(k){try{var v=localStorage.getItem(k);if(!v)return null;var o=JSON.parse(v);if(o&&o._exp&&o._exp<Date.now()){try{localStorage.removeItem(k);}catch(e){}return null;}return o&&o.data?o.data:null;}catch(e){return null;}}function lsSet(k,d,ttlSec){try{localStorage.setItem(k,JSON.stringify({data:d,_exp:Date.now()+ttlSec*1000}));}catch(e){try{localStorage.removeItem(k);}catch(e2){}}}window.__lsGet=lsGet;window.__lsSet=lsSet;function setHTML(sel,html){var el=typeof sel==='string'?document.querySelector(sel):sel;if(el)el.innerHTML=html||'';}window.__setHTML=setHTML;function applyAvatar(url){if(!url)return;var av=document.getElementById('hero-avatar');if(!av)return;var img=document.createElement('img');img.src=url;img.alt='';img.width=56;img.height=56;img.decoding='async';img.onerror=function(){av.innerHTML='<span class="hero-avatar-ph">👤</span>';};av.innerHTML='';av.appendChild(img);}function __setUpdatedAt(source){var el=document.getElementById('updated-at');if(!el)return;var d=new Date(),p=function(n){return(n<10?'0':'')+n;};var label='更新于 '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());if(source==='live')label+=' · 实时';else if(source==='cache')label+=' · 缓存';el.textContent=label;el.classList.remove('flash','src-live','src-cache');void el.offsetWidth;el.classList.add('flash');if(source==='live')el.classList.add('src-live');else if(source==='cache')el.classList.add('src-cache');}function applyPlayback(d,isCache){if(!d)return;if(d.playbackHScrollHtml)setHTML('#playback-hscroll',d.playbackHScrollHtml);var src=isCache?'cache':(d.playbackSource||'');__setUpdatedAt(src);if(window.__scheduleEnrich)window.__scheduleEnrich();}window.__applyPlayback=applyPlayback;function applyMeta(d,isCache){if(!d)return;var n=document.getElementById('hero-name');if(n&&d.name)n.textContent=d.name;applyAvatar(d.avatar);if(d.statsHtml)setHTML('#stats-box',d.statsHtml);if(!isCache)try{lsSet('mt:meta',d,1800);}catch(e){}}window.__applyMeta=applyMeta;var __homeDataLoading=false;
 function fetchPart(part,force){return fetch('/api/home-data?part='+encodeURIComponent(part)+(force?'&force=1':''),{credentials:'same-origin',cache:'no-store'}).then(function(r){if(r.status===401){return r.json().catch(function(){return{};}).then(function(d){var msg=(d&&d.error)||'登录已失效，请重新登录';try{sessionStorage.setItem('mt:relogin',msg);}catch(e){}if(window.__toast)window.__toast(msg,{type:'warn',duration:2200});setTimeout(function(){location.href='/login';},1000);return null;});}if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){if(!d)return null;if(d.login){location.href='/login';return null;}return d;});}window.__fetchPart=fetchPart;var __loadedParts={};function loadPartOnce(part){if(__loadedParts[part])return Promise.resolve(__loadedParts[part]);return fetchPart(part).then(function(d){__loadedParts[part]=d;return d;});}window.__loadPartOnce=loadPartOnce;window.__loadedParts=__loadedParts;function loadHomeData(opts){opts=opts||{};var silent=!!opts.silent;if(__homeDataLoading&&!silent)return;__homeDataLoading=true;__lastRefreshAt=Date.now();function onPlayback(d,isCache){if(!d)return;applyPlayback(d,isCache);if(!isCache){try{lsSet('mt:pb',d,900);}catch(e){}if(!silent&&window.__initialDetail){var s=window.__initialDetail,idx=s.indexOf('/');if(idx>0&&window.openDetail)openDetail(s.slice(0,idx),s.slice(idx+1),false);window.__initialDetail=null;}}if(!silent&&window.__hideSplash)window.__hideSplash(true);}if(!silent){var cachedPb=lsGet('mt:pb');if(cachedPb){try{onPlayback(cachedPb,true);}catch(e){}}else if(window.__earlyPbApplied&&window.__hideSplash){window.__hideSplash(true);}}var pPlayback;if(!silent&&window.__primaryBootP){pPlayback=window.__primaryBootP.then(function(d){window.__primaryBootP=null;if(d){onPlayback(d,false);return d;}return fetchPart('playback').then(function(x){onPlayback(x,false);return x;});}).catch(function(){return fetchPart('playback').then(function(x){onPlayback(x,false);return x;});});}else{pPlayback=fetchPart('playback').then(function(x){onPlayback(x,false);return x;});}pPlayback=pPlayback.catch(function(){if(!silent){setHTML('#playback-hscroll','<div class="empty"><p>请求过于频繁或网络异常，请稍后重试</p><p style="margin-top:12px"><button class="btn-ghost" onclick="location.reload()">重试</button></p></div>');if(window.__hideSplash)window.__hideSplash(true);}});Promise.resolve(pPlayback).then(function(){__homeDataLoading=false;if(!silent){var cachedMeta=lsGet('mt:meta');if(cachedMeta)setTimeout(function(){try{applyMeta(cachedMeta,true);}catch(e){}},0);}var runMeta=function(){fetchPart('meta').then(function(d){applyMeta(d,false);}).catch(function(){});};if(window.requestIdleCallback)requestIdleCallback(runMeta,{timeout:800});else setTimeout(runMeta,80);});}var __refreshTick=0;function silentRefresh(){if(document.hidden)return;var __m=document.getElementById('modal');if(__m&&__m.classList.contains('open'))return;__refreshTick++;__lastRefreshAt=Date.now();fetchPart('playback').then(function(d){applyPlayback(d);try{lsSet('mt:pb',d,900);}catch(e){}}).catch(function(){});if(__refreshTick%4===0)fetchPart('meta').then(function(d){applyMeta(d,false);}).catch(function(){});}window.__refreshStats=silentRefresh;
-window.forceRefresh=async function(){if(window.__forceRefreshing)return;window.__forceRefreshing=true;try{localStorage.removeItem('mt:pb');localStorage.removeItem('mt:meta');}catch(e){}var btn=document.getElementById('btn-refresh');var span=btn&&btn.querySelector('span');var oldText=span?span.textContent:'刷新';if(btn)btn.classList.add('loading');if(span)span.textContent='刷新中';var okCount=0,cacheCount=0,failCount=0,cooling=0,hitLimit=false;var GAP_OK=300,GAP_LIMIT=1000;try{var wanted=['playback','meta'];var loaded=window.__loadedParts||{};['history'].forEach(function(p){if(loaded[p])wanted.push(p);});for(var i=0;i<wanted.length;i++){if(hitLimit)break;var part=wanted[i];if(i>0){var gap=cooling>0?GAP_LIMIT:GAP_OK;await new Promise(function(r){setTimeout(r,gap);});}var d=null;try{d=await fetchPart(part,true);}catch(e){d=null;}if(!d){failCount++;continue;}var isCache=false;if(part==='playback'&&d.playbackSource==='cache')isCache=true;if(part==='meta'&&d.metaSource==='cache')isCache=true;if(isCache)cacheCount++;else okCount++;if(part==='playback'){applyPlayback(d);try{lsSet('mt:pb',d,900);}catch(e){}}else if(part==='meta'){applyMeta(d,false);}else if(part==='watchlist'&&d.watchlistHtml){__setHTML('#watchlist',d.watchlistHtml);}else if(part==='calendar'&&d.calendarHtml){__setHTML('#calendar',d.calendarHtml);}else if(part==='history'){if(d.historyHtml)__setHTML('#history .grid',d.historyHtml);if(d.historyMoreHtml!=null)__setHTML('#history-more',d.historyMoreHtml);}window.__loadedParts[part]=d;if(d.rateLimited||(d.cooling&&d.cooling>0)){hitLimit=true;cooling=Math.max(cooling,Number(d.cooling)||0);}else if(isCache&&(part==='playback'||part==='meta')){hitLimit=true;}}if(failCount&&!okCount&&!cacheCount){__errToast('刷新失败',new Error('Trakt 或网络不可用'));}else if(hitLimit){var msg=cooling>0?('Trakt 限流，已展示缓存（约 '+cooling+' 秒后再试）'):'已用缓存数据（上游暂不可用）';__toast(msg,{type:'warn',duration:2200});}else if(failCount||cacheCount){__toast('已刷新（部分数据来自缓存）',{type:'warn',duration:1800});}else{__toast('已刷新',{type:'success',duration:1200});}if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){__errToast('刷新失败',e);}finally{if(btn)btn.classList.remove('loading');if(span)span.textContent=oldText;window.__forceRefreshing=false;}};
+window.forceRefresh=async function(){if(window.__forceRefreshing)return;window.__forceRefreshing=true;try{localStorage.removeItem('mt:pb');localStorage.removeItem('mt:meta');}catch(e){}var btn=document.getElementById('btn-refresh');var span=btn&&btn.querySelector('span');var oldText=span?span.textContent:'刷新';if(btn)btn.classList.add('loading');if(span)span.textContent='刷新中';var okCount=0,cacheCount=0,failCount=0,cooling=0,hitLimit=false;var GAP_OK=300,GAP_LIMIT=1000;try{var wanted=['playback','meta'];var loaded=window.__loadedParts||{};['history'].forEach(function(p){if(loaded[p])wanted.push(p);});for(var i=0;i<wanted.length;i++){if(hitLimit)break;var part=wanted[i];if(i>0){var gap=cooling>0?GAP_LIMIT:GAP_OK;await new Promise(function(r){setTimeout(r,gap);});}var d=null;try{d=await fetchPart(part,true);}catch(e){d=null;}if(!d){failCount++;continue;}var isCache=false;if(part==='playback'&&d.playbackSource==='cache')isCache=true;if(part==='meta'&&d.metaSource==='cache')isCache=true;if(isCache)cacheCount++;else okCount++;if(part==='playback'){applyPlayback(d);try{lsSet('mt:pb',d,900);}catch(e){}}else if(part==='meta'){applyMeta(d,false);}else if(part==='watchlist'||part==='calendar'||part==='history'){__applyPart(part,d);__savePartSnap(part,d);}window.__loadedParts[part]=d;if(__partFailed(d)){try{delete window.__loadedParts[part];}catch(e){}}if(d.rateLimited||(d.cooling&&d.cooling>0)){hitLimit=true;cooling=Math.max(cooling,Number(d.cooling)||0);}else if(isCache&&(part==='playback'||part==='meta')){hitLimit=true;}}if(failCount&&!okCount&&!cacheCount){__errToast('刷新失败',new Error('Trakt 或网络不可用'));}else if(hitLimit){var msg=cooling>0?('Trakt 限流，已展示缓存（约 '+cooling+' 秒后再试）'):'已用缓存数据（上游暂不可用）';__toast(msg,{type:'warn',duration:2200});}else if(failCount||cacheCount){__toast('已刷新（部分数据来自缓存）',{type:'warn',duration:1800});}else{__toast('已刷新',{type:'success',duration:1200});}if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){__errToast('刷新失败',e);}finally{if(btn)btn.classList.remove('loading');if(span)span.textContent=oldText;window.__forceRefreshing=false;}};
 function startHomeData(){loadHomeData({silent:false});}if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',startHomeData);}else{startHomeData();}var REFRESH_MS=${HOME_AUTO_REFRESH_MINUTES}*60*1000;var __lastRefreshAt=Date.now();if(REFRESH_MS>0){setInterval(silentRefresh,REFRESH_MS);document.addEventListener('visibilitychange',function(){if(document.hidden)return;if(Date.now()-__lastRefreshAt>=REFRESH_MS)silentRefresh();});}})();`;
 }
 
@@ -6801,7 +7027,28 @@ async function __apiJson(r){var data=null;try{data=await r.json();}catch(e){data
 function __confirm(opts){opts=opts||{};return new Promise(function(resolve){var modal=document.getElementById('confirm-modal');if(!modal){resolve(window.confirm(opts.message||opts.title||'确认操作'));return;}var iconEl=document.getElementById('confirm-icon'),titleEl=document.getElementById('confirm-title'),msgEl=document.getElementById('confirm-msg'),okBtn=document.getElementById('confirm-ok'),cancelBtn=document.getElementById('confirm-cancel'),backdrop=modal.querySelector('.confirm-backdrop');iconEl.className='confirm-icon'+(opts.tone?' '+opts.tone:'');iconEl.textContent=opts.icon||'?';titleEl.textContent=opts.title||'确认操作';msgEl.textContent=opts.message||'';msgEl.style.display=opts.message?'':'none';okBtn.textContent=opts.okText||'确定';cancelBtn.textContent=opts.cancelText||'取消';okBtn.className='confirm-btn confirm-ok'+(opts.tone==='danger'?' danger':'');var settled=false;function cleanup(){okBtn.removeEventListener('click',onOk);cancelBtn.removeEventListener('click',onCancel);backdrop.removeEventListener('click',onCancel);document.removeEventListener('keydown',onKey,true);modal.classList.remove('open');modal.style.display='none';}function finish(v){if(settled)return;settled=true;cleanup();resolve(v);}function onOk(){finish(true);}function onCancel(){finish(false);}function onKey(e){if(e.key==='Escape'){e.preventDefault();e.stopPropagation();finish(false);}}okBtn.addEventListener('click',onOk);cancelBtn.addEventListener('click',onCancel);backdrop.addEventListener('click',onCancel);document.addEventListener('keydown',onKey,true);modal.style.display='block';modal.classList.add('open');setTimeout(function(){try{okBtn.focus();}catch(err){}},40);});}window.__confirm=__confirm;
 function __fadeRemoveCard(card){if(!card)return;card.style.transition='opacity 0.25s ease, transform 0.25s ease';card.style.opacity='0';card.style.transform='scale(0.96)';setTimeout(function(){var day=card.closest('.day'),pane=card.closest('.pane');card.remove();if(day&&!day.querySelector('.item')){day.style.transition='opacity 0.2s ease';day.style.opacity='0';setTimeout(function(){if(day.parentNode)day.remove();__maybeShowEmpty(pane);if(window.__refreshStats)window.__refreshStats();},200);return;}__maybeShowEmpty(pane);if(window.__refreshStats)window.__refreshStats();},260);}
 function __maybeShowEmpty(pane){if(!pane)return;setTimeout(function(){if(pane.querySelector('.item'))return;if(pane.querySelector('.empty'))return;var grid=pane.querySelector('.grid');if(!grid)return;var pid=pane.id,txt='这里暂时没有内容';if(pid==='playback')txt='暂时没有继续观看的内容';else if(pid==='watchlist')txt='待看列表是空的';else if(pid==='calendar')txt='未来 30 天没有待播剧集';else if(pid==='history')txt='还没有观看记录';grid.innerHTML='<div class="empty"><p>'+txt+'</p></div>';},120);}
-document.querySelectorAll('.tab').forEach(t=>{t.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.pane').forEach(x=>x.classList.remove('active'));t.classList.add('active');var tabName=t.dataset.tab,pane=document.getElementById(tabName);if(pane)pane.classList.add('active');if(tabName==='search'){setTimeout(function(){var inp=document.getElementById('search-input');if(inp)inp.focus();if(inp&&!inp.value.trim()&&window.__loadTrending)window.__loadTrending();},60);return;}if(tabName==='playback')return;var partMap={watchlist:'watchlist',calendar:'calendar',history:'history'};var part=partMap[tabName];if(!part)return;var loaded=window.__loadedParts||{};if(loaded[part])return;window.__loadPartOnce(part).then(function(d){if(!d)return;if(part==='watchlist'){if(d.watchlistHtml)__setHTML('#watchlist',d.watchlistHtml);}else if(part==='calendar'){if(d.calendarHtml){__setHTML('#calendar',d.calendarHtml);try{var dropped=JSON.parse(localStorage.getItem('mt:dropped')||'[]');if(Array.isArray(dropped)&&dropped.length){var cal=document.getElementById('calendar');if(cal)dropped.forEach(function(did){cal.querySelectorAll('[data-drop-show-id="'+did+'"]').forEach(function(b){var card=b.closest('.item');if(card){var day=card.closest('.day');card.remove();if(day&&!day.querySelector('.item'))day.remove();}});});}}catch(e){}}}else if(part==='history'){if(d.historyHtml)__setHTML('#history .grid',d.historyHtml);if(d.historyMoreHtml!=null)__setHTML('#history-more',d.historyMoreHtml);}if(window.__scheduleEnrich)window.__scheduleEnrich();}).catch(function(){var p=document.getElementById(tabName);if(p)p.innerHTML='<div class="empty"><p>加载失败，请稍后重试</p></div>';});});});
+/* 分片渲染：把 home-data part 响应统一落到对应 pane */
+function __partHtml(d){return d?String((d.watchlistHtml||'')+(d.calendarHtml||'')+(d.historyHtml||'')):'';}
+/* 服务端兜底占位（"暂时无法加载…"）视为失败：不写快照、不进内存缓存、允许重试 */
+function __partFailed(d){if(!d)return true;var h=__partHtml(d);if(!h&&d.historyMoreHtml==null)return true;return /暂时无法加载/.test(h);}
+function __applyPart(part,d){if(!d)return false;if(part==='watchlist'){if(d.watchlistHtml)__setHTML('#watchlist',d.watchlistHtml);}else if(part==='calendar'){if(d.calendarHtml){__setHTML('#calendar',d.calendarHtml);try{var dropped=JSON.parse(localStorage.getItem('mt:dropped')||'[]');if(Array.isArray(dropped)&&dropped.length){var cal=document.getElementById('calendar');if(cal)dropped.forEach(function(did){cal.querySelectorAll('[data-drop-show-id="'+did+'"]').forEach(function(b){var card=b.closest('.item');if(card){var day=card.closest('.day');card.remove();if(day&&!day.querySelector('.item'))day.remove();}});});}}catch(e){}}}else if(part==='history'){if(d.historyHtml)__setHTML('#history .grid',d.historyHtml);if(d.historyMoreHtml!=null)__setHTML('#history-more',d.historyMoreHtml);}else{return false;}if(window.__scheduleEnrich)window.__scheduleEnrich();return true;}
+window.__applyPart=__applyPart;window.__partFailed=__partFailed;
+/* 分片本地快照：上游全挂 / KV 被清时用手机本地缓存兜底展示 */
+var __PART_LS={watchlist:'mt:wl',calendar:'mt:cal',history:'mt:hist'},__PART_SNAP_TTL=259200; /* 3 天 */
+/* 启动脚本的 lsGet/lsSet 在 IIFE 内，这里必须走 window.__lsGet/__lsSet 暴露的版本 */
+function __lsGetSafe(k){try{if(typeof window.__lsGet==='function')return window.__lsGet(k);}catch(e){}try{var v=localStorage.getItem(k);if(!v)return null;var o=JSON.parse(v);if(o&&o._exp&&o._exp<Date.now()){try{localStorage.removeItem(k);}catch(e2){}return null;}return o&&o.data?o.data:null;}catch(e){return null;}}
+function __lsSetSafe(k,d,ttlSec){try{if(typeof window.__lsSet==='function'){window.__lsSet(k,d,ttlSec);return;}localStorage.setItem(k,JSON.stringify({data:d,_exp:Date.now()+ttlSec*1000}));}catch(e){}}
+function __savePartSnap(part,d){var k=__PART_LS[part];if(!k||!d||__partFailed(d))return;__lsSetSafe(k,d,__PART_SNAP_TTL);}
+function __loadPartSnap(part){var k=__PART_LS[part];if(!k)return null;var s=__lsGetSafe(k);return s&&!__partFailed(s)?s:null;}
+window.__savePartSnap=__savePartSnap;window.__loadPartSnap=__loadPartSnap;
+/* 取分片：失败结果不进 __loadedParts，保证下次点击能真正重试 */
+function __fetchPartForTab(part){try{delete window.__loadedParts[part];}catch(e){}return window.__loadPartOnce(part).then(function(d){if(__partFailed(d)){try{delete window.__loadedParts[part];}catch(e){}return null;}__savePartSnap(part,d);return d;}).catch(function(){try{delete window.__loadedParts[part];}catch(e){}return null;});}
+window.__fetchPartForTab=__fetchPartForTab;
+document.querySelectorAll('.tab').forEach(t=>{t.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.pane').forEach(x=>x.classList.remove('active'));t.classList.add('active');var tabName=t.dataset.tab,pane=document.getElementById(tabName);if(pane)pane.classList.add('active');if(tabName==='search'){setTimeout(function(){var inp=document.getElementById('search-input');if(inp)inp.focus();if(inp&&!inp.value.trim()&&window.__loadTrending)window.__loadTrending();},60);return;}if(tabName==='playback')return;var partMap={watchlist:'watchlist',calendar:'calendar',history:'history'};var part=partMap[tabName];if(!part)return;var loaded=window.__loadedParts||{};if(loaded[part]&&!__partFailed(loaded[part]))return;var snap=__loadPartSnap(part);if(snap)__applyPart(part,snap);window.__fetchPartForTab(part).then(function(d){if(d){__applyPart(part,d);return;}var lv=snap||__loadPartSnap(part);if(lv){__applyPart(part,lv);if(window.__toast)window.__toast('上游暂不可用，已展示上次数据',{type:'warn',duration:1800});return;}var p=document.getElementById(tabName);if(p)p.innerHTML='<div class="empty"><p>加载失败，请稍后重试</p></div>';});});});
+/* 首屏空闲预热待看/日历/记录：
+   ① tab 秒开；② 让服务端 KV 保持热度，避免低频分片被 CF 按 expirationTtl 物理删除。
+   非 force 拉取，服务端命中缓存时不会打 Trakt；命中限流冷却时会走兜底链，不额外触发 429。 */
+(function(){var order=['watchlist','calendar','history'],GAP=4000;function warm(i){if(i>=order.length||document.hidden)return;var p=order[i];function next(){setTimeout(function(){warm(i+1);},GAP);}var loaded=window.__loadedParts||{};if(loaded[p]&&!__partFailed(loaded[p])){next();return;}__fetchPartForTab(p).then(next);}function start(){setTimeout(function(){warm(0);},1500);}if(window.requestIdleCallback)window.requestIdleCallback(start,{timeout:3000});else start();})();
 async function logout(){if(!(await __confirm({icon:'🚪',title:'退出登录',message:'确定要退出当前 Trakt 账号吗？',okText:'退出',cancelText:'取消',tone:'warn'})))return;try{localStorage.removeItem('mt:pb');localStorage.removeItem('mt:meta');}catch(e){}await fetch('/auth/logout',{method:'POST'});location.href='/login';}
 window.logout=logout;
 async function loadMoreHistory(btn){return __loadMore(btn,'#history .grid','/api/more?type=history&page='+parseInt(btn.dataset.page||'2'));}
