@@ -124,8 +124,8 @@ const KV_STALE_RETENTION = 86400 * 7,
 
 const HOME_AUTO_REFRESH_MINUTES = 30;
 
-const APP_JS_VERSION = "132",
-  APP_CSS_VERSION = "132";
+const APP_JS_VERSION = "133",
+  APP_CSS_VERSION = "133";
 
 const CC_API = "public, max-age=1800, stale-while-revalidate=600";
 const CC_NO_STORE = "no-store";
@@ -382,6 +382,7 @@ const KV_MEM_TTL = 1800000,
   KV_DOWN_COOLDOWN_MS = 30000;
 
 const KV_MIN_PUT_INTERVAL_MS = 3600000;
+const LAST_GOOD_MIN_PUT_INTERVAL_MS = 6 * 3600000;
 const DEFAULT_JITTER_SEC = 600;
 const __KV_LASTPUT_MAX = 5000;
 
@@ -502,7 +503,7 @@ async function kvGetJSON(env, key, memOnly, edgeTtl, missTtl) {
  * 写入缓存：先写内存，再异步写 KV。
  * payload 会带 _ts / _ttl；KV 实际 expiration 会额外保留一段 stale。
  */
-function kvPutJSON(env, ctx, key, payload, ttl, memOnly, force) {
+function kvPutJSON(env, ctx, key, payload, ttl, memOnly, force, staleRetention) {
   const memMs =
     payload && payload.miss
       ? 30000
@@ -537,7 +538,7 @@ function kvPutJSON(env, ctx, key, payload, ttl, memOnly, force) {
   }
 
   const logicalTtl = ttl || 60;
-  const staleRetention = KV_STALE_RETENTION;
+  const staleRet = staleRetention != null ? staleRetention : KV_STALE_RETENTION;
   const body =
     payload && typeof payload === "object"
       ? { ...payload, _ttl: logicalTtl }
@@ -546,7 +547,7 @@ function kvPutJSON(env, ctx, key, payload, ttl, memOnly, force) {
   const p = env.TMDB_CACHE.put(key, JSON.stringify(body), {
     expirationTtl: Math.min(
       86400 * 30,
-      Math.max(60, logicalTtl + staleRetention),
+      Math.max(60, logicalTtl + staleRet),
     ),
   })
     .then(() => kvMarkUp())
@@ -613,6 +614,7 @@ async function cachedJSON(
     sourceTracker = null,
     lastGoodKey = null,
     revalidate = true,
+    staleRetention = null,
   } = {},
 ) {
   const jitterSec = stableJitter(
@@ -752,6 +754,11 @@ async function cachedJSON(
   /** 把成功数据同步写一份到 last-good 副本 */
   function writeLastGood(data) {
     if (!lastGoodKey) return;
+    const now = Date.now();
+    const guardKey = "lgput:" + lastGoodKey;
+    const last = __kvLastPut.get(guardKey) || 0;
+    if (last && now - last < LAST_GOOD_MIN_PUT_INTERVAL_MS) return;
+    __kvLastPut.set(guardKey, now);
     kvPutJSON(env, ctx, lastGoodKey, { data }, LAST_GOOD_KV_TTL, false);
   }
 
@@ -941,7 +948,7 @@ async function cachedJSON(
 
 /* 前端 SW：静态资源 stale-while-revalidate；/api/ 与导航请求不走缓存 */
 const SW_JS_CONTENT = String.raw`
-const VERSION = "v132";
+const VERSION = "v133";
 const RUNTIME_CACHE = "trakt-static-" + VERSION;
 const NAV_CACHE = "trakt-nav-" + VERSION;
 const NAV_TIMEOUT = 2500;
@@ -3414,6 +3421,7 @@ async function getWatchlist(
       bypass: !!force,
       revalidate: true,
       lastGoodKey: CK.lastGood.watchlist(prefix, sort),
+      staleRetention: 86400,
       ...(sourceTracker ? { sourceTracker } : {}),
     },
   );
@@ -3720,11 +3728,13 @@ async function handleMarkSeasonWatched(request, env, ctx) {
         kvPutJSON(
           env,
           ctx,
-          CK.season(showId, season),
-          { data: r },
-          SEASON_KV_TTL,
-          false,
-        );
+          key,
+          { data, _ts: wts },
+          effectiveTtl,
+          memOnlyOverride != null ? memOnlyOverride : memOnly,
+          force,
+          staleRetention,
+    );
       }
     } catch {}
   }
@@ -4678,6 +4688,7 @@ async function getCalendarCached(
       bypass: !!force,
       revalidate: true,
       lastGoodKey: CK.lastGood.calendar(prefix),
+      staleRetention: 86400,
       ...(sourceTracker ? { sourceTracker } : {}),
     },
   );
