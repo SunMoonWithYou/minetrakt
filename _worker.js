@@ -70,7 +70,7 @@ const THEME_STORAGE_KEY = "mt:theme",
  * 从而在任何首帧渲染之前就确定主题，彻底避免 FOUC（黑→白闪烁）。
  * 注意：用裸 localStorage（不走 lsGet 的 TTL 包装），否则读到 {data:...} 解析失败。
  */
-const THEME_BOOT_SCRIPT = `<script>(function(){try{var K=${JSON.stringify(THEME_STORAGE_KEY)};var t=localStorage.getItem(K);if(t!=='light'&&t!=='dark'&&t!=='system')t='dark';var d=document.documentElement;d.setAttribute('data-theme',t);var dark=(t==='dark')||(t==='system'&&(!window.matchMedia||matchMedia('(prefers-color-scheme: dark)').matches));var c=dark?${JSON.stringify(THEME_COLOR_DARK)}:${JSON.stringify(THEME_COLOR_LIGHT)};var tc=document.querySelector('meta[name="theme-color"]');if(tc)tc.setAttribute('content',c);var cs=document.querySelector('meta[name="color-scheme"]');if(cs)cs.setAttribute('content',dark?'dark':'light');var sb=document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]');if(sb)sb.setAttribute('content',dark?'black-translucent':'default');d.style.backgroundColor=c;})();<\/script>`;
+const THEME_BOOT_SCRIPT = `<script>(function(){try{var K=${JSON.stringify(THEME_STORAGE_KEY)};var t=localStorage.getItem(K);if(t!=='light'&&t!=='dark'&&t!=='system')t='dark';var d=document.documentElement;d.setAttribute('data-theme',t);var dark=(t==='dark')||(t==='system'&&(!window.matchMedia||matchMedia('(prefers-color-scheme: dark)').matches));var c=dark?${JSON.stringify(THEME_COLOR_DARK)}:${JSON.stringify(THEME_COLOR_LIGHT)};var tc=document.querySelector('meta[name="theme-color"]');if(tc)tc.setAttribute('content',c);var cs=document.querySelector('meta[name="color-scheme"]');if(cs)cs.setAttribute('content',dark?'dark':'light');var sb=document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]');if(sb)sb.setAttribute('content',dark?'black-translucent':'default');d.style.backgroundColor=c;}catch(e){}})();<\/script>`;
 const FAVICON_URL = "/assets/favicon.ico",
   ICON_192 = "/assets/icon-192.png",
   ICON_512 = "/assets/icon-512.png",
@@ -94,7 +94,7 @@ const ASSET_ORIGINS = {
     "image/png",
   ],
 };
-const TRAKT_UA = "MineTrakt/1.0 (+https://minetrakt.app; Cloudflare-Workers)";
+const TRAKT_UA = "MineTrakt/1.0";
 const JSON_HEADERS = {
   "Content-Type": "application/json",
   "User-Agent": TRAKT_UA,
@@ -107,14 +107,14 @@ const PAGE_SIZE = 20, // 历史记录每页条数
   TMDB_KV_TTL = 86400 * 7, // TMDB 详情：7 天
   OMDB_KV_TTL = 86400 * 7, // OMDB 评分：7 天
   WATCHLIST_PAGE_SIZE = 30, // watchlist 每页 30 条
-  WATCHLIST_KV_TTL = 7200, // watchlist：2 小时
-  CALENDAR_KV_TTL = 7200, // 日历：2 小时
+  WATCHLIST_KV_TTL = 3600, // watchlist：1 小时（原 30 分钟，配合三层兜底可放宽）
+  CALENDAR_KV_TTL = 3600, // 日历：1 小时（原 30 分钟）
   TREND_KV_TTL = 21600, // 趋势：6 小时
   MISS_KV_TTL = 300, // 空结果：5 分钟（防击穿）
-  HISTORY_KV_TTL = 10800, // 历史记录：3 小时
-  PLAYBACK_KV_TTL = 7200, // 继续观看：2 小时
-  STATS_KV_TTL = 7200, // 统计：2 小时
-  PROFILE_KV_TTL = 14400, // 用户资料：4 小时
+  HISTORY_KV_TTL = 5400, // 历史记录：1.5 小时（原 1 小时）
+  PLAYBACK_KV_TTL = 5400, // 继续观看：1.5 小时（原 1 小时）
+  STATS_KV_TTL = 3600, // 统计：1 小时
+  PROFILE_KV_TTL = 7200, // 用户资料：2 小时
   ENTITY_KV_TTL = 86400, // Trakt 实体：1 天
   SEASON_KV_TTL = 86400, // 季数据：1 天
   DOUBAN_KV_TTL = 21600, // 豆瓣列表：6 小时
@@ -127,8 +127,8 @@ const PAGE_SIZE = 20, // 历史记录每页条数
  *   key 不含日期/版本号，用于跨 key 轮换兜底（日历换天、待看换版本号）。 */
 const KV_STALE_RETENTION = 86400 * 7,
   LAST_GOOD_KV_TTL = 86400 * 7;
-const HOME_AUTO_REFRESH_MINUTES = 60; // 静默刷新间隔（分钟）；不 force，过期才回源
-const APP_JS_VERSION = "127",
+const HOME_AUTO_REFRESH_MINUTES = 30;
+const APP_JS_VERSION = "123",
   APP_CSS_VERSION = "121";
 
 const CC_API = "public, max-age=1800, stale-while-revalidate=600"; // API 数据：本地 30 分钟 + SWR 后台刷新
@@ -216,8 +216,8 @@ const backoff = (i, base = 500, jitter = 500) =>
  * hidden/dropped 等直接用 fetchT，只有拦在这一层才能全覆盖。
  * ============================================================ */
 const TRAKT_HOST_RE = /^https?:\/\/api\.trakt\.tv\//i;
-const TRAKT_MIN_GAP_MS = 1800; // 两次 Trakt 请求最小间隔（1.8s，削峰降风控）
-const TRAKT_GAP_MAX_WAIT_MS = 12000; // 单请求最多排队等待，超时放行避免拖死
+const TRAKT_MIN_GAP_MS = 1000; // 两次 Trakt 请求最小间隔
+const TRAKT_GAP_MAX_WAIT_MS = 10000; // 单请求最多排队等待，超时放行避免拖死
 let __traktTail = Promise.resolve(),
   __traktLast = 0;
 /** 排队获取一次 Trakt 出网许可（FIFO + 最小间隔） */
@@ -306,8 +306,7 @@ function consumeRetryAfter(r, userKey) {
  * - 尊重 per-user 429 冷却（isTraktRateLimited），冷却期内不发网络请求
  * - 429 时解析 Retry-After 并 markTraktRateLimited
  * - wantPageCount：把 X-Pagination-Page-Count 挂到数组的 __pageCount（不可枚举）
- * - 返回值：仅 2xx 成功为 JSON 本体；404/403/429/5xx/网络失败为 { __error, __cooling? }
- *   （失败结果不得写入 KV，由 cachedJSON 的 __isErrorPayload 拦截）
+ * - 返回值若失败为 { __error, __cooling? }，成功为 JSON 本体
  */
 async function traktFetch(
   url,
@@ -341,9 +340,13 @@ async function traktFetch(
           ...errShape,
         };
       }
-      // 404 与 5xx 一律失败：禁止空数组冒充成功写入 KV（仅 2xx 成功才更新缓存）
       if (r.status === 404) {
-        return { __error: "HTTP 404", ...errShape };
+        return wantPageCount
+          ? Object.defineProperty([], "__pageCount", {
+              value: 1,
+              enumerable: false,
+            })
+          : null;
       }
       if (r.status === 403) {
         return { __error: "HTTP 403", ...errShape };
@@ -442,22 +445,18 @@ function kvMemSet(key, val, ttlMs) {
   __kvMemExp.set(key, Date.now() + (ttlMs || KV_MEM_TTL));
   if (__kvMem.size > 4000) {
     const now = Date.now();
-    // 1) 先清已过期
     for (const [k, t] of __kvMemExp) {
       if (t < now) {
         __kvMem.delete(k);
         __kvMemExp.delete(k);
       }
     }
-    // 2) 仍超限：按过期时间升序淘汰最老的 ~800 条（比 FIFO 更合理）
     if (__kvMem.size > 4000) {
-      const arr = [];
-      for (const [k, t] of __kvMemExp) arr.push([k, t]);
-      arr.sort((a, b) => a[1] - b[1]);
-      const n = Math.min(800, arr.length);
-      for (let i = 0; i < n; i++) {
-        __kvMem.delete(arr[i][0]);
-        __kvMemExp.delete(arr[i][0]);
+      let i = 0;
+      for (const k of __kvMem.keys()) {
+        __kvMem.delete(k);
+        __kvMemExp.delete(k);
+        if (++i >= 800) break;
       }
     }
   }
@@ -480,8 +479,7 @@ function singleFlight(key, fn) {
 
 /** 读缓存：内存优先，未命中再读 KV；KV 异常时返回 KV_ERR 并短暂标记 down。 */
 async function kvGetJSON(env, key, memOnly, edgeTtl, missTtl) {
-  const mem = kvMemGet(key);
-  if (mem !== undefined) return mem;
+  // 读路径一律走 KV，避免内存负缓存（KV_MISS）挡住真实数据
   if (memOnly) return undefined;
   if (!env.TMDB_CACHE || kvIsDown()) return KV_ERR;
   try {
@@ -490,16 +488,7 @@ async function kvGetJSON(env, key, memOnly, edgeTtl, missTtl) {
       cacheTtl: edgeTtl || KV_EDGE_TTL,
     });
     kvMarkUp();
-    const result = v === null || v === undefined ? KV_MISS : v;
-    // KV 明确为空：只在内存里做短时负缓存（missTtl），避免上游一恢复就被之前的空标记挡住
-    const memMs =
-      result === KV_MISS
-        ? Math.max(5000, (missTtl || MISS_KV_TTL) * 1000)
-        : result && result._ttl
-          ? Math.min(KV_MEM_TTL, Math.max(5000, result._ttl * 1000))
-          : KV_MEM_TTL;
-    kvMemSet(key, result, memMs);
-    return result;
+    return v === null || v === undefined ? KV_MISS : v;
   } catch {
     kvMarkDown();
     return KV_ERR;
@@ -775,10 +764,9 @@ async function cachedJSON(
     return false;
   }
 
-  /** 后台异步刷新（SWR），失败不写 KV；限流中禁止回源 */
+  /** 后台异步刷新（SWR），失败不写 KV */
   function scheduleRefresh() {
     if (!ctx || typeof ctx.waitUntil !== "function") return;
-    if (userKey && isTraktRateLimited(userKey)) return;
     const flightKey = "swr:" + key;
     if (__kvInflight.has(flightKey)) return;
     ctx.waitUntil(
@@ -890,8 +878,8 @@ async function cachedJSON(
  * ============================================================ */
 
 // 前端 SW：静态资源 stale-while-revalidate；/api/ 与导航请求不走缓存
-const SW_JS_CONTENT = String.raw`/* MineTrakt SW v127 */
-const VERSION = "v127";
+const SW_JS_CONTENT = String.raw`/* MineTrakt SW v123 */
+const VERSION = "v123";
 const RUNTIME_CACHE = "trakt-static-" + VERSION;
 const NAV_CACHE = "trakt-nav-" + VERSION;
 const NAV_TIMEOUT = 2500;
@@ -1817,8 +1805,7 @@ function readAuth(request) {
  * 刷新失败返回 null，调用方按未登录处理。
  */
 async function refreshIfNeeded(auth, env) {
-  // 仅剩 <10 分钟才刷新，避免频繁打 /oauth/token
-  if (auth.expires_at - Date.now() > 10 * 60_000) return auth;
+  if (auth.expires_at - Date.now() > 30 * 60_000) return auth;
   let res;
   try {
     res = await fetchT(
@@ -2006,14 +1993,9 @@ function buildProfileCookie(profile) {
  * 每次增删 watchlist 会 bump 版本号，用来让旧缓存自动失效。
  */
 async function getWatchlistVersion(env, ctx, userKey) {
+  // 无 wlv key 时默认 "0"（与 wl:{uid}:0:added 对齐）；不读进程内存
   if (!userKey) return "0";
   const key = CK.watchlistVersion(userKey);
-  const mem = kvMemGet(key);
-  if (mem !== undefined && mem !== KV_MISS) {
-    const v =
-      mem && typeof mem === "object" && mem.data != null ? mem.data : mem;
-    if (v != null && v !== "") return String(v);
-  }
   if (!env || !env.TMDB_CACHE || kvIsDown()) return "0";
   try {
     const raw = await env.TMDB_CACHE.get(key, {
@@ -2021,10 +2003,10 @@ async function getWatchlistVersion(env, ctx, userKey) {
       cacheTtl: KV_EDGE_TTL,
     });
     kvMarkUp();
-    let v = "0";
-    if (raw != null)
-      v = String(typeof raw === "object" && raw.data != null ? raw.data : raw);
-    kvMemSet(key, { data: v, _ts: Date.now() }, KV_MEM_TTL);
+    if (raw == null) return "0";
+    const v = String(
+      typeof raw === "object" && raw.data != null ? raw.data : raw,
+    );
     return v || "0";
   } catch {
     kvMarkDown();
@@ -3355,6 +3337,33 @@ async function getWatchlist(headers, sort = "added", env, ctx, userKey, force, s
       ...(sourceTracker ? { sourceTracker } : {}),
     },
   );
+  if (Array.isArray(data) && data.length) return data;
+  // 当前版本为空时直接读 lg:wl
+  if (env.TMDB_CACHE && !kvIsDown()) {
+    try {
+      const lgKey = CK.lastGood.watchlist(prefix, sort);
+      const raw = await env.TMDB_CACHE.get(lgKey, {
+        type: "json",
+        cacheTtl: KV_EDGE_TTL,
+      });
+      kvMarkUp();
+      if (raw != null) {
+        const v =
+          typeof raw === "object" && raw.data !== undefined ? raw.data : raw;
+        if (Array.isArray(v) && v.length) {
+          if (sourceTracker) {
+            sourceTracker.fromCache = true;
+            sourceTracker.age = raw._ts
+              ? Math.max(0, Math.round((Date.now() - raw._ts) / 1000))
+              : 0;
+          }
+          return v;
+        }
+      }
+    } catch {
+      kvMarkDown();
+    }
+  }
   return Array.isArray(data) ? data : null;
 }
 
@@ -4362,7 +4371,7 @@ function streamHomeShell(initialDetail, profileHint) {
 
 /** 用户活动签名缓存（内存 5 分钟） */
 const __actSigMemCache = new Map();
-const ACT_SIG_MEM_TTL = 900000; // 15 分钟内存签名，减少 last_activities
+const ACT_SIG_MEM_TTL = 300000;
 
 /**
  * 拉 sync/last_activities 生成签名。
@@ -4573,9 +4582,8 @@ async function handleHomeData(request, env, ctx) {
   const wantWatchlist = part === "watchlist" || part === "all";
   const wantCalendar = part === "calendar" || part === "all";
   const wantHistory = part === "history" || part === "all";
-  // 非 force 不打 last_activities，降低 /sync 压力；强制刷新时再取签名
   const actSigP =
-    force && (wantMeta || wantWatchlist || wantHistory)
+    wantMeta || wantWatchlist || wantHistory
       ? getUserActivitySig(headers, env, ctx, userKey)
       : Promise.resolve(null);
 
@@ -4588,11 +4596,11 @@ async function handleHomeData(request, env, ctx) {
     calendar = null,
     watchlist = null;
 
-  const playbackSrc = { fromCache: null, age: 0 };
+  const playbackSrc = { fromCache: true, age: 0 };
   const metaSrc = { fromCache: null, age: 0 };
-  const watchlistSrc = { fromCache: null, age: 0 };
-  const calendarSrc = { fromCache: null, age: 0 };
-  const historySrc = { fromCache: null, age: 0 };
+  const watchlistSrc = { fromCache: true, age: 0 };
+  const calendarSrc = { fromCache: true, age: 0 };
+  const historySrc = { fromCache: true, age: 0 };
   const opts = (o) =>
     force
       ? { ...o, bypass: true, revalidate: true }
@@ -4746,7 +4754,7 @@ async function handleHomeData(request, env, ctx) {
     });
   }
   const concurrency = 1;
-  const gapMs = force ? 1600 : 1200;
+  const gapMs = force ? 500 : 400;
   await runLimited(taskFns, concurrency, gapMs);
   const actSig = await actSigP.catch(() => null);
   if (actSig && actSig.sig)
@@ -6990,9 +6998,9 @@ function splashCriticalCss() {
  * · forceRefresh 手动刷新：串行 + 动态间隔防 429
  * ============================================================ */
 function getBootstrapScript() {
-  return `(function(){var __CFG=window.__HOME_CONFIG__||{};if(!__CFG.loggedIn)return;window.__HOME_CONFIG__=null;if(__CFG.initialDetail)window.__initialDetail=__CFG.initialDetail;if(!window.__splashT0)window.__splashT0=Date.now();window.__splashHidden=false;window.__hideSplash=function(force){try{if(window.__splashHidden)return;window.__splashHidden=true;var el=document.getElementById('splash');if(!el)return;var wait=force?0:Math.max(0,120-(Date.now()-(window.__splashT0||Date.now())));setTimeout(function(){try{el.classList.add('hide');setTimeout(function(){try{if(el&&el.parentNode)el.parentNode.removeChild(el);}catch(e){}},280);}catch(e){}},wait);}catch(e){}};setTimeout(function(){if(window.__hideSplash)window.__hideSplash();},80);function lsGet(k){try{var v=localStorage.getItem(k);if(!v)return null;var o=JSON.parse(v);if(o&&o._exp&&o._exp<Date.now()){try{localStorage.removeItem(k);}catch(e){}return null;}return o&&o.data?o.data:null;}catch(e){return null;}}function lsSet(k,d,ttlSec){try{localStorage.setItem(k,JSON.stringify({data:d,_exp:Date.now()+ttlSec*1000}));}catch(e){try{localStorage.removeItem(k);}catch(e2){}}}window.__lsGet=lsGet;window.__lsSet=lsSet;function setHTML(sel,html){var el=typeof sel==='string'?document.querySelector(sel):sel;if(el)el.innerHTML=html||'';}window.__setHTML=setHTML;function applyAvatar(url){if(!url)return;var av=document.getElementById('hero-avatar');if(!av)return;var img=document.createElement('img');img.src=url;img.alt='';img.width=56;img.height=56;img.decoding='async';img.onerror=function(){av.innerHTML='<span class="hero-avatar-ph">👤</span>';};av.innerHTML='';av.appendChild(img);}function __setUpdatedAt(source,ageSec){var el=document.getElementById('updated-at');if(!el)return;var p=function(n){return(n<10?'0':'')+n;};var label='';if(typeof ageSec==='number'&&isFinite(ageSec)&&ageSec>=0){var d=new Date(Date.now()-ageSec*1000);label='更新于 '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());}else if(source==='live'){label='已更新';}else if(source==='cache'){label='缓存数据';}else{return;}if(source==='live')label+=' · 实时';else if(source==='cache')label+=' · 缓存';el.textContent=label;el.classList.remove('flash','src-live','src-cache');void el.offsetWidth;el.classList.add('flash');if(source==='live')el.classList.add('src-live');else if(source==='cache')el.classList.add('src-cache');}function applyPlayback(d,isCache){if(!d)return;if(d.playbackHScrollHtml)setHTML('#playback-hscroll',d.playbackHScrollHtml);var src=isCache?'cache':(d.playbackSource||'');var age=null;if(typeof d.playbackAgeSec==='number'&&isFinite(d.playbackAgeSec))age=Math.max(0,d.playbackAgeSec);else if(d._dataTs)age=Math.max(0,Math.round((Date.now()-d._dataTs)/1000));else if(src==='live')age=0;if(src==='live'||(typeof age==='number'&&age===0)){try{d._dataTs=Date.now();}catch(e){}}else if(typeof age==='number'&&!d._dataTs){try{d._dataTs=Date.now()-age*1000;}catch(e){}}__setUpdatedAt(src,age);if(window.__scheduleEnrich)window.__scheduleEnrich();}window.__applyPlayback=applyPlayback;function applyMeta(d,isCache){if(!d)return;var n=document.getElementById('hero-name');if(n&&d.name)n.textContent=d.name;applyAvatar(d.avatar);if(d.statsHtml)setHTML('#stats-box',d.statsHtml);if(!isCache)try{lsSet('mt:meta',d,1800);}catch(e){}}window.__applyMeta=applyMeta;var __homeDataLoading=false;
-function fetchPart(part,force){return fetch('/api/home-data?part='+encodeURIComponent(part)+(force?'&force=1':''),{credentials:'same-origin',cache:'no-store'}).then(function(r){if(r.status===401){return r.json().catch(function(){return{};}).then(function(d){var msg=(d&&d.error)||'登录已失效，请重新登录';try{sessionStorage.setItem('mt:relogin',msg);}catch(e){}if(window.__toast)window.__toast(msg,{type:'warn',duration:2200});setTimeout(function(){location.href='/login';},1000);return null;});}if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){if(!d)return null;if(d.login){location.href='/login';return null;}return d;});}window.__fetchPart=fetchPart;var __loadedParts={};function loadPartOnce(part){if(__loadedParts[part])return Promise.resolve(__loadedParts[part]);return fetchPart(part).then(function(d){__loadedParts[part]=d;return d;});}window.__loadPartOnce=loadPartOnce;window.__loadedParts=__loadedParts;function loadHomeData(opts){opts=opts||{};var silent=!!opts.silent;if(__homeDataLoading&&!silent)return;__homeDataLoading=true;__lastRefreshAt=Date.now();function onPlayback(d,isCache){if(!d)return;applyPlayback(d,isCache);if(!isCache){try{lsSet('mt:pb',d,900);}catch(e){}if(!silent&&window.__initialDetail){var s=window.__initialDetail,idx=s.indexOf('/');if(idx>0&&window.openDetail)openDetail(s.slice(0,idx),s.slice(idx+1),false);window.__initialDetail=null;}}if(!silent&&window.__hideSplash)window.__hideSplash(true);}if(!silent){var cachedPb=lsGet('mt:pb');if(cachedPb){try{onPlayback(cachedPb,true);}catch(e){}}else if(window.__earlyPbApplied&&window.__hideSplash){window.__hideSplash(true);}}var pPlayback;if(!silent&&window.__primaryBootP){pPlayback=window.__primaryBootP.then(function(d){window.__primaryBootP=null;if(d){onPlayback(d,false);return d;}return fetchPart('playback').then(function(x){onPlayback(x,false);return x;});}).catch(function(){return fetchPart('playback').then(function(x){onPlayback(x,false);return x;});});}else{pPlayback=fetchPart('playback').then(function(x){onPlayback(x,false);return x;});}pPlayback=pPlayback.catch(function(){if(!silent){setHTML('#playback-hscroll','<div class="empty"><p>请求过于频繁或网络异常，请稍后重试</p><p style="margin-top:12px"><button class="btn-ghost" onclick="location.reload()">重试</button></p></div>');if(window.__hideSplash)window.__hideSplash(true);}});Promise.resolve(pPlayback).then(function(){__homeDataLoading=false;if(!silent){var cachedMeta=lsGet('mt:meta');if(cachedMeta)setTimeout(function(){try{applyMeta(cachedMeta,true);}catch(e){}},0);}var runMeta=function(){fetchPart('meta').then(function(d){applyMeta(d,false);}).catch(function(){});};if(window.requestIdleCallback)requestIdleCallback(runMeta,{timeout:800});else setTimeout(runMeta,80);});}var __refreshTick=0;function silentRefresh(){if(document.hidden)return;var __m=document.getElementById('modal');if(__m&&__m.classList.contains('open'))return;__refreshTick++;__lastRefreshAt=Date.now();fetchPart('playback').then(function(d){if(!d)return;applyPlayback(d,false);if(d.playbackSource==='live'){try{lsSet('mt:pb',d,900);}catch(e){}}}).catch(function(){});if(__refreshTick%6===0)fetchPart('meta').then(function(d){if(!d)return;applyMeta(d,false);if(d.metaSource==='live'){try{lsSet('mt:meta',d,1800);}catch(e){}}}).catch(function(){});}window.__refreshStats=silentRefresh;
-window.forceRefresh=async function(){if(window.__forceRefreshing)return;window.__forceRefreshing=true;var btn=document.getElementById('btn-refresh');var span=btn&&btn.querySelector('span');var oldText=span?span.textContent:'刷新';if(btn)btn.classList.add('loading');if(span)span.textContent='刷新中';var okCount=0,cacheCount=0,failCount=0,cooling=0,hitLimit=false;var GAP_OK=1600,GAP_LIMIT=2200;try{var wanted=['playback','meta'];var loaded=window.__loadedParts||{};['history','watchlist','calendar'].forEach(function(p){if(loaded[p])wanted.push(p);});for(var i=0;i<wanted.length;i++){if(hitLimit)break;var part=wanted[i];if(i>0){var gap=cooling>0?GAP_LIMIT:GAP_OK;await new Promise(function(r){setTimeout(r,gap);});}var d=null;try{d=await fetchPart(part,true);}catch(e){d=null;}if(!d){failCount++;continue;}var isCache=false;if(part==='playback'&&d.playbackSource==='cache')isCache=true;if(part==='meta'&&d.metaSource==='cache')isCache=true;if(part==='watchlist'&&d.watchlistSource==='cache')isCache=true;if(part==='calendar'&&d.calendarSource==='cache')isCache=true;if(part==='history'&&d.historySource==='cache')isCache=true;if(isCache)cacheCount++;else okCount++;if(part==='playback'){applyPlayback(d,false);if(!isCache){try{lsSet('mt:pb',d,900);}catch(e){}}}else if(part==='meta'){applyMeta(d,false);if(!isCache){try{lsSet('mt:meta',d,1800);}catch(e){}}}else if(part==='watchlist'||part==='calendar'||part==='history'){__applyPart(part,d);if(!isCache)__savePartSnap(part,d);}window.__loadedParts[part]=d;if(__partFailed(d)){try{delete window.__loadedParts[part];}catch(e){}}if(d.rateLimited||(d.cooling&&d.cooling>0)){hitLimit=true;cooling=Math.max(cooling,Number(d.cooling)||0);}else if(isCache&&(part==='playback'||part==='meta')){hitLimit=true;}}if(failCount&&!okCount&&!cacheCount){__errToast('刷新失败',new Error('Trakt 或网络不可用'));}else if(hitLimit){var msg=cooling>0?('Trakt 限流，已展示缓存（约 '+cooling+' 秒后再试）'):'已用缓存数据（上游暂不可用）';__toast(msg,{type:'warn',duration:2200});}else if(failCount||cacheCount){__toast('已刷新（部分数据来自缓存）',{type:'warn',duration:1800});}else{__toast('已刷新',{type:'success',duration:1200});}if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){__errToast('刷新失败',e);}finally{if(btn)btn.classList.remove('loading');if(span)span.textContent=oldText;window.__forceRefreshing=false;}};
+  return `(function(){var __CFG=window.__HOME_CONFIG__||{};if(!__CFG.loggedIn)return;window.__HOME_CONFIG__=null;if(__CFG.initialDetail)window.__initialDetail=__CFG.initialDetail;if(!window.__splashT0)window.__splashT0=Date.now();window.__splashHidden=false;window.__hideSplash=function(force){try{if(window.__splashHidden)return;window.__splashHidden=true;var el=document.getElementById('splash');if(!el)return;var wait=force?0:Math.max(0,120-(Date.now()-(window.__splashT0||Date.now())));setTimeout(function(){try{el.classList.add('hide');setTimeout(function(){try{if(el&&el.parentNode)el.parentNode.removeChild(el);}catch(e){}},280);}catch(e){}},wait);}catch(e){}};setTimeout(function(){if(window.__hideSplash)window.__hideSplash();},80);function lsGet(k){try{var v=localStorage.getItem(k);if(!v)return null;var o=JSON.parse(v);if(o&&o._exp&&o._exp<Date.now()){try{localStorage.removeItem(k);}catch(e){}return null;}return o&&o.data?o.data:null;}catch(e){return null;}}function lsSet(k,d,ttlSec){try{localStorage.setItem(k,JSON.stringify({data:d,_exp:Date.now()+ttlSec*1000}));}catch(e){try{localStorage.removeItem(k);}catch(e2){}}}window.__lsGet=lsGet;window.__lsSet=lsSet;function setHTML(sel,html){var el=typeof sel==='string'?document.querySelector(sel):sel;if(el)el.innerHTML=html||'';}window.__setHTML=setHTML;function applyAvatar(url){if(!url)return;var av=document.getElementById('hero-avatar');if(!av)return;var img=document.createElement('img');img.src=url;img.alt='';img.width=56;img.height=56;img.decoding='async';img.onerror=function(){av.innerHTML='<span class="hero-avatar-ph">👤</span>';};av.innerHTML='';av.appendChild(img);}function __setUpdatedAt(source){var el=document.getElementById('updated-at');if(!el)return;var d=new Date(),p=function(n){return(n<10?'0':'')+n;};var label='更新于 '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());if(source==='live')label+=' · 实时';else if(source==='cache')label+=' · 缓存';el.textContent=label;el.classList.remove('flash','src-live','src-cache');void el.offsetWidth;el.classList.add('flash');if(source==='live')el.classList.add('src-live');else if(source==='cache')el.classList.add('src-cache');}function applyPlayback(d,isCache){if(!d)return;if(d.playbackHScrollHtml)setHTML('#playback-hscroll',d.playbackHScrollHtml);var src=isCache?'cache':(d.playbackSource||'');__setUpdatedAt(src);if(window.__scheduleEnrich)window.__scheduleEnrich();}window.__applyPlayback=applyPlayback;function applyMeta(d,isCache){if(!d)return;var n=document.getElementById('hero-name');if(n&&d.name)n.textContent=d.name;applyAvatar(d.avatar);if(d.statsHtml)setHTML('#stats-box',d.statsHtml);if(!isCache)try{lsSet('mt:meta',d,1800);}catch(e){}}window.__applyMeta=applyMeta;var __homeDataLoading=false;
+function fetchPart(part,force){return fetch('/api/home-data?part='+encodeURIComponent(part)+(force?'&force=1':''),{credentials:'same-origin',cache:'no-store'}).then(function(r){if(r.status===401){return r.json().catch(function(){return{};}).then(function(d){var msg=(d&&d.error)||'登录已失效，请重新登录';try{sessionStorage.setItem('mt:relogin',msg);}catch(e){}if(window.__toast)window.__toast(msg,{type:'warn',duration:2200});setTimeout(function(){location.href='/login';},1000);return null;});}if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){if(!d)return null;if(d.login){location.href='/login';return null;}return d;});}window.__fetchPart=fetchPart;var __loadedParts={};function loadPartOnce(part){if(__loadedParts[part])return Promise.resolve(__loadedParts[part]);return fetchPart(part).then(function(d){__loadedParts[part]=d;return d;});}window.__loadPartOnce=loadPartOnce;window.__loadedParts=__loadedParts;function loadHomeData(opts){opts=opts||{};var silent=!!opts.silent;if(__homeDataLoading&&!silent)return;__homeDataLoading=true;__lastRefreshAt=Date.now();function onPlayback(d,isCache){if(!d)return;applyPlayback(d,isCache);if(!isCache){try{lsSet('mt:pb',d,900);}catch(e){}if(!silent&&window.__initialDetail){var s=window.__initialDetail,idx=s.indexOf('/');if(idx>0&&window.openDetail)openDetail(s.slice(0,idx),s.slice(idx+1),false);window.__initialDetail=null;}}if(!silent&&window.__hideSplash)window.__hideSplash(true);}if(!silent){var cachedPb=lsGet('mt:pb');if(cachedPb){try{onPlayback(cachedPb,true);}catch(e){}}else if(window.__earlyPbApplied&&window.__hideSplash){window.__hideSplash(true);}}var pPlayback;if(!silent&&window.__primaryBootP){pPlayback=window.__primaryBootP.then(function(d){window.__primaryBootP=null;if(d){onPlayback(d,false);return d;}return fetchPart('playback').then(function(x){onPlayback(x,false);return x;});}).catch(function(){return fetchPart('playback').then(function(x){onPlayback(x,false);return x;});});}else{pPlayback=fetchPart('playback').then(function(x){onPlayback(x,false);return x;});}pPlayback=pPlayback.catch(function(){if(!silent){setHTML('#playback-hscroll','<div class="empty"><p>请求过于频繁或网络异常，请稍后重试</p><p style="margin-top:12px"><button class="btn-ghost" onclick="location.reload()">重试</button></p></div>');if(window.__hideSplash)window.__hideSplash(true);}});Promise.resolve(pPlayback).then(function(){__homeDataLoading=false;if(!silent){var cachedMeta=lsGet('mt:meta');if(cachedMeta)setTimeout(function(){try{applyMeta(cachedMeta,true);}catch(e){}},0);}var runMeta=function(){fetchPart('meta').then(function(d){applyMeta(d,false);}).catch(function(){});};if(window.requestIdleCallback)requestIdleCallback(runMeta,{timeout:800});else setTimeout(runMeta,80);});}var __refreshTick=0;function silentRefresh(){if(document.hidden)return;var __m=document.getElementById('modal');if(__m&&__m.classList.contains('open'))return;__refreshTick++;__lastRefreshAt=Date.now();fetchPart('playback').then(function(d){applyPlayback(d);try{lsSet('mt:pb',d,900);}catch(e){}}).catch(function(){});if(__refreshTick%4===0)fetchPart('meta').then(function(d){applyMeta(d,false);}).catch(function(){});}window.__refreshStats=silentRefresh;
+window.forceRefresh=async function(){if(window.__forceRefreshing)return;window.__forceRefreshing=true;try{localStorage.removeItem('mt:pb');localStorage.removeItem('mt:meta');}catch(e){}var btn=document.getElementById('btn-refresh');var span=btn&&btn.querySelector('span');var oldText=span?span.textContent:'刷新';if(btn)btn.classList.add('loading');if(span)span.textContent='刷新中';var okCount=0,cacheCount=0,failCount=0,cooling=0,hitLimit=false;var GAP_OK=300,GAP_LIMIT=1000;try{var wanted=['playback','meta'];var loaded=window.__loadedParts||{};['history'].forEach(function(p){if(loaded[p])wanted.push(p);});for(var i=0;i<wanted.length;i++){if(hitLimit)break;var part=wanted[i];if(i>0){var gap=cooling>0?GAP_LIMIT:GAP_OK;await new Promise(function(r){setTimeout(r,gap);});}var d=null;try{d=await fetchPart(part,true);}catch(e){d=null;}if(!d){failCount++;continue;}var isCache=false;if(part==='playback'&&d.playbackSource==='cache')isCache=true;if(part==='meta'&&d.metaSource==='cache')isCache=true;if(isCache)cacheCount++;else okCount++;if(part==='playback'){applyPlayback(d);try{lsSet('mt:pb',d,900);}catch(e){}}else if(part==='meta'){applyMeta(d,false);}else if(part==='watchlist'||part==='calendar'||part==='history'){__applyPart(part,d);__savePartSnap(part,d);}window.__loadedParts[part]=d;if(__partFailed(d)){try{delete window.__loadedParts[part];}catch(e){}}if(d.rateLimited||(d.cooling&&d.cooling>0)){hitLimit=true;cooling=Math.max(cooling,Number(d.cooling)||0);}else if(isCache&&(part==='playback'||part==='meta')){hitLimit=true;}}if(failCount&&!okCount&&!cacheCount){__errToast('刷新失败',new Error('Trakt 或网络不可用'));}else if(hitLimit){var msg=cooling>0?('Trakt 限流，已展示缓存（约 '+cooling+' 秒后再试）'):'已用缓存数据（上游暂不可用）';__toast(msg,{type:'warn',duration:2200});}else if(failCount||cacheCount){__toast('已刷新（部分数据来自缓存）',{type:'warn',duration:1800});}else{__toast('已刷新',{type:'success',duration:1200});}if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){__errToast('刷新失败',e);}finally{if(btn)btn.classList.remove('loading');if(span)span.textContent=oldText;window.__forceRefreshing=false;}};
 function startHomeData(){loadHomeData({silent:false});}if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',startHomeData);}else{startHomeData();}var REFRESH_MS=${HOME_AUTO_REFRESH_MINUTES}*60*1000;var __lastRefreshAt=Date.now();if(REFRESH_MS>0){setInterval(silentRefresh,REFRESH_MS);document.addEventListener('visibilitychange',function(){if(document.hidden)return;if(Date.now()-__lastRefreshAt>=REFRESH_MS)silentRefresh();});}})();`;
 }
 
