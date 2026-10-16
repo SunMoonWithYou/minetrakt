@@ -1,50 +1,43 @@
 /* ============================================================
- * MineTrakt —— Cloudflare Workers 单文件应用（影视追踪 PWA）
+ * MineTrakt —— Cloudflare Workers 单文件影视追踪 PWA
  * ============================================================
  *
- * 【这是什么】
- *   基于 Trakt 的个人追剧面板：继续观看 / 待看 / 日历 / 记录 / 搜索，
- *   叠加 TMDB 评分、OMDB 评分、豆瓣榜单、平台剧场、骨朵热榜等增强数据。
- *   一个文件包含全部后端路由 + HTML/CSS/客户端 JS，直接部署到 Workers。
+ * 功能：Trakt 追剧面板（继续观看 / 待看 / 日历 / 记录 / 搜索），
+ *      叠加 TMDB 评分、OMDB 评分、豆瓣榜单、平台剧场、骨朵热榜。
  *
- * 【环境配置】
- *   变量：TRAKT_CLIENT_ID（必填）· TMDB_API_KEY · OMDB_API_KEY（可选）
- *   绑定：KV 命名空间 TMDB_CACHE
+ * 环境：
+ *   变量 TRAKT_CLIENT_ID（必填）、TMDB_API_KEY、OMDB_API_KEY（可选）
+ *   绑定 KV 命名空间 TMDB_CACHE
  *
- * 【路由表】
- *   /                  启动页：读 Cookie 判断登录态，~400ms 后跳 /home 或 /login
- *   /login             登录页（Trakt 设备码流程；已登录 302 → /home）
- *   /home              首页（未登录 302 → /login）
- *   /api/home-data     首页数据分片（playback/meta/watchlist/calendar/history）
- *   /api/*             其余数据接口：详情/季/演员/搜索/趋势/榜单/写操作等
- *   /api/app-version   版本对账（前端回前台时比对，不一致自动 reload）
- *   /app.js /app.css   前端静态资源（immutable 长缓存，版本号破缓存）
- *   /sw.js             Service Worker（静态资源 stale-while-revalidate）
+ * 路由：
+ *   /                  启动页，按登录态跳 /home 或 /login
+ *   /login             登录页（Trakt 设备码）
+ *   /home              首页
+ *   /api/home-data     首页数据分片
+ *   /api/*             其余数据接口
+ *   /app.js /app.css   前端静态资源
+ *   /sw.js             Service Worker
  *   /auth/*            登录 / 登出 / 轮询
  *
- * 【认证】
- *   Trakt OAuth 设备码 → Cookie(trakt_auth) 存 token + trakt_id（90 天）。
- *   trakt_id 固化进 Cookie 后，请求不再重复打 /users/me。
+ * 认证：
+ *   Trakt OAuth 设备码 → Cookie(trakt_auth) 存 token + trakt_id。
  *
- * 【缓存】
- *   三级：进程内存 Map → KV(TMDB_CACHE) → 上游。统一走 cachedJSON()：
- *   · 常规请求：命中未过期缓存就不打上游；过期或冷启动才请求
- *   · force=1（用户点刷新）：绕过缓存；失败回退旧 KV，绝不写脏数据
- *   · 上游 429：按用户标记冷却期，冷却内直接短路返回缓存
+ * 缓存：
+ *   三级：进程内存 Map → KV(TMDB_CACHE) → 上游，统一走 cachedJSON()。
+ *   · force=1 绕过缓存；失败回退旧 KV，绝不写脏数据
+ *   · 上游 429 时按用户标记冷却期
  *
- * 【主题】
- *   三态 dark / light / system（跟随系统），localStorage 键 mt:theme。
- *   THEME_BOOT_SCRIPT 内联在 <head> 最前同步执行，防首帧闪烁；
- *   CSS 变量：:root 为深色默认，html[data-theme="light"] 及
- *   @media(prefers-color-scheme: light) 下的 [data-theme="system"] 覆盖为浅色。
+ * 主题：
+ *   dark / light / system 三态，localStorage 键 mt:theme。
+ *   THEME_BOOT_SCRIPT 内联在 <head> 最前同步执行，防首帧闪烁。
  *
- * 【改版须知】
- *   改客户端 JS → bump APP_JS_VERSION；改样式 → bump APP_CSS_VERSION；
- *   SW 内嵌版本（SW_JS_CONTENT 的 vXXX）同步；版本号触发用户端缓存更新。
- *   页面模板全是反引号字符串：内容里的 </script> 必须写成 <\/script>。
+ * 改版须知：
+ *   改客户端 JS → bump APP_JS_VERSION
+ *   改样式     → bump APP_CSS_VERSION
+ *   SW 内嵌版本（SW_JS_CONTENT 的 vXXX）同步
+ *   模板字符串内 </script> 必须写成 <\/script>
  * ============================================================ */
 
-// Trakt / TMDB / OMDB / 豆瓣 / 剧场 等外部服务端点
 const TRAKT_AUTH = "https://auth.trakt.tv",
   TRAKT_API = "https://api.trakt.tv",
   TMDB_API = "https://api.themoviedb.org/3",
@@ -55,27 +48,26 @@ const TRAKT_AUTH = "https://auth.trakt.tv",
   DOUBAN_API = "https://widget.v2too.top/data/douban.json",
   THEATER_API = "https://widget.v2too.top/data/theater.json",
   GUDUO_API = "https://widget.v2too.top/data/guduo.json";
+
 const APP_NAME = "MineTrakt",
   APP_SHORT_NAME = "MineTrakt",
-  THEME_COLOR = "#050505"; // 深色主题色（默认）
+  THEME_COLOR = "#050505";
 
-// 主题系统：三态（dark / light / system），客户端 localStorage 持久化
+/* 主题系统：三态（dark / light / system） */
 const THEME_STORAGE_KEY = "mt:theme",
   THEME_COLOR_DARK = "#050505",
   THEME_COLOR_LIGHT = "#ffffff";
 
-/**
- * 主题启动脚本 —— 必须内联在 <head> 最前面、同步执行。
- * 作用：读 localStorage → 立刻给 <html> 打 data-theme → 同步 meta 与底色，
- * 从而在任何首帧渲染之前就确定主题，彻底避免 FOUC（黑→白闪烁）。
- * 注意：用裸 localStorage（不走 lsGet 的 TTL 包装），否则读到 {data:...} 解析失败。
- */
+/* 主题启动脚本 —— 必须内联在 <head> 最前面、同步执行，避免 FOUC */
 const THEME_BOOT_SCRIPT = `<script>(function(){try{var K=${JSON.stringify(THEME_STORAGE_KEY)};var t=localStorage.getItem(K);if(t!=='light'&&t!=='dark'&&t!=='system')t='dark';var d=document.documentElement;d.setAttribute('data-theme',t);var dark=(t==='dark')||(t==='system'&&(!window.matchMedia||matchMedia('(prefers-color-scheme: dark)').matches));var c=dark?${JSON.stringify(THEME_COLOR_DARK)}:${JSON.stringify(THEME_COLOR_LIGHT)};var tc=document.querySelector('meta[name="theme-color"]');if(tc)tc.setAttribute('content',c);var cs=document.querySelector('meta[name="color-scheme"]');if(cs)cs.setAttribute('content',dark?'dark':'light');var sb=document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]');if(sb)sb.setAttribute('content',dark?'black-translucent':'default');d.style.backgroundColor=c;}catch(e){}})();<\/script>`;
+
 const FAVICON_URL = "/assets/favicon.ico",
   ICON_192 = "/assets/icon-192.png",
   ICON_512 = "/assets/icon-512.png",
   APPLE_ICON = "/assets/icon-512.png",
   SPLASH_LOGO = "/assets/logo.png";
+
+/* 静态资源回源映射 */
 const ASSET_ORIGINS = {
   "/assets/favicon.ico": [
     "https://i.ibb.co/s9tgxVhb/Mine-Trakt-icon-32x32.png",
@@ -94,49 +86,53 @@ const ASSET_ORIGINS = {
     "image/png",
   ],
 };
+
 const TRAKT_UA = "MineTrakt/1.0";
+
 const JSON_HEADERS = {
   "Content-Type": "application/json",
   "User-Agent": TRAKT_UA,
 };
 
-const COOKIE_NAME = "trakt_auth", // 认证 Cookie 名
-  COOKIE_MAX_AGE = 60 * 60 * 24 * 90, // 90 天
-  PROFILE_COOKIE = "trakt_profile"; // 昵称/头像提示 Cookie（非敏感）
-const PAGE_SIZE = 20, // 历史记录每页条数
-  TMDB_KV_TTL = 86400 * 7, // TMDB 详情：7 天
-  OMDB_KV_TTL = 86400 * 7, // OMDB 评分：7 天
-  WATCHLIST_PAGE_SIZE = 30, // watchlist 每页 30 条
-  WATCHLIST_KV_TTL = 3600, // watchlist：1 小时（原 30 分钟，配合三层兜底可放宽）
-  CALENDAR_KV_TTL = 3600, // 日历：1 小时（原 30 分钟）
-  TREND_KV_TTL = 21600, // 趋势：6 小时
-  MISS_KV_TTL = 300, // 空结果：5 分钟（防击穿）
-  HISTORY_KV_TTL = 5400, // 历史记录：1.5 小时（原 1 小时）
-  PLAYBACK_KV_TTL = 5400, // 继续观看：1.5 小时（原 1 小时）
-  STATS_KV_TTL = 3600, // 统计：1 小时
-  PROFILE_KV_TTL = 7200, // 用户资料：2 小时
-  ENTITY_KV_TTL = 86400, // Trakt 实体：1 天
-  SEASON_KV_TTL = 86400, // 季数据：1 天
-  DOUBAN_KV_TTL = 21600, // 豆瓣列表：6 小时
-  THEATER_KV_TTL = 21600, // 平台剧场：6 小时
-  GUDUO_KV_TTL = 21600; // 骨朵热榜：6 小时
-/* KV 物理保留策略：
- * - KV_STALE_RETENTION：写入时额外保留的 stale 时长。固定 7 天，
- *   避免「待看/日历」这类低频访问分片被 CF 提前物理删除（原来只有 TTL×6）。
- * - LAST_GOOD_KV_TTL：「最后一次成功数据」兜底副本的 TTL。
- *   key 不含日期/版本号，用于跨 key 轮换兜底（日历换天、待看换版本号）。 */
+/* Cookie 配置 */
+const COOKIE_NAME = "trakt_auth",
+  COOKIE_MAX_AGE = 60 * 60 * 24 * 90,
+  PROFILE_COOKIE = "trakt_profile";
+
+/* 各类数据的 KV 逻辑 TTL（秒） */
+const PAGE_SIZE = 20,
+  TMDB_KV_TTL = 86400 * 7,
+  OMDB_KV_TTL = 86400 * 7,
+  WATCHLIST_PAGE_SIZE = 30,
+  WATCHLIST_KV_TTL = 3600,
+  CALENDAR_KV_TTL = 3600,
+  TREND_KV_TTL = 21600,
+  MISS_KV_TTL = 300,
+  HISTORY_KV_TTL = 5400,
+  PLAYBACK_KV_TTL = 5400,
+  STATS_KV_TTL = 3600,
+  PROFILE_KV_TTL = 7200,
+  ENTITY_KV_TTL = 86400,
+  SEASON_KV_TTL = 86400,
+  DOUBAN_KV_TTL = 21600,
+  THEATER_KV_TTL = 21600,
+  GUDUO_KV_TTL = 21600;
+
+/* KV 物理保留策略 */
 const KV_STALE_RETENTION = 86400 * 7,
   LAST_GOOD_KV_TTL = 86400 * 7;
-const HOME_AUTO_REFRESH_MINUTES = 30;
-const APP_JS_VERSION = "130",
-  APP_CSS_VERSION = "121";
 
-const CC_API = "public, max-age=1800, stale-while-revalidate=600"; // API 数据：本地 30 分钟 + SWR 后台刷新
-const CC_NO_STORE = "no-store"; // 敏感/实时数据：禁止缓存
+const HOME_AUTO_REFRESH_MINUTES = 30;
+
+const APP_JS_VERSION = "130",
+  APP_CSS_VERSION = "122";
+
+const CC_API = "public, max-age=1800, stale-while-revalidate=600";
+const CC_NO_STORE = "no-store";
 const CT_JSON = "application/json; charset=utf-8";
 const CT_HTML = "text/html; charset=utf-8";
 
-/** 统一 JSON 响应构造（新代码请使用本助手，逐步替换分散的 new Response(JSON.stringify(...))） */
+/** 统一 JSON 响应构造 */
 function jsonResp(data, headers) {
   return new Response(JSON.stringify(data), {
     headers: Object.assign(
@@ -146,53 +142,45 @@ function jsonResp(data, headers) {
   });
 }
 
-/* 缓存 key 构造器
- * 统一管理所有 KV / 内存缓存的 key 命名，便于排查和批量失效 */
+/* 缓存 key 构造器 */
 const CK = {
-  playback: (u) => `pb:${u}`, // 继续观看
-  stats: (u) => `stats:${u}`, // 统计
-  profile: (u) => `prof:${u}:me`, // 用户资料
-  history: (u, p = 1) => `hist:${u}:p${p}`, // 历史记录（按页）
-  calendar: (u, day) => `cal:${u}:${day}`, // 追剧日历
-  watchProgress: (u, id) => `tpr:${u}:${id}`, // 剧集观看进度
-  movieHistory: (u, id) => `tmh:${u}:${id}`, // 电影观看历史
-  entity: (t, id) => `te:${t}:${id}`, // Trakt 实体详情
-  season: (id, n) => `ts:${id}:${n}`, // 季数据
-  traktSearch: (t, id) => `tsp:${t}:${id}`, // TMDB→Trakt ID 映射
-  watchlist: (u, v, s) => `wl:${u}:${v}:${s}`, // watchlist（含版本号）
-  watchlistVersion: (u) => `wlv:${u}`, // watchlist 版本号
-  omdb: (id) => `omdb:${id}`, // OMDB 评分
-  enrich: (k) => `e:${k}`, // 富化数据
-  trend: (p) => `trend:day:${p}`, // TMDB 趋势
-  tmdb: (p) => `td:${p}`, // TMDB 详情
-  douban: "douban:v1:all", // 豆瓣（全局）
-  theater: "theater:v1:all", // 剧场（全局）
-  guduo: "guduo:v1:all", // 骨朵热榜（全局）
-  platform: (id, page, media) => `plat:${id}:${media}:p${page}`, // 平台筛选
-  uidRt: (rt) => `uid:rt:${rt}`, // refresh_token → uid
-  uidAt: (at) => `uid:at:${at}`, // access_token → uid
-  moreHistory: (u, p) => `more:hist:${u}:p${p}`, // 观看记录翻页
-  morePlayback: (u, p, l) => `more:pb:${u}:p${p}:l${l}`, // 继续观看翻页
-  /* 「最后一次成功数据」兜底副本（lg: = last good）
-   * 特点：key 不含日期 / 版本号，物理保留 7 天以上。
-   * 用途：主 key 轮换（日历换天、待看换版本号）或 KV 读取失败时回退。 */
+  playback: (u) => `pb:${u}`,
+  stats: (u) => `stats:${u}`,
+  profile: (u) => `prof:${u}:me`,
+  history: (u, p = 1) => `hist:${u}:p${p}`,
+  calendar: (u, day) => `cal:${u}:${day}`,
+  watchProgress: (u, id) => `tpr:${u}:${id}`,
+  movieHistory: (u, id) => `tmh:${u}:${id}`,
+  entity: (t, id) => `te:${t}:${id}`,
+  season: (id, n) => `ts:${id}:${n}`,
+  traktSearch: (t, id) => `tsp:${t}:${id}`,
+  watchlist: (u, v, s) => `wl:${u}:${v}:${s}`,
+  watchlistVersion: (u) => `wlv:${u}`,
+  omdb: (id) => `omdb:${id}`,
+  enrich: (k) => `e:${k}`,
+  trend: (p) => `trend:day:${p}`,
+  tmdb: (p) => `td:${p}`,
+  douban: "douban:v1:all",
+  theater: "theater:v1:all",
+  guduo: "guduo:v1:all",
+  platform: (id, page, media) => `plat:${id}:${media}:p${page}`,
+  uidRt: (rt) => `uid:rt:${rt}`,
+  uidAt: (at) => `uid:at:${at}`,
+  moreHistory: (u, p) => `more:hist:${u}:p${p}`,
+  morePlayback: (u, p, l) => `more:pb:${u}:p${p}:l${l}`,
+  /* 「最后一次成功数据」兜底副本（key 不含日期/版本号） */
   lastGood: {
     playback: (u) => `lg:pb:${u}`,
     stats: (u) => `lg:stats:${u}`,
     profile: (u) => `lg:prof:${u}`,
     history: (u, p = 1) => `lg:hist:${u}:p${p}`,
-    calendar: (u) => `lg:cal:${u}`, // 不含日期
-    watchlist: (u, s = "added") => `lg:wl:${u}:${s}`, // 不含版本号
+    calendar: (u) => `lg:cal:${u}`,
+    watchlist: (u, s = "added") => `lg:wl:${u}:${s}`,
   },
 };
 
-
-/**
- * 带超时的 fetch。
- * 使用 AbortController 在 ms 毫秒后中止请求，避免上游挂死。
- */
+/** 带超时的 fetch（Trakt 请求统一经过出网闸门） */
 async function fetchT(url, opts = {}, ms = 8000) {
-  // Trakt 请求统一经过出网闸门，削峰避免风控（TMDB / 其他域名不受影响）
   if (TRAKT_HOST_RE.test(url)) await traktGate();
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), ms);
@@ -204,22 +192,21 @@ async function fetchT(url, opts = {}, ms = 8000) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 const backoff = (i, base = 500, jitter = 500) =>
   sleep(base * (i + 1) + Math.random() * jitter);
 
 /* ============================================================
- * Trakt 出网闸门
- * ------------------------------------------------------------
- * Trakt 的限流维度是 client_id / IP，而本 Worker 只有一个 client_id，
- * 所以只要在实例内把 Trakt 请求串行化 + 限最小间隔，就能显著削峰。
- * 放在 fetchT 而不是 traktFetch：翻页(/api/more)、待看增删、日历、
- * hidden/dropped 等直接用 fetchT，只有拦在这一层才能全覆盖。
+ * Trakt 出网闸门：串行化 + 最小间隔，削峰避免风控
  * ============================================================ */
 const TRAKT_HOST_RE = /^https?:\/\/api\.trakt\.tv\//i;
-const TRAKT_MIN_GAP_MS = 1000; // 两次 Trakt 请求最小间隔
-const TRAKT_GAP_MAX_WAIT_MS = 10000; // 单请求最多排队等待，超时放行避免拖死
+
+const TRAKT_MIN_GAP_MS = 1000;
+const TRAKT_GAP_MAX_WAIT_MS = 10000;
+
 let __traktTail = Promise.resolve(),
   __traktLast = 0;
+
 /** 排队获取一次 Trakt 出网许可（FIFO + 最小间隔） */
 function traktGate() {
   const prev = __traktTail;
@@ -235,10 +222,13 @@ function traktGate() {
     }
   });
 }
-const TRAKT_RATE_LIMIT_COOLDOWN = 60000; // 基础冷却 60s（连续 429 按 2 的幂递增）
-const TRAKT_RATE_LIMIT_MAX_COOLDOWN = 300000; // 冷却封顶 5 分钟
+
+/* 限流冷却：连续 429 按 2 的幂递增，成功即清零 */
+const TRAKT_RATE_LIMIT_COOLDOWN = 60000;
+const TRAKT_RATE_LIMIT_MAX_COOLDOWN = 300000;
+
 const __traktRateLimitByUser = new Map();
-const __traktStrikes = new Map(); // userKey → 连续 429 次数（成功即清零）
+const __traktStrikes = new Map();
 
 /** 判断指定用户是否处于限流冷却期 */
 function isTraktRateLimited(userKey) {
@@ -254,12 +244,11 @@ function traktRateLimitedRemaining(userKey) {
   return Math.max(0, Math.ceil((until - Date.now()) / 1000));
 }
 
-/** 记录一次 429：冷却时长按连续命中次数指数递增，成功一次即清零 */
+/** 记录一次 429：冷却时长按连续命中次数指数递增 */
 function markTraktRateLimited(ms, userKey) {
   const k = userKey || "__anon__";
   const strikes = (__traktStrikes.get(k) || 0) + 1;
   __traktStrikes.set(k, strikes);
-  // 1→60s, 2→120s, 3→240s, 4+→300s（封顶 5 分钟）
   const exp = Math.min(
     TRAKT_RATE_LIMIT_MAX_COOLDOWN,
     TRAKT_RATE_LIMIT_COOLDOWN * Math.pow(2, strikes - 1),
@@ -271,6 +260,7 @@ function markTraktRateLimited(ms, userKey) {
   const until = Date.now() + wait;
   const cur = __traktRateLimitByUser.get(k) || 0;
   if (until > cur) __traktRateLimitByUser.set(k, until);
+
   if (__traktRateLimitByUser.size > 500) {
     const now = Date.now();
     for (const [key, v] of __traktRateLimitByUser) {
@@ -303,23 +293,23 @@ function consumeRetryAfter(r, userKey) {
 
 /**
  * Trakt 统一请求封装。
- * - 尊重 per-user 429 冷却（isTraktRateLimited），冷却期内不发网络请求
- * - 429 时解析 Retry-After 并 markTraktRateLimited
- * - wantPageCount：把 X-Pagination-Page-Count 挂到数组的 __pageCount（不可枚举）
- * - 返回值若失败为 { __error, __cooling? }，成功为 JSON 本体
+ * - 尊重 per-user 429 冷却
+ * - wantPageCount：把 X-Pagination-Page-Count 挂到数组的 __pageCount
+ * - 失败返回 { __error, __cooling? }，成功返回 JSON 本体
  */
 async function traktFetch(
   url,
   headers,
   {
-    retries = 2, // 重试次数
-    timeout = 12000, // 单次超时
-    userKey, // 用于限流隔离
-    wantPageCount = false, // 是否附加 __pageCount
-    backoffBase = 500, // 退避基数
+    retries = 2,
+    timeout = 12000,
+    userKey,
+    wantPageCount = false,
+    backoffBase = 500,
   } = {},
 ) {
   const errShape = wantPageCount ? { __pageCount: 1 } : {};
+
   if (isTraktRateLimited(userKey)) {
     return {
       __error: "429 rate limited",
@@ -332,6 +322,7 @@ async function traktFetch(
   for (let i = 0; i <= retries; i++) {
     try {
       const r = await fetchT(url, { headers }, timeout);
+
       if (r.status === 429) {
         consumeRetryAfter(r, userKey);
         return {
@@ -357,8 +348,10 @@ async function traktFetch(
         await backoff(i, backoffBase, 500);
         continue;
       }
+
       const data = await r.json();
-      clearTraktStrikes(userKey); // 请求成功 → 清零连续 429 计数，冷却逐步回落到基础值
+      clearTraktStrikes(userKey);
+
       if (wantPageCount && Array.isArray(data)) {
         Object.defineProperty(data, "__pageCount", {
           value: parseInt(r.headers.get("X-Pagination-Page-Count") || "1") || 1,
@@ -377,26 +370,35 @@ async function traktFetch(
 
 const traktGet = (url, headers, retries = 2, userKey) =>
   traktFetch(url, headers, { retries, timeout: 12000, userKey });
+
+/* ============================================================
+ * KV / 内存缓存层
+ * ============================================================ */
 const KV_MEM_TTL = 1800000,
   KV_EDGE_TTL = 1800,
-  KV_MISS = Symbol("kv-miss"), // 表示 KV 明确返回空
-  KV_ERR = Symbol("kv-err"), // 表示 KV 读取异常
-  KV_MIN_PUT_TTL = 30, // 小于该 TTL（秒）不写 KV
-  KV_DOWN_COOLDOWN_MS = 30000; // KV 异常后冷却 30s 不再尝试
+  KV_MISS = Symbol("kv-miss"),
+  KV_ERR = Symbol("kv-err"),
+  KV_MIN_PUT_TTL = 30,
+  KV_DOWN_COOLDOWN_MS = 30000;
+
 const KV_MIN_PUT_INTERVAL_MS = 3600000;
-const DEFAULT_JITTER_SEC = 600; // 未显式指定 jitter 时，按 key 在 0~600s 内确定性错峰
+const DEFAULT_JITTER_SEC = 600;
 const __KV_LASTPUT_MAX = 5000;
 
-const __kvLastPut = new Map(); // key → 上次写入时间
-const __kvMem = new Map(), // 内存缓存 value
-  __kvMemExp = new Map(), // 内存缓存过期时间
-  __kvInflight = new Map(); // single-flight 中的 Promise
-const __kvMemStale = new Map(); // 内存中的 stale 副本（兜底）
-const STALE_MAX_AGE = 3600000; // stale 最长保留 1 小时
+const __kvLastPut = new Map();
+const __kvMem = new Map(),
+  __kvMemExp = new Map(),
+  __kvInflight = new Map();
+const __kvMemStale = new Map();
+const STALE_MAX_AGE = 3600000;
 
-/** 存入 stale 副本（内存），用于 fetcher 失败时兜底 */
-function kvMemStaleSet(key, data) {
-  __kvMemStale.set(key, { data, ts: Date.now() });
+/** 存入 stale 副本（内存） */
+function kvMemStaleSet(key, data, dataTs) {
+  __kvMemStale.set(key, {
+    data,
+    ts: Date.now(),
+    _ts: dataTs != null ? dataTs : Date.now(),
+  });
   if (__kvMemStale.size > 3000) {
     const it = __kvMemStale.keys();
     for (let i = 0; i < 800; i++) {
@@ -414,9 +416,11 @@ function kvMemStaleGet(key) {
     __kvMemStale.delete(key);
     return undefined;
   }
-  return e.data;
+  return e;
 }
+
 let __kvDownUntil = 0;
+
 function kvIsDown() {
   return Date.now() < __kvDownUntil;
 }
@@ -477,9 +481,8 @@ function singleFlight(key, fn) {
   return p;
 }
 
-/** 读缓存：内存优先，未命中再读 KV；KV 异常时返回 KV_ERR 并短暂标记 down。 */
+/** 读缓存：内存优先，未命中再读 KV；KV 异常时返回 KV_ERR */
 async function kvGetJSON(env, key, memOnly, edgeTtl, missTtl) {
-  // 读路径一律走 KV，避免内存负缓存（KV_MISS）挡住真实数据
   if (memOnly) return undefined;
   if (!env.TMDB_CACHE || kvIsDown()) return KV_ERR;
   try {
@@ -496,8 +499,8 @@ async function kvGetJSON(env, key, memOnly, edgeTtl, missTtl) {
 }
 
 /**
- * 写入缓存：先写内存，再异步写 KV（受 KV_MIN_PUT_INTERVAL_MS 节流，force 可跳过间隔）。
- * payload 会带 _ts / _ttl；KV 实际 expiration 会额外保留一段 stale 便于回退。
+ * 写入缓存：先写内存，再异步写 KV。
+ * payload 会带 _ts / _ttl；KV 实际 expiration 会额外保留一段 stale。
  */
 function kvPutJSON(env, ctx, key, payload, ttl, memOnly, force) {
   const memMs =
@@ -506,6 +509,7 @@ function kvPutJSON(env, ctx, key, payload, ttl, memOnly, force) {
       : ttl
         ? Math.min(KV_MEM_TTL, Math.max(5000, ttl * 1000))
         : KV_MEM_TTL;
+
   if (
     payload &&
     typeof payload === "object" &&
@@ -513,14 +517,17 @@ function kvPutJSON(env, ctx, key, payload, ttl, memOnly, force) {
     !payload._ts
   )
     payload._ts = Date.now();
+
   kvMemSet(key, payload, memMs);
   if (memOnly) return;
   if (!env.TMDB_CACHE || kvIsDown()) return;
-  if (ttl != null && ttl < KV_MIN_PUT_TTL) return; // 太短不写 KV
+  if (ttl != null && ttl < KV_MIN_PUT_TTL) return;
+
   const now = Date.now();
   const lastPut = __kvLastPut.get(key) || 0;
   if (!force && lastPut && now - lastPut < KV_MIN_PUT_INTERVAL_MS) return;
   __kvLastPut.set(key, now);
+
   if (__kvLastPut.size > __KV_LASTPUT_MAX) {
     const it = __kvLastPut.keys();
     for (let i = 0; i < 1000; i++) {
@@ -528,21 +535,25 @@ function kvPutJSON(env, ctx, key, payload, ttl, memOnly, force) {
       if (k) __kvLastPut.delete(k);
     }
   }
+
   const logicalTtl = ttl || 60;
-  // 固定保留 7 天 stale：低频访问的分片（待看/日历）也能在回源失败时兜底
   const staleRetention = KV_STALE_RETENTION;
   const body =
     payload && typeof payload === "object"
       ? { ...payload, _ttl: logicalTtl }
       : payload;
+
   const p = env.TMDB_CACHE.put(key, JSON.stringify(body), {
-    // 总 TTL 上限 30 天，防止极端 TTL 配置超出限制
-    expirationTtl: Math.min(86400 * 30, Math.max(60, logicalTtl + staleRetention)),
+    expirationTtl: Math.min(
+      86400 * 30,
+      Math.max(60, logicalTtl + staleRetention),
+    ),
   })
     .then(() => kvMarkUp())
     .catch(() => {
       kvMarkDown();
     });
+
   if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
 }
 
@@ -559,8 +570,7 @@ function __isErrorPayload(d) {
 
 /**
  * 按 key 的确定性抖动（秒）。
- * 同一 key 永远得到同一个偏移 → 各分片过期时刻稳定且彼此错开；
- * 相比随机抖动，既避免多分片同时过期打上游，也避免同一分片反复横跳。
+ * 同一 key 永远得到同一个偏移，既避免多分片同时过期，也避免反复横跳。
  */
 function stableJitter(key, maxSec) {
   const m = Math.floor(Number(maxSec) || 0);
@@ -599,20 +609,16 @@ async function cachedJSON(
     jitter,
     userKey,
     bypass = false,
-    // preserveTs：写入前对比新旧数据内容，内容未变化时沿用旧 _ts。
-    // 用于让前端「更新于」展示数据真正变化的时间，而非上次抓取时间。
     preserveTs = false,
     sourceTracker = null,
-    // lastGoodKey：可选的「最后一次成功数据」兜底副本 key（见 CK.lastGood）。
-    // 主 key 轮换（日历换天 / 待看换版本号）或 KV 读取失败时回退到它。
     lastGoodKey = null,
-    // revalidate=false：有缓存就直接返回（忽略逻辑 TTL / 不后台刷新），仅冷启动 miss 时才打上游
     revalidate = true,
   } = {},
 ) {
-  // 抖动改为「按 key 确定性抖动」：同一分片偏移稳定，不同分片彼此错开，
-  // 避免多个分片在同一时刻集体过期把上游打成突发（原先是随机 0~90s）。
-  const jitterSec = stableJitter(key, jitter != null ? jitter : DEFAULT_JITTER_SEC);
+  const jitterSec = stableJitter(
+    key,
+    jitter != null ? jitter : DEFAULT_JITTER_SEC,
+  );
   const effectiveTtl = ttl + jitterSec;
   const softAge =
     swr === true ? Math.floor(ttl * 0.5) : typeof swr === "number" ? swr : 0;
@@ -630,8 +636,7 @@ async function cachedJSON(
     return (Date.now() - cached._ts) / 1000;
   }
 
-  /** 记录数据来源（供前端展示 cache/live 标签）；
-   *  live 场景下 liveAgeSec 为「数据内容真正变化距现在的秒数」 */
+  /** 记录数据来源 */
   function markSource(fromCache, cached, liveAgeSec) {
     if (sourceTracker && typeof sourceTracker === "object") {
       if (fromCache === null) {
@@ -650,8 +655,7 @@ async function cachedJSON(
     }
   }
 
-  /* ---------- preserveTs：真实数据更新时间 ----------
-   * 稳定序列化（键排序），避免上游返回字段顺序抖动导致误判「内容已变化」 */
+  /* 稳定序列化（键排序），用于内容对比 */
   function __stableStr(v) {
     if (v === undefined) return "null";
     if (v === null || typeof v !== "object") return JSON.stringify(v);
@@ -663,6 +667,7 @@ async function cachedJSON(
       "}"
     );
   }
+
   /** 读取旧的缓存 payload（内存优先，其次 KV），用于内容对比 */
   async function prevRawForTs() {
     if (!preserveTs) return null;
@@ -677,9 +682,10 @@ async function cachedJSON(
     }
     return null;
   }
+
   /**
-   * 统一写缓存：内容未变化 → 沿用旧 _ts（真实数据更新时间）。
-   * 返回 live 场景应上报的 ageSec（内容刚变化时为 0，未变化时为旧 _ts 的年龄）。
+   * 统一写缓存：内容未变化 → 沿用旧 _ts。
+   * 返回 live 场景应上报的 ageSec。
    */
   async function writeFresh(
     data,
@@ -692,6 +698,7 @@ async function cachedJSON(
     const unchanged =
       !!(prev && prev._ts && __stableStr(prev.data) === __stableStr(data));
     const wts = unchanged ? prev._ts : Date.now();
+
     kvPutJSON(
       env,
       ctx,
@@ -701,12 +708,13 @@ async function cachedJSON(
       memOnlyOverride != null ? memOnlyOverride : memOnly,
       force,
     );
-    kvMemStaleSet(key, data);
+    kvMemStaleSet(key, data, wts);
     writeLastGood(data);
     return unchanged
       ? Math.max(0, Math.round((Date.now() - wts) / 1000))
       : 0;
   }
+
   function tryOldNormal() {
     const mem = kvMemGet(key);
     if (mem !== undefined && mem !== KV_MISS && !mem.miss) {
@@ -717,16 +725,16 @@ async function cachedJSON(
       }
     }
     const st = kvMemStaleGet(key);
-    if (st !== undefined && st !== null && !__isErrorPayload(st)) {
-      markSource(true, null);
-      return { found: true, val: st, raw: null };
+    if (st && st.data !== undefined && !__isErrorPayload(st.data)) {
+      markSource(true, { _ts: st._ts });
+      return { found: true, val: st.data, raw: null, ts: st._ts };
     }
     return { found: false };
   }
 
   /**
    * 「最后一次成功数据」兜底（异步读 KV）。
-   * key 不含日期 / 版本号，故不受日历换天、待看换版本号影响。
+   * key 不含日期/版本号，不受日历换天、待看换版本号影响。
    */
   async function tryLastGood() {
     if (!lastGoodKey || !env || !env.TMDB_CACHE || kvIsDown())
@@ -741,7 +749,7 @@ async function cachedJSON(
     return { found: false };
   }
 
-  /** 把成功数据同步写一份到 last-good 副本（走 1 小时写节流，避免影响 KV 写入配额） */
+  /** 把成功数据同步写一份到 last-good 副本 */
   function writeLastGood(data) {
     if (!lastGoodKey) return;
     kvPutJSON(env, ctx, lastGoodKey, { data }, LAST_GOOD_KV_TTL, false);
@@ -749,7 +757,7 @@ async function cachedJSON(
 
   /**
    * 统一的兜底链：内存 stale → 当前 key 的 KV 旧值 → last-good 副本。
-   * 命中后回填内存，保证同一实例后续请求不再重复读 KV。
+   * 命中后回填内存。
    */
   async function fallbackChain() {
     const old = tryOldNormal();
@@ -757,11 +765,16 @@ async function cachedJSON(
       if (old.raw && old.raw !== KV_MISS)
         kvMemSet(key, old.raw, KV_MEM_TTL);
       else if (old.val != null) {
-        kvMemSet(key, { data: old.val, _ts: Date.now() }, KV_MEM_TTL);
-        kvMemStaleSet(key, old.val);
+        kvMemSet(
+          key,
+          { data: old.val, _ts: old.ts || Date.now() },
+          KV_MEM_TTL,
+        );
+        kvMemStaleSet(key, old.val, old.ts);
       }
       return { found: true, val: old.val };
     }
+
     if (env && env.TMDB_CACHE && !kvIsDown()) {
       try {
         const kvStale = await env.TMDB_CACHE.get(key, { type: "json" });
@@ -773,13 +786,14 @@ async function cachedJSON(
                 ? kvStale
                 : { data: v, _ts: (kvStale && kvStale._ts) || Date.now() };
             kvMemSet(key, memPayload, KV_MEM_TTL);
-            kvMemStaleSet(key, v);
+            kvMemStaleSet(key, v, (kvStale && kvStale._ts) || undefined);
             markSource(true, kvStale);
             return { found: true, val: v };
           }
         }
       } catch {}
     }
+
     const lg = await tryLastGood();
     if (lg.found) {
       const memPayload =
@@ -787,17 +801,14 @@ async function cachedJSON(
           ? lg.raw
           : { data: lg.val, _ts: (lg.raw && lg.raw._ts) || Date.now() };
       kvMemSet(key, memPayload, KV_MEM_TTL);
-      kvMemStaleSet(key, lg.val);
+      kvMemStaleSet(key, lg.val, (lg.raw && lg.raw._ts) || undefined);
       markSource(true, lg.raw || null);
       return { found: true, val: lg.val };
     }
     return { found: false };
   }
 
-  /* ---------- bypass 分支：强制刷新 ----------
-   * 规则：仅在拿到「正确、非错误」数据时才写 KV；
-   * API 限流 / 网络失败 / 错误载荷 → 绝不污染 KV，优先回退展示旧缓存。
-   * ------------------------------------------------ */
+  /* ---------- bypass 分支：强制刷新 ---------- */
   if (bypass) {
     return singleFlight("force:" + key, async () => {
       let data = null;
@@ -806,7 +817,6 @@ async function cachedJSON(
       } catch {
         data = null;
       }
-      // 统一把带 __error / 限流的结果视为失败，禁止入库
       if (data && (data.__error || data.__cooling != null)) data = null;
       if (!__isErrorPayload(data)) {
         const liveAge = await writeFresh(data, { force: true });
@@ -814,7 +824,6 @@ async function cachedJSON(
         return unwrap ? data : { data };
       }
 
-      // 失败兜底链：内存 stale → 当前 key 的 KV 旧值 → last-good 副本
       const fb = await fallbackChain();
       if (fb.found) return unwrap ? fb.val : { data: fb.val };
       markSource(null, null);
@@ -822,7 +831,7 @@ async function cachedJSON(
     });
   }
 
-  /** 判断是否需要刷新（超过逻辑 TTL 或 swr 软过期阈值） */
+  /** 判断是否需要刷新 */
   function needRefresh(cached) {
     if (!cached || cached === KV_MISS || cached.miss || !cached._ts)
       return false;
@@ -832,7 +841,7 @@ async function cachedJSON(
     return false;
   }
 
-  /** 后台异步刷新（SWR），失败不写 KV；staleRaw 为刷新前的旧缓存（用于内容对比） */
+  /** 后台异步刷新（SWR），失败不写 KV */
   function scheduleRefresh(staleRaw) {
     if (!ctx || typeof ctx.waitUntil !== "function") return;
     const flightKey = "swr:" + key;
@@ -845,7 +854,6 @@ async function cachedJSON(
         } catch {
           data = null;
         }
-        // 限流 / 错误结果绝不能写进 KV
         if (data && (data.__error || data.__cooling != null)) data = null;
         const down = kvIsDown();
         if (!__isErrorPayload(data)) {
@@ -857,11 +865,10 @@ async function cachedJSON(
       }),
     );
   }
+
   const mem = kvMemGet(key);
   if (mem !== undefined) {
     if (mem === KV_MISS) {
-      // 主 key 明确为空（可能已被 CF 物理删除，如日历换天 / 待看换版本号）
-      // → 先试 last-good 副本，仍无则返回 null（负缓存由 missTtl 短时控制）
       const lg = await tryLastGood();
       if (lg.found) {
         kvMemSet(
@@ -869,7 +876,7 @@ async function cachedJSON(
           { data: lg.val, _ts: (lg.raw && lg.raw._ts) || Date.now() },
           KV_MEM_TTL,
         );
-        kvMemStaleSet(key, lg.val);
+        kvMemStaleSet(key, lg.val, (lg.raw && lg.raw._ts) || undefined);
         markSource(true, lg.raw || null);
         return unwrap ? lg.val : { data: lg.val };
       }
@@ -882,11 +889,10 @@ async function cachedJSON(
     return mem;
   }
 
-  // KV 命中 / 拉取
   return singleFlight(key, async () => {
     const cached = await kvGetJSON(env, key, memOnly, edgeTtl, missTtl);
+
     if (cached !== undefined && cached !== KV_MISS && cached !== KV_ERR) {
-      // 有 KV：默认直接返回。仅 revalidate=true 且逻辑过期时才后台/同步刷新
       if (revalidate && needRefresh(cached)) {
         if (softAge > 0 && ageSec(cached) <= effectiveTtl) {
           scheduleRefresh(cached);
@@ -900,9 +906,14 @@ async function cachedJSON(
         return cached;
       }
       if (!__isErrorPayload(unwrapVal(cached))) {
-        kvMemStaleSet(key, unwrapVal(cached));
+        kvMemStaleSet(
+          key,
+          unwrapVal(cached),
+          (cached && cached._ts) || undefined,
+        );
       }
     }
+
     const kvBroken = cached === KV_ERR || cached === undefined;
     let data = null;
     try {
@@ -910,8 +921,8 @@ async function cachedJSON(
     } catch {
       data = null;
     }
-    // 限流 / 错误结果绝不能写进 KV
     if (data && (data.__error || data.__cooling != null)) data = null;
+
     if (!__isErrorPayload(data)) {
       const liveAge = await writeFresh(data, {
         memOnlyOverride: memOnly || kvBroken,
@@ -923,34 +934,19 @@ async function cachedJSON(
       markSource(false, null, liveAge);
       return unwrap ? data : { data };
     }
-    // 失败兜底链：内存 stale → 当前 key 的 KV 旧值 → last-good 副本
+
     const fb = await fallbackChain();
     if (fb.found) return unwrap ? fb.val : { data: fb.val };
     markSource(null, null);
     return null;
   });
 }
+
 /* ============================================================
- * 第二部分：路由分发 · 静态资源 · Service Worker · 认证与设备码登录
- * ------------------------------------------------------------
- * Cookie trakt_auth = b64url({ access_token, refresh_token, expires_at,
- *   code_verifier, trakt_id })；由 buildCookie() 生成，readAuth() 解析。
- * ------------------------------------------------------------
- * Cookie trakt_auth = b64url({
- *   access_token,
- *   refresh_token,
- *   expires_at,
- *   code_verifier,
- *   trakt_id
- * })
- * ------------------------------------------------------------
- * 鉴权设计要点：
- *   · trakt_id 一旦成功获取就固化到 Cookie，避免每次打 /users/me
- *   · strict 模式：拿不到稳定身份 → 401 + 清 Cookie + relogin
- *   · 公共数据接口不开 strict，限流时仍可用
+ * 第二部分：路由 · 静态资源 · SW · 认证与设备码登录
  * ============================================================ */
 
-// 前端 SW：静态资源 stale-while-revalidate；/api/ 与导航请求不走缓存
+/* 前端 SW：静态资源 stale-while-revalidate；/api/ 与导航请求不走缓存 */
 const SW_JS_CONTENT = String.raw`/* MineTrakt SW v130 */
 const VERSION = "v130";
 const RUNTIME_CACHE = "trakt-static-" + VERSION;
@@ -992,7 +988,6 @@ self.addEventListener("fetch", function (event) {
   if (url.origin !== self.location.origin) return;
   if (url.pathname === "/sw.js") return;
 
-  // 导航请求：启动页 "/" 走缓存优先（重复启动瞬时打开），其余 network-first
   if (req.mode === "navigate") {
     event.respondWith(
       new URL(req.url).pathname === "/"
@@ -1015,10 +1010,7 @@ self.addEventListener("fetch", function (event) {
   }
 });
 
-/**
- * 记忆化缓存句柄表：SW 生命周期内每个 Cache 只 open 一次 IndexedDB，
- * 后续调用直接拿到已 resolved 的 Cache 对象，冷启动不重复付数据库开销。
- */
+/* 记忆化缓存句柄表 */
 var __cachePs = {};
 function getCache(name) {
   if (!__cachePs[name]) __cachePs[name] = caches.open(name);
@@ -1027,10 +1019,7 @@ function getCache(name) {
 
 /**
  * 启动页 "/"：stale-while-revalidate。
- * · 有缓存：立即返回（重复启动瞬时打开，无白屏），同时后台拉新版刷新缓存
- * · 无缓存：走网络，成功后写入缓存
- * 安全性：缓存的启动页只含"跳转目标"，而 /login 与 /home 都会做服务端登录态
- * 校验并 302 自愈，故缓存不会导致跳错页面；/home 内容始终走网络保持最新。
+ * 有缓存立即返回，同时后台拉新版刷新缓存。
  */
 async function navigateLaunchSwr(req) {
   var cache = await getCache(NAV_CACHE);
@@ -1049,20 +1038,17 @@ async function navigateLaunchSwr(req) {
 }
 
 /**
- * 非启动页导航（/login、/home 等）：纯 network-first + 超时保护。
- * · 始终拉最新网络内容：部署新版本后立即生效，不回退旧页面
- * · 超时/断网直接抛错，由浏览器展示默认错误页（不返回脏数据）
- * · 不写不读缓存：/login 与 /home 均为个性化页面（服务端按 Cookie 302 分流），
- *   避免把某个登录态的页面持久化后误导其他用户
- * 注：启动页 "/" 已由 navigateLaunchSwr 单独处理，不会进入本函数
+ * 非启动页导航：纯 network-first + 超时保护。
+ * 不写不读缓存（个性化页面）。
  */
 async function navigateNetworkFirst(req) {
   var ctrl = new AbortController();
-  var timer = setTimeout(function () { ctrl.abort(); }, NAV_TIMEOUT);
+  var timer = setTimeout(function () {
+    ctrl.abort();
+  }, NAV_TIMEOUT);
   try {
     return await fetch(req, { signal: ctrl.signal });
   } catch (e) {
-    // 超时/断网兜底：先试缓存（含旧版本导航缓存），否则返回轻量占位页
     try {
       var cache = await getCache(NAV_CACHE);
       var cached = await cache.match(req);
@@ -1070,20 +1056,15 @@ async function navigateNetworkFirst(req) {
     } catch (_) {}
     return new Response(
       '<meta http-equiv="refresh" content="3">' +
-      '<p style="font-family:sans-serif">网络较慢，正在重试…</p>',
-      { headers: { "Content-Type": "text/html; charset=utf-8" } }
+        '<p style="font-family:sans-serif">网络较慢，正在重试…</p>',
+      { headers: { "Content-Type": "text/html; charset=utf-8" } },
     );
   } finally {
     clearTimeout(timer);
   }
 }
-/**
- * 静态资源：stale-while-revalidate。
- * · 有缓存：立即返回旧版本（秒开），同时后台拉新版写入缓存
- * · 无缓存：等网络响应，成功后写入缓存
- * fetch 不等 caches.open()（IndexedDB 会拖慢被 Link 预加载的 app.css/app.js），
- * 缓存读写全部经记忆化句柄并行进行。
- */
+
+/** 静态资源：stale-while-revalidate */
 async function staleWhileRevalidate(req) {
   var cacheP = getCache(RUNTIME_CACHE);
   var networkP = fetch(req).then(function (r) {
@@ -1107,22 +1088,25 @@ async function staleWhileRevalidate(req) {
   return cached || networkP;
 }`;
 
-/** Cloudflare Worker 入口：按 path 分发静态资源 / 认证 / API / 首页 */
+/** Cloudflare Worker 入口：按 path 分发 */
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url),
       path = url.pathname;
+
     if (path.startsWith("/assets/")) return handleAsset(path, ctx);
     if (path === "/app.css") return handleAppCss();
     if (path === "/app.js") return handleAppJs(request);
     if (path === "/favicon.ico") return Response.redirect(FAVICON_URL, 302);
     if (path === "/manifest.webmanifest") return handleManifest();
     if (path === "/sw.js") return handleServiceWorker();
+
     if (path === "/auth/device") return handleDevice(env);
     if (path === "/auth/poll" && request.method === "POST")
       return handlePoll(request, env, ctx);
     if (path === "/auth/logout" && request.method === "POST")
       return handleLogout(request, env, ctx);
+
     if (path === "/api/more") return handleMore(request, env, ctx);
     if (path === "/api/season") return handleSeason(request, env, ctx);
     if (path === "/api/detail") return handleApiDetail(request, env, ctx);
@@ -1136,10 +1120,10 @@ export default {
     if (path === "/api/douban-list") return handleDoubanList(request, env, ctx);
     if (path === "/api/theater-list")
       return handleTheaterList(request, env, ctx);
-    // 骨朵热榜：分类筛选 + 横向滚动 / 弹窗网格
     if (path === "/api/guduo-list") return handleGuduoList(request, env, ctx);
     if (path === "/api/platform-list")
       return handlePlatformList(request, env, ctx);
+
     if (path === "/api/watchlist/add" && request.method === "POST")
       return handleWatchlistAdd(request, env, ctx);
     if (path === "/api/watchlist/remove" && request.method === "POST")
@@ -1159,21 +1143,15 @@ export default {
     if (path === "/api/app-version") return handleAppVersion();
     if (path === "/api/auth-status") return handleAuthStatus(request);
 
-    // 启动页 / 登录页 / 首页 三分离
     if (path === "/login") return handleLogin(request, env, ctx);
     if (path === "/home") return handleHome(request, env, ctx);
     if (path === "/" || path === "") return handleLaunch(request, env, ctx);
 
-    // 其余（含 /detail/xxx 深链）走首页逻辑
     return handleHome(request, env, ctx);
   },
 };
 
-
-/**
- * 静态资源处理：回源到 ASSET_ORIGINS 指定的 URL，
- * 使用 caches.default 缓存一年。
- */
+/** 静态资源处理：回源到 ASSET_ORIGINS，caches.default 缓存一年 */
 async function handleAsset(path, ctx) {
   const entry = ASSET_ORIGINS[path];
   if (!entry) return new Response("Not Found", { status: 404 });
@@ -1263,7 +1241,7 @@ function handleManifest() {
   );
 }
 
-/** 版本对账接口：前端用它在回前台时检测是否有新版本（零上游请求） */
+/** 版本对账接口：前端回前台时检测是否有新版本（零上游请求） */
 function handleAppVersion() {
   return new Response(
     JSON.stringify({ js: APP_JS_VERSION, css: APP_CSS_VERSION }),
@@ -1287,16 +1265,9 @@ function handleServiceWorker() {
   });
 }
 
-
 /**
  * 基础认证检查。
- * 流程：
- *   1. 从 Cookie 读 trakt_auth
- *   2. 必要时刷新 token
- *   3. 返回 { ok, auth, headers, needsCookieUpdate }
- *
- * 注意：不再在这里尝试补 trakt_id，交给 getStableUserId(strict) 处理，
- * 减少一次不必要的 /users/me 请求。
+ * 流程：读 Cookie → 必要时刷新 token → 返回 { ok, auth, headers, needsCookieUpdate }
  */
 async function requireAuth(request, env) {
   const cookieAuth = readAuth(request);
@@ -1316,17 +1287,10 @@ async function requireAuth(request, env) {
 /**
  * 要求登录的 API 入口助手。
  *
- * @param {Request} request
- * @param {object} env
- * @param {object} ctx
- * @param {object} opts
- * @param {boolean} opts.html   错误响应用 HTML（用于页面型 API）
- * @param {boolean} opts.strict 严格模式：
- *   · 拿不到稳定身份（限流/401/403/无 slug+无 trakt）时
- *   · 返回 401 + 清 Cookie + relogin，让前端回登录页
+ * @param {boolean} opts.html   错误响应用 HTML
+ * @param {boolean} opts.strict 严格模式：拿不到稳定身份 → 401 + 清 Cookie + relogin
  *
- * @returns {{ ok:true, auth, headers, needsCookieUpdate, userKey }
- *         | { ok:false, response }}
+ * @returns {{ ok:true, auth, headers, needsCookieUpdate, userKey } | { ok:false, response }}
  */
 async function authed(
   request,
@@ -1380,13 +1344,11 @@ async function authed(
   };
 }
 
-/**
- * 将技术性错误码转成面向用户的中文提示。
- * 支持 extra.cooling 提示剩余冷却秒数。
- */
+/** 把技术性错误码转成面向用户的中文提示 */
 function humanizeApiError(codeOrMsg, extra) {
   const s = String(codeOrMsg || "").trim();
   const cooling = extra && extra.cooling != null ? Number(extra.cooling) : null;
+
   const map = {
     unauthorized: "登录已过期，请重新登录",
     "bad body": "请求数据格式有误，请重试",
@@ -1399,6 +1361,7 @@ function humanizeApiError(codeOrMsg, extra) {
       "Trakt 上暂时没有对应条目，可能是新片或中文内容尚未同步",
   };
   if (map[s]) return map[s];
+
   if (/^429|rate\s*limit|限流/i.test(s)) {
     if (cooling != null && cooling > 0)
       return `Trakt 请求过于频繁，请约 ${cooling} 秒后再试`;
@@ -1440,8 +1403,8 @@ function unauthorizedHtml() {
 
 /**
  * 统一 JSON 响应构造器。
- * - 会自动 humanize data.error
- * - 如果 needsCookieUpdate，会下发最新 Cookie
+ * - 自动 humanize data.error
+ * - needsCookieUpdate 时下发最新 Cookie
  */
 function authJson(auth, needsCookieUpdate, data, status = 200) {
   const headers = { "Content-Type": CT_JSON };
@@ -1456,10 +1419,7 @@ function authJson(auth, needsCookieUpdate, data, status = 200) {
   return new Response(JSON.stringify(data), { status, headers });
 }
 
-/**
- * 统一 HTML/文本响应构造器。
- * 支持自定义 status / contentType / extra headers。
- */
+/** 统一 HTML/文本响应构造器 */
 function authResp(
   auth,
   needsCookieUpdate,
@@ -1493,29 +1453,33 @@ async function traktSyncAction(
   env,
   ctx,
   {
-    allowedTypes, // 允许的 type 数组，如 ["movie","show"]
-    idField = "id", // 从 body 取哪个字段作为 id
-    buildPayload, // (type, traktId, body) => Trakt 请求体
-    endpoint, // Trakt API 路径，如 "/sync/watchlist/remove"
+    allowedTypes,
+    idField = "id",
+    buildPayload,
+    endpoint,
     timeout = 10000,
-    afterOk, // 成功后的回调 (auth, headers, env, ctx)
+    afterOk,
   },
 ) {
   const A = await authed(request, env, ctx);
   if (!A.ok) return A.response;
   const { auth, headers, needsCookieUpdate } = A;
+
   const parsed = await parseJsonBody(request);
   if (!parsed.ok) return parsed.error;
   const body = parsed.body || {};
   const type = body.type,
     rawId = body[idField];
+
   if (!allowedTypes.includes(type) || rawId == null || rawId === "") {
     return authJson(auth, needsCookieUpdate, { error: "bad params" }, 400);
   }
+
   const traktId = Number(rawId);
   if (!Number.isFinite(traktId) || traktId <= 0) {
     return authJson(auth, needsCookieUpdate, { error: "bad id" }, 400);
   }
+
   const payload = buildPayload(type, traktId, body);
   if (!payload)
     return authJson(auth, needsCookieUpdate, { error: "bad params" }, 400);
@@ -1534,6 +1498,7 @@ async function traktSyncAction(
   } catch (e) {
     return authJson(auth, needsCookieUpdate, { error: String(e) }, 502);
   }
+
   if (!r.ok) {
     const text = await r.text().catch(() => "");
     return authJson(
@@ -1543,24 +1508,25 @@ async function traktSyncAction(
       r.status,
     );
   }
+
   if (typeof afterOk === "function") await afterOk(auth, headers, env, ctx);
   const result = await r.json().catch(() => null);
   return authJson(auth, needsCookieUpdate, { ok: true, result });
 }
-
 
 /**
  * 设备码授权：第一步
  * 请求 Trakt /oauth/device/code，返回 user_code、state（含 device_code+PKCE）。
  *
  * 错误处理：
- *   · 429 → { error, rateLimited: true, retryAfter } + 429 状态码
- *   · 403 → CLIENT_ID 配错提示
- *   · 5xx → 通用中文提示
+ *   429 → { error, rateLimited: true, retryAfter } + 429
+ *   403 → CLIENT_ID 配错提示
+ *   5xx → 通用中文提示
  */
 async function handleDevice(env) {
   const codeVerifier = randomString(64),
     codeChallenge = await pkceChallenge(codeVerifier);
+
   let res;
   try {
     res = await fetchT(
@@ -1585,6 +1551,7 @@ async function handleDevice(env) {
 
   if (!res.ok) {
     const errText = await res.text();
+
     if (res.status === 429) {
       const ra = parseInt(res.headers.get("Retry-After") || "", 10);
       const waitSec = Number.isFinite(ra) && ra > 0 ? Math.min(ra, 180) : 30;
@@ -1597,6 +1564,7 @@ async function handleDevice(env) {
         { status: 429, headers: { "Retry-After": String(waitSec) } },
       );
     }
+
     if (res.status === 403) {
       return Response.json(
         {
@@ -1606,6 +1574,7 @@ async function handleDevice(env) {
         { status: 502 },
       );
     }
+
     return Response.json(
       { error: "Trakt 服务暂时不可用，请稍后重试" },
       { status: 502 },
@@ -1619,6 +1588,7 @@ async function handleDevice(env) {
         code_verifier: codeVerifier,
       }),
     );
+
   return Response.json({
     state,
     user_code: data.user_code,
@@ -1630,11 +1600,6 @@ async function handleDevice(env) {
 
 /**
  * 设备码授权：第二步（轮询）
- *
- * 关键改动（本轮）：
- *   · 登录成功后必须拿到 traktId（数字 trakt_id 或 slug）
- *   · 拿不到则拒绝下发 Cookie，返回 relogin 让前端重试
- *   · 所有错误分支都返回中文 message，前端直接显示
  *
  * Trakt 可能的响应：
  *   202 authorization_pending / slow_down  → 继续等待
@@ -1690,6 +1655,7 @@ async function handlePoll(request, env, ctx) {
       code_verifier: decoded.code_verifier,
       trakt_id: null,
     };
+
     let traktId = null;
     let meStatus = 0;
     try {
@@ -1703,6 +1669,7 @@ async function handlePoll(request, env, ctx) {
         else if (ids.slug) traktId = "s:" + String(ids.slug);
       }
     } catch {}
+
     if (!traktId) {
       const limited = meStatus === 429;
       return Response.json(
@@ -1745,6 +1712,7 @@ async function handlePoll(request, env, ctx) {
       if (rt) kvMemSet(CK.uidRt(rt.slice(0, 32)), traktId, KV_MEM_TTL);
       if (at) kvMemSet(CK.uidAt(at.slice(0, 24)), traktId, KV_MEM_TTL);
     }
+
     return new Response(JSON.stringify({ ok: true }), {
       status: 200,
       headers: {
@@ -1754,20 +1722,13 @@ async function handlePoll(request, env, ctx) {
     });
   }
 
-  /* ============================================================
-   * 轮询结果处理
-   * ------------------------------------------------------------
-   * 统一返回 { status, message } 结构：
-   *   · status  给前端做分支判断（字符串枚举）
-   *   · message 面向用户的中文提示，前端直接显示
-   * 不再返回原始 HTTP 状态码和 raw 文本，避免前端拼出
-   * “HTTP 502 · error” 这类让用户困惑的提示。
-   * ============================================================ */
+  /* 轮询结果：统一返回 { status, message } 结构 */
   const rawText = await res.text();
   let err = "unknown";
   try {
     err = JSON.parse(rawText).error;
   } catch {}
+
   if (err === "authorization_pending" || err === "slow_down") {
     return Response.json({ status: err }, { status: 202 });
   }
@@ -1790,7 +1751,6 @@ async function handlePoll(request, env, ctx) {
     );
   }
 
-  // 其它（502/500/网络层）：上游服务异常（前端稍后自动重试）
   return Response.json(
     {
       status: "error",
@@ -1802,10 +1762,7 @@ async function handlePoll(request, env, ctx) {
   );
 }
 
-/**
- * 登出：清 Cookie，并异步清理该用户的 KV 缓存。
- * 失败不阻断登出流程。
- */
+/** 登出：清 Cookie，并异步清理该用户的 KV 缓存 */
 async function handleLogout(request, env, ctx) {
   try {
     const cookieAuth = readAuth(request);
@@ -1834,14 +1791,13 @@ async function handleLogout(request, env, ctx) {
         bustHomeUserCaches(userKey, env, ctx);
       }
     }
-  } catch {
-  }
+  } catch {}
+
   return new Response(null, {
     status: 204,
     headers: { "Set-Cookie": clearCookieHeader() },
   });
 }
-
 
 /** 构造认证 Cookie：b64url(JSON) + HttpOnly + Secure + SameSite=Lax */
 function buildCookie(auth, traktId) {
@@ -1874,11 +1830,12 @@ function readAuth(request) {
 }
 
 /**
- * 检查 token 是否即将过期，如果剩余 < 30 分钟就刷新。
+ * 检查 token 是否即将过期，剩余 < 30 分钟就刷新。
  * 刷新失败返回 null，调用方按未登录处理。
  */
 async function refreshIfNeeded(auth, env) {
   if (auth.expires_at - Date.now() > 30 * 60_000) return auth;
+
   let res;
   try {
     res = await fetchT(
@@ -1900,6 +1857,7 @@ async function refreshIfNeeded(auth, env) {
     return null;
   }
   if (!res.ok) return null;
+
   const data = await res.json();
   return {
     access_token: data.access_token,
@@ -1931,12 +1889,7 @@ function makeTraktHeaders(env, auth) {
  *   4. GET /users/me 拉取（成功会写 KV，90 天有效）
  *   5. 降级：rt/at 前缀 / anon
  *
- * strict=true 时：
- *   · 限流 / 401 / 403 / 无法获取 → 返回 null，绝不降级
- *   · 调用方（authed）据此判定登录失败
- *
- * 注意：Trakt 的用户 IDs 可能只有 slug（无数字 trakt），
- * 此时用 "s:<slug>" 作为 uid，保证稳定性。
+ * strict=true 时限流 / 401 / 403 / 无法获取 → 返回 null，绝不降级。
  */
 async function getStableUserId(
   auth,
@@ -1951,9 +1904,11 @@ async function getStableUserId(
   const rt = auth.refresh_token ? String(auth.refresh_token) : "";
   const at = auth.access_token ? String(auth.access_token) : "";
   const memKey = rt ? CK.uidRt(rt.slice(0, 32)) : CK.uidAt(at.slice(0, 24));
+
   const memCached = kvMemGet(memKey);
   if (memCached !== undefined && memCached !== KV_MISS && memCached)
     return String(memCached);
+
   if (env && env.TMDB_CACHE) {
     try {
       const raw = await env.TMDB_CACHE.get(memKey, {
@@ -1975,10 +1930,10 @@ async function getStableUserId(
     }
   }
 
-  // 已知限流：strict 直接判失败，不再打 /users/me
   if (isTraktRateLimited(rt || at)) {
     if (strict) return null;
   }
+
   try {
     const r = await fetchT(`${TRAKT_API}/users/me`, { headers }, 8000);
     if (r.ok) {
@@ -1987,15 +1942,14 @@ async function getStableUserId(
       let uid = null;
       if (ids.trakt != null && ids.trakt !== "") uid = String(ids.trakt);
       else if (ids.slug) uid = "s:" + String(ids.slug);
+
       if (uid) {
         kvMemSet(memKey, uid, KV_MEM_TTL);
         if (env && env.TMDB_CACHE) {
           const putP = env.TMDB_CACHE.put(
             memKey,
             JSON.stringify({ data: uid, _ts: Date.now() }),
-            {
-              expirationTtl: 60 * 60 * 24 * 90,
-            },
+            { expirationTtl: 60 * 60 * 24 * 90 },
           ).catch(() => {});
           if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(putP);
         }
@@ -2008,7 +1962,9 @@ async function getStableUserId(
       if (strict) return null;
     }
   } catch {}
+
   if (strict) return null;
+
   const userId = rt
     ? "r" + rt.slice(0, 20)
     : at
@@ -2018,10 +1974,7 @@ async function getStableUserId(
   return userId;
 }
 
-/**
- * 仅写内存的映射缓存（用于已验证过的 traktId 快速复用）。
- * 不做 KV 写入，避免污染。
- */
+/** 仅写内存的映射缓存（用于已验证过的 traktId 快速复用） */
 function rememberTraktUserId(auth, traktId) {
   if (!auth || !traktId) return;
   const id = String(traktId);
@@ -2030,13 +1983,10 @@ function rememberTraktUserId(auth, traktId) {
   if (rt) kvMemSet(CK.uidRt(rt.slice(0, 32)), id, KV_MEM_TTL);
   if (at) kvMemSet(CK.uidAt(at.slice(0, 24)), id, KV_MEM_TTL);
 }
+
 /* ============================================================
  * 第三部分：外部数据源（TMDB · 豆瓣 · 剧场 · 骨朵 · OMDB）+ 用户写操作
- * ------------------------------------------------------------
- * 公共数据走长 TTL 缓存；写操作（watchlist / history / drop）后必须
- * bust 该用户缓存；用户数据接口一律 strict 鉴权（401 + relogin）。
  * ============================================================ */
-
 
 /** 清 Cookie 的响应头 */
 function clearCookieHeader() {
@@ -2066,7 +2016,6 @@ function buildProfileCookie(profile) {
  * 每次增删 watchlist 会 bump 版本号，用来让旧缓存自动失效。
  */
 async function getWatchlistVersion(env, ctx, userKey) {
-  // 无 wlv key 时默认 "0"（与 wl:{uid}:0:added 对齐）；不读进程内存
   if (!userKey) return "0";
   const key = CK.watchlistVersion(userKey);
   if (!env || !env.TMDB_CACHE || kvIsDown()) return "0";
@@ -2117,6 +2066,7 @@ function invalidateWatchlistCache(env, ctx, userKey) {
       }
     }
   }
+
   if (env && env.TMDB_CACHE && userKey) {
     const verKey = CK.watchlistVersion(userKey);
     const bump = (async () => {
@@ -2175,12 +2125,14 @@ function userCacheKeys(userKey) {
 function bustHomeUserCaches(userKey, env, ctx) {
   if (!userKey) return;
   const { exact, prefix } = userCacheKeys(userKey);
+
   for (const k of [...__kvMem.keys()]) {
     if (exact.includes(k) || prefix.some((p) => k.startsWith(p))) {
       __kvMem.delete(k);
       __kvMemExp.delete(k);
     }
   }
+
   if (env && env.TMDB_CACHE) {
     const fixedKeys = [
       CK.playback(userKey),
@@ -2200,7 +2152,7 @@ function bustHomeUserCaches(userKey, env, ctx) {
  * 并发受限的任务执行器。
  * @param {Array<() => Promise>} taskFns  任务工厂（调用时才执行）
  * @param {number} concurrency           最大并行数
- * @param {number} delayMs               启动下一个任务前的间隔（读缓存时应为 0）
+ * @param {number} delayMs               启动下一个任务前的间隔
  */
 async function runLimited(taskFns, concurrency = 2, delayMs = 150) {
   let idx = 0;
@@ -2218,7 +2170,6 @@ async function runLimited(taskFns, concurrency = 2, delayMs = 150) {
   for (let i = 0; i < n; i++) workers.push(worker());
   await Promise.all(workers);
 }
-
 
 /** 带异常的 TMDB GET（失败返回 null） */
 async function tmdbGet(url) {
@@ -2245,19 +2196,13 @@ function tmdbUrl(path, env, extra = {}) {
 /** 带缓存的 TMDB 详情（默认 1 天 TTL） */
 async function tmdbDetailCached(path, env, ctx, ttl = 86400) {
   if (!env.TMDB_API_KEY) return null;
-  return cachedJSON(
-    env,
-    ctx,
-    CK.tmdb(path),
-    () => tmdbGet(tmdbUrl(path, env)),
-    {
-      ttl,
-      missTtl: MISS_KV_TTL,
-      swr: Math.min(3600, Math.floor(ttl * 0.4)),
-      edgeTtl: 900,
-      jitter: 200,
-    },
-  );
+  return cachedJSON(env, ctx, CK.tmdb(path), () => tmdbGet(tmdbUrl(path, env)), {
+    ttl,
+    missTtl: MISS_KV_TTL,
+    swr: Math.min(3600, Math.floor(ttl * 0.4)),
+    edgeTtl: 900,
+    jitter: 200,
+  });
 }
 
 /** 拼 TMDB 图片 URL */
@@ -2279,13 +2224,12 @@ function mapTmdbItem(r, typeHint) {
       ? r.title || r.original_title || ""
       : r.name || r.original_name || r.title || "",
     year: dateStr.slice(0, 4),
-    date: dateStr, // 完整日期（精确排序用）
+    date: dateStr,
     poster: r.poster_path ? tmdbPoster(r.poster_path) : null,
     overview: r.overview || "",
     popularity: r.popularity || 0,
   };
 }
-
 
 /** 拉豆瓣列表（走 6 小时缓存） */
 async function getDoubanRaw(env, ctx) {
@@ -2348,8 +2292,10 @@ function collectDoubanLists(data, keys) {
  */
 function pickDoubanSection(data, section, filter) {
   if (!data) return [];
+
   const typeFilter = filter || "all";
   let tvRaw = [];
+
   if (section === "domestic") tvRaw = collectDoubanLists(data, ["tv_domestic"]);
   else if (section === "hktw") {
     const all = Array.isArray(data.tv) ? data.tv : [];
@@ -2392,6 +2338,7 @@ function pickDoubanSection(data, section, filter) {
     }
     return false;
   }
+
   if (typeFilter === "movie") push(mvRaw, "movie");
   else if (typeFilter === "tv") push(tvRaw, "tv");
   else {
@@ -2433,17 +2380,17 @@ async function handleDoubanList(request, env, ctx) {
   const section = url.searchParams.get("section") || "domestic";
   const mode = url.searchParams.get("mode") || "grid";
   const filter = url.searchParams.get("filter") || "all";
+
   const data = await getDoubanRaw(env, ctx);
   const items = pickDoubanSection(data, section, filter);
   const html = renderDoubanItems(items);
+
   const outHeaders = {
     "Content-Type": CT_HTML,
     "Cache-Control": CC_API,
   };
   return listResp(html, mode, outHeaders);
-  return new Response(html, { headers: outHeaders });
 }
-
 
 /** 拉剧场列表（走 6 小时缓存） */
 async function getTheaterRaw(env, ctx) {
@@ -2500,6 +2447,7 @@ function theaterPlatformOf(x) {
   if (!x) return "";
   if (x.__platform)
     return x.__platform === "玛卡巴卡的悬疑剧" ? "悬疑剧" : x.__platform;
+
   const candidates = [
     x.platform,
     x.platformTitle,
@@ -2548,6 +2496,7 @@ function pickTheaterSection(data, platform) {
     !platform || platform === "all"
       ? list
       : list.filter((x) => theaterPlatformOf(x) === platform);
+
   const seen = new Set(),
     out = [];
   for (const x of filtered) {
@@ -2603,13 +2552,6 @@ function renderTheaterItems(items) {
     .join("");
 }
 
-/**
- * 剧场列表 API。
- * mode=grid      纯卡片 HTML
- * mode=hscroll   包裹 .h-scroll
- * mode=platforms 返回平台列表 JSON
- * mode=debug     返回数据结构摘要（排查用）
- */
 /** 列表响应：hscroll 模式包横向滚动壳，空内容给占位；其余原样输出 */
 function listResp(html, mode, headers) {
   if (mode !== "hscroll") return new Response(html, { headers });
@@ -2621,15 +2563,24 @@ function listResp(html, mode, headers) {
   return new Response(`<div class="h-scroll">${html}</div>`, { headers });
 }
 
+/**
+ * 剧场列表 API。
+ * mode=grid      纯卡片 HTML
+ * mode=hscroll   包裹 .h-scroll
+ * mode=platforms 返回平台列表 JSON
+ * mode=debug     返回数据结构摘要（排查用）
+ */
 async function handleTheaterList(request, env, ctx) {
   const url = new URL(request.url);
   const mode = url.searchParams.get("mode") || "grid";
   const platform = url.searchParams.get("platform") || "all";
+
   const data = await getTheaterRaw(env, ctx);
   const outHeaders = {
     "Content-Type": CT_HTML,
     "Cache-Control": CC_API,
   };
+
   if (mode === "debug") {
     const summary = { type: typeof data, keys: [], sample: null, itemCount: 0 };
     if (data && typeof data === "object") {
@@ -2655,6 +2606,7 @@ async function handleTheaterList(request, env, ctx) {
       },
     });
   }
+
   if (mode === "platforms") {
     return new Response(
       JSON.stringify({ platforms: getTheaterPlatforms(data) }),
@@ -2666,16 +2618,15 @@ async function handleTheaterList(request, env, ctx) {
       },
     );
   }
+
   const html = renderTheaterItems(pickTheaterSection(data, platform));
   return listResp(html, mode, outHeaders);
-  return new Response(html, { headers: outHeaders });
 }
 
 /* -------------------- 骨朵热榜 --------------------
  * 数据：GUDUO_API（widget.v2too.top/data/guduo.json）
  * 分类：剧集 / 电影 / 动漫 / 综艺（GUDUO_CATEGORIES）
  * API：/api/guduo-list?mode=hscroll|grid|categories&category=
- * 首页：位于「继续观看」与「平台剧场」之间，带筛选 Tab + 查看更多
  * ---------------------------------------------------- */
 
 /** 拉骨朵热榜（走 6 小时缓存） */
@@ -2794,11 +2745,13 @@ async function handleGuduoList(request, env, ctx) {
   const url = new URL(request.url);
   const mode = url.searchParams.get("mode") || "grid";
   const category = url.searchParams.get("category") || "all";
+
   const data = await getGuduoRaw(env, ctx);
   const outHeaders = {
     "Content-Type": CT_HTML,
     "Cache-Control": CC_API,
   };
+
   if (mode === "debug") {
     const cats = (data && data.categories) || {};
     const summary = {
@@ -2819,6 +2772,7 @@ async function handleGuduoList(request, env, ctx) {
       },
     });
   }
+
   if (mode === "categories") {
     const cats = (data && data.categories) || {};
     const list = GUDUO_CATEGORIES.filter(
@@ -2831,9 +2785,9 @@ async function handleGuduoList(request, env, ctx) {
       },
     });
   }
+
   const html = renderGuduoItems(pickGuduoSection(data, category));
   return listResp(html, mode, outHeaders);
-  return new Response(html, { headers: outHeaders });
 }
 
 /* -------------------- 流媒体平台筛选（TMDB discover） --------------------
@@ -2954,6 +2908,7 @@ function renderPlatformItems(items) {
 /** 从 TMDB discover 拉某平台内容（电影 + 剧集合并） */
 async function fetchPlatformDiscover(plat, media, page, env) {
   if (!env.TMDB_API_KEY || !plat) return { items: [], totalPages: 1 };
+
   const pageNum = Math.max(1, Math.min(20, page || 1));
   const wantMovie = media === "all" || media === "movie";
   const wantTv = media === "all" || media === "tv";
@@ -2979,6 +2934,7 @@ async function fetchPlatformDiscover(plat, media, page, env) {
   if (plat.kind === "watch") {
     const providerStr = (plat.providers || []).join("|");
     const region = plat.watchRegion || "US";
+
     if (wantMovie && providerStr) {
       jobs.push(
         tmdbGet(
@@ -3034,11 +2990,13 @@ async function fetchPlatformDiscover(plat, media, page, env) {
   const seen = new Set();
   const out = [];
   let maxPages = 1;
+
   for (const r of results) {
     if (!r || !r.data) continue;
     const tp = Number(r.data.total_pages) || 1;
     if (tp > maxPages) maxPages = tp;
     if (!Array.isArray(r.data.results)) continue;
+
     for (const row of r.data.results) {
       const item = mapTmdbItem(row, r.media === "movie" ? "movie" : "tv");
       if (!item || !item.tmdbId || seen.has(item.type + ":" + item.tmdbId))
@@ -3048,6 +3006,7 @@ async function fetchPlatformDiscover(plat, media, page, env) {
       out.push(item);
     }
   }
+
   out.sort((a, b) => {
     const da = a.date || "";
     const db = b.date || "";
@@ -3056,6 +3015,7 @@ async function fetchPlatformDiscover(plat, media, page, env) {
     if (!db) return -1;
     return db.localeCompare(da);
   });
+
   return { items: out, totalPages: Math.min(20, maxPages) };
 }
 
@@ -3068,6 +3028,7 @@ async function handlePlatformList(request, env, ctx) {
     1,
     Math.min(20, parseInt(url.searchParams.get("page") || "1", 10) || 1),
   );
+
   const plat = PLATFORMS[id];
   const outHeadersHtml = {
     "Content-Type": CT_HTML,
@@ -3087,6 +3048,7 @@ async function handlePlatformList(request, env, ctx) {
       headers: outHeadersHtml,
     });
   }
+
   if (!env.TMDB_API_KEY) {
     if (mode === "json" || mode === "preview")
       return new Response(JSON.stringify({ error: "no tmdb", items: [] }), {
@@ -3096,8 +3058,10 @@ async function handlePlatformList(request, env, ctx) {
       headers: outHeadersHtml,
     });
   }
+
   const cacheMedia = mode === "preview" ? "preview" : media;
   const cachePage = mode === "preview" ? 1 : page;
+
   const data = await cachedJSON(
     env,
     ctx,
@@ -3147,13 +3111,7 @@ async function handlePlatformList(request, env, ctx) {
 
   const html = renderPlatformItems(list);
   return listResp(html, mode, outHeadersHtml);
-  const wrap =
-    `<div class="platform-result" data-page="${page}" data-total-pages="${totalPages}" data-has-more="${page < totalPages ? "1" : "0"}">` +
-    (html || '<div class="empty"><p>暂无该平台内容</p></div>') +
-    `</div>`;
-  return new Response(wrap, { headers: outHeadersHtml });
 }
-
 
 /** 构造 Trakt sync 请求体 */
 function traktSyncPayload(kind, id) {
@@ -3183,6 +3141,7 @@ async function resolveTraktIdFromTmdb(tmdbId, type, headers, userKey) {
       userKey,
     );
     if (!Array.isArray(arr) || !arr.length) return null;
+
     const prefer = t === "movie" ? "movie" : t === "show" ? "show" : null;
     if (
       prefer &&
@@ -3203,20 +3162,23 @@ async function resolveTraktIdFromTmdb(tmdbId, type, headers, userKey) {
 
   let traktId = await tryOnce(type);
   if (traktId) return traktId;
+
   const other = type === "movie" ? "show" : "movie";
   traktId = await tryOnce(other);
   if (traktId) return traktId;
+
   return await tryOnce(null);
 }
-
 
 /** 拉 OMDB 评分（IMDb / RT / Metacritic） */
 async function fetchOmdbRatings(imdbId, env, ctx) {
   if (!imdbId || !env.OMDB_API_KEY) return null;
+
   let id = String(imdbId).trim();
   if (/^\d+$/.test(id)) id = "tt" + id.padStart(7, "0");
   if (!/^tt\d+$/i.test(id)) return null;
   id = id.toLowerCase();
+
   return cachedJSON(
     env,
     ctx,
@@ -3228,7 +3190,9 @@ async function fetchOmdbRatings(imdbId, env, ctx) {
         const r = await fetchT(url, {}, 8000);
         if (r.ok) d = await r.json();
       } catch {}
+
       if (!d || d.Response !== "True") return null;
+
       const out = {};
       if (Array.isArray(d.Ratings)) {
         for (const r of d.Ratings) {
@@ -3257,6 +3221,7 @@ async function fetchOmdbRatings(imdbId, env, ctx) {
 /** 拉 TMDB 预告片（优先中文，其次英文） */
 async function fetchTmdbVideos(type, id, env, ctx) {
   if (!env.TMDB_API_KEY) return null;
+
   return cachedJSON(
     env,
     ctx,
@@ -3264,8 +3229,10 @@ async function fetchTmdbVideos(type, id, env, ctx) {
     async () => {
       const mk = (lang) =>
         `${TMDB_API}/${type}/${id}/videos?language=${lang}&api_key=${env.TMDB_API_KEY}`;
+
       const zhRes = await tmdbGet(mk("zh-CN"));
       const zhList = zhRes && Array.isArray(zhRes.results) ? zhRes.results : [];
+
       const hasZhPlayable = zhList.some(
         (v) =>
           v &&
@@ -3274,8 +3241,10 @@ async function fetchTmdbVideos(type, id, env, ctx) {
           (v.type === "Trailer" || v.type === "Teaser"),
       );
       if (hasZhPlayable) return { results: zhList };
+
       const enRes = await tmdbGet(mk("en-US"));
       const enList = enRes && Array.isArray(enRes.results) ? enRes.results : [];
+
       const merged = [...zhList, ...enList];
       return merged.length ? { results: merged } : null;
     },
@@ -3295,6 +3264,7 @@ function mcColor(n) {
   if (n >= 40) return "#ffcc33";
   return "#ff0000";
 }
+
 const RATING_LOGOS = {
   tmdb: `<svg class="ext-logo" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="#01B4E4" d="M6.62 12a2.291 2.291 0 0 1 2.292-2.295h-.013A2.291 2.291 0 0 1 11.189 12a2.291 2.291 0 0 1-2.29 2.291h.013A2.291 2.291 0 0 1 6.62 12zm10.72-4.062h4.266a2.291 2.291 0 0 0 2.29-2.291 2.291 2.291 0 0 0-2.29-2.296H17.34a2.291 2.291 0 0 0-2.291 2.296 2.291 2.291 0 0 0 2.29 2.29zM2.688 20.645h8.285a2.291 2.291 0 0 0 2.291-2.292 2.291 2.291 0 0 0-2.29-2.295H2.687a2.291 2.291 0 0 0-2.291 2.295 2.291 2.291 0 0 0 2.29 2.292zm10.881-6.354h.81l1.894-4.586H15.19l-1.154 3.008h-.013l-1.135-3.008h-1.154zm4.208 0h1.011V9.705h-1.011zm2.878 0h3.235v-.93h-2.223v-.933h1.99v-.934h-1.99v-.855h2.107v-.934h-3.112zM1.31 7.941h1.01V4.247h1.31v-.895H0v.895h1.31zm3.747 0h1.011V5.959h1.958v1.984h1.011v-4.59h-1.01v1.711H6.061V3.351H5.057zm5.348 0h3.242v-.933H11.41v-.934h1.99v-.933h-1.99v-.856h2.107v-.934h-3.112zM.162 14.296h1.005v-3.52h.013l1.167 3.52h.765l1.206-3.52h.013v3.52h1.011v-4.59H3.82L2.755 12.7h-.013L1.686 9.705H.156zm14.534 6.353h1.641a3.188 3.188 0 0 0 .98-.149 2.531 2.531 0 0 0 .824-.437 2.123 2.123 0 0 0 .567-.713 2.193 2.193 0 0 0 .223-.983 2.399 2.399 0 0 0-.218-1.07 1.958 1.958 0 0 0-.586-.716 2.405 2.405 0 0 0-.873-.392 4.349 4.349 0 0 0-1.046-.13h-1.519zm1.013-3.656h.596a2.26 2.26 0 0 1 .606.08 1.514 1.514 0 0 1 .503.244 1.167 1.167 0 0 1 .34.412 1.28 1.28 0 0 1 .13.587 1.546 1.546 0 0 1-.13.658 1.127 1.127 0 0 1-.347.433 1.41 1.41 0 0 1-.518.238 2.797 2.797 0 0 1-.649.07h-.538zm4.686 3.656h1.88a2.997 2.997 0 0 0 .613-.064 1.735 1.735 0 0 0 .554-.214 1.221 1.221 0 0 0 .402-.39 1.105 1.105 0 0 0 .155-.606 1.188 1.188 0 0 0-.071-.415 1.01 1.01 0 0 0-.204-.34 1.087 1.087 0 0 0-.317-.24 1.297 1.297 0 0 0-.413-.13v-.012a1.203 1.203 0 0 0 .575-.366.962.962 0 0 0 .216-.648 1.081 1.081 0 0 0-.149-.603 1.022 1.022 0 0 0-.389-.354 1.673 1.673 0 0 0-.54-.169 4.463 4.463 0 0 0-.6-.041h-1.712zm1.011-3.734h.687a1.4 1.4 0 0 1 .24.022.748.748 0 0 1 .22.075.432.432 0 0 1 .16.147.418.418 0 0 1 .061.236.47.47 0 0 1-.055.233.433.433 0 0 1-.146.156.62.62 0 0 1-.204.084 1.058 1.058 0 0 1-.23.026h-.745zm0 1.835h.765a1.96 1.96 0 0 1 .266.02 1.015 1.015 0 0 1 .26.07.519.519 0 0 1 .204.152.406.406 0 0 1 .08.26.481.481 0 0 1-.06.253.519.519 0 0 1-.16.168.62.62 0 0 1-.217.09 1.155 1.155 0 0 1-.237.027H21.4z"/></svg>`,
   imdb: `<svg class="ext-logo" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="#F5C518" d="M22.3781 0H1.6218C.7411.0583.0587.7437.0018 1.5953l-.001 20.783c.0585.8761.7125 1.543 1.5559 1.6191A.337.337 0 0 0 1.6016 24h20.7971a.4579.4579 0 0 0 .0437-.002c.8727-.0768 1.5568-.8271 1.5568-1.7085V1.7098c0-.8914-.696-1.6416-1.584-1.7078A.3294.3294 0 0 0 22.3781 0zm0 .496a1.2144 1.2144 0 0 1 1.1252 1.2139v20.5797c0 .6377-.4875 1.1602-1.1045 1.2145H1.6016c-.5967-.0543-1.0645-.5297-1.1053-1.1258V1.6284C.5371 1.0185 1.0184.5364 1.6217.496h20.7564zM4.7954 8.2603v7.3636H2.8899V8.2603h1.9055zm6.5367 0v7.3636H9.6707v-4.9704l-.6711 4.9704H7.813l-.6986-4.8618-.0066 4.8618h-1.668V8.2603h2.468c.0748.4476.1492.9694.2307 1.5734l.2712 1.8713.4407-3.4447h2.4817zm2.9772 1.3289c.0742.0404.122.108.1417.2034.0279.0953.0345.3118.0345.6442v2.8548c0 .4881-.0345.7867-.0955.8954-.0609.1152-.2304.1695-.5018.1695V9.5211c.204 0 .3457.0205.4211.0681zm-.0211 6.0347c.4543 0 .8006-.0265 1.0245-.0742.2304-.0477.4204-.1357.5694-.2648.1556-.1218.2642-.298.3251-.5219.0611-.2238.1021-.6648.1021-1.3224v-2.5832c0-.6986-.0271-1.1668-.0742-1.4039-.041-.237-.1431-.4543-.3126-.6437-.1695-.1973-.4198-.3324-.7456-.421-.3191-.0808-.8542-.1285-1.7694-.1285h-1.4244v7.3636h2.3051zm5.14-1.7827c0 .3523-.0199.5762-.0544.6708-.033.0947-.1894.1424-.3046.1424-.1086 0-.19-.0477-.2238-.1351-.041-.0887-.0609-.2986-.0609-.6238v-1.9469c0-.3324.0199-.5423.0543-.6237.0338-.0808.1086-.122.2171-.122.1153 0 .2709.0412.3114.1425.041.0947.0609.2986.0609.6032v1.8926zm-2.4747-5.5809v7.3636h1.7157l.1152-.4675c.1556.1894.3251.3324.5152.4271.1828.0881.4608.1357.678.1357.3047 0 .5629-.0748.7802-.237.2165-.1562.3589-.3462.4198-.5628.0543-.2173.0887-.543.0887-.9841v-2.0675c0-.4409-.0139-.7324-.0344-.8681-.0199-.1357-.0742-.2781-.1695-.4204-.1021-.1425-.2437-.251-.4272-.3325-.1834-.0742-.3999-.1152-.6576-.1152-.2172 0-.4952.0477-.6846.1285-.1835.0887-.353.2238-.5086.4007V8.2603h-1.8309z"/></svg>`,
@@ -3310,6 +3280,7 @@ const RATING_LOGOS = {
  */
 function renderExtRatings(r, opts = {}) {
   const out = [];
+
   if (r && r.imdb != null)
     out.push(
       `<span class="ext-rating ext-imdb" title="IMDb ${r.imdb.toFixed(1)}/10">${RATING_LOGOS.imdb}<span class="ext-score">${r.imdb.toFixed(1)}</span></span>`,
@@ -3339,15 +3310,14 @@ function renderExtRatings(r, opts = {}) {
     out.push(
       `<a class="ext-rating ext-douban" href="${esc(opts.doubanUrl)}" target="_blank" rel="noopener" title="在豆瓣搜索该片">${RATING_LOGOS.douban}<span class="ext-score">↗</span></a>`,
     );
+
   return out.join("");
 }
-
 
 /**
  * 直接从 Trakt 拉 watchlist（不分页，一次拉全）。
  * Trakt 的 watchlist 分四类：movies / shows / seasons / episodes。
- * 用户可能只把「某一季」或「某一集」加入 watchlist，此时 movies+shows 都是空，
- * 只拉前两类会导致待看页显示为空，因此四类全拉。
+ * 四类全拉，避免只加季/集的用户待看页显示为空。
  */
 async function fetchWatchlistRaw(headers, sort, userKey, debug) {
   const qs = `extended=full`;
@@ -3357,6 +3327,7 @@ async function fetchWatchlistRaw(headers, sort, userKey, debug) {
     traktGet(`${TRAKT_API}/sync/watchlist/seasons?${qs}`, headers, 1, userKey),
     traktGet(`${TRAKT_API}/sync/watchlist/episodes?${qs}`, headers, 1, userKey),
   ]);
+
   if (debug) {
     debug.movies = Array.isArray(movies)
       ? movies.length
@@ -3379,14 +3350,17 @@ async function fetchWatchlistRaw(headers, sort, userKey, debug) {
         ? episodes.__error
         : "null";
   }
-  // movies / shows 失败才整体报错；seasons / episodes 失败不致命（部分老账号无此两类）
+
+  /* movies / shows 失败才整体报错；seasons / episodes 失败不致命 */
   if (movies && movies.__error) return { __error: movies.__error };
   if (shows && shows.__error) return { __error: shows.__error };
+
   const merged = [];
   if (Array.isArray(movies)) for (const x of movies) merged.push(x);
   if (Array.isArray(shows)) for (const x of shows) merged.push(x);
   if (Array.isArray(seasons)) for (const x of seasons) merged.push(x);
   if (Array.isArray(episodes)) for (const x of episodes) merged.push(x);
+
   switch (sort) {
     case "title":
       merged.sort((a, b) =>
@@ -3417,13 +3391,22 @@ async function fetchWatchlistRaw(headers, sort, userKey, debug) {
 /**
  * 带缓存的 watchlist 拉取。
  * key 含版本号，写入 watchlist 后 bump 版本号即可让旧缓存自动失效。
- * force=1 时 bypass 缓存直接打 Trakt。
  */
-async function getWatchlist(headers, sort = "added", env, ctx, userKey, force, sourceTracker) {
+async function getWatchlist(
+  headers,
+  sort = "added",
+  env,
+  ctx,
+  userKey,
+  force,
+  sourceTracker,
+) {
   if (!env) return fetchWatchlistRaw(headers, sort, userKey);
+
   const prefix = userKey || "anon";
   const debug = {};
   const ver = await getWatchlistVersion(env, ctx, prefix);
+
   const data = await cachedJSON(
     env,
     ctx,
@@ -3443,7 +3426,8 @@ async function getWatchlist(headers, sort = "added", env, ctx, userKey, force, s
   );
   if (sourceTracker) sourceTracker.debug = debug;
   if (Array.isArray(data) && data.length) return data;
-  // 当前版本为空时直接读 lg:wl
+
+  /* 当前版本为空时直接读 lg:wl */
   if (env.TMDB_CACHE && !kvIsDown()) {
     try {
       const lgKey = CK.lastGood.watchlist(prefix, sort);
@@ -3484,24 +3468,25 @@ async function getWatchlistTmdbIds(headers, env, ctx, userKey, type) {
   return ids;
 }
 
-
 /**
  * 搜索 API：TMDB 搜索 movie + tv，合并按 popularity 排序。
- * 不依赖用户身份，所以不开启 strict。
  */
 async function handleSearch(request, env, ctx) {
   const url = new URL(request.url),
     q = (url.searchParams.get("q") || "").trim(),
     typeFilter = url.searchParams.get("type") || "all";
+
   const A = await authed(request, env, ctx);
   if (!A.ok) return A.response;
   const { auth, needsCookieUpdate } = A;
+
   const outHeaders = {
     "Content-Type": CT_JSON,
     "Cache-Control": CC_NO_STORE,
   };
   if (needsCookieUpdate)
     outHeaders["Set-Cookie"] = buildCookie(auth, auth.trakt_id);
+
   if (!q)
     return new Response(JSON.stringify({ items: [] }), { headers: outHeaders });
   if (!env.TMDB_API_KEY)
@@ -3511,6 +3496,7 @@ async function handleSearch(request, env, ctx) {
 
   const wantMovie = typeFilter === "all" || typeFilter === "movie";
   const wantShow = typeFilter === "all" || typeFilter === "show";
+
   const [movieRes, tvRes] = await Promise.all([
     wantMovie
       ? tmdbGet(
@@ -3518,11 +3504,10 @@ async function handleSearch(request, env, ctx) {
         )
       : Promise.resolve(null),
     wantShow
-      ? tmdbGet(
-          tmdbUrl("/search/tv", env, { query: q, include_adult: "false" }),
-        )
+      ? tmdbGet(tmdbUrl("/search/tv", env, { query: q, include_adult: "false" }))
       : Promise.resolve(null),
   ]);
+
   const merged = [];
   if (movieRes && Array.isArray(movieRes.results)) {
     for (const r of movieRes.results) {
@@ -3537,6 +3522,7 @@ async function handleSearch(request, env, ctx) {
     }
   }
   merged.sort((a, b) => b.popularity - a.popularity);
+
   return new Response(JSON.stringify({ items: merged.slice(0, 30) }), {
     headers: outHeaders,
   });
@@ -3547,11 +3533,13 @@ async function handleTrending(request, env, ctx) {
   const A = await authed(request, env, ctx);
   if (!A.ok) return A.response;
   if (!env.TMDB_API_KEY) return Response.json({ items: [] });
+
   const url = new URL(request.url);
   const page = Math.max(
     1,
     Math.min(5, parseInt(url.searchParams.get("page") || "1", 10) || 1),
   );
+
   const data = await cachedJSON(
     env,
     ctx,
@@ -3565,12 +3553,14 @@ async function handleTrending(request, env, ctx) {
       jitter: 600,
     },
   );
+
   const items = [];
   const results = data && Array.isArray(data.results) ? data.results : [];
   for (const r of results) {
     const item = mapTmdbItem(r);
     if (item) items.push(item);
   }
+
   return new Response(JSON.stringify({ items }), {
     headers: {
       "Content-Type": CT_JSON,
@@ -3578,7 +3568,6 @@ async function handleTrending(request, env, ctx) {
     },
   });
 }
-
 
 /**
  * 加入待看。
@@ -3588,15 +3577,18 @@ async function handleWatchlistAdd(request, env, ctx) {
   const A = await authed(request, env, ctx);
   if (!A.ok) return A.response;
   const { auth, headers, needsCookieUpdate, userKey } = A;
+
   const parsed = await parseJsonBody(request);
   if (!parsed.ok) return parsed.error;
   const body = parsed.body || {},
     type = body.type,
     tmdbId = body.tmdbId,
     rawId = body.id;
+
   if ((type !== "movie" && type !== "show") || (!tmdbId && !rawId)) {
     return authJson(auth, needsCookieUpdate, { error: "bad params" }, 400);
   }
+
   let traktId = null;
   if (rawId && !tmdbId) {
     const n = Number(rawId);
@@ -3617,6 +3609,7 @@ async function handleWatchlistAdd(request, env, ctx) {
       );
     }
   }
+
   const payload = traktSyncPayload(type, traktId);
   let r;
   try {
@@ -3632,6 +3625,7 @@ async function handleWatchlistAdd(request, env, ctx) {
   } catch (e) {
     return authJson(auth, needsCookieUpdate, { error: String(e) }, 502);
   }
+
   if (!r.ok) {
     const errText = await r.text().catch(() => "");
     return authJson(
@@ -3641,6 +3635,7 @@ async function handleWatchlistAdd(request, env, ctx) {
       r.status,
     );
   }
+
   invalidateWatchlistCache(env, ctx, userKey);
   const result = await r.json().catch(() => null);
   return authJson(auth, needsCookieUpdate, { ok: true, traktId, result });
@@ -3685,27 +3680,25 @@ async function handleUnmarkWatched(request, env, ctx) {
   });
 }
 
-
 /**
  * 把某季所有已播出集数标记为已看。
- * 流程：
- *   1. 拉季数据（优先缓存）
- *   2. 过滤出已播出的集
- *   3. 批量 POST /sync/history
- *   4. bust 用户缓存
+ * 流程：拉季数据 → 过滤已播出集 → 批量 POST /sync/history → bust 用户缓存
  */
 async function handleMarkSeasonWatched(request, env, ctx) {
   const A = await authed(request, env, ctx);
   if (!A.ok) return A.response;
   const { auth, headers, needsCookieUpdate, userKey } = A;
+
   const parsed = await parseJsonBody(request);
   if (!parsed.ok) return parsed.error;
   const body = parsed.body || {};
   const showId = Number(body.showId),
     season = Number(body.season);
+
   if (!Number.isFinite(showId) || showId <= 0 || !Number.isFinite(season)) {
     return authJson(auth, needsCookieUpdate, { error: "参数无效" }, 400);
   }
+
   let seasonData = await cachedJSON(
     env,
     ctx,
@@ -3721,16 +3714,13 @@ async function handleMarkSeasonWatched(request, env, ctx) {
     },
     { ttl: SEASON_KV_TTL, missTtl: 60, swr: 3600, edgeTtl: 1800, jitter: 300 },
   );
+
   if (!seasonData || !Array.isArray(seasonData.episodes)) {
     try {
       const r = await traktFetch(
         `${TRAKT_API}/shows/${showId}/seasons/${season}?extended=full,episodes`,
         headers,
-        {
-          retries: 1,
-          timeout: 12000,
-          userKey,
-        },
+        { retries: 1, timeout: 12000, userKey },
       );
       if (r && !r.__error && Array.isArray(r.episodes)) {
         seasonData = r;
@@ -3745,16 +3735,13 @@ async function handleMarkSeasonWatched(request, env, ctx) {
       }
     } catch {}
   }
+
   if (!seasonData || !Array.isArray(seasonData.episodes)) {
     try {
       const all = await traktFetch(
         `${TRAKT_API}/shows/${showId}/seasons?extended=full,episodes`,
         headers,
-        {
-          retries: 1,
-          timeout: 15000,
-          userKey,
-        },
+        { retries: 1, timeout: 15000, userKey },
       );
       if (Array.isArray(all)) {
         const found = all.find((s) => s && s.number === season);
@@ -3792,6 +3779,7 @@ async function handleMarkSeasonWatched(request, env, ctx) {
       502,
     );
   }
+
   const now = Date.now();
   const episodes = seasonData.episodes
     .filter((ep) => ep && ep.number != null && ep.first_aired)
@@ -3806,6 +3794,7 @@ async function handleMarkSeasonWatched(request, env, ctx) {
       message: "本季暂无可标记的已播出集数",
     });
   }
+
   let r;
   try {
     r = await fetchT(
@@ -3825,6 +3814,7 @@ async function handleMarkSeasonWatched(request, env, ctx) {
       502,
     );
   }
+
   if (!r.ok) {
     const text = await r.text().catch(() => "");
     if (r.status === 429) {
@@ -3846,8 +3836,10 @@ async function handleMarkSeasonWatched(request, env, ctx) {
       r.status,
     );
   }
+
   const result = await r.json().catch(() => null);
   bustHomeUserCaches(userKey, env, ctx);
+
   const seasonKey = CK.season(showId, season);
   __kvMem.delete(seasonKey);
   __kvMemExp.delete(seasonKey);
@@ -3856,13 +3848,13 @@ async function handleMarkSeasonWatched(request, env, ctx) {
     if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
     else p.catch(() => {});
   }
+
   return authJson(auth, needsCookieUpdate, {
     ok: true,
     marked: episodes.length,
     result,
   });
 }
-
 
 /**
  * 弃剧：加入 Trakt hidden/dropped + hidden/calendar。
@@ -3872,15 +3864,18 @@ async function handleDropShow(request, env, ctx) {
   const A = await authed(request, env, ctx);
   if (!A.ok) return A.response;
   const { auth, headers, needsCookieUpdate, userKey } = A;
+
   const parsed = await parseJsonBody(request);
   if (!parsed.ok) return parsed.error;
   const body = parsed.body || {};
   const showId = Number(body.id || body.showId);
+
   if (!Number.isFinite(showId) || showId <= 0)
     return authJson(auth, needsCookieUpdate, { error: "bad id" }, 400);
 
   const payload = { shows: [{ ids: { trakt: showId } }] };
   let result = null;
+
   try {
     const r = await fetchT(
       `${TRAKT_API}/users/hidden/dropped`,
@@ -3908,6 +3903,7 @@ async function handleDropShow(request, env, ctx) {
   } catch (e) {
     return authJson(auth, needsCookieUpdate, { error: String(e) }, 502);
   }
+
   try {
     await fetchT(
       `${TRAKT_API}/users/hidden/calendar`,
@@ -3919,9 +3915,11 @@ async function handleDropShow(request, env, ctx) {
       8000,
     );
   } catch {}
+
   const today = new Date(Date.now() + 8 * 3600 * 1000)
     .toISOString()
     .slice(0, 10);
+
   if (userKey) {
     const dropKey = `dropped:${userKey}`;
     const calKey = CK.calendar(userKey, today);
@@ -3934,6 +3932,7 @@ async function handleDropShow(request, env, ctx) {
         nextIds = [...new Set(prevData.ids.map(Number).concat(showId))];
       }
     } catch {}
+
     for (const k of [...__kvMem.keys()]) {
       if (
         k === calKey ||
@@ -3945,8 +3944,10 @@ async function handleDropShow(request, env, ctx) {
         __kvMemExp.delete(k);
       }
     }
+
     kvPutJSON(env, ctx, dropKey, { data: { ids: nextIds } }, 1800, false);
     __droppedShowIdsMem.set(dropKey, { ids: nextIds, ts: Date.now() });
+
     if (env && env.TMDB_CACHE) {
       const dels = [calKey, CK.playback(userKey), `act:${userKey}`].map((k) =>
         env.TMDB_CACHE.delete(k).catch(() => {}),
@@ -3956,23 +3957,23 @@ async function handleDropShow(request, env, ctx) {
       else Promise.all(dels).catch(() => {});
     }
   }
+
   bustHomeUserCaches(userKey, env, ctx);
+
   const added =
     result && result.added && result.added.shows ? result.added.shows : 0;
   return authJson(auth, needsCookieUpdate, { ok: true, added, result, showId });
 }
 
-
 /**
  * 单剧播出日历 API。
  * 返回所有季所有已定档集数的 first_aired，供前端渲染日历。
- *
- * strict: true —— 依赖用户身份，拿不到就回登录页。
  */
 async function handleShowCalendar(request, env, ctx) {
   const url = new URL(request.url),
     showId = url.searchParams.get("id"),
     tmdbId = url.searchParams.get("tmdb");
+
   if (!showId || !/^\d+$/.test(showId))
     return Response.json({ error: "bad params" }, { status: 400 });
 
@@ -3988,8 +3989,10 @@ async function handleShowCalendar(request, env, ctx) {
   );
   if (!Array.isArray(seasons))
     return Response.json({ error: "failed" }, { status: 502 });
+
   const zhTitles = {};
   let zhShowTitle = "";
+
   if (tmdbId && /^\d+$/.test(tmdbId) && env.TMDB_API_KEY) {
     try {
       const tmdbShow = await tmdbDetailCached(`/tv/${tmdbId}`, env, ctx);
@@ -4050,27 +4053,27 @@ async function handleShowCalendar(request, env, ctx) {
   );
 }
 
-
 /**
  * 观看小结 API。
  * period=month|year，ref=YYYY-MM 或 YYYY。
  * 数据走 memOnly 缓存（6 小时），不写 KV。
- *
- * strict: true —— 纯用户数据。
  */
 async function handleSummary(request, env, ctx) {
   const A = await authed(request, env, ctx, { strict: true });
   if (!A.ok) return A.response;
   const { auth, headers, needsCookieUpdate, userKey } = A;
+
   const url = new URL(request.url);
   const period = url.searchParams.get("period") === "year" ? "year" : "month";
   const now = new Date(Date.now() + 8 * 3600 * 1000);
   let ref = (url.searchParams.get("ref") || "").trim();
+
   if (period === "month") {
     if (!/^\d{4}-\d{2}$/.test(ref)) ref = now.toISOString().slice(0, 7);
   } else {
     if (!/^\d{4}$/.test(ref)) ref = String(now.getUTCFullYear());
   }
+
   const cacheKey = `sum2:${userKey}:${period}:${ref}`;
   const data = await cachedJSON(
     env,
@@ -4085,6 +4088,7 @@ async function handleSummary(request, env, ctx) {
       jitter: 600,
     },
   );
+
   return authJson(auth, needsCookieUpdate, data || { error: "empty" });
 }
 
@@ -4115,21 +4119,20 @@ function summaryRange(period, ref) {
 async function fetchHistoryRange(headers, start, end, userKey) {
   const out = [];
   const limit = 100;
+
   for (let page = 1; page <= 3; page++) {
     if (page > 1) await sleep(80);
     if (isTraktRateLimited(userKey)) {
       return out.length ? out : { __error: "rate limited" };
     }
+
     const qs = `extended=full&page=${page}&limit=${limit}&start_at=${encodeURIComponent(start)}&end_at=${encodeURIComponent(end)}`;
     const data = await traktFetch(
       `${TRAKT_API}/users/me/history?${qs}`,
       headers,
-      {
-        retries: 0,
-        timeout: 12000,
-        userKey,
-      },
+      { retries: 0, timeout: 12000, userKey },
     );
+
     if (!data || data.__error) {
       if (page === 1)
         return { __error: (data && data.__error) || "fetch failed" };
@@ -4137,6 +4140,7 @@ async function fetchHistoryRange(headers, start, end, userKey) {
     }
     if (!Array.isArray(data)) return { __error: "invalid response" };
     if (!data.length) break;
+
     out.push(...data);
     if (data.length < limit) break;
   }
@@ -4146,8 +4150,7 @@ async function fetchHistoryRange(headers, start, end, userKey) {
 /**
  * 构造观看小结。
  * 输入时间段，聚合出：电影数、剧集数、集数、总时长、最忙一天、
- * 电影 TOP8、剧集 TOP8、每日热力。
- * 中文标题通过 TMDB 补全。
+ * 电影 TOP8、剧集 TOP8、每日热力。中文标题通过 TMDB 补全。
  */
 async function buildSummary(headers, period, ref, env, ctx, userKey) {
   const { start, end, label } = summaryRange(period, ref);
@@ -4160,6 +4163,7 @@ async function buildSummary(headers, period, ref, env, ctx, userKey) {
   const dayCount = new Map();
   let totalMinutes = 0,
     episodePlays = 0;
+
   for (const it of items) {
     if (!it) continue;
     const watchedAt = it.watched_at || "";
@@ -4180,6 +4184,7 @@ async function buildSummary(headers, period, ref, env, ctx, userKey) {
       const tmdbId = m.ids && m.ids.tmdb;
       const id = traktId || tmdbId || (m.ids && m.ids.imdb) || m.title;
       if (!id) continue;
+
       const key = String(id);
       const runtime = Number(m.runtime) || 0;
       const prev = moviePlays.get(key) || {
@@ -4203,6 +4208,7 @@ async function buildSummary(headers, period, ref, env, ctx, userKey) {
         tmdbId = s.ids && s.ids.tmdb;
       const sid = traktId || tmdbId || s.title;
       if (!sid) continue;
+
       const key = String(sid);
       const runtime = Number(e.runtime) || Number(s.runtime) || 0;
       const prev = showEpisodes.get(key) || {
@@ -4228,13 +4234,16 @@ async function buildSummary(headers, period, ref, env, ctx, userKey) {
       showEpisodes.set(key, prev);
     }
   }
+
   let busiest = null;
   for (const [d, n] of dayCount) {
     if (!busiest || n > busiest.count) busiest = { date: d, count: n };
   }
+
   let topMovies = [...moviePlays.values()]
     .sort((a, b) => b.plays - a.plays || b.minutes - a.minutes)
     .slice(0, 8);
+
   let topShows = [...showEpisodes.values()]
     .map((s) => ({
       title: s.title,
@@ -4247,6 +4256,7 @@ async function buildSummary(headers, period, ref, env, ctx, userKey) {
     }))
     .sort((a, b) => b.episodes - a.episodes || b.plays - a.plays)
     .slice(0, 8);
+
   async function zhTitle(kind, item) {
     const fallback = item.title || "";
     if (!env || !env.TMDB_API_KEY) return fallback;
@@ -4284,6 +4294,7 @@ async function buildSummary(headers, period, ref, env, ctx, userKey) {
       topShows[i] = { ...s, title: await zhTitle("tv", s) };
     }),
   ]);
+
   topMovies = topMovies.map((m) => ({
     title: m.title,
     year: m.year,
@@ -4292,6 +4303,7 @@ async function buildSummary(headers, period, ref, env, ctx, userKey) {
     detailType: "movie",
     detailId: m.tmdb ? "tmdb-" + m.tmdb : m.traktId ? String(m.traktId) : null,
   }));
+
   topShows = topShows.map((s) => ({
     title: s.title,
     year: s.year,
@@ -4305,6 +4317,7 @@ async function buildSummary(headers, period, ref, env, ctx, userKey) {
   const days = [...dayCount.entries()]
     .sort((a, b) => a[0].localeCompare(b[0]))
     .map(([date, count]) => ({ date, count }));
+
   let prevRef = null,
     nextRef = null;
   if (period === "month") {
@@ -4343,10 +4356,10 @@ async function buildSummary(headers, period, ref, env, ctx, userKey) {
     sampleSize: items.length,
   };
 }
-/* ============================================================
- * 第四部分：首页数据分片（handleHomeData）· 首页壳与骨架 · 详情/季/演员 API
- * ============================================================ */
 
+/* ============================================================
+ * 第四部分：首页数据分片 · 首页壳与骨架 · 详情/季/演员 API
+ * ============================================================ */
 
 /** 首页路由：/home 需要登录；未登录重定向到 /login */
 async function handleHome(request, env, ctx) {
@@ -4356,19 +4369,18 @@ async function handleHome(request, env, ctx) {
     const parts = url.pathname.split("/").filter(Boolean);
     if (parts.length === 3) initialDetail = parts[1] + "/" + parts[2];
   }
+
   const cookieAuth = readAuth(request);
   if (!cookieAuth) return Response.redirect(new URL("/login", url), 302);
+
   const profileHint = readProfileHint(request);
   return streamHomeShell(initialDetail, profileHint);
 }
 
-/** 启动页路由：/ → splash（服务端分流），约 0.8s 后跳 /home 或 /login */
 /**
  * 启动页 Link 响应头。
- * · 始终 preconnect 到 Trakt / TMDB（跳转后要立即打这些接口）
- * · 已登录（将跳 /home）时额外 preload /app.js 与 /app.css，让首页首屏更快
- * 注意：HTML 内已有 <link rel="preload">，这里用响应头双保险——响应头在 HTML
- * 解析前就送达，抓取发起得更早。
+ * · 始终 preconnect 到 Trakt / TMDB
+ * · 已登录时额外 preload /app.js 与 /app.css
  */
 function launchLinkHeader(request) {
   const parts = [
@@ -4387,9 +4399,7 @@ function launchLinkHeader(request) {
 
 /**
  * 启动页响应（路由 "/"）。
- * 服务端零 I/O、HTML 全内联，响应头额外做两件事：
- *   · Link: rel=preconnect —— 提前建连到 Trakt/TMDB，跳转后的首页数据更快
- *   · no-cache —— 保证始终拿到最新版本号（配合前端版本对账）
+ * 服务端零 I/O、HTML 全内联，响应头额外做 preconnect 和 no-cache。
  */
 function handleLaunch(request) {
   return new Response(renderLaunchPage(request), {
@@ -4410,7 +4420,7 @@ function handleLogin(request) {
   return html(renderLoginPage());
 }
 
-/** 轻量登录态探测：仅读 Cookie，不打上游，供启动页快速分流 */
+/** 轻量登录态探测：仅读 Cookie，不打上游 */
 function handleAuthStatus(request) {
   const authed = !!readAuth(request);
   return new Response(JSON.stringify({ loggedIn: authed }), {
@@ -4436,6 +4446,7 @@ function streamHomeShell(initialDetail, profileHint) {
   const boot = initialDetail
     ? `<script>window.__initialDetail=${jsStr(initialDetail)};<\/script>`
     : "";
+
   const stream = new ReadableStream({
     async start(controller) {
       const enc = new TextEncoder();
@@ -4463,6 +4474,7 @@ function streamHomeShell(initialDetail, profileHint) {
       controller.close();
     },
   });
+
   return new Response(stream, {
     headers: {
       "Content-Type": CT_HTML,
@@ -4484,9 +4496,10 @@ const ACT_SIG_MEM_TTL = 300000;
  */
 async function getUserActivitySig(headers, env, ctx, userKey) {
   if (!userKey || userKey === "anon") return null;
+
   const now = Date.now();
   const mem = __actSigMemCache.get(userKey);
-  if (mem && now - mem.ts < ACT_SIG_MEM_TTL) return { sig: mem.sig };
+  if (mem && now - mem.ts < ACT_SIG_MEM_TTL) return mem.val;
 
   const result = await cachedJSON(
     env,
@@ -4499,20 +4512,34 @@ async function getUserActivitySig(headers, env, ctx, userKey) {
         userKey,
       });
       if (!a || a.__error) return null;
+
       const sig = [
         (a.movies && a.movies.watched_at) || "",
         (a.episodes && a.episodes.watched_at) || "",
         (a.shows && a.shows.watched_at) || "",
         (a.watchlist && a.watchlist.updated_at) || "",
-        a.paused_at || "",
+        (a.episodes && a.episodes.paused_at) || "",
+        (a.movies && a.movies.paused_at) || "",
       ].join("|");
-      return { sig };
+
+      const playbackTs =
+        [
+          a.episodes && a.episodes.paused_at,
+          a.episodes && a.episodes.watched_at,
+          a.movies && a.movies.paused_at,
+          a.movies && a.movies.watched_at,
+        ]
+          .filter((t) => t && String(t).trim())
+          .sort()
+          .pop() || null;
+
+      return { sig, playbackTs };
     },
     { ttl: 600, missTtl: 120, swr: true, memOnly: true, jitter: 60 },
   );
 
   if (result && result.sig) {
-    __actSigMemCache.set(userKey, { sig: result.sig, ts: now });
+    __actSigMemCache.set(userKey, { val: result, ts: now });
     if (__actSigMemCache.size > 500) {
       const it = __actSigMemCache.keys();
       for (let i = 0; i < 100; i++) {
@@ -4545,11 +4572,13 @@ async function getDroppedShowIds(headers, env, ctx, userKey) {
     key,
     async () => {
       if (isTraktRateLimited(userKey)) return { __error: "rate limited" };
+
       const ids = new Set();
       try {
         for (let page = 1; page <= 5; page++) {
           if (page > 1) await sleep(50);
           if (isTraktRateLimited(userKey)) return { __error: "rate limited" };
+
           const r = await fetchT(
             `${TRAKT_API}/users/hidden/dropped?type=show&page=${page}&limit=100`,
             { headers },
@@ -4560,9 +4589,11 @@ async function getDroppedShowIds(headers, env, ctx, userKey) {
             return { __error: "HTTP 429" };
           }
           if (!r.ok) return { __error: "HTTP " + r.status };
+
           const arr = await r.json();
           if (!Array.isArray(arr)) return { __error: "invalid response" };
           if (!arr.length) break;
+
           for (const it of arr) {
             const id = it && it.show && it.show.ids && it.show.ids.trakt;
             if (id) ids.add(Number(id));
@@ -4601,7 +4632,15 @@ async function getDroppedShowIds(headers, env, ctx, userKey) {
 }
 
 /** 带缓存的追剧日历拉取 */
-async function getCalendarCached(today, headers, env, ctx, userKey, force, sourceTracker) {
+async function getCalendarCached(
+  today,
+  headers,
+  env,
+  ctx,
+  userKey,
+  force,
+  sourceTracker,
+) {
   const prefix = userKey || "anon";
   return cachedJSON(
     env,
@@ -4614,6 +4653,7 @@ async function getCalendarCached(today, headers, env, ctx, userKey, force, sourc
           dbg.rateLimited = true;
           return { __error: "rate limited" };
         }
+
         const r = await fetchT(
           `${TRAKT_API}/calendars/my/shows/${today}/30?extended=full&images=poster`,
           { headers },
@@ -4668,13 +4708,17 @@ async function handleHomeData(request, env, ctx) {
       },
     );
   }
+
   const { auth, headers, needsCookieUpdate, userKey } = A;
   const url = new URL(request.url);
+
   const today = new Date(Date.now() + 8 * 3600 * 1000)
     .toISOString()
     .slice(0, 10);
+
   const part = url.searchParams.get("part") || "all";
   const force = url.searchParams.get("force") === "1";
+
   const fetchJson = (u, retries = 1) =>
     traktFetch(u, headers, {
       retries,
@@ -4696,8 +4740,9 @@ async function handleHomeData(request, env, ctx) {
   const wantWatchlist = part === "watchlist" || part === "all";
   const wantCalendar = part === "calendar" || part === "all";
   const wantHistory = part === "history" || part === "all";
+
   const actSigP =
-    wantMeta || wantWatchlist || wantHistory
+    wantPlayback || wantMeta || wantWatchlist || wantHistory
       ? getUserActivitySig(headers, env, ctx, userKey)
       : Promise.resolve(null);
 
@@ -4715,12 +4760,9 @@ async function handleHomeData(request, env, ctx) {
   const watchlistSrc = { fromCache: true, age: 0 };
   const calendarSrc = { fromCache: true, age: 0 };
   const historySrc = { fromCache: true, age: 0 };
-  const opts = (o) =>
-    force
-      ? { ...o, bypass: true, revalidate: true }
-      : // 保留各分片自己的 swr 设置：过期先返回旧值 + waitUntil 后台刷新，
-        // 用户请求不再干等 Trakt，上游刷新也天然错峰
-        { ...o, revalidate: true };
+
+  const opts = (o) => (force ? { ...o, bypass: true, revalidate: true } : { ...o, revalidate: true });
+
   if (wantPlayback) {
     taskFns.push(async () => {
       playback = await cachedJSON(
@@ -4757,13 +4799,13 @@ async function handleHomeData(request, env, ctx) {
             edgeTtl: 300,
             jitter: 300,
           }),
-          preserveTs: true,
           sourceTracker: playbackSrc,
           lastGoodKey: CK.lastGood.playback(userKey),
         },
       );
     });
   }
+
   if (wantHistory) {
     taskFns.push(async () => {
       history = await cachedJSON(
@@ -4787,14 +4829,10 @@ async function handleHomeData(request, env, ctx) {
             dbg.error = r.__error;
             return r;
           }
-          // 包装为对象，保证 pageCount 经 JSON/KV 往返后仍保留
           if (Array.isArray(r)) {
             dbg.items = r.length;
             dbg.pageCount = r.__pageCount || 1;
-            return {
-              items: r,
-              pageCount: r.__pageCount || 1,
-            };
+            return { items: r, pageCount: r.__pageCount || 1 };
           }
           dbg.items = "null";
           return r;
@@ -4812,6 +4850,7 @@ async function handleHomeData(request, env, ctx) {
       );
     });
   }
+
   if (wantCalendar) {
     taskFns.push(async () => {
       calendar = await getCalendarCached(
@@ -4825,6 +4864,7 @@ async function handleHomeData(request, env, ctx) {
       );
     });
   }
+
   if (wantWatchlist) {
     taskFns.push(async () => {
       try {
@@ -4842,6 +4882,7 @@ async function handleHomeData(request, env, ctx) {
       }
     });
   }
+
   if (wantMeta) {
     taskFns.push(async () => {
       profile = await cachedJSON(
@@ -4885,12 +4926,15 @@ async function handleHomeData(request, env, ctx) {
       );
     });
   }
+
   const concurrency = 1;
   const gapMs = force ? 500 : 400;
   await runLimited(taskFns, concurrency, gapMs);
+
   const actSig = await actSigP.catch(() => null);
   if (actSig && actSig.sig)
     kvMemSet(`act:${userKey}:last`, actSig.sig, KV_MEM_TTL);
+
   if (isTraktRateLimited(userKey)) {
     result.rateLimited = true;
     result.cooling = traktRateLimitedRemaining(userKey);
@@ -4898,6 +4942,7 @@ async function handleHomeData(request, env, ctx) {
     result.rateLimited = false;
     result.cooling = 0;
   }
+
   if (wantPlayback) {
     const pbList = Array.isArray(playback) ? playback : [];
     try {
@@ -4912,19 +4957,29 @@ async function handleHomeData(request, env, ctx) {
         : playbackSrc.fromCache === false
           ? "live"
           : "";
-    result.playbackAgeSec = playbackSrc.age || 0;
-    // 诊断信息：来源 + 当前条数 + Trakt 原始返回（仅调试用）
+
+    let playbackAgeSec = playbackSrc.age || 0;
+    if (actSig && actSig.playbackTs) {
+      const t = Date.parse(actSig.playbackTs);
+      if (Number.isFinite(t))
+        playbackAgeSec = Math.max(0, Math.round((Date.now() - t) / 1000));
+    }
+    result.playbackAgeSec = playbackAgeSec;
+
     result.playbackDebug = {
       source: result.playbackSource || null,
       ageSec: result.playbackAgeSec,
       items: Array.isArray(playback) ? playback.length : null,
+      lastActivity: actSig && actSig.playbackTs ? actSig.playbackTs : null,
       ...(playbackSrc.debug || {}),
     };
   }
+
   if (wantMeta) {
     if (profile && !profile.__error && profile.ids && profile.ids.trakt) {
       rememberTraktUserId(auth, profile.ids.trakt);
     }
+
     const username = (profile && !profile.__error && profile.username) || "我",
       displayName = (profile && !profile.__error && profile.name) || username,
       movieCount =
@@ -4961,6 +5016,7 @@ async function handleHomeData(request, env, ctx) {
           ? "live"
           : "";
     result.metaAgeSec = metaSrc.age || 0;
+
     try {
       const pname = displayName || "";
       const pavatar = avatarUrl || "";
@@ -4974,6 +5030,7 @@ async function handleHomeData(request, env, ctx) {
       }
     } catch {}
   }
+
   if (wantHistory) {
     try {
       const historyItems = Array.isArray(history)
@@ -4981,14 +5038,17 @@ async function handleHomeData(request, env, ctx) {
         : history && Array.isArray(history.items)
           ? history.items
           : null;
+
       let historyPageCount = 1;
       if (history && !Array.isArray(history) && history.pageCount)
         historyPageCount = Number(history.pageCount) || 1;
       else if (historyItems && historyItems.__pageCount)
         historyPageCount = historyItems.__pageCount || 1;
+
       const historyHasMore =
         historyPageCount > 1 ||
         (Array.isArray(historyItems) && historyItems.length >= PAGE_SIZE);
+
       result.historyHtml = renderHistoryPage(historyItems, env);
       result.historyMoreHtml = historyHasMore
         ? `<div class="load-more-wrap"><button class="load-more" data-page="2" onclick="loadMoreHistory(this)">加载更多</button></div>`
@@ -4998,6 +5058,7 @@ async function handleHomeData(request, env, ctx) {
       result.historyMoreHtml = "";
     }
   }
+
   if (wantCalendar) {
     try {
       let calFiltered = calendar;
@@ -5015,6 +5076,7 @@ async function handleHomeData(request, env, ctx) {
       result.calendarHtml = emptyPaneHtml("暂时无法加载追剧日历");
     }
   }
+
   if (wantWatchlist) {
     try {
       if (!Array.isArray(watchlist)) {
@@ -5030,8 +5092,7 @@ async function handleHomeData(request, env, ctx) {
             ? `<div class="load-more-wrap"><button class="load-more" data-page="2" data-sort="added" onclick="loadMoreWatchlist(this)">加载更多</button></div>`
             : "";
         result.watchlistHtml =
-          `<div id="watchlist-grid" class="grid">${cardsHtml}</div>` +
-          moreHtml;
+          `<div id="watchlist-grid" class="grid">${cardsHtml}</div>` + moreHtml;
       }
     } catch {
       result.watchlistHtml = emptyPaneHtml("暂时无法加载待看列表");
@@ -5045,13 +5106,13 @@ async function handleHomeData(request, env, ctx) {
         : watchlistSrc.fromCache === false
           ? "live"
           : "";
-    // 诊断信息：来源 + 当前条数 + Trakt watchlist 四类各返回多少条（仅调试用）
     result.watchlistDebug = {
       source: result.watchlistSource || null,
       items: Array.isArray(watchlist) ? watchlist.length : null,
       ...(watchlistSrc.debug || {}),
     };
   }
+
   if (wantCalendar) {
     result.calendarSource =
       calendarSrc.fromCache === true
@@ -5059,13 +5120,13 @@ async function handleHomeData(request, env, ctx) {
         : calendarSrc.fromCache === false
           ? "live"
           : "";
-    // 诊断信息：来源 + 当前条数 + Trakt 原始返回（仅调试用）
     result.calendarDebug = {
       source: result.calendarSource || null,
       items: Array.isArray(calendar) ? calendar.length : null,
       ...(calendarSrc.debug || {}),
     };
   }
+
   if (wantHistory) {
     result.historySource =
       historySrc.fromCache === true
@@ -5073,7 +5134,6 @@ async function handleHomeData(request, env, ctx) {
         : historySrc.fromCache === false
           ? "live"
           : "";
-    // 诊断信息：来源 + 当前条数/分页 + Trakt 原始返回（仅调试用）
     result.historyDebug = {
       source: result.historySource || null,
       items: Array.isArray(history)
@@ -5091,7 +5151,6 @@ async function handleHomeData(request, env, ctx) {
 
   return new Response(JSON.stringify(result), { headers: outHeaders });
 }
-
 
 /** 非流式渲染首页 shell（保留兼容） */
 function renderHomeShell(initialDetail, profileHint) {
@@ -5112,9 +5171,22 @@ function renderHomeShell(initialDetail, profileHint) {
 function renderPlatformRows() {
   const card = (p) =>
     `<button type="button" class="platform-card" data-platform="${p.id}" title="${p.name}"><div class="platform-card-left"><img class="platform-card-logo" src="${p.logo}" alt="" loading="lazy"><span class="platform-card-name">${p.name}</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="${p.id}"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button>`;
+
   const row = (list) =>
     `<div class="platform-row"><div class="platform-cards">${list.map(card).join("")}</div></div>`;
-  const ids = ["netflix", "disney", "hbomax", "appletv", "prime", "iqiyi", "youku", "tencent", "mgtv", "bilibili"];
+
+  const ids = [
+    "netflix",
+    "disney",
+    "hbomax",
+    "appletv",
+    "prime",
+    "iqiyi",
+    "youku",
+    "tencent",
+    "mgtv",
+    "bilibili",
+  ];
   const cards = ids.map((id) => PLATFORMS[id]).filter(Boolean);
   return `<div class="platform-rows">${row(cards.slice(0, 5))}${row(cards.slice(5))}</div>`;
 }
@@ -5124,6 +5196,7 @@ function renderHomeSkeleton(initialDetail, profileHint) {
   const boot = initialDetail
     ? `<script>window.addEventListener('load',()=>{const s=${jsStr(initialDetail)},idx=s.indexOf('/');if(idx>0)openDetail(s.slice(0,idx),s.slice(idx+1),false);});<\/script>`
     : "";
+
   const heroName =
     profileHint && profileHint.name ? esc(profileHint.name) : "…";
   const heroAvatarHtml =
@@ -5134,20 +5207,19 @@ function renderHomeSkeleton(initialDetail, profileHint) {
   const section = (id, title, extraHtml) =>
     `<div class="home-section"><div class="home-section-head"><h2 class="home-section-title">${title}</h2><button class="home-more-btn" type="button" onclick="openListModal('${id}')"><span>查看更多</span><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg></button></div>${extraHtml || ""}<div class="h-scroll-wrap"><div class="h-scroll" id="${id}-hscroll"><div class="pane-loading"><div class="spinner"></div></div></div></div></div>`;
 
-  return `<div class="container"><!-- 吸顶栏：头像 / 统计 / 主导航，滚动时固定在顶部 --><div class="top-sticky"><header class="hero"><div class="hero-left"><button type="button" class="hero-avatar" id="hero-avatar" title="观看小结" aria-label="打开观看小结">${heroAvatarHtml}</button><div class="hero-text"><h1 class="hero-name" id="hero-name">${heroName}</h1><p class="updated-at" id="updated-at"></p></div></div><div class="hero-actions"><button class="btn-action" id="btn-refresh" onclick="forceRefresh()" title="刷新数据"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg><span>刷新</span></button><button class="btn-action" id="btn-theme" onclick="cycleTheme()" title="主题：深色" aria-label="切换主题：深色"><span class="theme-icon" id="theme-icon"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></span><span>主题</span></button><button class="btn-action" id="btn-logout" onclick="logout()" title="退出登录"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg><span>退出</span></button></div></header><div class="stats" id="stats-box">${renderStatsHtml(null)}</div><nav class="tabs"><button class="tab active" data-tab="playback"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9.5 21v-6h5v6"/></svg><span>首页</span></button><button class="tab" data-tab="watchlist"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg><span>待看</span></button><button class="tab" data-tab="calendar"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg><span>日历</span></button><button class="tab" data-tab="history"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/></svg><span>记录</span></button><button class="tab" data-tab="search"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg><span>搜索</span></button></nav></div><section id="playback" class="pane active">${section("playback", "继续观看")}<div class="home-section platform-section"><div class="home-section-head"><h2 class="home-section-title">流媒体平台</h2></div>${renderPlatformRows()}${section("guduo", "骨朵热榜", '<div class="theater-home-tabs" id="guduo-home-tabs" style="display:none"></div>')}${section("theater", "平台剧场", '<div class="theater-home-tabs" id="theater-home-tabs" style="display:none"></div>')}${section("douban-domestic", "豆瓣热播国产剧")}${section("douban-hktw", "豆瓣热播港台剧")}${section("douban-jpkr", "豆瓣热播日韩剧")}${section("douban-western", "豆瓣热播欧美剧")}</section><section id="watchlist" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="calendar" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="history" class="pane"><div class="grid"></div><div id="history-more"></div></section><section id="search" class="pane"><div class="search-bar"><input id="search-input" class="search-input" type="search" placeholder="搜索电影 / 剧集" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></div><div id="search-results" class="grid"></div></section><div class="app-version">MineTrakt v${APP_JS_VERSION}</div></div><div id="list-modal" class="list-modal"><div class="list-modal-backdrop" onclick="closeListModal()"></div><div class="list-modal-panel"><div class="list-modal-head"><h3 class="list-modal-title" id="list-modal-title"></h3><button type="button" class="list-modal-close" onclick="closeListModal()" aria-label="关闭">×</button></div><div class="list-modal-body" id="list-modal-body"></div></div></div><div id="summary-modal" class="summary-modal" style="display:none" role="dialog" aria-modal="true" aria-label="观看小结"><div class="summary-backdrop" onclick="window.__closeSummary()"></div><div class="summary-panel"><div class="summary-head"><h2 class="summary-title">观看小结</h2><button type="button" class="summary-close" onclick="window.__closeSummary()" aria-label="关闭">×</button></div><div id="summary-modal-body" class="summary-body"><div class="pane-loading"><div class="spinner"></div></div></div></div></div><div id="person-modal" class="person-modal"><div class="person-backdrop" onclick="closePerson()"></div><div class="person-panel"><div class="person-panel-head"><div class="person-panel-name" id="person-modal-name"></div><button class="person-close" onclick="closePerson()" aria-label="关闭">×</button></div><div class="person-panel-body" id="person-modal-body"></div></div></div><div id="confirm-modal" class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title" style="display:none"><div class="confirm-backdrop"></div><div class="confirm-panel"><div class="confirm-icon" id="confirm-icon">?</div><div class="confirm-title" id="confirm-title"></div><div class="confirm-msg" id="confirm-msg"></div><div class="confirm-actions"><button class="confirm-btn confirm-cancel" id="confirm-cancel" type="button">取消</button><button class="confirm-btn confirm-ok" id="confirm-ok" type="button">确定</button></div></div></div><div id="modal" class="modal"><div class="modal-backdrop" onclick="closeDetail()"></div><div class="modal-panel"><div class="modal-shell"><button class="modal-close" onclick="closeDetail()" aria-label="关闭"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button><div class="modal-body" id="modal-body"></div></div></div></div><div id="show-cal-modal" class="show-cal-modal"><div class="show-cal-backdrop" onclick="closeShowCal()"></div><div class="show-cal-panel"><div class="show-cal-head"><div class="show-cal-name" id="show-cal-name"></div><button class="show-cal-close" onclick="closeShowCal()" aria-label="关闭">×</button></div><div class="show-cal-info" id="show-cal-info"></div><div class="show-cal-nav"><button onclick="calShiftMonth(-1)" aria-label="上个月">‹</button><div id="show-cal-month">—</div><button onclick="calShiftMonth(1)" aria-label="下个月">›</button></div><div class="show-cal-weekdays"><span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span></div><div class="show-cal-grid" id="show-cal-grid"></div><div class="show-cal-legend"><span class="legend-item"><i class="legend-dot legend-past"></i>已播出</span><span class="legend-item"><i class="legend-dot legend-today"></i>今天</span><span class="legend-item"><i class="legend-dot legend-future"></i>待播出</span></div><div class="show-cal-detail" id="show-cal-detail"></div></div></div><script src="/app.js?v=${APP_JS_VERSION}" defer><\/script>${boot}`;
+  return `<div class="container"><div class="top-sticky"><header class="hero"><div class="hero-left"><button type="button" class="hero-avatar" id="hero-avatar" title="观看小结" aria-label="打开观看小结">${heroAvatarHtml}</button><div class="hero-text"><h1 class="hero-name" id="hero-name">${heroName}</h1><p class="updated-at" id="updated-at"></p></div></div><div class="hero-actions"><button class="btn-action" id="btn-refresh" onclick="forceRefresh()" title="刷新数据"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg><span>刷新</span></button><button class="btn-action" id="btn-theme" onclick="cycleTheme()" title="主题：深色" aria-label="切换主题：深色"><span class="theme-icon" id="theme-icon"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></span><span>主题</span></button><button class="btn-action" id="btn-logout" onclick="logout()" title="退出登录"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg><span>退出</span></button></div></header><div class="stats" id="stats-box">${renderStatsHtml(null)}</div><nav class="tabs"><button class="tab active" data-tab="playback"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9.5 21v-6h5v6"/></svg><span>首页</span></button><button class="tab" data-tab="watchlist"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg><span>待看</span></button><button class="tab" data-tab="calendar"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg><span>日历</span></button><button class="tab" data-tab="history"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/></svg><span>记录</span></button><button class="tab" data-tab="search"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg><span>搜索</span></button></nav></div><section id="playback" class="pane active">${section("playback", "继续观看")}<div class="home-section platform-section"><div class="home-section-head"><h2 class="home-section-title">流媒体平台</h2></div>${renderPlatformRows()}${section("guduo", "骨朵热榜", '<div class="theater-home-tabs" id="guduo-home-tabs" style="display:none"></div>')}${section("theater", "平台剧场", '<div class="theater-home-tabs" id="theater-home-tabs" style="display:none"></div>')}${section("douban-domestic", "豆瓣热播国产剧")}${section("douban-hktw", "豆瓣热播港台剧")}${section("douban-jpkr", "豆瓣热播日韩剧")}${section("douban-western", "豆瓣热播欧美剧")}</section><section id="watchlist" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="calendar" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="history" class="pane"><div class="grid"></div><div id="history-more"></div></section><section id="search" class="pane"><div class="search-bar"><input id="search-input" class="search-input" type="search" placeholder="搜索电影 / 剧集" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></div><div id="search-results" class="grid"></div></section><div class="app-version">MineTrakt v${APP_JS_VERSION}</div></div><div id="list-modal" class="list-modal"><div class="list-modal-backdrop" onclick="closeListModal()"></div><div class="list-modal-panel"><div class="list-modal-head"><h3 class="list-modal-title" id="list-modal-title"></h3><button type="button" class="list-modal-close" onclick="closeListModal()" aria-label="关闭">×</button></div><div class="list-modal-body" id="list-modal-body"></div></div></div><div id="summary-modal" class="summary-modal" style="display:none" role="dialog" aria-modal="true" aria-label="观看小结"><div class="summary-backdrop" onclick="window.__closeSummary()"></div><div class="summary-panel"><div class="summary-head"><h2 class="summary-title">观看小结</h2><button type="button" class="summary-close" onclick="window.__closeSummary()" aria-label="关闭">×</button></div><div id="summary-modal-body" class="summary-body"><div class="pane-loading"><div class="spinner"></div></div></div></div></div><div id="person-modal" class="person-modal"><div class="person-backdrop" onclick="closePerson()"></div><div class="person-panel"><div class="person-panel-head"><div class="person-panel-name" id="person-modal-name"></div><button class="person-close" onclick="closePerson()" aria-label="关闭">×</button></div><div class="person-panel-body" id="person-modal-body"></div></div></div><div id="confirm-modal" class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title" style="display:none"><div class="confirm-backdrop"></div><div class="confirm-panel"><div class="confirm-icon" id="confirm-icon">?</div><div class="confirm-title" id="confirm-title"></div><div class="confirm-msg" id="confirm-msg"></div><div class="confirm-actions"><button class="confirm-btn confirm-cancel" id="confirm-cancel" type="button">取消</button><button class="confirm-btn confirm-ok" id="confirm-ok" type="button">确定</button></div></div></div><div id="modal" class="modal"><div class="modal-backdrop" onclick="closeDetail()"></div><div class="modal-panel"><div class="modal-shell"><button class="modal-close" onclick="closeDetail()" aria-label="关闭"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button><div class="modal-body" id="modal-body"></div></div></div></div><div id="show-cal-modal" class="show-cal-modal"><div class="show-cal-backdrop" onclick="closeShowCal()"></div><div class="show-cal-panel"><div class="show-cal-head"><div class="show-cal-name" id="show-cal-name"></div><button class="show-cal-close" onclick="closeShowCal()" aria-label="关闭">×</button></div><div class="show-cal-info" id="show-cal-info"></div><div class="show-cal-nav"><button onclick="calShiftMonth(-1)" aria-label="上个月">‹</button><div id="show-cal-month">—</div><button onclick="calShiftMonth(1)" aria-label="下个月">›</button></div><div class="show-cal-weekdays"><span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span></div><div class="show-cal-grid" id="show-cal-grid"></div><div class="show-cal-legend"><span class="legend-item"><i class="legend-dot legend-past"></i>已播出</span><span class="legend-item"><i class="legend-dot legend-today"></i>今天</span><span class="legend-item"><i class="legend-dot legend-future"></i>待播出</span></div><div class="show-cal-detail" id="show-cal-detail"></div></div></div><script src="/app.js?v=${APP_JS_VERSION}" defer><\/script>${boot}`;
 }
-
 
 /**
  * 详情扩展 API。
  * 懒加载演员、推荐、预告片、第三方评分，减少首次详情体积。
- * 不依赖用户身份，不开启 strict。
  */
 async function handleDetailExtras(request, env, ctx) {
   const url = new URL(request.url);
   const type = url.searchParams.get("type");
   const tmdbId = url.searchParams.get("tmdb");
   const imdbId = url.searchParams.get("imdb");
+
   if (!type || (type !== "movie" && type !== "show"))
     return new Response("bad params", { status: 400 });
 
@@ -5197,6 +5269,7 @@ async function handleDetailExtras(request, env, ctx) {
       ? tmdbFull.credits.cast
       : []
   ).slice(0, 20);
+
   const castHtml = cast
     .map((c) => {
       const initial = Array.from(c.name || "?")[0] || "?";
@@ -5215,6 +5288,7 @@ async function handleDetailExtras(request, env, ctx) {
       : tmdbFull && tmdbFull.videos && Array.isArray(tmdbFull.videos.results)
         ? tmdbFull.videos.results
         : [];
+
   const trailers = videos.filter(
     (v) =>
       v &&
@@ -5230,6 +5304,7 @@ async function handleDetailExtras(request, env, ctx) {
       (v.iso_639_1 === "en" ? 5 : 0);
     return score(b) - score(a);
   });
+
   const trailersHtml = trailers
     .slice(0, 4)
     .map((v) => {
@@ -5245,6 +5320,7 @@ async function handleDetailExtras(request, env, ctx) {
       ? tmdbFull.recommendations.results
       : []
   ).slice(0, 12);
+
   const recsHtml = recs
     .map((r, i) =>
       mediaItem({
@@ -5261,11 +5337,10 @@ async function handleDetailExtras(request, env, ctx) {
     .join("");
 
   const tmdbRating =
-    tmdbFull &&
-    tmdbFull.vote_average != null &&
-    Number(tmdbFull.vote_average) > 0
+    tmdbFull && tmdbFull.vote_average != null && Number(tmdbFull.vote_average) > 0
       ? Number(tmdbFull.vote_average)
       : null;
+
   const ratingsHtml =
     out.omdb || tmdbRating != null
       ? renderExtRatings(out.omdb, { tmdb: tmdbRating })
@@ -5274,12 +5349,7 @@ async function handleDetailExtras(request, env, ctx) {
   return authResp(
     auth,
     needsCookieUpdate,
-    JSON.stringify({
-      castHtml,
-      recsHtml,
-      ratingsHtml,
-      trailersHtml,
-    }),
+    JSON.stringify({ castHtml, recsHtml, ratingsHtml, trailersHtml }),
     {
       contentType: "application/json; charset=utf-8",
       extra: {
@@ -5288,7 +5358,6 @@ async function handleDetailExtras(request, env, ctx) {
     },
   );
 }
-
 
 /** 演员详情页（公共数据，不 strict） */
 async function handlePerson(request, env, ctx) {
@@ -5300,21 +5369,18 @@ async function handlePerson(request, env, ctx) {
   const A = await authed(request, env, ctx, { html: true });
   if (!A.ok) return A.response;
   const { auth, needsCookieUpdate } = A;
+
   if (!env.TMDB_API_KEY)
-    return authResp(
-      auth,
-      needsCookieUpdate,
-      emptyView({ text: "TMDB 未配置", error: true }),
-      {
-        status: 502,
-      },
-    );
+    return authResp(auth, needsCookieUpdate, emptyView({ text: "TMDB 未配置", error: true }), {
+      status: 502,
+    });
 
   const person = await tmdbDetailCached(
     `/person/${id}?append_to_response=combined_credits,external_ids`,
     env,
     ctx,
   );
+
   if (!person)
     return authResp(
       auth,
@@ -5359,10 +5425,7 @@ async function handlePerson(request, env, ctx) {
       const title = isMovie
         ? c.title || c.original_title || ""
         : c.name || c.original_name || "";
-      const year = ((c.release_date || c.first_air_date || "") + "").slice(
-        0,
-        4,
-      );
+      const year = ((c.release_date || c.first_air_date || "") + "").slice(0, 4);
       const poster = c.poster_path ? tmdbPoster(c.poster_path) : null;
       const role = c.character || "";
       return mediaItem({
@@ -5381,14 +5444,12 @@ async function handlePerson(request, env, ctx) {
 
   const rows = [];
   if (dept) rows.push(`<div class="person-row"><b>职业</b>${esc(dept)}</div>`);
-  if (gender)
-    rows.push(`<div class="person-row"><b>性别</b>${esc(gender)}</div>`);
+  if (gender) rows.push(`<div class="person-row"><b>性别</b>${esc(gender)}</div>`);
   if (birthday)
     rows.push(
       `<div class="person-row"><b>生日</b>${esc(birthday)}${deathday ? " — " + esc(deathday) : ""}</div>`,
     );
-  if (place)
-    rows.push(`<div class="person-row"><b>出生地</b>${esc(place)}</div>`);
+  if (place) rows.push(`<div class="person-row"><b>出生地</b>${esc(place)}</div>`);
 
   const html = `<div class="person-head">${photo ? `<img class="person-photo" src="${photo}" alt="">` : `<div class="person-photo person-photo-ph">${esc(initial)}</div>`}<div class="person-info"><div class="person-name">${esc(name)}</div>${rows.length ? `<div class="person-rows">${rows.join("")}</div>` : ""}</div></div>${bio ? `<div class="person-bio">${esc(bio)}</div>` : ""}${creditsHtml ? `<div class="person-credits-title">参演作品</div><div class="grid">${creditsHtml}</div>` : '<p class="person-sub">暂无参演作品信息</p>'}`;
 
@@ -5396,7 +5457,6 @@ async function handlePerson(request, env, ctx) {
     extra: { "Cache-Control": "private, max-age=3600" },
   });
 }
-
 
 /**
  * 季剧集 API。
@@ -5408,6 +5468,7 @@ async function handleSeason(request, env, ctx) {
     seasonNum = parseInt(url.searchParams.get("season") || "0"),
     tmdbId = url.searchParams.get("tmdb"),
     slug = url.searchParams.get("slug") || "";
+
   if (isNaN(seasonNum) || (!showId && !tmdbId))
     return new Response("bad params", { status: 400 });
 
@@ -5416,6 +5477,7 @@ async function handleSeason(request, env, ctx) {
   const { auth, headers, needsCookieUpdate, userKey } = A;
 
   const validShowId = showId && /^\d+$/.test(showId);
+
   const [progress, traktSeason, tmdbSeason] = await Promise.all([
     validShowId
       ? cachedJSON(
@@ -5466,26 +5528,15 @@ async function handleSeason(request, env, ctx) {
     ? progress.seasons.find((s) => s.number === seasonNum)
     : null;
   const traktEpisodes =
-    traktSeason && Array.isArray(traktSeason.episodes)
-      ? traktSeason.episodes
-      : [];
+    traktSeason && Array.isArray(traktSeason.episodes) ? traktSeason.episodes : [];
 
   return authResp(
     auth,
     needsCookieUpdate,
-    renderSeasonEpisodes(
-      seasonProgress,
-      tmdbSeason,
-      seasonNum,
-      slug,
-      traktEpisodes,
-    ),
-    {
-      extra: { "Cache-Control": CC_NO_STORE },
-    },
+    renderSeasonEpisodes(seasonProgress, tmdbSeason, seasonNum, slug, traktEpisodes),
+    { extra: { "Cache-Control": CC_NO_STORE } },
   );
 }
-
 
 /**
  * 详情 API。
@@ -5496,6 +5547,7 @@ async function handleApiDetail(request, env, ctx) {
     const url = new URL(request.url),
       type = url.searchParams.get("type"),
       rawId = url.searchParams.get("id");
+
     if (!type || !rawId || (type !== "movie" && type !== "show"))
       return new Response("bad params", { status: 400 });
 
@@ -5516,7 +5568,6 @@ async function handleApiDetail(request, env, ctx) {
 
     const t = type === "movie" ? "movie" : "tv";
 
-    // 并行拉实体 / 搜索映射
     const entityP = traktId
       ? cachedJSON(
           env,
@@ -5557,8 +5608,7 @@ async function handleApiDetail(request, env, ctx) {
               if (!Array.isArray(arr) || !arr.length) return null;
               const key = type === "movie" ? "movie" : "show";
               return (
-                (arr[0][key] && arr[0][key].ids && arr[0][key].ids.trakt) ||
-                null
+                (arr[0][key] && arr[0][key].ids && arr[0][key].ids.trakt) || null
               );
             },
             { ttl: 86400 * 7, missTtl: 120, swr: 3600, edgeTtl: 3600 },
@@ -5570,16 +5620,12 @@ async function handleApiDetail(request, env, ctx) {
 
     const tmdbId =
       (entity && entity.ids && entity.ids.tmdb) || tmdbIdHint || null;
+
     const tmdbBasicP =
       tmdbId && env.TMDB_API_KEY
-        ? tmdbDetailCached(
-            `/${t}/${tmdbId}?append_to_response=external_ids`,
-            env,
-            ctx,
-          )
+        ? tmdbDetailCached(`/${t}/${tmdbId}?append_to_response=external_ids`, env, ctx)
         : Promise.resolve(null);
 
-    // 用户进度（剧集） / 电影历史
     const userProgressP =
       type === "show" && traktId
         ? cachedJSON(
@@ -5632,6 +5678,7 @@ async function handleApiDetail(request, env, ctx) {
         502,
       );
     }
+
     if (!entity) {
       const genres =
         tmdbBasic && Array.isArray(tmdbBasic.genres)
@@ -5673,6 +5720,7 @@ async function handleApiDetail(request, env, ctx) {
       type === "movie"
         ? tmdbBasic && tmdbBasic.id
         : entity.ids && entity.ids.tmdb;
+
     if (wlTmdbId && env.TMDB_CACHE) {
       try {
         const wlType = type === "movie" ? "movies" : "shows";
@@ -5686,6 +5734,7 @@ async function handleApiDetail(request, env, ctx) {
         inWatchlist = ids.includes(wlTmdbId);
       } catch {}
     }
+
     let initialSeasonNum = null;
     if (type === "show" && userProgress) {
       if (userProgress.next_episode && userProgress.next_episode.season)
@@ -5765,10 +5814,10 @@ async function handleApiDetail(request, env, ctx) {
     });
   }
 }
+
 /* ============================================================
  * 第五部分：列表/卡片 HTML 渲染 · 详情富化 · handleMore 分页
  * ============================================================ */
-
 
 /** 从 Trakt 实体的 images.poster 中提取海报 URL */
 function posterOfTrakt(obj) {
@@ -5799,12 +5848,14 @@ function buildBaseItem(traktItem) {
     traktId: null,
     enrichKey: null,
   };
+
   let kind = traktItem.type;
   if (!kind) {
     if (traktItem.show && traktItem.episode) kind = "episode";
     else if (traktItem.movie) kind = "movie";
     else if (traktItem.show) kind = "show";
   }
+
   if (kind === "movie" || traktItem.movie) {
     const m = traktItem.movie || {};
     base.tag = "电影";
@@ -5821,7 +5872,6 @@ function buildBaseItem(traktItem) {
         : m.ids && m.ids.trakt
           ? String(m.ids.trakt)
           : null;
-    // enrichKey 用于后续 TMDB 富化（补中文标题/海报）
     if (m.ids && m.ids.tmdb) base.enrichKey = "movie:tmdb:" + m.ids.tmdb;
     else if (m.ids && m.ids.imdb) base.enrichKey = "movie:imdb:" + m.ids.imdb;
     else if (m.title)
@@ -5845,7 +5895,6 @@ function buildBaseItem(traktItem) {
           ? String(s.year)
           : "";
     base.detailType = "show";
-    // 移除待看时：单集条目要用单集自己的 Trakt ID
     base.traktId =
       kind === "episode" && e.ids && e.ids.trakt
         ? String(e.ids.trakt)
@@ -5873,7 +5922,6 @@ function buildBaseItem(traktItem) {
     base.line1 =
       se.number != null ? `第 ${se.number} 季` : s.year ? String(s.year) : "";
     base.detailType = "show";
-    // 移除待看时：单季条目要用单季自己的 Trakt ID
     base.traktId = se.ids && se.ids.trakt ? String(se.ids.trakt) : null;
     base.detailId =
       s.ids && s.ids.tmdb
@@ -5902,21 +5950,19 @@ function parseEnrichKey(key) {
   if (i1 < 0) return null;
   const i2 = key.indexOf(":", i1 + 1);
   if (i2 < 0) return null;
+
   const kind = key.slice(0, i1),
     source = key.slice(i1 + 1, i2),
     rest = key.slice(i2 + 1);
+
   if (kind !== "movie" && kind !== "tv") return null;
+
   if (source === "title") {
     const lastColon = rest.lastIndexOf(":");
     if (lastColon > 0) {
       const maybeYear = rest.slice(lastColon + 1);
       if (/^\d{4}$/.test(maybeYear)) {
-        return {
-          kind,
-          source,
-          title: rest.slice(0, lastColon),
-          year: maybeYear,
-        };
+        return { kind, source, title: rest.slice(0, lastColon), year: maybeYear };
       }
     }
     return { kind, source, title: rest, year: "" };
@@ -5932,6 +5978,7 @@ async function enrichOne(key, env, ctx) {
   if (!env.TMDB_API_KEY) return null;
   const parsed = parseEnrichKey(key);
   if (!parsed) return null;
+
   return cachedJSON(
     env,
     ctx,
@@ -5939,6 +5986,7 @@ async function enrichOne(key, env, ctx) {
     async () => {
       const { kind, source } = parsed;
       let d = null;
+
       if (source === "tmdb")
         d = await tmdbGet(tmdbUrl(`/${kind}/${parsed.value}`, env));
       else if (source === "imdb") {
@@ -5963,6 +6011,7 @@ async function enrichOne(key, env, ctx) {
         if (search && search.results && search.results.length)
           d = await tmdbGet(tmdbUrl(`/${kind}/${search.results[0].id}`, env));
       }
+
       return d && (d.title || d.name)
         ? {
             title: d.title || d.name || "",
@@ -5986,12 +6035,15 @@ async function handleEnrich(request, env, ctx) {
   } catch {
     return Response.json({}, { status: 400 });
   }
+
   const rawItems = Array.isArray(body.items) ? body.items : [];
   if (!rawItems.length) return Response.json({});
+
   const limited = rawItems.slice(0, 80),
     out = {},
     seen = new Set(),
     tasks = [];
+
   for (const it of limited) {
     const key = it && it.key;
     if (!key || seen.has(key)) continue;
@@ -6006,7 +6058,9 @@ async function handleEnrich(request, env, ctx) {
         }),
     );
   }
+
   await Promise.all(tasks);
+
   return new Response(JSON.stringify(out), {
     headers: {
       "Content-Type": CT_JSON,
@@ -6014,7 +6068,6 @@ async function handleEnrich(request, env, ctx) {
     },
   });
 }
-
 
 /**
  * 渲染单个媒体卡片（.item）。
@@ -6058,6 +6111,7 @@ function mediaItem(opts) {
       opts.tag && opts.tagClass === "upcoming"
         ? `<span class="tag ${esc(opts.tagClass)}">（${esc(opts.tag)}）</span>`
         : "";
+
   let calendarBtns = "";
   if (opts.calendarShowId) {
     calendarBtns += `<button class="cal-open-btn" type="button" data-cal-show-id="${esc(opts.calendarShowId)}" data-cal-show-name="${esc(opts.calendarShowName || opts.title)}"${opts.calendarTmdbId ? ` data-cal-show-tmdb="${esc(String(opts.calendarTmdbId))}"` : ""} title="查看这部剧的播出日历"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:4px"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>播出日历</button>`;
@@ -6068,9 +6122,9 @@ function mediaItem(opts) {
   const calendarBtnHtml = calendarBtns
     ? `<div class="cal-action-row">${calendarBtns}</div>`
     : "";
+
   return `<div class="item${clickable}"${dataAttrs}${enrichAttrs}${style}>${removeHtml}${watchedHtml}${unwatchHtml}<div class="poster">${opts.poster ? `<img src="${opts.poster}" loading="lazy" alt="">` : `<div class="poster-ph"><span>${opts.tagClass === "movie" ? "🎬" : "📺"}</span></div>`}${playHtml}${dropHtml}</div><div class="info"><div class="name-row"><span class="name">${esc(opts.title)}</span>${tagHtml}</div>${opts.line1 ? `<div class="meta">${esc(opts.line1)}</div>` : ""}${opts.overview ? `<div class="overview">${esc(opts.overview)}</div>` : ""}${opts.line2 ? `<div class="meta dim">${esc(opts.line2)}</div>` : ""}${bar}${calendarBtnHtml}</div></div>`;
 }
-
 
 /**
  * 渲染观看记录列表。
@@ -6083,11 +6137,13 @@ function renderHistoryPage(items, env, isFragment) {
   if (!Array.isArray(items))
     return isFragment ? "" : emptyPaneHtml("暂时无法加载观看记录");
   if (!items.length) return isFragment ? "" : emptyView("还没有观看记录");
+
   return items
     .map((item, i) => {
       const when = fmtRelative(item.watched_at),
         delay = isFragment ? 0 : Math.min(i, 24) * 20,
         e = buildBaseItem(item);
+
       let unwatchType = null,
         unwatchId = null;
       if (item.movie && item.movie.ids && item.movie.ids.trakt) {
@@ -6097,6 +6153,7 @@ function renderHistoryPage(items, env, isFragment) {
         unwatchType = "episode";
         unwatchId = item.episode.ids.trakt;
       }
+
       return mediaItem({
         poster: e.poster,
         tag: e.tag,
@@ -6116,8 +6173,6 @@ function renderHistoryPage(items, env, isFragment) {
     .join("");
 }
 
-
-/** watchlist 排序工具栏 */
 /** watchlist 空状态 */
 function emptyWatchlistHtml() {
   return `<div class="empty"><svg viewBox="0 0 24 24" width="56" height="56" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.25"><circle cx="12" cy="12" r="10"/><path d="M12 8v8M8 12h8"/></svg><p>待看列表是空的</p><p style="font-size:0.82rem;color:#5a6474;margin-top:10px;line-height:1.6;text-align:center">去 Trakt 上把想看的电影 / 剧集加入 watchlist，这里就会显示</p></div>`;
@@ -6130,6 +6185,7 @@ function renderWatchlistItems(items, env) {
     .map((item, i) => {
       const e = buildBaseItem(item);
       if (!e.title || !e.detailId) return "";
+
       const when = item.listed_at
           ? "添加于 " + fmtRelative(item.listed_at)
           : "",
@@ -6144,6 +6200,7 @@ function renderWatchlistItems(items, env) {
                 : "show"
             : null,
         removeId = e.traktId;
+
       return mediaItem({
         poster: e.poster,
         tag: e.tag,
@@ -6164,7 +6221,6 @@ function renderWatchlistItems(items, env) {
     .join("");
 }
 
-
 /** 构造 Infuse 深链 */
 function buildInfuseHrefForContinue(item) {
   if (!item) return null;
@@ -6172,9 +6228,11 @@ function buildInfuseHrefForContinue(item) {
   if (movie && movie.ids && movie.ids.tmdb) {
     return `infuse://movie/${movie.ids.tmdb}`;
   }
+
   const show = item.show;
   const tmdbId = show && show.ids && show.ids.tmdb;
   if (!tmdbId) return null;
+
   const ep =
     item.episode || (item.progress && item.progress.next_episode) || null;
   const season = ep ? (ep.season != null ? ep.season : ep.season_number) : null;
@@ -6183,6 +6241,7 @@ function buildInfuseHrefForContinue(item) {
       ? ep.number
       : ep.episode_number
     : null;
+
   if (season != null && number != null) {
     return `infuse://series/${tmdbId}-${season}-${number}`;
   }
@@ -6198,6 +6257,7 @@ function buildInfuseHrefForContinue(item) {
  */
 function renderContinueItems(upNext, mode = "grid") {
   if (mode === true) mode = "fragment";
+
   const items = [];
   if (Array.isArray(upNext)) {
     for (const entry of upNext) {
@@ -6210,11 +6270,11 @@ function renderContinueItems(upNext, mode = "grid") {
       } else if (entry.show && entry.progress && entry.progress.next_episode) {
         const completed = entry.progress.completed;
         if (typeof completed === "number" && completed <= 0) continue;
+
         const next = entry.progress.next_episode;
         items.push({
           source: "upnext",
-          sortKey:
-            entry.last_watched_at || entry.progress.last_watched_at || "",
+          sortKey: entry.last_watched_at || entry.progress.last_watched_at || "",
           showProgress: {
             completed: Number(entry.progress.completed) || 0,
             aired: Number(entry.progress.aired) || 0,
@@ -6235,12 +6295,15 @@ function renderContinueItems(upNext, mode = "grid") {
       }
     }
   }
+
   items.sort((a, b) => (b.sortKey || "").localeCompare(a.sortKey || ""));
+
   if (!items.length) {
     const emptyHtml = `<div class="empty"><svg viewBox="0 0 24 24" width="56" height="56" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.25"><circle cx="12" cy="12" r="10"/><path d="M8 12h8M12 8v8"/></svg><p>暂时没有继续观看的内容</p><p style="font-size:0.82rem;color:#5a6474;margin-top:10px;line-height:1.6;text-align:center">去 Trakt 上标记一些已看剧集后，这里会显示下一集</p></div>`;
     if (mode === "fragment") return "";
     return emptyHtml;
   }
+
   const parts = items.map((it, i) => {
     const delay = Math.min(i, 24) * 20,
       item = it.raw,
@@ -6252,6 +6315,7 @@ function renderContinueItems(upNext, mode = "grid") {
       playPct =
         typeof item.progress === "number" ? Math.round(item.progress) : null,
       e = buildBaseItem(item);
+
     let barPct = playPct;
     if (barPct == null && it.showProgress && it.showProgress.aired > 0) {
       barPct = Math.max(
@@ -6262,6 +6326,7 @@ function renderContinueItems(upNext, mode = "grid") {
         ),
       );
     }
+
     const subLine =
       it.showProgress && it.showProgress.aired > 0
         ? `已看 ${it.showProgress.completed} / ${it.showProgress.aired} 集`
@@ -6270,6 +6335,7 @@ function renderContinueItems(upNext, mode = "grid") {
           : epTag
             ? `下一集 ${epTag}`
             : "下一集";
+
     let watchedType = null,
       watchedId = null;
     if (item.movie && item.movie.ids && item.movie.ids.trakt) {
@@ -6279,7 +6345,9 @@ function renderContinueItems(upNext, mode = "grid") {
       watchedType = "episode";
       watchedId = item.episode.ids.trakt;
     }
+
     const playHref = buildInfuseHrefForContinue(item);
+
     return mediaItem({
       poster: e.poster,
       tag: e.tag,
@@ -6298,12 +6366,11 @@ function renderContinueItems(upNext, mode = "grid") {
       playHref,
     });
   });
+
   if (mode === "fragment") return parts.join("");
-  if (mode === "hscroll")
-    return `<div class="h-scroll">${parts.join("")}</div>`;
+  if (mode === "hscroll") return `<div class="h-scroll">${parts.join("")}</div>`;
   return `<div class="grid">${parts.join("")}</div>`;
 }
-
 
 /**
  * 渲染追剧日历。
@@ -6312,24 +6379,27 @@ function renderContinueItems(upNext, mode = "grid") {
 function renderCalendarPage(calendar, env, zhTitles) {
   if (!Array.isArray(calendar)) return emptyPaneHtml("暂时无法加载追剧日历");
   if (!calendar.length) return emptyView("未来 30 天没有待播剧集");
+
   const toBeijingDay = (iso) => {
       if (!iso) return "";
       const d = new Date(new Date(iso).getTime() + 8 * 3600 * 1000);
       return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
     },
     groups = new Map();
+
   for (const item of calendar) {
     const day = toBeijingDay(item.first_aired);
     if (!day) continue;
     if (!groups.has(day)) groups.set(day, []);
     groups.get(day).push(item);
   }
+
   const today = toBeijingDay(new Date().toISOString()),
     out = [];
+
   for (const [day, items] of groups.entries()) {
-    items.sort((a, b) =>
-      (a.first_aired || "").localeCompare(b.first_aired || ""),
-    );
+    items.sort((a, b) => (a.first_aired || "").localeCompare(b.first_aired || ""));
+
     const d = new Date(day + "T00:00:00Z"),
       wd = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"][
         d.getUTCDay()
@@ -6343,11 +6413,13 @@ function renderCalendarPage(calendar, env, zhTitles) {
           );
           timeStr = `${String(bj.getUTCHours()).padStart(2, "0")}:${String(bj.getUTCMinutes()).padStart(2, "0")}`;
         }
+
         const e = buildBaseItem(item),
           showTraktId = item.show && item.show.ids ? item.show.ids.trakt : null,
           zhTitle =
             showTraktId != null && zhTitles ? zhTitles[showTraktId] : null,
           displayTitle = zhTitle || e.title || "未知节目";
+
         return mediaItem({
           poster: e.poster,
           tagClass: "upcoming",
@@ -6365,6 +6437,7 @@ function renderCalendarPage(calendar, env, zhTitles) {
           dropShowId: showTraktId ? String(showTraktId) : null,
         });
       });
+
     out.push(
       `<div class="day"><div class="day-head"><span class="day-num">${day.slice(8)}</span><div><div class="day-mon">${day.slice(0, 7)}</div><div class="day-wd">${wd}</div></div>${isToday ? '<span class="today">今天</span>' : ""}</div><div class="grid">${parts.join("")}</div></div>`,
     );
@@ -6372,28 +6445,23 @@ function renderCalendarPage(calendar, env, zhTitles) {
   return out.join("");
 }
 
-
 /** 从用户进度中推导第一个未看的集数 */
 function firstUnwatchedEpisode(userProgress) {
   if (!userProgress || userProgress.__error) return null;
+
   const ne = userProgress.next_episode;
   if (ne && ne.season != null && ne.number != null) return ne;
-  const seasons = Array.isArray(userProgress.seasons)
-    ? userProgress.seasons
-    : [];
+
+  const seasons = Array.isArray(userProgress.seasons) ? userProgress.seasons : [];
   for (const s of seasons) {
     if (!s || !(s.number > 0) || !Array.isArray(s.episodes)) continue;
     for (const ep of s.episodes) {
       if (ep && ep.number != null && !ep.completed)
-        return {
-          season: s.number,
-          number: ep.number,
-        };
+        return { season: s.number, number: ep.number };
     }
   }
   return null;
 }
-
 
 /**
  * 渲染详情页主 HTML 片段。
@@ -6422,8 +6490,7 @@ function renderDetailFragment(d) {
     overview = (tmdb && tmdb.overview) || entity.overview || "",
     year =
       (
-        ((tmdb && tmdb.release_date) || (tmdb && tmdb.first_air_date) || "") +
-        ""
+        ((tmdb && tmdb.release_date) || (tmdb && tmdb.first_air_date) || "") + ""
       ).slice(0, 4) || (entity.year ? String(entity.year) : ""),
     tmdbRating =
       tmdb && tmdb.vote_average != null && Number(tmdb.vote_average) > 0
@@ -6464,6 +6531,7 @@ function renderDetailFragment(d) {
       (tmdb.imdb_id || (tmdb.external_ids && tmdb.external_ids.imdb_id))) ||
     (entity.ids && entity.ids.imdb) ||
     null;
+
   let statusHtml = "";
   if (isMovie) {
     if (movieWatched) {
@@ -6478,6 +6546,7 @@ function renderDetailFragment(d) {
   } else if (!isMovie) {
     statusHtml = `<div class="d-status"><div class="d-status-icon">○</div><div class="d-status-body"><div class="d-status-title">尚未观看</div><div class="d-status-sub">还没有观看记录</div></div></div>`;
   }
+
   const iconCheck =
     '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="5 12.5 10 17.5 19 7"/></svg>';
   const iconBm =
@@ -6486,6 +6555,7 @@ function renderDetailFragment(d) {
     '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" stroke="none"><path d="M7 3h10a1 1 0 0 1 1 1v16l-6-3.5L6 20V4a1 1 0 0 1 1-1z"/></svg>';
   const iconPlay =
     '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" stroke="none"><path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11.04-6.86a1 1 0 0 0 0-1.72L9.5 4.28A1 1 0 0 0 8 5.14z"/></svg>';
+
   let barBtns = "";
   if (isMovie && traktId) {
     if (movieWatched)
@@ -6504,17 +6574,20 @@ function renderDetailFragment(d) {
       ? Number(seasonProgress.completed) || 0
       : 0;
     const seasonAllWatched = seasonTotal > 0 && seasonWatched >= seasonTotal;
+
     if (seasonAllWatched)
       barBtns += `<button class="d-act d-act-watched active" type="button" disabled title="本季已看完">${iconCheck}</button>`;
     else
       barBtns += `<button class="d-act d-act-watched" type="button" data-mark-season-all="${esc(String(traktId))}" data-season-num="${initialSeasonNum}" title="标记本季已看">${iconCheck}</button>`;
   }
+
   if (wlTmdbId) {
     if (inWatchlist)
       barBtns += `<button class="d-act d-act-wl active" type="button" disabled title="已在待看">${iconBmFill}</button>`;
     else
       barBtns += `<button class="d-act d-act-wl" type="button" data-wl-add-detail="${esc(String(wlTmdbId))}" data-wl-add-detail-type="${isMovie ? "movie" : "show"}" title="加入待看">${iconBm}</button>`;
   }
+
   let infuseHref = "";
   if (isMovie && tmdb && tmdb.id) {
     infuseHref = `infuse://movie/${tmdb.id}`;
@@ -6537,9 +6610,9 @@ function renderDetailFragment(d) {
   }
   if (infuseHref)
     barBtns += `<a class="d-act d-act-play" href="${esc(infuseHref)}" rel="noopener" title="在 Infuse 中查看">${iconPlay}</a>`;
-  const actionsHtml = barBtns
-    ? `<div class="d-action-bar">${barBtns}</div>`
-    : "";
+
+  const actionsHtml = barBtns ? `<div class="d-action-bar">${barBtns}</div>` : "";
+
   const cast = (credits && credits.cast ? credits.cast : []).slice(0, 20);
   const castInner = cast
     .map((c) => {
@@ -6552,9 +6625,11 @@ function renderDetailFragment(d) {
       return `<div class="${cls}"${personAttrs}>${c.profile_path ? `<img class="cast-img" src="${TMDB_IMG}/w185${c.profile_path}" loading="lazy" alt="">` : `<div class="cast-img cast-ph">${esc(initial)}</div>`}<div class="cast-name">${esc(c.name || "")}</div><div class="cast-role">${esc(c.character || "")}</div></div>`;
     })
     .join("");
+
   const recs = (
     recommendations && recommendations.results ? recommendations.results : []
   ).slice(0, 12);
+
   const recsInner = recs
     .map((r, i) =>
       mediaItem({
@@ -6569,6 +6644,7 @@ function renderDetailFragment(d) {
       }),
     )
     .join("");
+
   let castSectionHtml = "";
   if (deferExtras) {
     castSectionHtml = `<section class="d-section" data-defer-parent="cast"><h2 class="d-section-title">演员</h2><div class="cast-scroll" data-defer-section="cast"><div class="pane-loading" style="padding:16px 0"><div class="spinner"></div></div></div></section>`;
@@ -6602,11 +6678,13 @@ function renderDetailFragment(d) {
   ) {
     ratingsSectionHtml = `<div class="detail-ext-ratings">${renderExtRatings(thirdParty, { trakt: traktRating, tmdb: tmdbRating, doubanUrl })}</div>`;
   }
+
   let seasonsHtml = "";
   if (!isMovie && tmdb && tmdb.seasons && tmdb.seasons.length) {
     const progressSeasons = new Map();
     if (Array.isArray(userProgress && userProgress.seasons))
       userProgress.seasons.forEach((s) => progressSeasons.set(s.number, s));
+
     const seasons = tmdb.seasons.filter((s) => s.season_number > 0);
     seasonsHtml = `<div class="seasons">${seasons
       .map((s) => {
@@ -6625,10 +6703,12 @@ function renderDetailFragment(d) {
                 )
               : "",
           loadedAttr = isOpen && bodyContent ? ' data-loaded="1"' : "";
+
         const loadingBody =
           isOpen && !bodyContent
             ? '<div class="modal-loading" style="padding:24px"><div class="spinner"></div></div>'
             : "";
+
         return `<div class="season-item${isOpen ? " open" : ""}"><div class="season-head" data-show="${traktId ? esc(String(traktId)) : ""}" data-season="${s.season_number}" data-tmdb="${esc(String(tmdb.id))}" data-slug="${esc(showSlug)}"><span class="season-title">${esc(s.name || "第 " + s.season_number + " 季")}</span><span class="season-meta">${watched} / ${total} 集</span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg></div><div class="season-body"${loadedAttr}>${bodyContent || loadingBody}</div></div>`;
       })
       .join("")}</div>`;
@@ -6638,7 +6718,6 @@ function renderDetailFragment(d) {
 
   return `<div class="detail-wrap"${rootAttrs}><div class="detail-hero">${backdrop ? `<img class="detail-bg" src="${backdrop}" alt="">` : ""}<div class="detail-inner">${poster ? `<img class="detail-poster" src="${poster}" alt="">` : `<div class="detail-poster detail-poster-ph">${isMovie ? "🎬" : "📺"}</div>`}<div class="detail-info"><h1 class="detail-title">${esc(title)}</h1>${tagline ? `<div class="detail-tagline">${esc(tagline)}</div>` : ""}<div class="detail-meta">${year ? `<span>${esc(year)}</span>` : ""}${runtimeStr ? `<span>${esc(runtimeStr)}</span>` : ""}</div>${ratingsSectionHtml}${genres ? `<div class="detail-genres">${esc(genres)}</div>` : ""}${overview ? `<p class="detail-overview">${esc(overview)}</p>` : ""}${statusHtml}${actionsHtml}</div></div></div><div class="detail-body">${castSectionHtml}${trailersSectionHtml}${seasonsHtml}${recsSectionHtml}</div></div>`;
 }
-
 
 /** 渲染某一季的集数列表 */
 function renderSeasonEpisodes(
@@ -6654,24 +6733,29 @@ function renderSeasonEpisodes(
     !tmdbSeason.episodes.length
   )
     return '<div class="ep-empty">暂无剧集信息</div>';
+
   const watched = new Map();
   if (Array.isArray(seasonProgress && seasonProgress.episodes))
     seasonProgress.episodes.forEach((e) => watched.set(e.number, e));
+
   const traktMap = new Map();
   if (Array.isArray(traktEpisodes))
     traktEpisodes.forEach((e) => {
       if (e && e.number != null) traktMap.set(e.number, e);
     });
+
   return tmdbSeason.episodes
     .map((ep) => {
       const num = ep.episode_number,
         w = watched.get(num),
         isWatched = !!(w && w.completed),
         traktEp = traktMap.get(num);
+
       const epId =
         (traktEp && traktEp.ids && traktEp.ids.trakt) ||
         (w && w.ids && w.ids.trakt) ||
         null;
+
       const traktUrl = showSlug
         ? `https://trakt.tv/shows/${showSlug}/seasons/${seasonNum}/episodes/${num}`
         : "";
@@ -6684,11 +6768,11 @@ function renderSeasonEpisodes(
         : epId
           ? `<button class="ep-watch-btn" type="button" data-episode-id="${esc(String(epId))}" data-episode-title="${esc(ep.name || "")}" title="标记本集已看">标记已看</button>`
           : "";
+
       return `<div class="episode${isWatched ? " watched" : ""}${clickable}"${attrs}><div class="ep-num">E${pad(num)}</div><div class="ep-body"><div class="ep-title">${esc(ep.name || "")}</div>${ep.overview ? `<div class="ep-overview">${esc(ep.overview)}</div>` : ""}</div><div class="ep-actions">${actionHtml}</div></div>`;
     })
     .join("");
 }
-
 
 /** 空视图（通用或错误） */
 function emptyView(opts) {
@@ -6703,7 +6787,6 @@ function emptyView(opts) {
 function emptyPaneHtml(text) {
   return `<div class="empty" style="padding:70px 20px"><p style="margin:0;font-size:.95rem">${esc(text)}</p><p style="font-size:.82rem;color:#7a8394;margin-top:10px">稍后重试即可恢复</p></div>`;
 }
-
 
 /** 生成指定长度的随机串（PKCE verifier 用） */
 function randomString(len) {
@@ -6785,10 +6868,7 @@ function fmtRelative(iso) {
   if (h < 24) return h + " 小时前";
   const day = Math.floor(h / 24);
   if (day < 7) return day + " 天前";
-  return d.toLocaleDateString("zh-CN", {
-    month: "numeric",
-    day: "numeric",
-  });
+  return d.toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" });
 }
 
 /** 返回 HTML 响应 */
@@ -6803,13 +6883,11 @@ function html(body) {
   });
 }
 
-
 /**
  * 加载更多 API。
- * type=history  观看记录翻页
- * type=playback 继续观看翻页
- * type=watchlist 待看列表翻页（走完整 getWatchlist 缓存）
- *
+ * type=history   观看记录翻页
+ * type=playback  继续观看翻页
+ * type=watchlist 待看列表翻页
  * strict: true —— 依赖用户身份。
  */
 async function handleMore(request, env, ctx) {
@@ -6817,12 +6895,12 @@ async function handleMore(request, env, ctx) {
     type = url.searchParams.get("type"),
     page = parseInt(url.searchParams.get("page") || "2"),
     limitParam = parseInt(url.searchParams.get("limit") || "0");
+
   const A = await authed(request, env, ctx, { html: true, strict: true });
   if (!A.ok) return A.response;
   const { auth, headers, needsCookieUpdate, userKey } = A;
 
   if (type === "history") {
-    // 翻页结果缓存 5 分钟：避免每次「加载更多」都直连 Trakt
     const data = await cachedJSON(
       env,
       ctx,
@@ -6852,26 +6930,21 @@ async function handleMore(request, env, ctx) {
       },
       { ttl: 300, missTtl: 60, swr: true, edgeTtl: 120, jitter: 120 },
     );
+
     if (!data || !Array.isArray(data.items))
       return new Response("", { status: 502 });
     const pageCount = data.pageCount || 1;
-    return authResp(
-      auth,
-      needsCookieUpdate,
-      renderHistoryPage(data.items, env, true),
-      {
-        extra: {
-          "X-Has-More": String(page < pageCount),
-          "X-Page": String(page),
-          "X-Page-Count": String(pageCount),
-        },
+    return authResp(auth, needsCookieUpdate, renderHistoryPage(data.items, env, true), {
+      extra: {
+        "X-Has-More": String(page < pageCount),
+        "X-Page": String(page),
+        "X-Page-Count": String(pageCount),
       },
-    );
+    });
   }
 
   if (type === "playback") {
     const limit = limitParam > 0 ? Math.min(limitParam, 60) : 20;
-    // 翻页结果缓存 5 分钟
     const data = await cachedJSON(
       env,
       ctx,
@@ -6901,11 +6974,13 @@ async function handleMore(request, env, ctx) {
       },
       { ttl: 300, missTtl: 60, swr: true, edgeTtl: 120, jitter: 150 },
     );
+
     if (!data || !Array.isArray(data.items))
       return new Response("", { status: 502 });
     const list = data.items;
     const pageCount = data.pageCount || 0;
     const hasMore = pageCount > 0 ? page < pageCount : list.length >= limit;
+
     return authResp(auth, needsCookieUpdate, renderContinueItems(list, "fragment"), {
       extra: {
         "X-Has-More": String(hasMore),
@@ -6928,6 +7003,7 @@ async function handleMore(request, env, ctx) {
       hasMore = Array.isArray(merged)
         ? start + WATCHLIST_PAGE_SIZE < merged.length
         : false;
+
     return authResp(auth, needsCookieUpdate, renderWatchlistItems(slice, env), {
       extra: {
         "X-Has-More": String(hasMore),
@@ -6940,7 +7016,6 @@ async function handleMore(request, env, ctx) {
   return new Response("", { status: 400 });
 }
 
-
 /**
  * 登录页：设备码授权 + 轮询。
  * 支持「换一个验证码」（__loginGen 取消旧轮询）；
@@ -6951,29 +7026,23 @@ function renderLoginPage() {
     `<div class="login-wrap"><div class="login-card"><div class="login-logo"><img src="${ICON_192}" alt="MineTrakt" width="64" height="64" style="display:block;margin:0 auto"></div><h1 class="login-title">MineTrakt</h1><p class="login-sub">首页 · 待看列表 · 追剧日历 · 观看记录</p><div id="login-area" class="login-area"><button class="btn-primary" onclick="startLogin()">使用 Trakt 登录</button></div></div></div><script>async function startLogin(){const area=document.getElementById('login-area');window.__loginGen=(window.__loginGen||0)+1;const gen=window.__loginGen;area.innerHTML='<div class="spinner"></div>';let r;try{r=await fetch('/auth/device');}catch(e){if(gen!==window.__loginGen)return;area.innerHTML='<div class="err-box"><p class="err-title">网络错误</p><p class="err">'+String(e)+'</p></div><button class="btn-primary" onclick="startLogin()">重试</button>';return;}if(gen!==window.__loginGen)return;if(!r.ok){const err=await r.json().catch(()=>({}));if(gen!==window.__loginGen)return;if(r.status===429||err.rateLimited){var wait=Number(err.retryAfter)||30;area.innerHTML='<div class="err-box" style="background:rgba(255,184,77,.10);border-color:rgba(255,184,77,.28)"><p class="err-title" style="color:#ffb84d">请求过于频繁</p><p class="err" style="color:#ffd693">Trakt 限流了，请 <span id="rl-count">'+wait+'</span> 秒后再试</p></div><button class="btn-primary" id="rl-btn" disabled style="opacity:.5;cursor:not-allowed">请稍候…</button>';var cnt=document.getElementById('rl-count'),btn=document.getElementById('rl-btn'),left=wait;var t=setInterval(function(){if(gen!==window.__loginGen){clearInterval(t);return;}left--;if(cnt)cnt.textContent=String(left);if(left<=0){clearInterval(t);if(btn){btn.disabled=false;btn.style.opacity='';btn.style.cursor='';btn.textContent='立即重试';btn.onclick=function(){startLogin();};}}},1000);return;}area.innerHTML='<div class="err-box"><p class="err-title">获取设备码失败</p><p class="err">'+(err.error||('HTTP '+r.status))+'</p>'+(err.hint?'<p class="hint">'+err.hint+'</p>':'')+'</div><button class="btn-primary" onclick="startLogin()">重试</button>';return;}const d=await r.json();if(gen!==window.__loginGen)return;const activateUrl='https://trakt.tv/activate',qr='https://api.qrserver.com/v1/create-qr-code/?size=220x220&color=4a6db8&bgcolor=ffffff&data='+encodeURIComponent(activateUrl);area.innerHTML='<div class="device-flow"><div class="steps"><div class="step"><span class="n">1</span><span>打开 <a href="'+activateUrl+'" target="_blank" rel="noopener">trakt.tv/activate</a></span></div><div class="step"><span class="n">2</span><span>输入下方代码</span></div></div><div class="code-box">'+d.user_code+'</div><button type="button" class="btn-ghost" id="refresh-code-btn" onclick="startLogin()" style="margin:4px 0 10px">换一个验证码</button><div class="step"><span class="n">3</span><span>在 Trakt 页面点击授权</span></div><div class="qr-box"><img src="'+qr+'" alt="QR"></div><p id="status" class="status" style="display:none"></p></div><details class="log-details"><summary>调试日志</summary><div id="log" class="log-box"></div></details>';let interval=(d.interval||5)*1000,attempt=0;const logEl=document.getElementById('log'),log=(s)=>{if(logEl)logEl.innerHTML+='<div>['+new Date().toLocaleTimeString()+'] '+s+'</div>';};const tick=async()=>{if(gen!==window.__loginGen)return;attempt++;let r2;try{r2=await fetch('/auth/poll',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({state:d.state})});}catch(e){if(gen!==window.__loginGen)return;log('网络错误');setTimeout(tick,interval);return;}if(gen!==window.__loginGen)return;if(r2.status===200){try{const st=document.getElementById('status');if(st){st.innerHTML='✓ 授权成功，正在进入…';st.className='status success';st.style.display='';}}catch(e){}setTimeout(()=>location.href='/home',400);return;}let text='';try{text=await r2.text();}catch{}let data={};try{data=JSON.parse(text);}catch{}log('HTTP '+r2.status+' · '+(data.status||data.message||'未知'));if(r2.status===202){if(data.status==='slow_down')interval+=2000;setTimeout(tick,interval);return;}if(r2.status===429){setTimeout(tick,Math.max(interval,5000));return;}if(r2.status===502||r2.status===503||r2.status===504){setTimeout(tick,Math.max(interval,3000));return;}if(r2.status===403){try{const st=document.getElementById('status');if(st){st.textContent=data.message||'你拒绝了授权，请换一个验证码重试';st.className='status error';st.style.display='';}const rb=document.getElementById('refresh-code-btn');if(rb){rb.style.borderColor='rgba(224,85,96,.45)';rb.style.color='#ff8a8a';}}catch(e){}return;}if(r2.status===410){try{const st=document.getElementById('status');if(st){st.textContent=data.message||'验证码无效或已过期，请换一个重试';st.className='status error';st.style.display='';}const rb=document.getElementById('refresh-code-btn');if(rb){rb.style.borderColor='rgba(224,85,96,.45)';rb.style.color='#ff8a8a';rb.focus();}}catch(e){}return;}setTimeout(tick,interval);};setTimeout(tick,1000);}<\/script><script>(function(){try{var msg=sessionStorage.getItem('mt:relogin');if(!msg)return;sessionStorage.removeItem('mt:relogin');var area=document.getElementById('login-area');if(!area)return;var p=document.createElement('p');p.className='err';p.style.cssText='margin-bottom:14px;text-align:center';p.textContent=msg;area.parentNode.insertBefore(p,area);}catch(e){}})();<\/script>`,
   );
 }
+
 /* ============================================================
  * 第六部分：页面壳 HTML · 启动脚本 · 客户端脚本 · 全量样式
  * ============================================================ */
-
 
 /** 启动页 splash（黑底 + logo + 进度条） */
 function renderSplash() {
   return `<div id="splash" class="splash" style="position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;overflow:hidden;background:var(--splash-bg,#000)"><div class="splash-glow"></div><div class="splash-inner"><div class="splash-logo"><img src="${SPLASH_LOGO}" alt="" width="96" height="96" loading="eager" decoding="async" style="display:block;filter:drop-shadow(0 0 22px var(--splash-glow-color,rgba(125,157,212,.55)))"></div><div class="splash-name">MineTrakt</div><div class="splash-bar"><div class="splash-bar-fill"></div></div></div></div>`;
 }
 
-/**
- * 独立启动页（路由 "/"）。
- * 服务端已通过 Cookie 判定登录态并直接写入跳转目标，
- * 前端零请求：展示 splash 约 600ms 后 location.replace 到 /home 或 /login。
- * 加速：展示期间预加载目标页的 app.js / app.css（预热 HTTP 缓存与 SW 缓存）。
- */
 /** 匹配 renderSplash() 里的 logo <img> 标签（启动页替换为内联 SVG 用） */
 const SPLASH_LOGO_IMG_RE =
   /<img src="[^"]*" alt="" width="96" height="96" loading="eager" decoding="async" style="[^"]*">/;
 
 /**
  * 启动页 logo：内联 SVG（品牌图形 + 渐变），无需任何图片请求。
- * 好处：首帧立即绘制，不再出现"图片未到 → 黑屏/白框"的空窗期。
+ * 首帧立即绘制，不再出现"图片未到 → 黑屏/白框"的空窗期。
  * 线上真实 logo 仍由 /assets 提供，仅在首页骨架使用。
  */
 function launchLogoSvg() {
@@ -6991,8 +7060,7 @@ function launchLogoSvg() {
 
 /**
  * 启动页专用关键 CSS（自包含、极简）。
- * 不复用 splashCriticalCss()——那份含 40+ 条首页专用规则（.container/.hero/.stats/.tab…），
- * 启动页一条都用不上却要全部解析，拖慢首帧渲染。这里只保留启动页真正需要的样式。
+ * 不复用 splashCriticalCss()——那份含 40+ 条首页专用规则。
  */
 function launchCriticalCss() {
   const B = "box-sizing:border-box";
@@ -7019,7 +7087,6 @@ function launchCriticalCss() {
 function renderLaunchPage(request) {
   const loggedIn = !!readAuth(request);
   const target = loggedIn ? "/home" : "/login";
-  // 预热目标页关键资源（仅已登录跳 /home 时有意义；静态资源 immutable，可安全复用）
   const warmAssets = loggedIn
     ? '<link rel="preload" as="script" href="/app.js?v=' +
       APP_JS_VERSION +
@@ -7037,6 +7104,7 @@ function renderLaunchPage(request) {
     'try{var inner=document.querySelector(".splash-inner");if(inner){var tg=document.createElement("div");tg.className="splash-tag";tg.textContent="正在进入";inner.appendChild(tg);}}catch(e){}' +
     "setTimeout(function(){ location.replace(t); },400);" +
     "})();<\/script>";
+
   return (
     '<!DOCTYPE html><html lang="zh-CN" data-theme="dark"><head>' +
     '<meta charset="utf-8">' +
@@ -7071,13 +7139,13 @@ function renderLaunchPage(request) {
   );
 }
 
-
 /** 渲染顶部 4 格统计（电影/剧集/集数/小时） */
 function renderStatsHtml(s) {
   const movieCount = s ? s.movie : 0,
     showCount = s ? s.show : 0,
     episodeCount = s ? s.episode : 0,
     totalHours = s ? s.hours : 0;
+
   const items = [
     {
       n: movieCount,
@@ -7104,6 +7172,7 @@ function renderStatsHtml(s) {
       icon: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
     },
   ];
+
   return items
     .map(
       (it) =>
@@ -7112,8 +7181,7 @@ function renderStatsHtml(s) {
     .join("");
 }
 
-
-/** 公共 <head> 片段：meta / 图标 / manifest / API 预连接 —— 各页面壳共用，避免重复维护 */
+/** 公共 <head> 片段：meta / 图标 / manifest / API 预连接 */
 function commonHeadMeta() {
   return `<meta charset="utf-8">${THEME_BOOT_SCRIPT}<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1,user-scalable=no"><meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"><meta http-equiv="Pragma" content="no-cache"><meta name="color-scheme" content="dark light"><meta name="theme-color" content="${THEME_COLOR}"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="${APP_SHORT_NAME}"><meta name="mobile-web-app-capable" content="yes"><meta name="format-detection" content="telephone=no"><title>${APP_NAME}</title><link rel="icon" href="${FAVICON_URL}" type="image/png"><link rel="apple-touch-icon" href="${APPLE_ICON}"><link rel="manifest" href="/manifest.webmanifest"><link rel="preconnect" href="https://api.trakt.tv" crossorigin><link rel="preconnect" href="https://api.themoviedb.org" crossorigin><link rel="preconnect" href="https://image.tmdb.org" crossorigin>`;
 }
@@ -7155,7 +7223,6 @@ function pageTail() {
 function pageShell(body) {
   return pageHeadEarly() + body + pageTail();
 }
-
 
 /** 关键路径 CSS（内联到 <head>，避免首屏闪烁） */
 function splashCriticalCss() {
@@ -7206,12 +7273,10 @@ window.forceRefresh=async function(){if(window.__forceRefreshing)return;window._
 function startHomeData(){loadHomeData({silent:false});}if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',startHomeData);}else{startHomeData();}var REFRESH_MS=${HOME_AUTO_REFRESH_MINUTES}*60*1000;var __lastRefreshAt=Date.now();if(REFRESH_MS>0){setInterval(silentRefresh,REFRESH_MS);document.addEventListener('visibilitychange',function(){if(document.hidden)return;if(Date.now()-__lastRefreshAt>=REFRESH_MS)silentRefresh();});}})();`;
 }
 
-
 /**
  * 浏览器端主脚本：拼到 /app.js。
  * 含交互、详情、watchlist、骨朵/剧场/豆瓣横向列表、小结等。
  * 修改后请 bump APP_JS_VERSION。
- * 注意：内部多为紧凑写法，避免破坏模板字符串转义。
  */
 function getClientSideScripts() {
   return (
@@ -7219,11 +7284,7 @@ function getClientSideScripts() {
     `
 function __esc(s){s=String(s==null?'':s);return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 function __toast(message,opts){opts=opts||{};if(!message)return;var type=opts.type||'info';var duration=opts.duration||2600;var container=document.getElementById('toast-container');if(!container){container=document.createElement('div');container.id='toast-container';document.body.appendChild(container);}var toast=document.createElement('div');toast.className='toast toast-'+type;var icons={success:'✓',error:'✕',warn:'!',info:'i'};toast.innerHTML='<span class="toast-icon">'+(icons[type]||icons.info)+'</span><span class="toast-msg">'+__esc(message)+'</span>';container.appendChild(toast);requestAnimationFrame(function(){toast.classList.add('toast-in');});var remove=function(){if(!toast.parentNode)return;toast.classList.remove('toast-in');toast.classList.add('toast-out');setTimeout(function(){if(toast.parentNode)toast.parentNode.removeChild(toast);},260);};var timer=setTimeout(remove,duration);toast.addEventListener('click',function(){clearTimeout(timer);remove();});}window.__toast=__toast;
-/* ==================== 主题切换（dark / light / system） ====================
- * 与 <head> 内的 THEME_BOOT_SCRIPT 共用 localStorage 键 mt:theme。
- * 该脚本负责"切换 + 图标同步 + 系统色变化响应"，启动脚本负责"首帧防闪"。
- * 注意：模板字符串内所有反引号与 </script> 均已转义，勿改为多行反引号。
- */
+/* 主题切换（dark / light / system） */
 var __THEME_KEY='mt:theme',__THEME_CYCLE=['dark','light','system'];
 var __THEME_LABEL={dark:'深色',light:'浅色',system:'跟随系统'};
 var __THEME_ICONS={
@@ -7241,27 +7302,19 @@ async function __apiJson(r){var data=null;try{data=await r.json();}catch(e){data
 function __confirm(opts){opts=opts||{};return new Promise(function(resolve){var modal=document.getElementById('confirm-modal');if(!modal){resolve(window.confirm(opts.message||opts.title||'确认操作'));return;}var iconEl=document.getElementById('confirm-icon'),titleEl=document.getElementById('confirm-title'),msgEl=document.getElementById('confirm-msg'),okBtn=document.getElementById('confirm-ok'),cancelBtn=document.getElementById('confirm-cancel'),backdrop=modal.querySelector('.confirm-backdrop');iconEl.className='confirm-icon'+(opts.tone?' '+opts.tone:'');iconEl.textContent=opts.icon||'?';titleEl.textContent=opts.title||'确认操作';msgEl.textContent=opts.message||'';msgEl.style.display=opts.message?'':'none';okBtn.textContent=opts.okText||'确定';cancelBtn.textContent=opts.cancelText||'取消';okBtn.className='confirm-btn confirm-ok'+(opts.tone==='danger'?' danger':'');var settled=false;function cleanup(){okBtn.removeEventListener('click',onOk);cancelBtn.removeEventListener('click',onCancel);backdrop.removeEventListener('click',onCancel);document.removeEventListener('keydown',onKey,true);modal.classList.remove('open');modal.style.display='none';}function finish(v){if(settled)return;settled=true;cleanup();resolve(v);}function onOk(){finish(true);}function onCancel(){finish(false);}function onKey(e){if(e.key==='Escape'){e.preventDefault();e.stopPropagation();finish(false);}}okBtn.addEventListener('click',onOk);cancelBtn.addEventListener('click',onCancel);backdrop.addEventListener('click',onCancel);document.addEventListener('keydown',onKey,true);modal.style.display='block';modal.classList.add('open');setTimeout(function(){try{okBtn.focus();}catch(err){}},40);});}window.__confirm=__confirm;
 function __fadeRemoveCard(card){if(!card)return;card.style.transition='opacity 0.25s ease, transform 0.25s ease';card.style.opacity='0';card.style.transform='scale(0.96)';setTimeout(function(){var day=card.closest('.day'),pane=card.closest('.pane');card.remove();if(day&&!day.querySelector('.item')){day.style.transition='opacity 0.2s ease';day.style.opacity='0';setTimeout(function(){if(day.parentNode)day.remove();__maybeShowEmpty(pane);if(window.__refreshStats)window.__refreshStats();},200);return;}__maybeShowEmpty(pane);if(window.__refreshStats)window.__refreshStats();},260);}
 function __maybeShowEmpty(pane){if(!pane)return;setTimeout(function(){if(pane.querySelector('.item'))return;if(pane.querySelector('.empty'))return;var grid=pane.querySelector('.grid');if(!grid)return;var pid=pane.id,txt='这里暂时没有内容';if(pid==='playback')txt='暂时没有继续观看的内容';else if(pid==='watchlist')txt='待看列表是空的';else if(pid==='calendar')txt='未来 30 天没有待播剧集';else if(pid==='history')txt='还没有观看记录';grid.innerHTML='<div class="empty"><p>'+txt+'</p></div>';},120);}
-/* 分片渲染：把 home-data part 响应统一落到对应 pane */
 function __partHtml(d){return d?String((d.watchlistHtml||'')+(d.calendarHtml||'')+(d.historyHtml||'')):'';}
-/* 服务端兜底占位（"暂时无法加载…"）视为失败：不写快照、不进内存缓存、允许重试 */
 function __partFailed(d){if(!d)return true;var h=__partHtml(d);if(!h&&d.historyMoreHtml==null)return true;return /暂时无法加载/.test(h);}
 function __applyPart(part,d){if(!d)return false;if(part==='watchlist'){if(d.watchlistHtml)__setHTML('#watchlist',d.watchlistHtml);}else if(part==='calendar'){if(d.calendarHtml){__setHTML('#calendar',d.calendarHtml);try{var dropped=JSON.parse(localStorage.getItem('mt:dropped')||'[]');if(Array.isArray(dropped)&&dropped.length){var cal=document.getElementById('calendar');if(cal)dropped.forEach(function(did){cal.querySelectorAll('[data-drop-show-id="'+did+'"]').forEach(function(b){var card=b.closest('.item');if(card){var day=card.closest('.day');card.remove();if(day&&!day.querySelector('.item'))day.remove();}});});}}catch(e){}}}else if(part==='history'){if(d.historyHtml)__setHTML('#history .grid',d.historyHtml);if(d.historyMoreHtml!=null)__setHTML('#history-more',d.historyMoreHtml);}else{return false;}if(window.__scheduleEnrich)window.__scheduleEnrich();return true;}
 window.__applyPart=__applyPart;window.__partFailed=__partFailed;
-/* 分片本地快照：上游全挂 / KV 被清时用手机本地缓存兜底展示 */
-var __PART_LS={watchlist:'mt:wl',calendar:'mt:cal',history:'mt:hist'},__PART_SNAP_TTL=259200; /* 3 天 */
-/* 启动脚本的 lsGet/lsSet 在 IIFE 内，这里必须走 window.__lsGet/__lsSet 暴露的版本 */
+var __PART_LS={watchlist:'mt:wl',calendar:'mt:cal',history:'mt:hist'},__PART_SNAP_TTL=259200;
 function __lsGetSafe(k){try{if(typeof window.__lsGet==='function')return window.__lsGet(k);}catch(e){}try{var v=localStorage.getItem(k);if(!v)return null;var o=JSON.parse(v);if(o&&o._exp&&o._exp<Date.now()){try{localStorage.removeItem(k);}catch(e2){}return null;}return o&&o.data?o.data:null;}catch(e){return null;}}
 function __lsSetSafe(k,d,ttlSec){try{if(typeof window.__lsSet==='function'){window.__lsSet(k,d,ttlSec);return;}localStorage.setItem(k,JSON.stringify({data:d,_exp:Date.now()+ttlSec*1000}));}catch(e){}}
 function __savePartSnap(part,d){var k=__PART_LS[part];if(!k||!d||__partFailed(d))return;__lsSetSafe(k,d,__PART_SNAP_TTL);}
 function __loadPartSnap(part){var k=__PART_LS[part];if(!k)return null;var s=__lsGetSafe(k);return s&&!__partFailed(s)?s:null;}
 window.__savePartSnap=__savePartSnap;window.__loadPartSnap=__loadPartSnap;
-/* 取分片：失败结果不进 __loadedParts，保证下次点击能真正重试 */
 function __fetchPartForTab(part){try{delete window.__loadedParts[part];}catch(e){}return window.__loadPartOnce(part).then(function(d){if(__partFailed(d)){try{delete window.__loadedParts[part];}catch(e){}return null;}__savePartSnap(part,d);return d;}).catch(function(){try{delete window.__loadedParts[part];}catch(e){}return null;});}
 window.__fetchPartForTab=__fetchPartForTab;
 document.querySelectorAll('.tab').forEach(t=>{t.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.pane').forEach(x=>x.classList.remove('active'));t.classList.add('active');var tabName=t.dataset.tab,pane=document.getElementById(tabName);if(pane)pane.classList.add('active');if(tabName==='search'){setTimeout(function(){var inp=document.getElementById('search-input');if(inp)inp.focus();if(inp&&!inp.value.trim()&&window.__loadTrending)window.__loadTrending();},60);return;}if(tabName==='playback')return;var partMap={watchlist:'watchlist',calendar:'calendar',history:'history'};var part=partMap[tabName];if(!part)return;var loaded=window.__loadedParts||{};if(loaded[part]&&!__partFailed(loaded[part]))return;var snap=__loadPartSnap(part);if(snap)__applyPart(part,snap);window.__fetchPartForTab(part).then(function(d){if(d){__applyPart(part,d);return;}var lv=snap||__loadPartSnap(part);if(lv){__applyPart(part,lv);if(window.__toast)window.__toast('上游暂不可用，已展示上次数据',{type:'warn',duration:1800});return;}var p=document.getElementById(tabName);if(p)p.innerHTML='<div class="empty"><p>加载失败，请稍后重试</p></div>';});});});
-/* 首屏空闲预热待看/日历/记录：
-   ① tab 秒开；② 让服务端 KV 保持热度，避免低频分片被 CF 按 expirationTtl 物理删除。
-   非 force 拉取，服务端命中缓存时不会打 Trakt；命中限流冷却时会走兜底链，不额外触发 429。 */
 (function(){var order=['watchlist','calendar','history'],GAP=4000;function warm(i){if(i>=order.length||document.hidden)return;var p=order[i];function next(){setTimeout(function(){warm(i+1);},GAP);}var loaded=window.__loadedParts||{};if(loaded[p]&&!__partFailed(loaded[p])){next();return;}__fetchPartForTab(p).then(next);}function start(){setTimeout(function(){warm(0);},1500);}if(window.requestIdleCallback)window.requestIdleCallback(start,{timeout:3000});else start();})();
 async function logout(){if(!(await __confirm({icon:'🚪',title:'退出登录',message:'确定要退出当前 Trakt 账号吗？',okText:'退出',cancelText:'取消',tone:'warn'})))return;try{localStorage.removeItem('mt:pb');localStorage.removeItem('mt:meta');}catch(e){}await fetch('/auth/logout',{method:'POST'});location.href='/login';}
 window.logout=logout;
@@ -7402,7 +7455,7 @@ document.addEventListener("click",function(e){
 })();
 window.closeListModal=function(){var modal=document.getElementById('list-modal');if(!modal)return;modal.classList.remove('open');document.body.style.overflow='';};
 document.addEventListener('keydown',function(e){if(e.key==='Escape'){var m=document.getElementById('list-modal');if(m&&m.classList.contains('open')){window.closeListModal();return;}}});
-async function loadGuduoHScroll(category){category=category||'all';var el=document.getElementById('guduo-hscroll');if(!el)return;el.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';try{var r=await fetch('/api/guduo-list?mode=hscroll&category='+encodeURIComponent(category));var html=r.ok?await r.text():'';var tmp=document.createElement('div');tmp.innerHTML=html;var inner=tmp.querySelector('.h-scroll');if(inner)el.innerHTML=inner.innerHTML;else if(html)el.innerHTML=html;else el.innerHTML='<div class="h-scroll-empty"><span class="spinner"></span></div>';if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){el.innerHTML='<div class="h-scroll-empty"><p>加载失败</p></div>';}}async function loadGuduoHomeTabs(){var tabsBox=document.getElementById('guduo-home-tabs');if(!tabsBox||tabsBox.dataset.loaded==='1')return;try{var r=await fetch('/api/guduo-list?mode=categories');var d=r.ok?await r.json():{categories:[]};var cats=(d&&d.categories)||[];if(!cats.length){/* 无数据也给固定四类 */}cats=cats.length?cats:['剧集','电影','动漫','综艺'];var html='<button class="theater-filter-tab active" data-category="all">全部</button>';for(var i=0;i<cats.length;i++){var p=cats[i];html+='<button class="theater-filter-tab" data-category="'+__esc(p)+'">'+__esc(p)+'</button>';}tabsBox.innerHTML=html;tabsBox.style.display='';tabsBox.dataset.loaded='1';tabsBox.addEventListener('click',function(e){var btn=e.target.closest('.theater-filter-tab');if(!btn)return;tabsBox.querySelectorAll('.theater-filter-tab').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');loadGuduoHScroll(btn.getAttribute('data-category')||'all');});}catch(e){}}async function loadTheaterHScroll(platform){platform=platform||'all';var el=document.getElementById('theater-hscroll');if(!el)return;el.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';try{var r=await fetch('/api/theater-list?mode=hscroll&platform='+encodeURIComponent(platform));var html=r.ok?await r.text():'';var tmp=document.createElement('div');tmp.innerHTML=html;var inner=tmp.querySelector('.h-scroll');if(inner)el.innerHTML=inner.innerHTML;else if(html)el.innerHTML=html;else el.innerHTML='<div class="h-scroll-empty"><span class="spinner"></span></div>';if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){el.innerHTML='<div class="h-scroll-empty"><p>加载失败</p></div>';}}
+async function loadGuduoHScroll(category){category=category||'all';var el=document.getElementById('guduo-hscroll');if(!el)return;el.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';try{var r=await fetch('/api/guduo-list?mode=hscroll&category='+encodeURIComponent(category));var html=r.ok?await r.text():'';var tmp=document.createElement('div');tmp.innerHTML=html;var inner=tmp.querySelector('.h-scroll');if(inner)el.innerHTML=inner.innerHTML;else if(html)el.innerHTML=html;else el.innerHTML='<div class="h-scroll-empty"><span class="spinner"></span></div>';if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){el.innerHTML='<div class="h-scroll-empty"><p>加载失败</p></div>';}}async function loadGuduoHomeTabs(){var tabsBox=document.getElementById('guduo-home-tabs');if(!tabsBox||tabsBox.dataset.loaded==='1')return;try{var r=await fetch('/api/guduo-list?mode=categories');var d=r.ok?await r.json():{categories:[]};var cats=(d&&d.categories)||[];if(!cats.length){}cats=cats.length?cats:['剧集','电影','动漫','综艺'];var html='<button class="theater-filter-tab active" data-category="all">全部</button>';for(var i=0;i<cats.length;i++){var p=cats[i];html+='<button class="theater-filter-tab" data-category="'+__esc(p)+'">'+__esc(p)+'</button>';}tabsBox.innerHTML=html;tabsBox.style.display='';tabsBox.dataset.loaded='1';tabsBox.addEventListener('click',function(e){var btn=e.target.closest('.theater-filter-tab');if(!btn)return;tabsBox.querySelectorAll('.theater-filter-tab').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');loadGuduoHScroll(btn.getAttribute('data-category')||'all');});}catch(e){}}async function loadTheaterHScroll(platform){platform=platform||'all';var el=document.getElementById('theater-hscroll');if(!el)return;el.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';try{var r=await fetch('/api/theater-list?mode=hscroll&platform='+encodeURIComponent(platform));var html=r.ok?await r.text():'';var tmp=document.createElement('div');tmp.innerHTML=html;var inner=tmp.querySelector('.h-scroll');if(inner)el.innerHTML=inner.innerHTML;else if(html)el.innerHTML=html;else el.innerHTML='<div class="h-scroll-empty"><span class="spinner"></span></div>';if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){el.innerHTML='<div class="h-scroll-empty"><p>加载失败</p></div>';}}
 async function loadTheaterHomeTabs(){var tabsBox=document.getElementById('theater-home-tabs');if(!tabsBox||tabsBox.dataset.loaded==='1')return;try{var r=await fetch('/api/theater-list?mode=platforms');var d=r.ok?await r.json():{platforms:[]};var platforms=(d&&d.platforms)||[];if(!platforms.length)return;var html='<button class="theater-filter-tab active" data-platform="all">全部</button>';for(var i=0;i<platforms.length;i++){var p=platforms[i];html+='<button class="theater-filter-tab" data-platform="'+__esc(p)+'">'+__esc(p)+'</button>';}tabsBox.innerHTML=html;tabsBox.style.display='';tabsBox.dataset.loaded='1';tabsBox.addEventListener('click',function(e){var btn=e.target.closest('.theater-filter-tab');if(!btn)return;tabsBox.querySelectorAll('.theater-filter-tab').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');loadTheaterHScroll(btn.dataset.platform);});}catch(e){}}
 (function(){var sections=[['douban-domestic','domestic'],['douban-hktw','hktw'],['douban-jpkr','jpkr'],['douban-western','western']];function loadOne(id,section){var el=document.getElementById(id+'-hscroll');if(!el)return;fetch('/api/douban-list?section='+section+'&mode=hscroll').then(function(r){return r.ok?r.text():'';}).then(function(html){if(html)el.outerHTML=html.replace('class="h-scroll"','class="h-scroll" id="'+id+'-hscroll"');if(window.__scheduleEnrich)window.__scheduleEnrich();}).catch(function(){});}function start(){sections.forEach(function(pair){loadOne(pair[0],pair[1]);});loadGuduoHScroll('all');loadGuduoHomeTabs();loadTheaterHScroll('all');loadTheaterHomeTabs();}if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start);else start();window.__reloadDoubanSections=start;})();
 let modalLoadingId=0;window.__lastDetailType=null;window.__lastDetailId=null;async function openDetail(type,id,push=true){const modal=document.getElementById('modal'),body=document.getElementById('modal-body');if(!modal||!body)return;window.__lastDetailType=type;window.__lastDetailId=id;modal.classList.add('open');document.body.style.overflow='hidden';if(push&&location.pathname!=='/detail/'+type+'/'+id)history.pushState({detail:true},'','/detail/'+type+'/'+id);const reqId=++modalLoadingId;body.innerHTML='<div class="modal-loading"><div class="spinner"></div></div>';body.scrollTop=0;try{const r=await fetch('/api/detail?type='+encodeURIComponent(type)+'&id='+encodeURIComponent(id));if(reqId!==modalLoadingId)return;if(!r.ok)throw new Error('HTTP '+r.status);body.innerHTML=await r.text();if(window.__detailDeferLoad)window.__detailDeferLoad(type);}catch(e){if(reqId!==modalLoadingId)return;body.innerHTML='<div class="modal-error"><p>加载失败，请稍后重试</p><button class="btn-ghost" type="button" style="margin-top:14px" onclick="window.__retryDetail&&window.__retryDetail()">重试</button></div>';}}window.openDetail=openDetail;
@@ -7460,4178 +7513,714 @@ document.addEventListener('click',function(e){const card=e.target.closest('.trai
 window.addEventListener('load',()=>{setTimeout(__runEnrich,200);});`
   );
 }
+
 /* ============================================================
- * pageStyles —— 完整样式（模板字符串，已格式化便于维护）
+ * pageStyles —— 完整样式
  * 含：启动页 / 登录 / 首页吸顶 / 列表卡片 / 详情模态 / 小结 等
  * 修改后请 bump APP_CSS_VERSION
  * ============================================================ */
 let __pageStylesCache = null;
 function pageStyles() {
   if (__pageStylesCache) return __pageStylesCache;
-  __pageStylesCache = `html {
-  color-scheme: dark;
-}
-html[data-theme="light"] {
-  color-scheme: light;
-}
-@media (prefers-color-scheme: light) {
-  html[data-theme="system"] {
-    color-scheme: light;
-  }
-}
-html,
-body {
-  background: var(--bg-solid);
-  color: var(--text);
-  margin: 0;
-  padding: 0;
-  min-height: 100%;
-  min-height: 100dvh;
-  transition: background-color 0.2s ease, color 0.2s ease;
-}
-* {
-  box-sizing: border-box;
-  margin: 0;
-  padding: 0;
-}
-.splash {
-  position: fixed;
-  inset: 0;
-  z-index: 9999;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  overflow: hidden;
-  background: var(--splash-bg);
-  transition: opacity 0.22s ease;
-  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
-  -webkit-tap-highlight-color: transparent;
-  animation: splashAutoHide 0.22s ease 0.45s forwards;
-}
-.splash.hide {
-  opacity: 0;
-  pointer-events: none;
-  animation: none;
-}
-@keyframes splashAutoHide {
-  to {
-    opacity: 0;
-    visibility: hidden;
-    pointer-events: none;
-  }
-}
-.splash-glow {
-  position: absolute;
-  width: 340px;
-  height: 340px;
-  border-radius: 50%;
-  background: radial-gradient(circle, var(--splash-glow-color) 0%, rgba(125, 157, 212, 0) 70%);
-  animation: splashPulse 2.4s ease-in-out infinite;
-}
-.splash-inner {
-  position: relative;
-  z-index: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 20px;
-}
-.splash-logo {
-  color: var(--splash-name-b);
-  animation: splashPop 0.75s cubic-bezier(0.22, 1.1, 0.36, 1) both;
-}
-.splash-logo img {
-  display: block;
-}
-.splash-name {
-  font-size: 1.35rem;
-  font-weight: 800;
-  letter-spacing: 0.4px;
-  background: var(--name-grad);
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
-  animation: splashFadeUp 0.6s ease 0.28s both;
-}
-.splash-bar {
-  width: 128px;
-  height: 3px;
-  border-radius: 99px;
-  background: var(--bar-track);
-  overflow: hidden;
-  animation: splashFadeUp 0.6s ease 0.45s both;
-}
-.splash-bar-fill {
-  height: 100%;
-  width: 42%;
-  border-radius: 99px;
-  background: var(--splash-bar-fill);
-  animation: splashSlide 1.15s cubic-bezier(0.65, 0, 0.35, 1) infinite;
-}
-@keyframes splashPulse {
-  0%,
-  100% {
-    transform: scale(0.85);
-    opacity: 0.7;
-  }
-  50% {
-    transform: scale(1.12);
-    opacity: 1;
-  }
-}
-@keyframes splashPop {
-  0% {
-    opacity: 0;
-    transform: scale(0.55) rotate(-8deg);
-  }
-  60% {
-    opacity: 1;
-    transform: scale(1.08) rotate(2deg);
-  }
-  100% {
-    opacity: 1;
-    transform: scale(1) rotate(0);
-  }
-}
-@keyframes splashFadeUp {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-@keyframes splashSlide {
-  0% {
-    transform: translateX(-130%);
-  }
-  100% {
-    transform: translateX(330%);
-  }
-}
-.spinner {
-  width: 30px;
-  height: 30px;
-  border: 3px solid var(--spinner-track);
-  border-top-color: var(--spinner-active);
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
-  margin: 4px auto;
-}
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
+  __pageStylesCache = `html { color-scheme: dark; }
+html[data-theme="light"] { color-scheme: light; }
+@media (prefers-color-scheme: light) { html[data-theme="system"] { color-scheme: light; } }
+html, body { background: var(--bg-solid); color: var(--text); margin: 0; padding: 0; min-height: 100%; min-height: 100dvh; transition: background-color 0.2s ease, color 0.2s ease; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+.splash { position: fixed; inset: 0; z-index: 9999; display: flex; align-items: center; justify-content: center; overflow: hidden; background: var(--splash-bg); transition: opacity 0.22s ease; font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; -webkit-tap-highlight-color: transparent; animation: splashAutoHide 0.22s ease 0.45s forwards; }
+.splash.hide { opacity: 0; pointer-events: none; animation: none; }
+@keyframes splashAutoHide { to { opacity: 0; visibility: hidden; pointer-events: none; } }
+.splash-glow { position: absolute; width: 340px; height: 340px; border-radius: 50%; background: radial-gradient(circle, var(--splash-glow-color) 0%, rgba(125, 157, 212, 0) 70%); animation: splashPulse 2.4s ease-in-out infinite; }
+.splash-inner { position: relative; z-index: 1; display: flex; flex-direction: column; align-items: center; gap: 20px; }
+.splash-logo { color: var(--splash-name-b); animation: splashPop 0.75s cubic-bezier(0.22, 1.1, 0.36, 1) both; }
+.splash-logo img { display: block; }
+.splash-name { font-size: 1.35rem; font-weight: 800; letter-spacing: 0.4px; background: var(--name-grad); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; animation: splashFadeUp 0.6s ease 0.28s both; }
+.splash-bar { width: 128px; height: 3px; border-radius: 99px; background: var(--bar-track); overflow: hidden; animation: splashFadeUp 0.6s ease 0.45s both; }
+.splash-bar-fill { height: 100%; width: 42%; border-radius: 99px; background: var(--splash-bar-fill); animation: splashSlide 1.15s cubic-bezier(0.65, 0, 0.35, 1) infinite; }
+@keyframes splashPulse { 0%, 100% { transform: scale(0.85); opacity: 0.7; } 50% { transform: scale(1.12); opacity: 1; } }
+@keyframes splashPop { 0% { opacity: 0; transform: scale(0.55) rotate(-8deg); } 60% { opacity: 1; transform: scale(1.08) rotate(2deg); } 100% { opacity: 1; transform: scale(1) rotate(0); } }
+@keyframes splashFadeUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+@keyframes splashSlide { 0% { transform: translateX(-130%); } 100% { transform: translateX(330%); } }
+.spinner { width: 30px; height: 30px; border: 3px solid var(--spinner-track); border-top-color: var(--spinner-active); border-radius: 50%; animation: spin 0.8s linear infinite; margin: 4px auto; }
+@keyframes spin { to { transform: rotate(360deg); } }
 :root {
-  --bg: #050505;
-  --surface: #0e0e10;
-  --surface-2: #16161a;
-  --surface-3: #1c1c22;
-  --border: rgba(255, 255, 255, 0.08);
-  --border-strong: rgba(255, 255, 255, 0.14);
-  --text: #f4f4f5;
-  --text-dim: #a1a1aa;
-  --text-mute: #71717a;
-  --accent: #a78bfa;
-  --accent-2: #c4b5fd;
-  --accent-soft: rgba(167, 139, 250, 0.12);
-  --accent-glow: rgba(167, 139, 250, 0.28);
-  --success: #34d399;
-  --blue: #c4b5fd;
-  --radius-sm: 10px;
-  --radius-md: 14px;
-  --radius-lg: 18px;
-  --radius-xl: 22px;
+  --bg: #050505; --surface: #0e0e10; --surface-2: #16161a; --surface-3: #1c1c22;
+  --border: rgba(255, 255, 255, 0.08); --border-strong: rgba(255, 255, 255, 0.14);
+  --text: #f4f4f5; --text-dim: #a1a1aa; --text-mute: #71717a;
+  --accent: #a78bfa; --accent-2: #c4b5fd; --accent-soft: rgba(167, 139, 250, 0.12); --accent-glow: rgba(167, 139, 250, 0.28);
+  --success: #34d399; --blue: #c4b5fd;
+  --radius-sm: 10px; --radius-md: 14px; --radius-lg: 18px; --radius-xl: 22px;
   --shadow-card: 0 8px 32px rgba(0, 0, 0, 0.55);
-
-  --bg-solid: #000000;
-  --panel-grad: linear-gradient(165deg, #16161a 0%, #0e0e10 100%);
-  --hover-bg: rgba(255, 255, 255, 0.04);
-  --hover-bg-strong: rgba(255, 255, 255, 0.09);
-  --sticky-bg: rgba(5, 5, 5, 0.88);
-  --sticky-border: rgba(255, 255, 255, 0.06);
-  --sticky-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
-  --overlay: rgba(2, 4, 8, 0.78);
-  --overlay-strong: rgba(0, 0, 0, 0.78);
-  --modal-bg: #000000;
-  --toast-bg: rgba(20, 22, 28, 0.96);
-  --toast-text: #ffffff;
-  --bar-track: rgba(255, 255, 255, 0.1);
-  --spinner-track: #212735;
-  --spinner-active: #7d9dd4;
+  --bg-solid: #000000; --panel-grad: linear-gradient(165deg, #16161a 0%, #0e0e10 100%);
+  --hover-bg: rgba(255, 255, 255, 0.04); --hover-bg-strong: rgba(255, 255, 255, 0.09);
+  --sticky-bg: rgba(5, 5, 5, 0.88); --sticky-border: rgba(255, 255, 255, 0.06); --sticky-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+  --overlay: rgba(2, 4, 8, 0.78); --overlay-strong: rgba(0, 0, 0, 0.78); --modal-bg: #000000;
+  --toast-bg: rgba(20, 22, 28, 0.96); --toast-text: #ffffff;
+  --bar-track: rgba(255, 255, 255, 0.1); --spinner-track: #212735; --spinner-active: #7d9dd4;
   --splash-bg: radial-gradient(circle at 50% 45%, #0a0a0a 0%, #000 62%);
-  --launch-splash-bg: radial-gradient(
-      120% 90% at 50% 108%,
-      rgba(124, 58, 237, 0.3) 0%,
-      rgba(124, 58, 237, 0) 55%
-    ),
-    radial-gradient(
-      110% 85% at 50% -12%,
-      rgba(56, 97, 190, 0.25) 0%,
-      rgba(0, 0, 0, 0) 55%
-    ),
-    #000;
-  --launch-glow: rgba(124, 58, 237, 0.18);
-  --splash-glow-color: rgba(125, 157, 212, 0.55);
-  --splash-name-b: #a8b2c4;
+  --launch-splash-bg: radial-gradient(120% 90% at 50% 108%, rgba(124, 58, 237, 0.3) 0%, rgba(124, 58, 237, 0) 55%), radial-gradient(110% 85% at 50% -12%, rgba(56, 97, 190, 0.25) 0%, rgba(0, 0, 0, 0) 55%), #000;
+  --launch-glow: rgba(124, 58, 237, 0.18); --splash-glow-color: rgba(125, 157, 212, 0.55); --splash-name-b: #a8b2c4;
   --splash-bar-fill: linear-gradient(90deg, #7d9dd4, #a78bfa);
-  --name-grad: linear-gradient(135deg, #fff 20%, #c4b5fd 90%);
-  --num-grad: linear-gradient(180deg, #fff 0%, #c4b5fd 100%);
-  --brand-grad: linear-gradient(135deg, #7c3aed 0%, #a78bfa 100%);
-  --brand-grad-hover: linear-gradient(145deg, #8b5cf6, #a78bfa);
-  --avatar-ring: rgba(167, 139, 250, 0.45);
-  --avatar-grad: linear-gradient(135deg, #1a2233, #2a3a55);
+  --name-grad: linear-gradient(135deg, #fff 20%, #c4b5fd 90%); --num-grad: linear-gradient(180deg, #fff 0%, #c4b5fd 100%);
+  --brand-grad: linear-gradient(135deg, #7c3aed 0%, #a78bfa 100%); --brand-grad-hover: linear-gradient(145deg, #8b5cf6, #a78bfa);
+  --avatar-ring: rgba(167, 139, 250, 0.45); --avatar-grad: linear-gradient(135deg, #1a2233, #2a3a55);
   --soft-card-grad: var(--soft-card-grad);
-  --btn-hover-bg: rgba(167, 139, 250, 0.1);
-  --btn-hover-border: rgba(167, 139, 250, 0.35);
-  --btn-hover-shadow: 0 4px 16px rgba(167, 139, 250, 0.18);
-  --danger-bg: rgba(224, 85, 96, 0.1);
-  --danger-border: rgba(224, 85, 96, 0.35);
-  --danger-shadow: 0 4px 16px rgba(224, 85, 96, 0.15);
-  --poster-ph-bg: rgba(0, 0, 0, 0.65);
-  --shadow-avatar: rgba(0, 0, 0, 0.5);
-  --shadow-login: rgba(0, 0, 0, 0.7);
-  --detail-hero-grad: linear-gradient(180deg, rgba(10, 14, 24, 0.6), rgba(10, 14, 24, 0.95));
-  --detail-bg-filter: brightness(0.5);
-  --chip-bg: rgba(255, 255, 255, 0.05);
-  --chip-bg-hover: rgba(255, 255, 255, 0.09);
-  --chip-fg: #a1a1aa;
-  --chip-fg-hover: #f4f4f5;
-  --chip-border: rgba(255, 255, 255, 0.08);
-  --chip-accent: #a78bfa;
-  --pill-bg: linear-gradient(165deg, rgba(255, 255, 255, 0.09) 0%, rgba(255, 255, 255, 0.04) 100%);
-  --pill-border: rgba(255, 255, 255, 0.12);
-  --pill-shadow: 0 8px 28px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.06);
-  --pill-fg: rgba(255, 255, 255, 0.55);
-  --pill-act-hover: rgba(255, 255, 255, 0.1);
-  --platform-card-grad: linear-gradient(145deg, #1a1a1a 0%, #0a0a0a 100%);
-  --platform-card-text: #ffffff;
-  --platform-shadow-hover: rgba(0, 0, 0, 0.65);
-  --scrollbar: #2a3345;
-  --link: #c4b5fd;
-  --link-hover: #ddd6fe;
-  --success-fg: #4ade80;
-  --warn-fg: #ffb84d;
-  --danger-fg: #ff8a8a;
-  --cal-accent: #4a6db8;
-  --cal-accent-2: #9db0d0;
-  --cal-accent-3: #7d9dd4;
-  --cal-cell-border: #3a4a68;
-  --cal-soft: rgba(90, 120, 180, 0.22);
-  --cal-soft-border: rgba(140, 170, 220, 0.35);
+  --btn-hover-bg: rgba(167, 139, 250, 0.1); --btn-hover-border: rgba(167, 139, 250, 0.35); --btn-hover-shadow: 0 4px 16px rgba(167, 139, 250, 0.18);
+  --danger-bg: rgba(224, 85, 96, 0.1); --danger-border: rgba(224, 85, 96, 0.35); --danger-shadow: 0 4px 16px rgba(224, 85, 96, 0.15);
+  --poster-ph-bg: rgba(0, 0, 0, 0.65); --shadow-avatar: rgba(0, 0, 0, 0.5); --shadow-login: rgba(0, 0, 0, 0.7);
+  --detail-hero-grad: linear-gradient(180deg, rgba(10, 14, 24, 0.6), rgba(10, 14, 24, 0.95)); --detail-bg-filter: brightness(0.5);
+  --chip-bg: rgba(255, 255, 255, 0.05); --chip-bg-hover: rgba(255, 255, 255, 0.09); --chip-fg: #a1a1aa; --chip-fg-hover: #f4f4f5; --chip-border: rgba(255, 255, 255, 0.08); --chip-accent: #a78bfa;
+  --pill-bg: linear-gradient(165deg, rgba(255, 255, 255, 0.09) 0%, rgba(255, 255, 255, 0.04) 100%); --pill-border: rgba(255, 255, 255, 0.12); --pill-shadow: 0 8px 28px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.06); --pill-fg: rgba(255, 255, 255, 0.55); --pill-act-hover: rgba(255, 255, 255, 0.1);
+  --platform-card-grad: linear-gradient(145deg, #1a1a1a 0%, #0a0a0a 100%); --platform-card-text: #ffffff; --platform-shadow-hover: rgba(0, 0, 0, 0.65);
+  --scrollbar: #2a3345; --link: #c4b5fd; --link-hover: #ddd6fe;
+  --success-fg: #4ade80; --warn-fg: #ffb84d; --danger-fg: #ff8a8a;
+  --cal-accent: #4a6db8; --cal-accent-2: #9db0d0; --cal-accent-3: #7d9dd4; --cal-cell-border: #3a4a68; --cal-soft: rgba(90, 120, 180, 0.22); --cal-soft-border: rgba(140, 170, 220, 0.35);
 }
-/* ============ 浅色主题（纯白清爽风）============
- * 手动选择 light 时生效；跟随系统时由下方 media query 复用同一组值。
- * 变量清单见 THEME_LIGHT_CSS_VARS，避免两处手写漂移。 */
 html[data-theme="light"] {
-
-  --danger-fg: #ff7b85;
-  --chip-bg: #18181b;
-  --chip-bg-hover: #3f3f46;
-  --chip-fg: #fafafa;
-  --chip-fg-hover: #ffffff;
-  --chip-border: rgba(255, 255, 255, 0.08);
-  --chip-accent: #e9d5ff;
-  --pill-bg: rgba(24, 24, 27, 0.9);
-  --pill-border: rgba(255, 255, 255, 0.12);
-  --pill-shadow: 0 8px 28px rgba(0, 0, 0, 0.3);
-  --pill-fg: rgba(255, 255, 255, 0.78);
-  --pill-act-hover: rgba(255, 255, 255, 0.16);  --bg: #ffffff;
-  --surface: #ffffff;
-  --surface-2: #f7f7f8;
-  --surface-3: #f1f1f3;
-  --border: rgba(0, 0, 0, 0.08);
-  --border-strong: rgba(0, 0, 0, 0.14);
-  --text: #18181b;
-  --text-dim: #52525b;
-  --text-mute: #71717a;
-  --accent: #7c3aed;
-  --accent-2: #6d28d9;
-  --accent-soft: rgba(124, 58, 237, 0.09);
-  --accent-glow: rgba(124, 58, 237, 0.2);
-  --success: #059669;
-  --blue: #6d28d9;
-  --shadow-card: 0 8px 28px rgba(0, 0, 0, 0.08);
-  --bg-solid: #ffffff;
-  --panel-grad: linear-gradient(165deg, #ffffff 0%, #f7f7f8 100%);
-  --hover-bg: rgba(0, 0, 0, 0.035);
-  --hover-bg-strong: rgba(0, 0, 0, 0.06);
-  --sticky-bg: rgba(243, 243, 245, 0.92);
-  --sticky-border: rgba(0, 0, 0, 0.07);
-  --sticky-shadow: 0 6px 20px rgba(0, 0, 0, 0.1);
-  --overlay: rgba(15, 18, 26, 0.42);
-  --overlay-strong: rgba(15, 18, 26, 0.45);
-  --modal-bg: #ffffff;
-  --toast-bg: rgba(24, 24, 27, 0.94);
-  --toast-text: #ffffff;
-  --bar-track: rgba(0, 0, 0, 0.08);
-  --spinner-track: #e4e4e7;
-  --spinner-active: #7c3aed;
+  --danger-fg: #ff7b85; --chip-bg: #f4f4f5; --chip-bg-hover: #e4e4e7; --chip-fg: #3f3f46; --chip-fg-hover: #18181b; --chip-border: rgba(0, 0, 0, 0.1); --chip-accent: #7c3aed;
+  --pill-bg: rgba(255, 255, 255, 0.92); --pill-border: rgba(0, 0, 0, 0.1); --pill-shadow: 0 8px 28px rgba(0, 0, 0, 0.08); --pill-fg: rgba(0, 0, 0, 0.6); --pill-act-hover: rgba(0, 0, 0, 0.06);
+  --bg: #ffffff; --surface: #ffffff; --surface-2: #f7f7f8; --surface-3: #f1f1f3;
+  --border: rgba(0, 0, 0, 0.08); --border-strong: rgba(0, 0, 0, 0.14);
+  --text: #18181b; --text-dim: #52525b; --text-mute: #71717a;
+  --accent: #7c3aed; --accent-2: #6d28d9; --accent-soft: rgba(124, 58, 237, 0.09); --accent-glow: rgba(124, 58, 237, 0.2);
+  --success: #059669; --blue: #6d28d9; --shadow-card: 0 8px 28px rgba(0, 0, 0, 0.08);
+  --bg-solid: #ffffff; --panel-grad: linear-gradient(165deg, #ffffff 0%, #f7f7f8 100%);
+  --hover-bg: rgba(0, 0, 0, 0.035); --hover-bg-strong: rgba(0, 0, 0, 0.06);
+  --sticky-bg: rgba(243, 243, 245, 0.92); --sticky-border: rgba(0, 0, 0, 0.07); --sticky-shadow: 0 6px 20px rgba(0, 0, 0, 0.1);
+  --overlay: rgba(15, 18, 26, 0.42); --overlay-strong: rgba(15, 18, 26, 0.45); --modal-bg: #ffffff;
+  --toast-bg: rgba(24, 24, 27, 0.94); --toast-text: #ffffff;
+  --bar-track: rgba(0, 0, 0, 0.08); --spinner-track: #e4e4e7; --spinner-active: #7c3aed;
   --splash-bg: radial-gradient(circle at 50% 45%, #ffffff 0%, #f4f4f6 62%);
-  --launch-splash-bg: radial-gradient(
-      120% 90% at 50% 108%,
-      rgba(124, 58, 237, 0.12) 0%,
-      rgba(124, 58, 237, 0) 55%
-    ),
-    radial-gradient(
-      110% 85% at 50% -12%,
-      rgba(56, 97, 190, 0.1) 0%,
-      rgba(255, 255, 255, 0) 55%
-    ),
-    #ffffff;
-  --launch-glow: rgba(124, 58, 237, 0.1);
-  --splash-glow-color: rgba(124, 58, 237, 0.22);
-  --splash-name-b: #52525b;
+  --launch-splash-bg: radial-gradient(120% 90% at 50% 108%, rgba(124, 58, 237, 0.12) 0%, rgba(124, 58, 237, 0) 55%), radial-gradient(110% 85% at 50% -12%, rgba(56, 97, 190, 0.1) 0%, rgba(255, 255, 255, 0) 55%), #ffffff;
+  --launch-glow: rgba(124, 58, 237, 0.1); --splash-glow-color: rgba(124, 58, 237, 0.22); --splash-name-b: #52525b;
   --splash-bar-fill: linear-gradient(90deg, #6d28d9, #7c3aed);
-  --name-grad: linear-gradient(135deg, #18181b 20%, #7c3aed 90%);
-  --num-grad: linear-gradient(180deg, #18181b 0%, #7c3aed 100%);
-  --brand-grad: linear-gradient(135deg, #6d28d9 0%, #7c3aed 100%);
-  --brand-grad-hover: linear-gradient(145deg, #7c3aed, #8b5cf6);
-  --avatar-ring: rgba(124, 58, 237, 0.4);
-  --avatar-grad: linear-gradient(135deg, #ede9fe, #ddd6fe);
+  --name-grad: linear-gradient(135deg, #18181b 20%, #7c3aed 90%); --num-grad: linear-gradient(180deg, #18181b 0%, #7c3aed 100%);
+  --brand-grad: linear-gradient(135deg, #6d28d9 0%, #7c3aed 100%); --brand-grad-hover: linear-gradient(145deg, #7c3aed, #8b5cf6);
+  --avatar-ring: rgba(124, 58, 237, 0.4); --avatar-grad: linear-gradient(135deg, #ede9fe, #ddd6fe);
   --soft-card-grad: linear-gradient(135deg, #ffffff, #f1f1f3);
-  --btn-hover-bg: #3f3f46;
-  --btn-hover-border: #3f3f46;
-  --btn-hover-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
-  --danger-bg: rgba(248, 113, 113, 0.16);
-  --danger-border: rgba(248, 113, 113, 0.5);
-  --danger-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+  --btn-hover-bg: rgba(124, 58, 237, 0.1); --btn-hover-border: rgba(124, 58, 237, 0.35); --btn-hover-shadow: 0 4px 16px rgba(124, 58, 237, 0.18);
+  --danger-bg: rgba(248, 113, 113, 0.16); --danger-border: rgba(248, 113, 113, 0.5); --danger-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
   --poster-ph-bg: rgba(0, 0, 0, 0.06);
-  --platform-card-grad: linear-gradient(145deg, #f4f4f5 0%, #e9e9ec 100%);
-  --platform-card-text: #3f3f46;
-  --platform-shadow-hover: rgba(0, 0, 0, 0.16);
-  --scrollbar: #d4d4d8;
-  --link: #6d28d9;
-  --link-hover: #5b21b6;
-  --success-fg: #059669;
-  --warn-fg: #b45309;
-  --cal-accent: #4a6db8;
-  --cal-accent-2: #5b6b88;
-  --cal-accent-3: #4a6db8;
-  --cal-cell-border: #d4d9e6;
-  --cal-soft: rgba(74, 109, 184, 0.12);
-  --cal-soft-border: rgba(74, 109, 184, 0.3);
-  --shadow-avatar: rgba(0, 0, 0, 0.12);
-  --shadow-login: rgba(0, 0, 0, 0.1);
-  --detail-hero-grad: linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(247, 247, 248, 0.96));
-  --detail-bg-filter: brightness(1.05) saturate(0.9);
+  --platform-card-grad: linear-gradient(145deg, #f4f4f5 0%, #e9e9ec 100%); --platform-card-text: #3f3f46; --platform-shadow-hover: rgba(0, 0, 0, 0.16);
+  --scrollbar: #d4d4d8; --link: #6d28d9; --link-hover: #5b21b6;
+  --success-fg: #059669; --warn-fg: #b45309;
+  --cal-accent: #4a6db8; --cal-accent-2: #5b6b88; --cal-accent-3: #4a6db8; --cal-cell-border: #d4d9e6; --cal-soft: rgba(74, 109, 184, 0.12); --cal-soft-border: rgba(74, 109, 184, 0.3);
+  --shadow-avatar: rgba(0, 0, 0, 0.12); --shadow-login: rgba(0, 0, 0, 0.1);
+  --detail-hero-grad: linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(247, 247, 248, 0.96)); --detail-bg-filter: brightness(1.05) saturate(0.9);
 }
 @media (prefers-color-scheme: light) {
   html[data-theme="system"] {
-
-    --shadow-avatar: rgba(0, 0, 0, 0.12);
-    --shadow-login: rgba(0, 0, 0, 0.1);
-    --detail-hero-grad: linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(247, 247, 248, 0.96));
-    --detail-bg-filter: brightness(1.05) saturate(0.9);
-    --danger-fg: #ff7b85;
-    --chip-bg: #18181b;
-    --chip-bg-hover: #3f3f46;
-    --chip-fg: #fafafa;
-    --chip-fg-hover: #ffffff;
-    --chip-border: rgba(255, 255, 255, 0.08);
-    --chip-accent: #e9d5ff;
-    --pill-bg: rgba(24, 24, 27, 0.9);
-    --pill-border: rgba(255, 255, 255, 0.12);
-    --pill-shadow: 0 8px 28px rgba(0, 0, 0, 0.3);
-    --pill-fg: rgba(255, 255, 255, 0.78);
-    --pill-act-hover: rgba(255, 255, 255, 0.16);    --bg: #ffffff;
-    --surface: #ffffff;
-    --surface-2: #f7f7f8;
-    --surface-3: #f1f1f3;
-    --border: rgba(0, 0, 0, 0.08);
-    --border-strong: rgba(0, 0, 0, 0.14);
-    --text: #18181b;
-    --text-dim: #52525b;
-    --text-mute: #71717a;
-    --accent: #7c3aed;
-    --accent-2: #6d28d9;
-    --accent-soft: rgba(124, 58, 237, 0.09);
-    --accent-glow: rgba(124, 58, 237, 0.2);
-    --success: #059669;
-    --blue: #6d28d9;
-    --shadow-card: 0 8px 28px rgba(0, 0, 0, 0.08);
-    --bg-solid: #ffffff;
-    --panel-grad: linear-gradient(165deg, #ffffff 0%, #f7f7f8 100%);
-    --hover-bg: rgba(0, 0, 0, 0.035);
-    --hover-bg-strong: rgba(0, 0, 0, 0.06);
-    --sticky-bg: rgba(243, 243, 245, 0.92);
-    --sticky-border: rgba(0, 0, 0, 0.07);
-    --sticky-shadow: 0 6px 20px rgba(0, 0, 0, 0.1);
-    --overlay: rgba(15, 18, 26, 0.42);
-    --overlay-strong: rgba(15, 18, 26, 0.45);
-    --modal-bg: #ffffff;
-    --toast-bg: rgba(24, 24, 27, 0.94);
-    --toast-text: #ffffff;
-    --bar-track: rgba(0, 0, 0, 0.08);
-    --spinner-track: #e4e4e7;
-    --spinner-active: #7c3aed;
+    --shadow-avatar: rgba(0, 0, 0, 0.12); --shadow-login: rgba(0, 0, 0, 0.1);
+    --detail-hero-grad: linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(247, 247, 248, 0.96)); --detail-bg-filter: brightness(1.05) saturate(0.9);
+    --danger-fg: #ff7b85; --chip-bg: #f4f4f5; --chip-bg-hover: #e4e4e7; --chip-fg: #3f3f46; --chip-fg-hover: #18181b; --chip-border: rgba(0, 0, 0, 0.1); --chip-accent: #7c3aed;
+    --pill-bg: rgba(255, 255, 255, 0.92); --pill-border: rgba(0, 0, 0, 0.1); --pill-shadow: 0 8px 28px rgba(0, 0, 0, 0.08); --pill-fg: rgba(0, 0, 0, 0.6); --pill-act-hover: rgba(0, 0, 0, 0.06);
+    --bg: #ffffff; --surface: #ffffff; --surface-2: #f7f7f8; --surface-3: #f1f1f3;
+    --border: rgba(0, 0, 0, 0.08); --border-strong: rgba(0, 0, 0, 0.14);
+    --text: #18181b; --text-dim: #52525b; --text-mute: #71717a;
+    --accent: #7c3aed; --accent-2: #6d28d9; --accent-soft: rgba(124, 58, 237, 0.09); --accent-glow: rgba(124, 58, 237, 0.2);
+    --success: #059669; --blue: #6d28d9; --shadow-card: 0 8px 28px rgba(0, 0, 0, 0.08);
+    --bg-solid: #ffffff; --panel-grad: linear-gradient(165deg, #ffffff 0%, #f7f7f8 100%);
+    --hover-bg: rgba(0, 0, 0, 0.035); --hover-bg-strong: rgba(0, 0, 0, 0.06);
+    --sticky-bg: rgba(243, 243, 245, 0.92); --sticky-border: rgba(0, 0, 0, 0.07); --sticky-shadow: 0 6px 20px rgba(0, 0, 0, 0.1);
+    --overlay: rgba(15, 18, 26, 0.42); --overlay-strong: rgba(15, 18, 26, 0.45); --modal-bg: #ffffff;
+    --toast-bg: rgba(24, 24, 27, 0.94); --toast-text: #ffffff;
+    --bar-track: rgba(0, 0, 0, 0.08); --spinner-track: #e4e4e7; --spinner-active: #7c3aed;
     --splash-bg: radial-gradient(circle at 50% 45%, #ffffff 0%, #f4f4f6 62%);
-    --launch-splash-bg: radial-gradient(
-        120% 90% at 50% 108%,
-        rgba(124, 58, 237, 0.12) 0%,
-        rgba(124, 58, 237, 0) 55%
-      ),
-      radial-gradient(
-        110% 85% at 50% -12%,
-        rgba(56, 97, 190, 0.1) 0%,
-        rgba(255, 255, 255, 0) 55%
-      ),
-      #ffffff;
-    --launch-glow: rgba(124, 58, 237, 0.1);
-    --splash-glow-color: rgba(124, 58, 237, 0.22);
-    --splash-name-b: #52525b;
+    --launch-splash-bg: radial-gradient(120% 90% at 50% 108%, rgba(124, 58, 237, 0.12) 0%, rgba(124, 58, 237, 0) 55%), radial-gradient(110% 85% at 50% -12%, rgba(56, 97, 190, 0.1) 0%, rgba(255, 255, 255, 0) 55%), #ffffff;
+    --launch-glow: rgba(124, 58, 237, 0.1); --splash-glow-color: rgba(124, 58, 237, 0.22); --splash-name-b: #52525b;
     --splash-bar-fill: linear-gradient(90deg, #6d28d9, #7c3aed);
-    --name-grad: linear-gradient(135deg, #18181b 20%, #7c3aed 90%);
-    --num-grad: linear-gradient(180deg, #18181b 0%, #7c3aed 100%);
-    --brand-grad: linear-gradient(135deg, #6d28d9 0%, #7c3aed 100%);
-    --brand-grad-hover: linear-gradient(145deg, #7c3aed, #8b5cf6);
-    --avatar-ring: rgba(124, 58, 237, 0.4);
-    --avatar-grad: linear-gradient(135deg, #ede9fe, #ddd6fe);
+    --name-grad: linear-gradient(135deg, #18181b 20%, #7c3aed 90%); --num-grad: linear-gradient(180deg, #18181b 0%, #7c3aed 100%);
+    --brand-grad: linear-gradient(135deg, #6d28d9 0%, #7c3aed 100%); --brand-grad-hover: linear-gradient(145deg, #7c3aed, #8b5cf6);
+    --avatar-ring: rgba(124, 58, 237, 0.4); --avatar-grad: linear-gradient(135deg, #ede9fe, #ddd6fe);
     --soft-card-grad: linear-gradient(135deg, #ffffff, #f1f1f3);
-    --btn-hover-bg: #3f3f46;
-    --btn-hover-border: #3f3f46;
-    --btn-hover-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
-    --danger-bg: rgba(248, 113, 113, 0.16);
-    --danger-border: rgba(248, 113, 113, 0.5);
-    --danger-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+    --btn-hover-bg: rgba(124, 58, 237, 0.1); --btn-hover-border: rgba(124, 58, 237, 0.35); --btn-hover-shadow: 0 4px 16px rgba(124, 58, 237, 0.18);
+    --danger-bg: rgba(248, 113, 113, 0.16); --danger-border: rgba(248, 113, 113, 0.5); --danger-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
     --poster-ph-bg: rgba(0, 0, 0, 0.06);
-    --platform-card-grad: linear-gradient(145deg, #f4f4f5 0%, #e9e9ec 100%);
-    --platform-card-text: #3f3f46;
-    --platform-shadow-hover: rgba(0, 0, 0, 0.16);
-    --scrollbar: #d4d4d8;
-    --link: #6d28d9;
-    --link-hover: #5b21b6;
-    --success-fg: #059669;
-    --warn-fg: #b45309;
-    --cal-accent: #4a6db8;
-    --cal-accent-2: #5b6b88;
-    --cal-accent-3: #4a6db8;
-    --cal-cell-border: #d4d9e6;
-    --cal-soft: rgba(74, 109, 184, 0.12);
-    --cal-soft-border: rgba(74, 109, 184, 0.3);
+    --platform-card-grad: linear-gradient(145deg, #f4f4f5 0%, #e9e9ec 100%); --platform-card-text: #3f3f46; --platform-shadow-hover: rgba(0, 0, 0, 0.16);
+    --scrollbar: #d4d4d8; --link: #6d28d9; --link-hover: #5b21b6;
+    --success-fg: #059669; --warn-fg: #b45309;
+    --cal-accent: #4a6db8; --cal-accent-2: #5b6b88; --cal-accent-3: #4a6db8; --cal-cell-border: #d4d9e6; --cal-soft: rgba(74, 109, 184, 0.12); --cal-soft-border: rgba(74, 109, 184, 0.3);
   }
 }
-body {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC",
-    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-  background: var(--bg-solid);
-  background-attachment: fixed;
-  color: var(--text);
-  -webkit-font-smoothing: antialiased;
-  line-height: 1.5;
-  overflow-x: hidden;
-  overscroll-behavior-y: none;
-}
-a {
-  color: var(--accent-2);
-  text-decoration: none;
-  transition: color 0.15s;
-}
-a:hover {
-  color: #ddd6fe;
-}
-img {
-  display: block;
-  max-width: 100%;
-}
-.container {
-  max-width: 880px;
-  width: 100%;
-  margin: 0 auto;
-  padding: 0 16px calc(80px + env(safe-area-inset-bottom));
-}
-.app-version {
-  text-align: center;
-  font-size: 0.7rem;
-  color: var(--text-mute);
-  opacity: 0.7;
-  padding: 8px 0 4px;
-  letter-spacing: 0.4px;
-  user-select: none;
-}
-.pane-loading {
-  padding: 60px 20px;
-  text-align: center;
-}
-.load-more-wrap {
-  text-align: center;
-  margin-top: 24px;
-}
-.load-more {
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  color: var(--text);
-  padding: 11px 32px;
-  border-radius: var(--radius-md);
-  font-size: 0.9rem;
-  font-weight: 600;
-  cursor: pointer;
-  transition: all 0.2s;
-  font-family: inherit;
-}
-.load-more:hover:not(:disabled) {
-  border-color: rgba(91, 124, 250, 0.45);
-  color: var(--accent-2);
-  box-shadow: 0 4px 20px var(--accent-glow);
-  background: var(--surface-3);
-}
-.load-more:disabled {
-  cursor: not-allowed;
-}
-.login-wrap {
-  min-height: 100vh;
-  min-height: 100dvh;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 20px;
-}
-.login-card {
-  width: 100%;
-  max-width: 440px;
-  background: var(--panel-grad);
-  border: 1px solid var(--border-strong);
-  border-radius: 24px;
-  padding: 44px 32px;
-  text-align: center;
-  box-shadow:
-    0 24px 64px var(--shadow-login),
-    inset 0 1px 0 var(--hover-bg-strong);
-}
-.login-logo {
-  color: var(--splash-name-b);
-  margin-bottom: 16px;
-}
-.login-title {
-  font-size: 1.75rem;
-  font-weight: 800;
-  letter-spacing: -0.5px;
-  background: var(--name-grad);
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
-  margin-bottom: 6px;
-}
-.login-sub {
-  color: var(--text-dim);
-  font-size: 0.9rem;
-  margin-bottom: 28px;
-}
-.btn-primary {
-  background: var(--brand-grad);
-  color: #fff;
-  border: none;
-  padding: 13px 30px;
-  border-radius: 12px;
-  font-size: 0.95rem;
-  font-weight: 700;
-  cursor: pointer;
-  box-shadow: 0 6px 24px var(--accent-glow);
-}
-.btn-primary:hover {
-  filter: brightness(1.08);
-  transform: translateY(-1px);
-}
-.btn-ghost {
-  background: var(--chip-bg);
-  color: var(--chip-fg);
-  border: 1px solid var(--chip-border);
-  padding: 8px 16px;
-  border-radius: 10px;
-  font-size: 0.85rem;
-  cursor: pointer;
-  transition: all 0.15s;
-  font-family: inherit;
-}
-.btn-ghost:hover {
-  color: var(--chip-fg-hover);
-  border-color: var(--chip-border);
-  background: var(--chip-bg-hover);
-}
-.steps {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.step {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  text-align: left;
-  padding: 4px 0;
-  font-size: 0.9rem;
-}
-.step .n {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 22px;
-  background: var(--accent);
-  color: #fff;
-  border-radius: 50%;
-  font-size: 0.72rem;
-  font-weight: 700;
-  flex-shrink: 0;
-}
-.code-box {
-  font-family: ui-monospace, Menlo, monospace;
-  font-size: 1.75rem;
-  font-weight: 800;
-  letter-spacing: 6px;
-  color: #a8c0e8;
-  background: rgba(90, 120, 180, 0.12);
-  border: 1px solid rgba(140, 170, 220, 0.35);
-  border-radius: 14px;
-  padding: 14px;
-  margin: 14px 0;
-  user-select: all;
-  text-align: center;
-}
-.qr-box {
-  background: #fff;
-  border-radius: 14px;
-  padding: 10px;
-  display: inline-block;
-  margin: 6px 0 14px;
-}
-.qr-box img {
-  border-radius: 8px;
-}
-.status {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 0.88rem;
-  padding: 8px 16px;
-  border-radius: 20px;
-  color: var(--text-dim);
-  background: var(--surface-2);
-}
-.status.success {
-  color: #4ade80;
-  background: rgba(74, 222, 128, 0.1);
-}
-.status.error {
-  color: #e05560;
-  background: rgba(224, 85, 96, 0.12);
-}
-.pulse {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  background: #7d9dd4;
-  border-radius: 50%;
-  animation: pulse 1.4s ease-in-out infinite;
-}
-@keyframes pulse {
-  0%,
-  100% {
-    opacity: 0.35;
-    transform: scale(0.85);
-  }
-  50% {
-    opacity: 1;
-    transform: scale(1.15);
-  }
-}
-.err-box {
-  background: rgba(224, 85, 96, 0.1);
-  border: 1px solid rgba(224, 85, 96, 0.28);
-  border-radius: 12px;
-  padding: 14px;
-  text-align: left;
-  margin-bottom: 14px;
-}
-.err-title {
-  font-weight: 600;
-  color: #e05560;
-  margin-bottom: 4px;
-  font-size: 0.92rem;
-}
-.err {
-  color: #e8a3ab;
-  font-size: 0.85rem;
-}
-.err-detail {
-  font-family: ui-monospace, Menlo, monospace;
-  font-size: 0.72rem;
-  color: var(--text-dim);
-  background: var(--surface-3);
-  padding: 8px 10px;
-  border-radius: 6px;
-  margin-top: 8px;
-  white-space: pre-wrap;
-  word-break: break-all;
-  max-height: 120px;
-  overflow: auto;
-}
-.hint {
-  color: var(--text-dim);
-  font-size: 0.82rem;
-  margin-top: 6px;
-}
-.log-details {
-  margin-top: 18px;
-  text-align: left;
-}
-.log-details summary {
-  cursor: pointer;
-  font-size: 0.76rem;
-  color: var(--text-dim);
-  padding: 4px 0;
-  user-select: none;
-}
-.log-box {
-  font-family: ui-monospace, Menlo, monospace;
-  font-size: 0.7rem;
-  color: var(--text-dim);
-  background: var(--surface-3);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 10px;
-  max-height: 160px;
-  overflow: auto;
-  margin-top: 6px;
-  line-height: 1.6;
-}
-.hero {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: calc(20px + env(safe-area-inset-top)) 0 20px;
-  gap: 16px;
-}
-.hero-left {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  min-width: 0;
-}
-.hero-avatar {
-  width: 50px;
-  height: 50px;
-  border-radius: 50%;
-  overflow: hidden;
-  flex-shrink: 0;
-  background: var(--surface-2);
-  border: 2px solid var(--avatar-ring);
-  box-shadow:
-    0 0 0 3px var(--accent-soft),
-    0 4px 20px var(--shadow-avatar);
-}
-.hero-avatar img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-}
-.hero-avatar-ph {
-  width: 100%;
-  height: 100%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 1.25rem;
-  background: var(--avatar-grad);
-}
-.hero-text {
-  min-width: 0;
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 1px;
-}
-.hero-name {
-  font-size: 1.45rem;
-  font-weight: 800;
-  letter-spacing: -0.4px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  background: var(--name-grad);
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
-}
-.updated-at {
-  font-size: 0.72rem;
-  color: var(--text-mute);
-  font-weight: 400;
-  letter-spacing: 0.2px;
-  transition: color 0.4s ease;
-}
-.updated-at:empty {
-  display: none;
-}
-.updated-at.flash {
-  animation: updatedFlash 1.1s ease-out;
-}
-.updated-at.src-live {
-  color: #4ade80;
-}
-.updated-at.src-cache {
-  color: var(--text-mute);
-}
-@keyframes updatedFlash {
-  0% {
-    color: var(--accent-2);
-  }
-  100% {
-    color: var(--text-mute);
-  }
-}
-.hero-actions {
-  display: flex;
-  gap: 8px;
-  flex-shrink: 0;
-}
-.btn-action {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  background: var(--chip-bg);
-  color: var(--chip-fg);
-  border: 1px solid var(--chip-border);
-  padding: 8px 14px;
-  border-radius: 10px;
-  font-size: 0.82rem;
-  font-weight: 600;
-  cursor: pointer;
-  font-family: inherit;
-  transition: all 0.18s ease;
-  -webkit-tap-highlight-color: transparent;
-}
-.btn-action svg {
-  flex-shrink: 0;
-  transition: transform 0.25s ease;
-}
-.btn-action:hover {
-  color: var(--chip-fg-hover);
-  border-color: var(--btn-hover-border);
-  background: var(--btn-hover-bg);
-  box-shadow: var(--btn-hover-shadow);
-}
-.btn-action:hover svg {
-  transform: rotate(180deg);
-}
-.btn-action:active {
-  transform: scale(0.97);
-}
-#btn-logout:hover {
-  color: var(--danger-fg);
-  background: var(--danger-bg);
-  border-color: var(--danger-border);
-  box-shadow: var(--danger-shadow);
-}
-#btn-logout:hover svg {
-  transform: translateX(2px);
-}
-#btn-theme:hover {
-  color: var(--chip-accent);
-}
-#btn-theme:hover svg {
-  transform: none;
-}
-#btn-theme svg {
-  transition: opacity 0.2s ease, transform 0.2s ease;
-}
-#btn-theme .theme-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-}
-@media (max-width: 420px) {
-  .btn-action span {
-    display: none;
-  }
-  .btn-action {
-    padding: 9px;
-  }
-  .hero-actions {
-    gap: 6px;
-  }
-}
-.stats {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 8px;
-  background: var(--panel-grad);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  padding: 18px 10px;
-  margin-bottom: 24px;
-  box-shadow:
-    var(--shadow-card),
-    inset 0 1px 0 rgba(255, 255, 255, 0.04);
-  position: relative;
-  overflow: hidden;
-}
-.stats::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 10%;
-  right: 10%;
-  height: 1px;
-  background: linear-gradient(90deg, transparent, rgba(167, 139, 250, 0.35), transparent);
-}
-.stat {
-  position: relative;
-  text-align: center;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 2px;
-  padding: 6px 2px;
-  border-radius: 12px;
-  transition: background 0.2s ease;
-}
-.stat:hover {
-  background: rgba(255, 255, 255, 0.025);
-}
-.stat + .stat::before {
-  content: "";
-  position: absolute;
-  left: -4px;
-  top: 18%;
-  bottom: 18%;
-  width: 1px;
-  background: linear-gradient(180deg, transparent, rgba(255, 255, 255, 0.08), transparent);
-}
-.stat-icon {
-  width: 30px;
-  height: 30px;
-  border-radius: 9px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  margin-bottom: 4px;
-  transition:
-    transform 0.25s ease,
-    box-shadow 0.25s ease;
-}
-.stat:hover .stat-icon {
-  transform: translateY(-1px) scale(1.06);
-}
-.stat-movie .stat-icon {
-  background: linear-gradient(135deg, rgba(167, 139, 250, 0.18), rgba(167, 139, 250, 0.06));
-  color: #c4b5fd;
-  box-shadow:
-    0 4px 14px rgba(167, 139, 250, 0.18),
-    inset 0 0 0 1px rgba(167, 139, 250, 0.18);
-}
-.stat-show .stat-icon {
-  background: linear-gradient(135deg, rgba(96, 165, 250, 0.18), rgba(96, 165, 250, 0.06));
-  color: #93c5fd;
-  box-shadow:
-    0 4px 14px rgba(96, 165, 250, 0.18),
-    inset 0 0 0 1px rgba(96, 165, 250, 0.18);
-}
-.stat-episode .stat-icon {
-  background: linear-gradient(135deg, rgba(52, 211, 153, 0.18), rgba(52, 211, 153, 0.06));
-  color: #6ee7b7;
-  box-shadow:
-    0 4px 14px rgba(52, 211, 153, 0.18),
-    inset 0 0 0 1px rgba(52, 211, 153, 0.18);
-}
-.stat-hours .stat-icon {
-  background: linear-gradient(135deg, rgba(251, 191, 36, 0.18), rgba(251, 191, 36, 0.06));
-  color: #fcd34d;
-  box-shadow:
-    0 4px 14px rgba(251, 191, 36, 0.18),
-    inset 0 0 0 1px rgba(251, 191, 36, 0.18);
-}
-.stat-num {
-  font-size: 1.35rem;
-  font-weight: 800;
-  letter-spacing: -0.6px;
-  line-height: 1.15;
-  background: var(--num-grad);
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
-}
-.stat-label {
-  font-size: 0.7rem;
-  color: var(--text-mute);
-  font-weight: 500;
-}
-.tabs {
-  display: flex;
-  gap: 4px;
-  margin-bottom: 6px;
-} /* 首页吸顶：头像+统计+Tab 滚动时固定顶部 */
-.top-sticky {
-  position: sticky;
-  top: 0;
-  z-index: 40;
-  margin: 0 -16px;
-  padding: 0 16px 4px;
-  background: var(--sticky-bg);
-  backdrop-filter: blur(18px) saturate(1.2);
-  -webkit-backdrop-filter: blur(18px) saturate(1.2);
-  border-bottom: 1px solid var(--sticky-border);
-  box-shadow: var(--sticky-shadow);
-}
-.top-sticky .hero {
-  padding-top: calc(12px + env(safe-area-inset-top));
-  padding-bottom: 6px;
-}
-.top-sticky .stats {
-  margin-bottom: 8px;
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; background: var(--bg-solid); background-attachment: fixed; color: var(--text); -webkit-font-smoothing: antialiased; line-height: 1.5; overflow-x: hidden; overscroll-behavior-y: none; }
+a { color: var(--accent-2); text-decoration: none; transition: color 0.15s; }
+a:hover { color: var(--link-hover); }
+img { display: block; max-width: 100%; }
+.container { max-width: 880px; width: 100%; margin: 0 auto; padding: 0 16px calc(80px + env(safe-area-inset-bottom)); }
+.app-version { text-align: center; font-size: 0.7rem; color: var(--text-mute); opacity: 0.7; padding: 8px 0 4px; letter-spacing: 0.4px; user-select: none; }
+.pane-loading { padding: 60px 20px; text-align: center; }
+.load-more-wrap { text-align: center; margin-top: 24px; }
+.load-more { background: var(--surface-2); border: 1px solid var(--border); color: var(--text); padding: 11px 32px; border-radius: var(--radius-md); font-size: 0.9rem; font-weight: 600; cursor: pointer; transition: all 0.2s; font-family: inherit; }
+.load-more:hover:not(:disabled) { border-color: rgba(91, 124, 250, 0.45); color: var(--accent-2); box-shadow: 0 4px 20px var(--accent-glow); background: var(--surface-3); }
+.load-more:disabled { cursor: not-allowed; }
+.login-wrap { min-height: 100vh; min-height: 100dvh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+.login-card { width: 100%; max-width: 440px; background: var(--panel-grad); border: 1px solid var(--border-strong); border-radius: 24px; padding: 44px 32px; text-align: center; box-shadow: 0 24px 64px var(--shadow-login), inset 0 1px 0 var(--hover-bg-strong); }
+.login-logo { color: var(--splash-name-b); margin-bottom: 16px; }
+.login-title { font-size: 1.75rem; font-weight: 800; letter-spacing: -0.5px; background: var(--name-grad); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 6px; }
+.login-sub { color: var(--text-dim); font-size: 0.9rem; margin-bottom: 28px; }
+.btn-primary { background: var(--brand-grad); color: #fff; border: none; padding: 13px 30px; border-radius: 12px; font-size: 0.95rem; font-weight: 700; cursor: pointer; box-shadow: 0 6px 24px var(--accent-glow); }
+.btn-primary:hover { filter: brightness(1.08); transform: translateY(-1px); }
+.btn-ghost { background: var(--chip-bg); color: var(--chip-fg); border: 1px solid var(--chip-border); padding: 8px 16px; border-radius: 10px; font-size: 0.85rem; cursor: pointer; transition: all 0.15s; font-family: inherit; }
+.btn-ghost:hover { color: var(--chip-fg-hover); border-color: var(--chip-border); background: var(--chip-bg-hover); }
+.steps { display: flex; flex-direction: column; gap: 6px; }
+.step { display: flex; align-items: center; gap: 10px; text-align: left; padding: 4px 0; font-size: 0.9rem; }
+.step .n { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; background: var(--accent); color: #fff; border-radius: 50%; font-size: 0.72rem; font-weight: 700; flex-shrink: 0; }
+.code-box { font-family: ui-monospace, Menlo, monospace; font-size: 1.75rem; font-weight: 800; letter-spacing: 6px; color: #a8c0e8; background: rgba(90, 120, 180, 0.12); border: 1px solid rgba(140, 170, 220, 0.35); border-radius: 14px; padding: 14px; margin: 14px 0; user-select: all; text-align: center; }
+.qr-box { background: #fff; border-radius: 14px; padding: 10px; display: inline-block; margin: 6px 0 14px; }
+.qr-box img { border-radius: 8px; }
+.status { display: inline-flex; align-items: center; gap: 8px; font-size: 0.88rem; padding: 8px 16px; border-radius: 20px; color: var(--text-dim); background: var(--surface-2); }
+.status.success { color: #4ade80; background: rgba(74, 222, 128, 0.1); }
+.status.error { color: #e05560; background: rgba(224, 85, 96, 0.12); }
+.err-box { background: rgba(224, 85, 96, 0.1); border: 1px solid rgba(224, 85, 96, 0.28); border-radius: 12px; padding: 14px; text-align: left; margin-bottom: 14px; }
+.err-title { font-weight: 600; color: #e05560; margin-bottom: 4px; font-size: 0.92rem; }
+.err { color: #e8a3ab; font-size: 0.85rem; }
+.hint { color: var(--text-dim); font-size: 0.82rem; margin-top: 6px; }
+.log-details { margin-top: 18px; text-align: left; }
+.log-details summary { cursor: pointer; font-size: 0.76rem; color: var(--text-dim); padding: 4px 0; user-select: none; }
+.log-box { font-family: ui-monospace, Menlo, monospace; font-size: 0.7rem; color: var(--text-dim); background: var(--surface-3); border: 1px solid var(--border); border-radius: 8px; padding: 10px; max-height: 160px; overflow: auto; margin-top: 6px; line-height: 1.6; }
+.hero { display: flex; justify-content: space-between; align-items: center; padding: calc(20px + env(safe-area-inset-top)) 0 20px; gap: 16px; }
+.hero-left { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.hero-avatar { width: 50px; height: 50px; border-radius: 50%; overflow: hidden; flex-shrink: 0; background: var(--surface-2); border: 2px solid var(--avatar-ring); box-shadow: 0 0 0 3px var(--accent-soft), 0 4px 20px var(--shadow-avatar); }
+.hero-avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.hero-avatar-ph { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; font-size: 1.25rem; background: var(--avatar-grad); }
+.hero-text { min-width: 0; flex: 1; display: flex; flex-direction: column; align-items: flex-start; gap: 1px; }
+.hero-name { font-size: 1.45rem; font-weight: 800; letter-spacing: -0.4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: var(--name-grad); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+.updated-at { font-size: 0.72rem; color: var(--text-mute); font-weight: 400; letter-spacing: 0.2px; transition: color 0.4s ease; }
+.updated-at:empty { display: none; }
+.updated-at.flash { animation: updatedFlash 1.1s ease-out; }
+.updated-at.src-live { color: #4ade80; }
+.updated-at.src-cache { color: var(--text-mute); }
+@keyframes updatedFlash { 0% { color: var(--accent-2); } 100% { color: var(--text-mute); } }
+.hero-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.btn-action { display: inline-flex; align-items: center; gap: 6px; background: var(--chip-bg); color: var(--chip-fg); border: 1px solid var(--chip-border); padding: 8px 14px; border-radius: 10px; font-size: 0.82rem; font-weight: 600; cursor: pointer; font-family: inherit; transition: all 0.18s ease; -webkit-tap-highlight-color: transparent; }
+.btn-action svg { flex-shrink: 0; transition: transform 0.25s ease; }
+.btn-action:hover { color: var(--chip-fg-hover); border-color: var(--btn-hover-border); background: var(--btn-hover-bg); box-shadow: var(--btn-hover-shadow); }
+.btn-action:hover svg { transform: rotate(180deg); }
+.btn-action:active { transform: scale(0.97); }
+#btn-logout:hover { color: var(--danger-fg); background: var(--danger-bg); border-color: var(--danger-border); box-shadow: var(--danger-shadow); }
+#btn-logout:hover svg { transform: translateX(2px); }
+#btn-theme:hover { color: var(--chip-accent); }
+#btn-theme:hover svg { transform: none; }
+#btn-theme svg { transition: opacity 0.2s ease, transform 0.2s ease; }
+#btn-theme .theme-icon { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
+@media (max-width: 420px) { .btn-action span { display: none; } .btn-action { padding: 9px; } .hero-actions { gap: 6px; } }
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; background: var(--panel-grad); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 18px 10px; margin-bottom: 24px; box-shadow: var(--shadow-card), inset 0 1px 0 rgba(255, 255, 255, 0.04); position: relative; overflow: hidden; }
+.stats::before { content: ""; position: absolute; top: 0; left: 10%; right: 10%; height: 1px; background: linear-gradient(90deg, transparent, rgba(167, 139, 250, 0.35), transparent); }
+.stat { position: relative; text-align: center; display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 6px 2px; border-radius: 12px; transition: background 0.2s ease; }
+.stat:hover { background: rgba(255, 255, 255, 0.025); }
+.stat + .stat::before { content: ""; position: absolute; left: -4px; top: 18%; bottom: 18%; width: 1px; background: linear-gradient(180deg, transparent, rgba(255, 255, 255, 0.08), transparent); }
+.stat-icon { width: 30px; height: 30px; border-radius: 9px; display: flex; align-items: center; justify-content: center; margin-bottom: 4px; transition: transform 0.25s ease, box-shadow 0.25s ease; }
+.stat:hover .stat-icon { transform: translateY(-1px) scale(1.06); }
+.stat-movie .stat-icon { background: linear-gradient(135deg, rgba(167, 139, 250, 0.18), rgba(167, 139, 250, 0.06)); color: #c4b5fd; box-shadow: 0 4px 14px rgba(167, 139, 250, 0.18), inset 0 0 0 1px rgba(167, 139, 250, 0.18); }
+.stat-show .stat-icon { background: linear-gradient(135deg, rgba(96, 165, 250, 0.18), rgba(96, 165, 250, 0.06)); color: #93c5fd; box-shadow: 0 4px 14px rgba(96, 165, 250, 0.18), inset 0 0 0 1px rgba(96, 165, 250, 0.18); }
+.stat-episode .stat-icon { background: linear-gradient(135deg, rgba(52, 211, 153, 0.18), rgba(52, 211, 153, 0.06)); color: #6ee7b7; box-shadow: 0 4px 14px rgba(52, 211, 153, 0.18), inset 0 0 0 1px rgba(52, 211, 153, 0.18); }
+.stat-hours .stat-icon { background: linear-gradient(135deg, rgba(251, 191, 36, 0.18), rgba(251, 191, 36, 0.06)); color: #fcd34d; box-shadow: 0 4px 14px rgba(251, 191, 36, 0.18), inset 0 0 0 1px rgba(251, 191, 36, 0.18); }
+.stat-num { font-size: 1.35rem; font-weight: 800; letter-spacing: -0.6px; line-height: 1.15; background: var(--num-grad); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+.stat-label { font-size: 0.7rem; color: var(--text-mute); font-weight: 500; }
+.tabs { display: flex; gap: 4px; margin-bottom: 6px; }
+.top-sticky { position: sticky; top: 0; z-index: 40; margin: 0 -16px; padding: 0 16px 4px; background: var(--sticky-bg); backdrop-filter: blur(18px) saturate(1.2); -webkit-backdrop-filter: blur(18px) saturate(1.2); border-bottom: 1px solid var(--sticky-border); box-shadow: var(--sticky-shadow); }
+.top-sticky .hero { padding-top: calc(12px + env(safe-area-inset-top)); padding-bottom: 6px; }
+.top-sticky .stats { margin-bottom: 8px; }
+@media (min-width: 768px) { .top-sticky { margin: 0 -28px; padding: 0 28px 8px; } }
+@media (min-width: 1024px) { .top-sticky { margin: 0 -36px; padding: 0 36px 8px; } }
+@media (min-width: 1280px) { .top-sticky { margin: 0 -40px; padding: 0 40px 8px; } }
+.tab { flex: 1 1 0; min-width: 0; background: transparent; border: none; color: var(--text-dim); padding: 9px 2px; border-radius: 999px; font-size: 0.75rem; font-weight: 600; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: center; display: flex; align-items: center; justify-content: center; gap: 5px; transition: color 0.2s ease, background 0.2s ease; font-family: inherit; outline: none !important; }
+.tab svg { flex-shrink: 0; opacity: 0.9; }
+.tab span { overflow: hidden; text-overflow: ellipsis; }
+.tab:hover { color: var(--text); background: rgba(255, 255, 255, 0.06); }
+.tab.active { background: var(--brand-grad); color: #fff; font-weight: 700; }
+.pane { display: none; }
+.pane.active { display: block; animation: fadeIn 0.3s ease; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+.grid { display: flex; flex-direction: column; gap: 10px; }
+.item { position: relative; display: flex; gap: 14px; background: var(--panel-grad); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 12px; transition: transform 0.2s ease, border-color 0.2s, box-shadow 0.2s; animation: fadeInUp 0.4s ease backwards; overflow: hidden; box-shadow: 0 4px 20px var(--shadow-card), inset 0 1px 0 var(--hover-bg); text-decoration: none; color: inherit; }
+.item.clickable { cursor: pointer; }
+.item.clickable:active { transform: scale(0.985); background: var(--surface-2); }
+@keyframes fadeInUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+.item:hover { border-color: rgba(167, 139, 250, 0.25); box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(167, 139, 250, 0.08); transform: translateY(-1px); }
+.wl-remove, .wl-drop, .wl-watched, .wl-unwatch { position: absolute; top: 6px; right: 6px; width: 26px; height: 26px; border-radius: 50%; background: rgba(0, 0, 0, 0.65); line-height: 1; cursor: pointer; z-index: 3; display: flex; align-items: center; justify-content: center; padding: 0; font-family: inherit; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); transition: background 0.15s, transform 0.15s, opacity 0.15s, color 0.15s; }
+.wl-remove { color: #fff; border: 1px solid rgba(255, 255, 255, 0.22); font-size: 1rem; font-weight: 400; opacity: 0.88; }
+.wl-remove:hover { background: rgba(200, 70, 80, 0.92); opacity: 1; transform: scale(1.06); }
+.wl-drop { position: absolute; top: 6px; right: 6px; width: 30px; height: 30px; border-radius: 50%; background: rgba(0, 0, 0, 0.72); color: #ff8a8a; border: 1px solid rgba(255, 120, 120, 0.55); font-size: 0.85rem; opacity: 1; z-index: 5; display: flex; align-items: center; justify-content: center; padding: 0; cursor: pointer; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
+.wl-drop:hover { background: rgba(200, 70, 80, 0.95); color: #fff; transform: scale(1.08); }
+.wl-drop svg { display: block; pointer-events: none; }
+.wl-drop:disabled { opacity: 0.5; cursor: wait; }
+.cal-action-row { display: flex; gap: 8px; margin-top: 8px; align-self: flex-start; flex-wrap: wrap; }
+.cal-open-btn, .cal-drop-btn { align-self: auto; margin-top: 0; margin-left: 0; display: inline-flex; align-items: center; justify-content: center; padding: 5px 12px; border-radius: 8px; font-size: 0.74rem; font-weight: 600; cursor: pointer; font-family: inherit; transition: all 0.15s; white-space: nowrap; }
+.cal-open-btn { background: rgba(90, 120, 180, 0.14); border: 1px solid rgba(140, 170, 220, 0.35); color: #9db5e0; }
+.cal-open-btn:hover { background: rgba(120, 150, 210, 0.28); color: #c2d4f0; border-color: rgba(140, 170, 220, 0.65); }
+.cal-open-btn svg { flex-shrink: 0; pointer-events: none; }
+.cal-open-btn.wl-added { background: rgba(74, 222, 128, 0.14) !important; border-color: rgba(74, 222, 128, 0.38) !important; color: #4ade80 !important; cursor: default !important; }
+.cal-drop-btn { background: rgba(224, 85, 96, 0.14); border: 1px solid rgba(224, 85, 96, 0.4); color: #ff8a8a; }
+.cal-drop-btn:hover { background: rgba(224, 85, 96, 0.3); color: #ffb3b3; border-color: rgba(224, 85, 96, 0.65); }
+.cal-drop-btn svg { flex-shrink: 0; pointer-events: none; }
+.cal-drop-btn:disabled { opacity: 0.5; cursor: wait; }
+.wl-watched { color: #4ade80; border: 1px solid rgba(74, 222, 128, 0.45); font-size: 0.85rem; font-weight: 700; opacity: 0.9; }
+.wl-watched:hover { background: rgba(74, 222, 128, 0.95); color: #000; opacity: 1; transform: scale(1.06); }
+.wl-unwatch { color: #ffb84d; border: 1px solid rgba(255, 184, 77, 0.45); font-size: 0.9rem; font-weight: 700; opacity: 0.9; }
+.wl-unwatch:hover { background: rgba(255, 184, 77, 0.95); color: #000; opacity: 1; transform: scale(1.06); }
+.wl-remove:disabled, .wl-watched:disabled, .wl-unwatch:disabled { opacity: 0.5; cursor: wait; }
+.poster { width: 76px; height: 114px; border-radius: 10px; overflow: hidden; flex-shrink: 0; background: var(--surface-2); position: relative; }
+.poster img { width: 100%; height: 100%; object-fit: cover; }
+.poster-ph { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; font-size: 1.8rem; background: var(--soft-card-grad); color: var(--text-dim); }
+.poster-play { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 46px; height: 46px; border-radius: 50%; background: rgba(8, 10, 18, 0.72); color: #fff; display: flex; align-items: center; justify-content: center; backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); opacity: 1; transition: opacity 0.2s ease, transform 0.2s ease, background 0.15s ease, box-shadow 0.2s ease; text-decoration: none; border: 1px solid rgba(255, 255, 255, 0.24); z-index: 4; box-shadow: 0 4px 18px rgba(0, 0, 0, 0.55); -webkit-tap-highlight-color: transparent; }
+.poster-play svg { display: block; margin-left: 2px; pointer-events: none; width: 24px; height: 24px; }
+.item:hover .poster-play { opacity: 1; }
+.poster-play:hover { background: linear-gradient(145deg, #8b5cf6, #a78bfa); transform: translate(-50%, -50%) scale(1.1); color: #fff; border-color: rgba(255, 255, 255, 0.4); box-shadow: 0 8px 28px rgba(139, 92, 246, 0.6); }
+.poster-play:active { transform: translate(-50%, -50%) scale(0.94); }
+.info { flex: 1; min-width: 0; display: flex; flex-direction: column; justify-content: center; gap: 4px; }
+.name-row { display: flex; align-items: baseline; gap: 0; overflow: hidden; white-space: nowrap; line-height: 1.3; letter-spacing: -0.2px; }
+.name { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 1rem; font-weight: 700; color: var(--text); }
+.tag { flex: 0 0 auto; font-size: inherit; font-weight: inherit; letter-spacing: 0; white-space: nowrap; }
+.tag.upcoming { color: #ffb84d; }
+.overview { font-size: 0.8rem; color: var(--text-dim); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; line-height: 1.45; margin-top: 4px; }
+.meta { font-size: 0.8rem; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.meta.dim { color: #7a8394; font-size: 0.78rem; margin-top: 2px; }
+.bar { height: 3px; background: rgba(255, 255, 255, 0.06); border-radius: 99px; overflow: hidden; margin-top: 8px; }
+.bar-fill { height: 100%; background: linear-gradient(90deg, #7c3aed, #c4b5fd); border-radius: 99px; box-shadow: 0 0 10px rgba(167, 139, 250, 0.5); }
+.search-bar { margin-bottom: 16px; }
+.search-input { width: 100%; background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 12px 16px; border-radius: 12px; font-size: 0.95rem; font-family: inherit; outline: none; transition: border-color 0.15s, background 0.15s; -webkit-appearance: none; appearance: none; }
+.search-input:focus { border-color: var(--accent); background: var(--surface-2); box-shadow: 0 0 0 3px var(--accent-soft); }
+.search-input::placeholder { color: var(--text-mute); }
+.trending-head { display: flex; align-items: center; gap: 8px; font-size: 0.88rem; font-weight: 700; color: var(--text); margin: 4px 0 14px; padding-left: 2px; letter-spacing: 0.2px; }
+.trending-head::before { content: ""; width: 3px; height: 14px; border-radius: 2px; background: linear-gradient(180deg, #f97316, #ef4444); }
+.home-section { margin-bottom: 24px; }
+.home-section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.home-section-title { font-size: 1rem; font-weight: 700; letter-spacing: 0.2px; display: flex; align-items: center; gap: 8px; }
+.home-section-title::before { content: ""; width: 3px; height: 16px; border-radius: 2px; background: linear-gradient(180deg, #a78bfa, #7c3aed); }
+.home-more-btn { background: transparent; border: none; color: var(--text-dim); font-size: 0.82rem; font-weight: 600; cursor: pointer; font-family: inherit; padding: 6px 10px; border-radius: 8px; transition: all 0.15s; display: inline-flex; align-items: center; gap: 4px; }
+.home-more-btn:hover { color: var(--accent-2); background: rgba(167, 139, 250, 0.1); }
+.home-more-btn svg { transition: transform 0.2s ease; }
+.platform-section { margin-bottom: 24px; }
+.platform-rows { display: flex; flex-direction: column; gap: 12px; }
+.platform-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.platform-cards { display: flex; gap: 12px; overflow-x: auto; padding: 4px 2px 10px; -webkit-overflow-scrolling: touch; scrollbar-width: none; flex: 1; min-width: 0; scroll-snap-type: x proximity; }
+.platform-cards::-webkit-scrollbar { display: none; }
+.platform-card { flex: 0 0 auto; width: min(46vw, 190px); height: 92px; border: none; border-radius: 18px; background: var(--platform-card-grad); box-shadow: 0 10px 28px var(--shadow-card), inset 0 1px 0 var(--hover-bg-strong); display: flex; align-items: stretch; padding: 0; cursor: pointer; overflow: hidden; position: relative; scroll-snap-align: start; transition: transform 0.18s ease, box-shadow 0.18s ease; -webkit-tap-highlight-color: transparent; font: inherit; color: var(--platform-card-text); }
+.platform-card:hover { transform: translateY(-3px); box-shadow: 0 16px 36px var(--platform-shadow-hover), inset 0 1px 0 var(--hover-bg-strong); }
+.platform-card:active { transform: scale(0.985); }
+.platform-card-left { flex: 0 0 42%; max-width: 42%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0; padding: 8px 4px 8px 8px; z-index: 2; position: relative; }
+.platform-card-logo { width: 46px; height: 46px; border-radius: 0; object-fit: contain; object-position: center; flex-shrink: 0; box-shadow: none; background: transparent; padding: 0; box-sizing: border-box; display: block; }
+.platform-card-name { display: none; }
+.platform-card-right { flex: 1; position: relative; min-width: 0; overflow: hidden; }
+.platform-card-posters { position: absolute; right: -6px; top: 50%; transform: translateY(-50%); width: 112px; height: 82px; }
+.platform-card-poster { position: absolute; width: 40px; height: 60px; border-radius: 8px; object-fit: cover; box-shadow: 0 5px 12px rgba(0, 0, 0, 0.28); border: 1.5px solid rgba(255, 255, 255, 0.95); background: #c5c9d0; top: 50%; margin-top: -30px; }
+.platform-card-poster-ph { background: linear-gradient(145deg, #d0d4db 0%, #b8bec8 100%); }
+.platform-card-poster.p0 { right: 6px; z-index: 5; transform: rotate(8deg); }
+.platform-card-poster.p1 { right: 26px; z-index: 4; transform: rotate(3deg); }
+.platform-card-poster.p2 { right: 46px; z-index: 3; transform: rotate(-4deg); }
+.platform-card-poster.p3 { right: 66px; z-index: 2; transform: rotate(-10deg); }
+@media (min-width: 768px) {
+  .platform-card { width: 340px; height: 128px; border-radius: 24px; }
+  .platform-card-logo { width: 72px; height: 72px; border-radius: 0; padding: 0; }
+  .platform-card-posters { width: 180px; height: 116px; }
+  .platform-card-poster { width: 64px; height: 96px; margin-top: -48px; border-radius: 11px; }
+  .platform-card-poster.p0 { right: 10px; } .platform-card-poster.p1 { right: 40px; } .platform-card-poster.p2 { right: 70px; } .platform-card-poster.p3 { right: 100px; }
+  .platform-cards { gap: 14px; }
+}
+.h-scroll-wrap { margin: 0 -16px; padding: 0 16px; }
+.h-scroll { display: flex; gap: 12px; overflow-x: auto; padding: 4px 0 12px; -webkit-overflow-scrolling: touch; scrollbar-width: none; scroll-snap-type: x proximity; }
+.h-scroll::-webkit-scrollbar { display: none; }
+.h-scroll-empty { padding: 30px 0; text-align: center; }
+.h-scroll .item { flex: 0 0 auto; width: 132px; display: flex; flex-direction: column; gap: 0; padding: 0; border-radius: 12px; background: transparent; border: none; overflow: visible; animation: none; box-shadow: none; scroll-snap-align: start; transform: none; }
+.h-scroll .item:hover { background: transparent; border: none; box-shadow: none; transform: none; }
+.h-scroll .item.clickable:active { transform: scale(0.96); background: transparent; }
+.h-scroll .item .poster { width: 100%; height: auto; aspect-ratio: 2/3; border-radius: 12px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5); transition: transform 0.25s ease, box-shadow 0.25s ease; }
+.h-scroll .item:hover .poster { transform: translateY(-3px); box-shadow: 0 12px 28px rgba(91, 124, 250, 0.3), 0 4px 16px rgba(0, 0, 0, 0.6); }
+.h-scroll .item .info { display: block; padding: 8px 2px 0; flex: none; justify-content: flex-start; }
+.h-scroll .item .name { font-size: 0.82rem; line-height: 1.3; }
+.h-scroll .item .overview { display: none; }
+.h-scroll .item .meta { font-size: 0.72rem; margin-top: 2px; color: var(--text-dim); }
+.h-scroll .item .meta.dim { font-size: 0.7rem; }
+.h-scroll .item .bar { margin-top: 6px; }
+.h-scroll .item .wl-watched, .h-scroll .item .wl-remove, .h-scroll .item .wl-drop, .h-scroll .item .wl-unwatch { top: 6px; right: 6px; width: 24px; height: 24px; font-size: 0.75rem; }
+.h-scroll .item .cal-action-row, .h-scroll .item .cal-open-btn { display: none; }
+.h-scroll .item .poster-play { width: 46px; height: 46px; opacity: 1; }
+.h-scroll .item .poster-play svg { width: 24px; height: 24px; }
+@media (min-width: 768px) { .h-scroll-wrap { margin: 0; padding: 0; } .h-scroll .item { width: 168px; } }
+@media (min-width: 1024px) { .h-scroll .item { width: 188px; } }
+@media (min-width: 1280px) { .h-scroll .item { width: 200px; } }
+@media (min-width: 1600px) { .h-scroll .item { width: 214px; } }
+@media (min-width: 1920px) { .container { width: 100%; padding-left: 48px; padding-right: 48px; } .h-scroll .item { width: 228px; } }
+@media (min-width: 2200px) { .h-scroll .item { width: 240px; } }
+.list-modal { position: fixed; inset: 0; z-index: 150; display: none; }
+.list-modal.open { display: block; }
+.list-modal-backdrop { position: absolute; inset: 0; background: rgba(2, 4, 8, 0.8); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); animation: fadeIn 0.2s ease; }
+.list-modal-panel { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: min(94vw, 1000px); max-height: 88vh; display: flex; flex-direction: column; background: var(--panel-grad); border: 1px solid var(--border-strong); border-radius: 18px; box-shadow: 0 30px 80px rgba(0, 0, 0, 0.85); overflow: hidden; animation: modalIn 0.25s cubic-bezier(0.2, 0.9, 0.3, 1); }
+.list-modal-head { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.list-modal-title { font-size: 1.05rem; font-weight: 700; }
+.list-modal-close { width: 40px; height: 40px; border-radius: 50%; border: 1px solid var(--chip-border); background: var(--chip-bg); color: var(--chip-fg); font-size: 1.2rem; cursor: pointer; font-family: inherit; line-height: 1; display: flex; align-items: center; justify-content: center; transition: all 0.15s; }
+.list-modal-close:hover { color: #fff; border-color: var(--border-strong); background: rgba(255, 255, 255, 0.08); }
+.list-modal-body { overflow-y: auto; padding: 16px 20px 24px; -webkit-overflow-scrolling: touch; }
+.douban-filter-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+.douban-filter-tab { background: var(--chip-bg); border: 1px solid var(--chip-border); color: var(--chip-fg); padding: 7px 16px; border-radius: 999px; font-size: 0.82rem; font-weight: 600; cursor: pointer; font-family: inherit; transition: all 0.15s; -webkit-tap-highlight-color: transparent; }
+.douban-filter-tab:hover { color: var(--chip-fg-hover); border-color: var(--chip-border); background: var(--chip-bg-hover); }
+.douban-filter-tab.active { background: var(--brand-grad); color: #fff; border-color: transparent; box-shadow: 0 4px 14px rgba(167, 139, 250, 0.3); }
+.theater-home-tabs { display: flex; gap: 8px; overflow-x: auto; padding: 0 16px 12px; margin: 0 -16px; scrollbar-width: none; -webkit-overflow-scrolling: touch; scroll-snap-type: x proximity; }
+.theater-home-tabs::-webkit-scrollbar { display: none; }
+.theater-filter-tab { flex-shrink: 0; background: var(--chip-bg); border: 1px solid var(--chip-border); color: var(--chip-fg); padding: 6px 14px; border-radius: 999px; font-size: 0.78rem; font-weight: 600; cursor: pointer; font-family: inherit; transition: all 0.15s; -webkit-tap-highlight-color: transparent; scroll-snap-align: start; }
+.theater-filter-tab:hover { color: var(--chip-fg-hover); border-color: var(--chip-border); background: var(--chip-bg-hover); }
+.theater-filter-tab.active { background: var(--brand-grad); color: #fff; border-color: transparent; box-shadow: 0 4px 14px rgba(167, 139, 250, 0.3); }
+@media (min-width: 768px) { .theater-home-tabs { margin: 0; padding-left: 0; padding-right: 0; } }
+@media (max-width: 599px) { .list-modal-panel { top: auto; bottom: 0; left: 0; right: 0; transform: none; width: 100%; max-height: 92vh; border-radius: 18px 18px 0 0; } }
+.show-cal-modal { position: fixed; inset: 0; z-index: 240; display: none; }
+.show-cal-modal.open { display: block; }
+.show-cal-backdrop { position: absolute; inset: 0; background: var(--overlay); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); animation: fadeIn 0.2s ease; }
+.show-cal-panel { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: min(92vw, 440px); max-height: 90vh; overflow-y: auto; background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 20px; box-shadow: 0 30px 80px rgba(0, 0, 0, 0.8); animation: modalIn 0.25s cubic-bezier(0.2, 0.9, 0.3, 1); }
+.show-cal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.show-cal-name { font-size: 0.95rem; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.show-cal-close { width: 40px; height: 40px; flex-shrink: 0; background: var(--chip-bg); border: 1px solid var(--chip-border); color: var(--chip-fg); border-radius: 50%; cursor: pointer; font-size: 1.2rem; line-height: 1; display: flex; align-items: center; justify-content: center; transition: all 0.15s; font-family: inherit; }
+.show-cal-close:hover { color: var(--chip-fg-hover); border-color: var(--chip-border); background: var(--chip-bg-hover); }
+.show-cal-info { font-size: 0.72rem; color: var(--text-dim); margin-bottom: 12px; line-height: 1.4; }
+.show-cal-nav { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; font-size: 0.88rem; color: var(--text); font-weight: 600; }
+.show-cal-nav button { width: 30px; height: 30px; background: var(--chip-bg); border: 1px solid var(--chip-border); color: var(--chip-fg); border-radius: 8px; cursor: pointer; font-size: 1rem; line-height: 1; display: flex; align-items: center; justify-content: center; transition: all 0.15s; font-family: inherit; }
+.show-cal-nav button:hover { color: var(--chip-fg-hover); border-color: var(--chip-border); background: var(--chip-bg-hover); }
+.show-cal-weekdays { display: grid; grid-template-columns: repeat(7, 1fr); text-align: center; font-size: 0.7rem; color: var(--text-dim); margin-bottom: 6px; }
+.show-cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
+.sc-day { position: relative; aspect-ratio: 1; display: flex; align-items: center; justify-content: center; border-radius: 8px; font-size: 0.8rem; color: var(--text-dim); cursor: default; border: 1px solid transparent; transition: background 0.15s, border-color 0.15s; }
+.sc-day.sc-has { cursor: pointer; font-weight: 700; }
+.sc-day.sc-past { background: var(--cal-soft); color: var(--cal-accent-2); border-color: rgba(120, 150, 210, 0.5); }
+.sc-day.sc-past:hover { background: var(--cal-soft-border); color: #d0dcf0; }
+.sc-day.sc-today-day { background: var(--cal-accent); color: #fff; border-color: #7d9dd4; box-shadow: 0 0 14px rgba(125, 157, 212, 0.7); }
+.sc-day.sc-today-day:hover { background: #5b7fc4; }
+.sc-day.sc-future { background: rgba(255, 184, 77, 0.18); color: #ffd693; border-color: rgba(255, 184, 77, 0.55); }
+.sc-day.sc-future:hover { background: rgba(255, 184, 77, 0.4); color: #fff0d0; }
+.sc-day.sc-active { outline: 2px solid #fff; outline-offset: -2px; }
+.sc-day.sc-empty { visibility: hidden; }
+.sc-badge { position: absolute; top: 2px; right: 2px; min-width: 14px; height: 14px; padding: 0 3px; border-radius: 7px; background: var(--cal-accent); color: #fff; font-size: 0.6rem; font-weight: 700; line-height: 14px; text-align: center; }
+.sc-day.sc-future .sc-badge { background: #d99a3a; }
+.show-cal-legend { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; margin-top: 14px; font-size: 0.7rem; color: var(--text-dim); }
+.legend-item { display: inline-flex; align-items: center; gap: 5px; }
+.legend-dot { display: inline-block; width: 10px; height: 10px; border-radius: 3px; }
+.legend-past { background: var(--cal-soft-border); border: 1px solid rgba(140, 170, 220, 0.8); }
+.legend-today { background: var(--cal-accent); border: 1px solid #7d9dd4; }
+.legend-future { background: rgba(255, 184, 77, 0.4); border: 1px solid rgba(255, 184, 77, 0.8); }
+.show-cal-detail { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 12px; min-height: 20px; }
+.sc-ep { display: flex; gap: 10px; align-items: baseline; padding: 6px 0; font-size: 0.82rem; }
+.sc-ep-tag { font-family: ui-monospace, Menlo, monospace; font-size: 0.72rem; font-weight: 700; color: #7d9dd4; flex-shrink: 0; }
+.sc-ep-title { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ext-rating { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px 4px 8px; border-radius: 8px; background: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.1); line-height: 1; font-size: 0.82rem; color: var(--text); white-space: nowrap; text-decoration: none; transition: background 0.15s, border-color 0.15s, transform 0.12s; }
+.ext-rating:hover { background: rgba(255, 255, 255, 0.1); border-color: rgba(255, 255, 255, 0.16); }
+.ext-logo { display: block; flex-shrink: 0; border-radius: 2px; }
+.ext-score { font-weight: 800; letter-spacing: 0.2px; font-variant-numeric: tabular-nums; }
+.ext-rating.ext-imdb { background: rgba(245, 197, 24, 0.14); border-color: rgba(245, 197, 24, 0.35); color: #f5c518; }
+.ext-rating.ext-imdb .ext-score { color: #f5c518; }
+.ext-rating.ext-rt { background: rgba(250, 50, 10, 0.12); border-color: rgba(250, 50, 10, 0.32); color: #ff7666; }
+.ext-rating.ext-rt .ext-score { color: #ff7666; }
+.ext-rating.ext-mc { background: rgba(255, 255, 255, 0.05); border-color: rgba(255, 255, 255, 0.12); color: var(--text); }
+.ext-rating.ext-trakt { background: rgba(237, 28, 36, 0.12); border-color: rgba(237, 28, 36, 0.32); color: #ff6b70; }
+.ext-rating.ext-trakt .ext-score { color: #ff6b70; }
+.ext-rating.ext-tmdb { background: rgba(1, 180, 228, 0.12); border-color: rgba(1, 180, 228, 0.32); color: #4dd0e1; }
+.ext-rating.ext-tmdb .ext-score { color: #4dd0e1; }
+.ext-rating.ext-douban { background: rgba(46, 150, 61, 0.12); border-color: rgba(46, 150, 61, 0.38); color: #4ecb71; }
+.ext-rating.ext-douban:hover { background: rgba(46, 150, 61, 0.22); border-color: rgba(46, 150, 61, 0.6); color: #6fe089; }
+.detail-ext-ratings { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 8px; align-items: center; }
+@media (min-width: 600px) {
+  .container { padding-left: 20px; padding-right: 20px; }
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+  .item { border-radius: 14px; }
+  .poster { width: 72px; height: 108px; }
 }
 @media (min-width: 768px) {
-  .top-sticky {
-    margin: 0 -28px;
-    padding: 0 28px 8px;
-  }
+  .container { width: 100%; padding: 0 28px calc(88px + env(safe-area-inset-bottom)); }
+  .hero { padding: 28px 0 22px; gap: 12px; }
+  .hero-avatar { width: 56px; height: 56px; }
+  .hero-name { font-size: 1.55rem; }
+  .stats { gap: 10px; padding: 18px 12px; margin-bottom: 24px; }
+  .stat-num { font-size: 1.5rem; }
+  .stat-label { font-size: 0.76rem; }
+  .stat-icon { width: 34px; height: 34px; border-radius: 10px; }
+  .tabs { position: relative; overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch; padding-bottom: 2px; }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tab { flex: 0 0 auto; padding: 9px 14px; font-size: 0.87rem; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 16px; }
+  .item { display: flex; flex-direction: column; gap: 0; padding: 0; border-radius: 12px; background: transparent; border: none; overflow: visible; }
+  .item:hover { background: transparent; border: none; }
+  .item.clickable:active { transform: none; background: transparent; }
+  .poster { width: 100%; height: auto; aspect-ratio: 2/3; border-radius: 12px; transition: transform 0.25s ease, box-shadow 0.25s ease; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5); }
+  .item:hover .poster { transform: translateY(-4px); box-shadow: 0 12px 32px rgba(91, 124, 250, 0.3), 0 4px 16px rgba(0, 0, 0, 0.6); }
+  .info { display: block; padding: 10px 2px 0; flex: none; justify-content: flex-start; }
+  .name { font-size: 0.88rem; }
+  .overview { -webkit-line-clamp: 2; font-size: 0.74rem; margin-top: 4px; }
+  .meta { font-size: 0.76rem; margin-top: 3px; }
+  .meta.dim { font-size: 0.72rem; }
+  .bar { margin-top: 8px; }
+  .wl-remove, .wl-watched, .wl-unwatch { top: 8px; right: 8px; width: 28px; height: 28px; }
+  .day-num { font-size: 1.6rem; }
 }
 @media (min-width: 1024px) {
-  .top-sticky {
-    margin: 0 -36px;
-    padding: 0 36px 8px;
-  }
+  .container { width: 100%; padding: 0 36px 100px; }
+  .hero { padding: 36px 0 26px; }
+  .hero-name { font-size: 1.7rem; }
+  .stats { gap: 12px; padding: 20px 14px; margin-bottom: 28px; }
+  .stat-num { font-size: 1.7rem; }
+  .stat-label { font-size: 0.78rem; }
+  .stat-icon { width: 36px; height: 36px; }
+  .grid { grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: 20px; }
+  .name { font-size: 0.9rem; }
+  .overview { -webkit-line-clamp: 3; font-size: 0.76rem; }
+  .wl-remove, .wl-watched, .wl-unwatch { top: 10px; right: 10px; width: 30px; height: 30px; }
+  .wl-watched, .wl-unwatch { font-size: 0.95rem; }
 }
 @media (min-width: 1280px) {
-  .top-sticky {
-    margin: 0 -40px;
-    padding: 0 40px 8px;
-  }
-}
-.tab {
-  flex: 1 1 0;
-  min-width: 0;
-  background: transparent;
-  border: none;
-  color: var(--text-dim);
-  padding: 9px 2px;
-  border-radius: 999px;
-  font-size: 0.75rem;
-  font-weight: 600;
-  cursor: pointer;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  text-align: center;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 5px;
-  transition:
-    color 0.2s ease,
-    background 0.2s ease;
-  font-family: inherit;
-  outline: none !important;
-}
-.tab svg {
-  flex-shrink: 0;
-  opacity: 0.9;
-}
-.tab span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.tab:hover {
-  color: var(--text);
-  background: rgba(255, 255, 255, 0.06);
-}
-.tab.active {
-  background: var(--brand-grad);
-  color: #fff;
-  font-weight: 700;
-}
-.pane {
-  display: none;
-}
-.pane.active {
-  display: block;
-  animation: fadeIn 0.3s ease;
-}
-@keyframes fadeIn {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-.grid {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-.item {
-  position: relative;
-  display: flex;
-  gap: 14px;
-  background: var(--panel-grad);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  padding: 12px;
-  transition:
-    transform 0.2s ease,
-    border-color 0.2s,
-    box-shadow 0.2s;
-  animation: fadeInUp 0.4s ease backwards;
-  overflow: hidden;
-  box-shadow:
-    0 4px 20px var(--shadow-card),
-    inset 0 1px 0 var(--hover-bg);
-  text-decoration: none;
-  color: inherit;
-}
-.item.clickable {
-  cursor: pointer;
-}
-.item.clickable:active {
-  transform: scale(0.985);
-  background: var(--surface-2);
-}
-@keyframes fadeInUp {
-  from {
-    opacity: 0;
-    transform: translateY(10px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-.item:hover {
-  border-color: rgba(167, 139, 250, 0.25);
-  box-shadow:
-    0 8px 28px rgba(0, 0, 0, 0.45),
-    0 0 0 1px rgba(167, 139, 250, 0.08);
-  transform: translateY(-1px);
-}
-.wl-remove,
-.wl-drop,
-.wl-watched,
-.wl-unwatch {
-  position: absolute;
-  top: 6px;
-  right: 6px;
-  width: 26px;
-  height: 26px;
-  border-radius: 50%;
-  background: rgba(0, 0, 0, 0.65);
-  line-height: 1;
-  cursor: pointer;
-  z-index: 3;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-  font-family: inherit;
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-  transition:
-    background 0.15s,
-    transform 0.15s,
-    opacity 0.15s,
-    color 0.15s;
-}
-.wl-remove {
-  color: #fff;
-  border: 1px solid rgba(255, 255, 255, 0.22);
-  font-size: 1rem;
-  font-weight: 400;
-  opacity: 0.88;
-}
-.wl-remove:hover {
-  background: rgba(200, 70, 80, 0.92);
-  opacity: 1;
-  transform: scale(1.06);
-}
-.wl-drop {
-  position: absolute;
-  top: 6px;
-  right: 6px;
-  width: 30px;
-  height: 30px;
-  border-radius: 50%;
-  background: rgba(0, 0, 0, 0.72);
-  color: #ff8a8a;
-  border: 1px solid rgba(255, 120, 120, 0.55);
-  font-size: 0.85rem;
-  opacity: 1;
-  z-index: 5;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-  cursor: pointer;
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-}
-.wl-drop:hover {
-  background: rgba(200, 70, 80, 0.95);
-  color: #fff;
-  transform: scale(1.08);
-}
-.wl-drop svg {
-  display: block;
-  pointer-events: none;
-}
-.wl-drop:disabled {
-  opacity: 0.5;
-  cursor: wait;
-}
-.cal-action-row {
-  display: flex;
-  gap: 8px;
-  margin-top: 8px;
-  align-self: flex-start;
-  flex-wrap: wrap;
-}
-.cal-open-btn,
-.cal-drop-btn {
-  align-self: auto;
-  margin-top: 0;
-  margin-left: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 5px 12px;
-  border-radius: 8px;
-  font-size: 0.74rem;
-  font-weight: 600;
-  cursor: pointer;
-  font-family: inherit;
-  transition: all 0.15s;
-  white-space: nowrap;
-}
-.cal-open-btn {
-  background: rgba(90, 120, 180, 0.14);
-  border: 1px solid rgba(140, 170, 220, 0.35);
-  color: #9db5e0;
-}
-.cal-open-btn:hover {
-  background: rgba(120, 150, 210, 0.28);
-  color: #c2d4f0;
-  border-color: rgba(140, 170, 220, 0.65);
-}
-.cal-open-btn svg {
-  flex-shrink: 0;
-  pointer-events: none;
-}
-.cal-open-btn.wl-added {
-  background: rgba(74, 222, 128, 0.14) !important;
-  border-color: rgba(74, 222, 128, 0.38) !important;
-  color: #4ade80 !important;
-  cursor: default !important;
-}
-.cal-drop-btn {
-  background: rgba(224, 85, 96, 0.14);
-  border: 1px solid rgba(224, 85, 96, 0.4);
-  color: #ff8a8a;
-}
-.cal-drop-btn:hover {
-  background: rgba(224, 85, 96, 0.3);
-  color: #ffb3b3;
-  border-color: rgba(224, 85, 96, 0.65);
-}
-.cal-drop-btn svg {
-  flex-shrink: 0;
-  pointer-events: none;
-}
-.cal-drop-btn:disabled {
-  opacity: 0.5;
-  cursor: wait;
-}
-.wl-watched {
-  color: #4ade80;
-  border: 1px solid rgba(74, 222, 128, 0.45);
-  font-size: 0.85rem;
-  font-weight: 700;
-  opacity: 0.9;
-}
-.wl-watched:hover {
-  background: rgba(74, 222, 128, 0.95);
-  color: #000;
-  opacity: 1;
-  transform: scale(1.06);
-}
-.wl-unwatch {
-  color: #ffb84d;
-  border: 1px solid rgba(255, 184, 77, 0.45);
-  font-size: 0.9rem;
-  font-weight: 700;
-  opacity: 0.9;
-}
-.wl-unwatch:hover {
-  background: rgba(255, 184, 77, 0.95);
-  color: #000;
-  opacity: 1;
-  transform: scale(1.06);
-}
-.wl-remove:disabled,
-.wl-watched:disabled,
-.wl-unwatch:disabled {
-  opacity: 0.5;
-  cursor: wait;
-}
-.poster {
-  width: 76px;
-  height: 114px;
-  border-radius: 10px;
-  overflow: hidden;
-  flex-shrink: 0;
-  background: var(--surface-2);
-  position: relative;
-}
-.poster img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-}
-.poster-ph {
-  width: 100%;
-  height: 100%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 1.8rem;
-  background: var(--soft-card-grad);
-  color: var(--text-dim);
-}
-.poster-play {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  width: 46px;
-  height: 46px;
-  border-radius: 50%;
-  background: rgba(8, 10, 18, 0.72);
-  color: #fff;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  opacity: 1;
-  transition:
-    opacity 0.2s ease,
-    transform 0.2s ease,
-    background 0.15s ease,
-    box-shadow 0.2s ease;
-  text-decoration: none;
-  border: 1px solid rgba(255, 255, 255, 0.24);
-  z-index: 4;
-  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.55);
-  -webkit-tap-highlight-color: transparent;
-}
-.poster-play svg {
-  display: block;
-  margin-left: 2px;
-  pointer-events: none;
-  width: 24px;
-  height: 24px;
-}
-.item:hover .poster-play {
-  opacity: 1;
-}
-.poster-play:hover {
-  background: linear-gradient(145deg, #8b5cf6, #a78bfa);
-  transform: translate(-50%, -50%) scale(1.1);
-  color: #fff;
-  border-color: rgba(255, 255, 255, 0.4);
-  box-shadow: 0 8px 28px rgba(139, 92, 246, 0.6);
-}
-.poster-play:active {
-  transform: translate(-50%, -50%) scale(0.94);
-}
-.info {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 4px;
-}
-.name-row {
-  display: flex;
-  align-items: baseline;
-  gap: 0;
-  overflow: hidden;
-  white-space: nowrap;
-  line-height: 1.3;
-  letter-spacing: -0.2px;
-}
-.name {
-  flex: 0 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 1rem;
-  font-weight: 700;
-  color: var(--text);
-}
-.tag {
-  flex: 0 0 auto;
-  font-size: inherit;
-  font-weight: inherit;
-  letter-spacing: 0;
-  white-space: nowrap;
-}
-.tag.upcoming {
-  color: #ffb84d;
-}
-.overview {
-  font-size: 0.8rem;
-  color: var(--text-dim);
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  line-height: 1.45;
-  margin-top: 4px;
-}
-.meta {
-  font-size: 0.8rem;
-  color: var(--text-dim);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.meta.dim {
-  color: #7a8394;
-  font-size: 0.78rem;
-  margin-top: 2px;
-}
-.bar {
-  height: 3px;
-  background: rgba(255, 255, 255, 0.06);
-  border-radius: 99px;
-  overflow: hidden;
-  margin-top: 8px;
-}
-.bar-fill {
-  height: 100%;
-  background: linear-gradient(90deg, #7c3aed, #c4b5fd);
-  border-radius: 99px;
-  box-shadow: 0 0 10px rgba(167, 139, 250, 0.5);
-}
-.search-bar {
-  margin-bottom: 16px;
-}
-.search-input {
-  width: 100%;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  color: var(--text);
-  padding: 12px 16px;
-  border-radius: 12px;
-  font-size: 0.95rem;
-  font-family: inherit;
-  outline: none;
-  transition:
-    border-color 0.15s,
-    background 0.15s;
-  -webkit-appearance: none;
-  appearance: none;
-}
-.search-input:focus {
-  border-color: var(--accent);
-  background: var(--surface-2);
-  box-shadow: 0 0 0 3px var(--accent-soft);
-}
-.search-input::placeholder {
-  color: var(--text-mute);
-}
-.trending-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 0.88rem;
-  font-weight: 700;
-  color: var(--text);
-  margin: 4px 0 14px;
-  padding-left: 2px;
-  letter-spacing: 0.2px;
-}
-.trending-head::before {
-  content: "";
-  width: 3px;
-  height: 14px;
-  border-radius: 2px;
-  background: linear-gradient(180deg, #f97316, #ef4444);
-}
-.home-section {
-  margin-bottom: 24px;
-}
-.home-section-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-.home-section-title {
-  font-size: 1rem;
-  font-weight: 700;
-  letter-spacing: 0.2px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.home-section-title::before {
-  content: "";
-  width: 3px;
-  height: 16px;
-  border-radius: 2px;
-  background: linear-gradient(180deg, #a78bfa, #7c3aed);
-}
-.home-more-btn {
-  background: transparent;
-  border: none;
-  color: var(--text-dim);
-  font-size: 0.82rem;
-  font-weight: 600;
-  cursor: pointer;
-  font-family: inherit;
-  padding: 6px 10px;
-  border-radius: 8px;
-  transition: all 0.15s;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-.home-more-btn:hover {
-  color: var(--accent-2);
-  background: rgba(167, 139, 250, 0.1);
-}
-.home-more-btn svg {
-  transition: transform 0.2s ease;
-}
-.platform-section {
-  margin-bottom: 24px;
-}
-.platform-rows {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-.platform-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-}
-.platform-cards {
-  display: flex;
-  gap: 12px;
-  overflow-x: auto;
-  padding: 4px 2px 10px;
-  -webkit-overflow-scrolling: touch;
-  scrollbar-width: none;
-  flex: 1;
-  min-width: 0;
-  scroll-snap-type: x proximity;
-}
-.platform-cards::-webkit-scrollbar {
-  display: none;
-}
-.platform-card {
-  flex: 0 0 auto;
-  width: min(46vw, 190px);
-  height: 92px;
-  border: none;
-  border-radius: 18px;
-  background: var(--platform-card-grad);
-  box-shadow:
-    0 10px 28px var(--shadow-card),
-    inset 0 1px 0 var(--hover-bg-strong);
-  display: flex;
-  align-items: stretch;
-  padding: 0;
-  cursor: pointer;
-  overflow: hidden;
-  position: relative;
-  scroll-snap-align: start;
-  transition: transform 0.18s ease, box-shadow 0.18s ease;
-  -webkit-tap-highlight-color: transparent;
-  font: inherit;
-  color: var(--platform-card-text);
-}
-.platform-card:hover {
-  transform: translateY(-3px);
-  box-shadow:
-    0 16px 36px var(--platform-shadow-hover),
-    inset 0 1px 0 var(--hover-bg-strong);
-}
-.platform-card:active {
-  transform: scale(0.985);
-}
-.platform-card-left {
-  flex: 0 0 42%;
-  max-width: 42%;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 0;
-  padding: 8px 4px 8px 8px;
-  z-index: 2;
-  position: relative;
-}
-.platform-card-logo {
-  width: 46px;
-  height: 46px;
-  border-radius: 0;
-  object-fit: contain;
-  object-position: center;
-  flex-shrink: 0;
-  box-shadow: none;
-  background: transparent;
-  padding: 0;
-  box-sizing: border-box;
-  display: block;
-}
-.platform-card-name {
-  display: none;
-}
-.platform-card-right {
-  flex: 1;
-  position: relative;
-  min-width: 0;
-  overflow: hidden;
-}
-.platform-card-posters {
-  position: absolute;
-  right: -6px;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 112px;
-  height: 82px;
-}
-.platform-card-poster {
-  position: absolute;
-  width: 40px;
-  height: 60px;
-  border-radius: 8px;
-  object-fit: cover;
-  box-shadow: 0 5px 12px rgba(0, 0, 0, 0.28);
-  border: 1.5px solid rgba(255, 255, 255, 0.95);
-  background: #c5c9d0;
-  top: 50%;
-  margin-top: -30px;
-}
-.platform-card-poster-ph {
-  background: linear-gradient(145deg, #d0d4db 0%, #b8bec8 100%);
-}
-.platform-card-poster.p0 {
-  right: 6px;
-  z-index: 5;
-  transform: rotate(8deg);
-}
-.platform-card-poster.p1 {
-  right: 26px;
-  z-index: 4;
-  transform: rotate(3deg);
-}
-.platform-card-poster.p2 {
-  right: 46px;
-  z-index: 3;
-  transform: rotate(-4deg);
-}
-.platform-card-poster.p3 {
-  right: 66px;
-  z-index: 2;
-  transform: rotate(-10deg);
-}
-@media (min-width: 768px) {
-  .platform-card {
-    width: 340px;
-    height: 128px;
-    border-radius: 24px;
-  }
-  .platform-card-logo {
-    width: 72px;
-    height: 72px;
-    border-radius: 0;
-    padding: 0;
-  }
-  .platform-card-posters {
-    width: 180px;
-    height: 116px;
-  }
-  .platform-card-poster {
-    width: 64px;
-    height: 96px;
-    margin-top: -48px;
-    border-radius: 11px;
-  }
-  .platform-card-poster.p0 { right: 10px; }
-  .platform-card-poster.p1 { right: 40px; }
-  .platform-card-poster.p2 { right: 70px; }
-  .platform-card-poster.p3 { right: 100px; }
-  .platform-cards {
-    gap: 14px;
-  }
-}
-.h-scroll-wrap {
-  margin: 0 -16px;
-  padding: 0 16px;
-}
-.h-scroll {
-  display: flex;
-  gap: 12px;
-  overflow-x: auto;
-  padding: 4px 0 12px;
-  -webkit-overflow-scrolling: touch;
-  scrollbar-width: none;
-  scroll-snap-type: x proximity;
-}
-.h-scroll::-webkit-scrollbar {
-  display: none;
-}
-.h-scroll-empty {
-  padding: 30px 0;
-  text-align: center;
-}
-.h-scroll .item {
-  flex: 0 0 auto;
-  width: 132px;
-  display: flex;
-  flex-direction: column;
-  gap: 0;
-  padding: 0;
-  border-radius: 12px;
-  background: transparent;
-  border: none;
-  overflow: visible;
-  animation: none;
-  box-shadow: none;
-  scroll-snap-align: start;
-  transform: none;
-}
-.h-scroll .item:hover {
-  background: transparent;
-  border: none;
-  box-shadow: none;
-  transform: none;
-}
-.h-scroll .item.clickable:active {
-  transform: scale(0.96);
-  background: transparent;
-}
-.h-scroll .item .poster {
-  width: 100%;
-  height: auto;
-  aspect-ratio: 2/3;
-  border-radius: 12px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
-  transition:
-    transform 0.25s ease,
-    box-shadow 0.25s ease;
-}
-.h-scroll .item:hover .poster {
-  transform: translateY(-3px);
-  box-shadow:
-    0 12px 28px rgba(91, 124, 250, 0.3),
-    0 4px 16px rgba(0, 0, 0, 0.6);
-}
-.h-scroll .item .info {
-  display: block;
-  padding: 8px 2px 0;
-  flex: none;
-  justify-content: flex-start;
-}
-.h-scroll .item .name {
-  font-size: 0.82rem;
-  line-height: 1.3;
-}
-.h-scroll .item .overview {
-  display: none;
-}
-.h-scroll .item .meta {
-  font-size: 0.72rem;
-  margin-top: 2px;
-  color: var(--text-dim);
-}
-.h-scroll .item .meta.dim {
-  font-size: 0.7rem;
-}
-.h-scroll .item .bar {
-  margin-top: 6px;
-}
-.h-scroll .item .wl-watched,
-.h-scroll .item .wl-remove,
-.h-scroll .item .wl-drop,
-.h-scroll .item .wl-unwatch {
-  top: 6px;
-  right: 6px;
-  width: 24px;
-  height: 24px;
-  font-size: 0.75rem;
-}
-.h-scroll .item .cal-action-row,
-.h-scroll .item .cal-open-btn {
-  display: none;
-}
-.h-scroll .item .poster-play {
-  width: 46px;
-  height: 46px;
-  opacity: 1;
-}
-.h-scroll .item .poster-play svg {
-  width: 24px;
-  height: 24px;
-}
-@media (min-width: 768px) {
-  .h-scroll-wrap {
-    margin: 0;
-    padding: 0;
-  }
-  .h-scroll .item {
-    width: 168px;
-  }
-}
-@media (min-width: 1024px) {
-  .h-scroll .item {
-    width: 188px;
-  }
-}
-@media (min-width: 1280px) {
-  .h-scroll .item {
-    width: 200px;
-  }
+  .container { width: 100%; padding: 0 40px 110px; }
+  .grid { grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 22px; }
+  .hero-name { font-size: 1.85rem; }
 }
 @media (min-width: 1600px) {
-  .h-scroll .item {
-    width: 214px;
-  }
+  .container { width: 100%; }
+  .grid { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 24px; }
 }
-@media (min-width: 1920px) {
-  .container {
-    width: 100%;
-    padding-left: 48px;
-    padding-right: 48px;
-  }
-  .h-scroll .item {
-    width: 228px;
-  }
-}
-@media (min-width: 2200px) {
-  .h-scroll .item {
-    width: 240px;
-  }
-}
-.list-modal {
-  position: fixed;
-  inset: 0;
-  z-index: 150;
-  display: none;
-}
-.list-modal.open {
-  display: block;
-}
-.list-modal-backdrop {
-  position: absolute;
-  inset: 0;
-  background: rgba(2, 4, 8, 0.8);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-  animation: fadeIn 0.2s ease;
-}
-.list-modal-panel {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  width: min(94vw, 1000px);
-  max-height: 88vh;
-  display: flex;
-  flex-direction: column;
-  background: var(--panel-grad);
-  border: 1px solid var(--border-strong);
-  border-radius: 18px;
-  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.85);
-  overflow: hidden;
-  animation: modalIn 0.25s cubic-bezier(0.2, 0.9, 0.3, 1);
-}
-.list-modal-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 16px 20px;
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
-}
-.list-modal-title {
-  font-size: 1.05rem;
-  font-weight: 700;
-}
-.list-modal-close {
-  width: 40px;
-  height: 40px;
-  border-radius: 50%;
-  border: 1px solid var(--chip-border);
-  background: var(--chip-bg);
-  color: var(--chip-fg);
-  font-size: 1.2rem;
-  cursor: pointer;
-  font-family: inherit;
-  line-height: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.15s;
-}
-.list-modal-close:hover {
-  color: #fff;
-  border-color: var(--border-strong);
-  background: rgba(255, 255, 255, 0.08);
-}
-.list-modal-body {
-  overflow-y: auto;
-  padding: 16px 20px 24px;
-  -webkit-overflow-scrolling: touch;
-}
-.douban-filter-tabs {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-bottom: 16px;
-}
-.douban-filter-tab {
-  background: var(--chip-bg);
-  border: 1px solid var(--chip-border);
-  color: var(--chip-fg);
-  padding: 7px 16px;
-  border-radius: 999px;
-  font-size: 0.82rem;
-  font-weight: 600;
-  cursor: pointer;
-  font-family: inherit;
-  transition: all 0.15s;
-  -webkit-tap-highlight-color: transparent;
-}
-.douban-filter-tab:hover {
-  color: var(--chip-fg-hover);
-  border-color: var(--chip-border);
-  background: var(--chip-bg-hover);
-}
-.douban-filter-tab.active {
-  background: var(--brand-grad);
-  color: #fff;
-  border-color: transparent;
-  box-shadow: 0 4px 14px rgba(167, 139, 250, 0.3);
-}
-.theater-home-tabs {
-  display: flex;
-  gap: 8px;
-  overflow-x: auto;
-  padding: 0 16px 12px;
-  margin: 0 -16px;
-  scrollbar-width: none;
-  -webkit-overflow-scrolling: touch;
-  scroll-snap-type: x proximity;
-}
-.theater-home-tabs::-webkit-scrollbar {
-  display: none;
-}
-.theater-filter-tab {
-  flex-shrink: 0;
-  background: var(--chip-bg);
-  border: 1px solid var(--chip-border);
-  color: var(--chip-fg);
-  padding: 6px 14px;
-  border-radius: 999px;
-  font-size: 0.78rem;
-  font-weight: 600;
-  cursor: pointer;
-  font-family: inherit;
-  transition: all 0.15s;
-  -webkit-tap-highlight-color: transparent;
-  scroll-snap-align: start;
-}
-.theater-filter-tab:hover {
-  color: var(--chip-fg-hover);
-  border-color: var(--chip-border);
-  background: var(--chip-bg-hover);
-}
-.theater-filter-tab.active {
-  background: var(--brand-grad);
-  color: #fff;
-  border-color: transparent;
-  box-shadow: 0 4px 14px rgba(167, 139, 250, 0.3);
-}
-@media (min-width: 768px) {
-  .theater-home-tabs {
-    margin: 0;
-    padding-left: 0;
-    padding-right: 0;
-  }
-}
+.day { margin-bottom: 26px; }
+.day-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; padding-left: 2px; }
+.day-num { font-size: 1.8rem; font-weight: 800; color: #7d9dd4; line-height: 1; letter-spacing: -1px; }
+.day-mon { font-size: 0.75rem; color: var(--text-dim); }
+.day-wd { font-size: 0.85rem; font-weight: 600; color: var(--text); }
+.today { background: var(--accent); color: #fff; font-size: 0.68rem; padding: 3px 9px; border-radius: 999px; font-weight: 700; margin-left: auto; }
+.empty { text-align: center; padding: 80px 20px; color: var(--text-dim); }
+.empty p { margin-top: 14px; font-size: 0.92rem; }
+@media (min-width: 700px) { .empty { padding: 120px 20px; } }
+.modal { position: fixed; inset: 0; z-index: 220; display: none; }
+.modal.open { display: block; }
+.modal-backdrop { position: absolute; inset: 0; background: var(--overlay-strong); backdrop-filter: blur(12px) saturate(1.1); -webkit-backdrop-filter: blur(12px) saturate(1.1); animation: fadeIn 0.2s ease; }
+.modal-panel { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 12px; padding-top: calc(12px + env(safe-area-inset-top)); padding-bottom: calc(12px + env(safe-area-inset-bottom)); pointer-events: none; }
+.modal-shell { pointer-events: auto; position: relative; display: flex; flex-direction: column; width: 100%; max-width: min(1120px, 100%); max-height: 100%; background: var(--modal-bg); border: 1px solid var(--border); border-radius: 18px; box-shadow: 0 40px 100px rgba(0, 0, 0, 0.85); animation: modalIn 0.28s cubic-bezier(0.2, 0.9, 0.3, 1); overflow: hidden; }
+.modal-body { position: relative; width: 100%; flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; background: var(--modal-bg); -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+.modal-close { position: absolute; top: 12px; right: 12px; z-index: 5; width: 40px; height: 40px; border-radius: 50%; background: rgba(13, 16, 23, 0.86); border: 1px solid rgba(255, 255, 255, 0.18); color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); transition: background 0.15s, transform 0.15s, border-color 0.15s; padding: 0; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.55); touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+.modal-close::before { content: ""; position: absolute; inset: -8px; border-radius: 50%; }
+.modal-close:hover { background: rgba(30, 38, 58, 0.95); transform: scale(1.05); border-color: rgba(255, 255, 255, 0.28); }
+.modal-close:active { transform: scale(0.94); background: rgba(50, 60, 88, 0.95); }
 @media (max-width: 599px) {
-  .list-modal-panel {
-    top: auto;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    transform: none;
-    width: 100%;
-    max-height: 92vh;
-    border-radius: 18px 18px 0 0;
-  }
-}
-.show-cal-modal {
-  position: fixed;
-  inset: 0;
-  z-index: 240;
-  display: none;
-}
-.show-cal-modal.open {
-  display: block;
-}
-.show-cal-backdrop {
-  position: absolute;
-  inset: 0;
-  background: var(--overlay);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-  animation: fadeIn 0.2s ease;
-}
-.show-cal-panel {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  width: min(92vw, 440px);
-  max-height: 90vh;
-  overflow-y: auto;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 16px;
-  padding: 20px;
-  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.8);
-  animation: modalIn 0.25s cubic-bezier(0.2, 0.9, 0.3, 1);
-}
-.show-cal-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 8px;
-}
-.show-cal-name {
-  font-size: 0.95rem;
-  font-weight: 700;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  flex: 1;
-  min-width: 0;
-}
-.show-cal-close {
-  width: 40px;
-  height: 40px;
-  flex-shrink: 0;
-  background: var(--chip-bg);
-  border: 1px solid var(--chip-border);
-  color: var(--chip-fg);
-  border-radius: 50%;
-  cursor: pointer;
-  font-size: 1.2rem;
-  line-height: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.15s;
-  font-family: inherit;
-}
-.show-cal-close:hover {
-  color: var(--chip-fg-hover);
-  border-color: var(--chip-border);
-  background: var(--chip-bg-hover);
-}
-.show-cal-info {
-  font-size: 0.72rem;
-  color: var(--text-dim);
-  margin-bottom: 12px;
-  line-height: 1.4;
-}
-.show-cal-nav {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 12px;
-  font-size: 0.88rem;
-  color: var(--text);
-  font-weight: 600;
-}
-.show-cal-nav button {
-  width: 30px;
-  height: 30px;
-  background: var(--chip-bg);
-  border: 1px solid var(--chip-border);
-  color: var(--chip-fg);
-  border-radius: 8px;
-  cursor: pointer;
-  font-size: 1rem;
-  line-height: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.15s;
-  font-family: inherit;
-}
-.show-cal-nav button:hover {
-  color: var(--chip-fg-hover);
-  border-color: var(--chip-border);
-  background: var(--chip-bg-hover);
-}
-.show-cal-weekdays {
-  display: grid;
-  grid-template-columns: repeat(7, 1fr);
-  text-align: center;
-  font-size: 0.7rem;
-  color: var(--text-dim);
-  margin-bottom: 6px;
-}
-.show-cal-grid {
-  display: grid;
-  grid-template-columns: repeat(7, 1fr);
-  gap: 4px;
-}
-.sc-day {
-  position: relative;
-  aspect-ratio: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 8px;
-  font-size: 0.8rem;
-  color: var(--text-dim);
-  cursor: default;
-  border: 1px solid transparent;
-  transition:
-    background 0.15s,
-    border-color 0.15s;
-}
-.sc-day.sc-has {
-  cursor: pointer;
-  font-weight: 700;
-}
-.sc-day.sc-past {
-  background: var(--cal-soft);
-  color: var(--cal-accent-2);
-  border-color: rgba(120, 150, 210, 0.5);
-}
-.sc-day.sc-past:hover {
-  background: var(--cal-soft-border);
-  color: #d0dcf0;
-}
-.sc-day.sc-today-day {
-  background: var(--cal-accent);
-  color: #fff;
-  border-color: #7d9dd4;
-  box-shadow: 0 0 14px rgba(125, 157, 212, 0.7);
-}
-.sc-day.sc-today-day:hover {
-  background: #5b7fc4;
-}
-.sc-day.sc-future {
-  background: rgba(255, 184, 77, 0.18);
-  color: #ffd693;
-  border-color: rgba(255, 184, 77, 0.55);
-}
-.sc-day.sc-future:hover {
-  background: rgba(255, 184, 77, 0.4);
-  color: #fff0d0;
-}
-.sc-day.sc-active {
-  outline: 2px solid #fff;
-  outline-offset: -2px;
-}
-.sc-day.sc-empty {
-  visibility: hidden;
-}
-.sc-badge {
-  position: absolute;
-  top: 2px;
-  right: 2px;
-  min-width: 14px;
-  height: 14px;
-  padding: 0 3px;
-  border-radius: 7px;
-  background: var(--cal-accent);
-  color: #fff;
-  font-size: 0.6rem;
-  font-weight: 700;
-  line-height: 14px;
-  text-align: center;
-}
-.sc-day.sc-future .sc-badge {
-  background: #d99a3a;
-}
-.show-cal-legend {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-  justify-content: center;
-  margin-top: 14px;
-  font-size: 0.7rem;
-  color: var(--text-dim);
-}
-.legend-item {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-}
-.legend-dot {
-  display: inline-block;
-  width: 10px;
-  height: 10px;
-  border-radius: 3px;
-}
-.legend-past {
-  background: var(--cal-soft-border);
-  border: 1px solid rgba(140, 170, 220, 0.8);
-}
-.legend-today {
-  background: var(--cal-accent);
-  border: 1px solid #7d9dd4;
-}
-.legend-future {
-  background: rgba(255, 184, 77, 0.4);
-  border: 1px solid rgba(255, 184, 77, 0.8);
-}
-.show-cal-detail {
-  margin-top: 14px;
-  border-top: 1px solid var(--border);
-  padding-top: 12px;
-  min-height: 20px;
-}
-.sc-ep {
-  display: flex;
-  gap: 10px;
-  align-items: baseline;
-  padding: 6px 0;
-  font-size: 0.82rem;
-}
-.sc-ep-tag {
-  font-family: ui-monospace, Menlo, monospace;
-  font-size: 0.72rem;
-  font-weight: 700;
-  color: #7d9dd4;
-  flex-shrink: 0;
-}
-.sc-ep-title {
-  color: var(--text);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.ext-rating {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 10px 4px 8px;
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.06);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  line-height: 1;
-  font-size: 0.82rem;
-  color: var(--text);
-  white-space: nowrap;
-  text-decoration: none;
-  transition:
-    background 0.15s,
-    border-color 0.15s,
-    transform 0.12s;
-}
-.ext-rating:hover {
-  background: rgba(255, 255, 255, 0.1);
-  border-color: rgba(255, 255, 255, 0.16);
-}
-.ext-logo {
-  display: block;
-  flex-shrink: 0;
-  border-radius: 2px;
-}
-.ext-score {
-  font-weight: 800;
-  letter-spacing: 0.2px;
-  font-variant-numeric: tabular-nums;
-}
-.ext-rating.ext-imdb {
-  background: rgba(245, 197, 24, 0.14);
-  border-color: rgba(245, 197, 24, 0.35);
-  color: #f5c518;
-}
-.ext-rating.ext-imdb .ext-score {
-  color: #f5c518;
-}
-.ext-rating.ext-rt {
-  background: rgba(250, 50, 10, 0.12);
-  border-color: rgba(250, 50, 10, 0.32);
-  color: #ff7666;
-}
-.ext-rating.ext-rt .ext-score {
-  color: #ff7666;
-}
-.ext-rating.ext-mc {
-  background: rgba(255, 255, 255, 0.05);
-  border-color: rgba(255, 255, 255, 0.12);
-  color: var(--text);
-}
-.ext-rating.ext-trakt {
-  background: rgba(237, 28, 36, 0.12);
-  border-color: rgba(237, 28, 36, 0.32);
-  color: #ff6b70;
-}
-.ext-rating.ext-trakt .ext-score {
-  color: #ff6b70;
-}
-.ext-rating.ext-tmdb {
-  background: rgba(1, 180, 228, 0.12);
-  border-color: rgba(1, 180, 228, 0.32);
-  color: #4dd0e1;
-}
-.ext-rating.ext-tmdb .ext-score {
-  color: #4dd0e1;
-}
-.ext-rating.ext-douban {
-  background: rgba(46, 150, 61, 0.12);
-  border-color: rgba(46, 150, 61, 0.38);
-  color: #4ecb71;
-}
-.ext-rating.ext-douban:hover {
-  background: rgba(46, 150, 61, 0.22);
-  border-color: rgba(46, 150, 61, 0.6);
-  color: #6fe089;
-}
-.detail-ext-ratings {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  justify-content: center;
-  margin-top: 8px;
-  align-items: center;
-}
-@media (min-width: 600px) {
-  .container {
-    padding-left: 20px;
-    padding-right: 20px;
-  }
-  .grid {
-    display: grid;
-    grid-template-columns: repeat(2, 1fr);
-    gap: 12px;
-  }
-  .item {
-    border-radius: 14px;
-  }
-  .poster {
-    width: 72px;
-    height: 108px;
-  }
-}
-@media (min-width: 768px) {
-  .container {
-    width: 100%;
-    padding: 0 28px calc(88px + env(safe-area-inset-bottom));
-  }
-  .hero {
-    padding: 28px 0 22px;
-    gap: 12px;
-  }
-  .hero-avatar {
-    width: 56px;
-    height: 56px;
-  }
-  .hero-name {
-    font-size: 1.55rem;
-  }
-  .stats {
-    gap: 10px;
-    padding: 18px 12px;
-    margin-bottom: 24px;
-  }
-  .stat-num {
-    font-size: 1.5rem;
-  }
-  .stat-label {
-    font-size: 0.76rem;
-  }
-  .stat-icon {
-    width: 34px;
-    height: 34px;
-    border-radius: 10px;
-  }
-  .tabs {
-    position: relative;
-    overflow-x: auto;
-    scrollbar-width: none;
-    -webkit-overflow-scrolling: touch;
-    padding-bottom: 2px;
-  }
-  .tabs::-webkit-scrollbar {
-    display: none;
-  }
-  .tab {
-    flex: 0 0 auto;
-    padding: 9px 14px;
-    font-size: 0.87rem;
-  }
-  .grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-    gap: 16px;
-  }
-  .item {
-    display: flex;
-    flex-direction: column;
-    gap: 0;
-    padding: 0;
-    border-radius: 12px;
-    background: transparent;
-    border: none;
-    overflow: visible;
-  }
-  .item:hover {
-    background: transparent;
-    border: none;
-  }
-  .item.clickable:active {
-    transform: none;
-    background: transparent;
-  }
-  .poster {
-    width: 100%;
-    height: auto;
-    aspect-ratio: 2/3;
-    border-radius: 12px;
-    transition:
-      transform 0.25s ease,
-      box-shadow 0.25s ease;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
-  }
-  .item:hover .poster {
-    transform: translateY(-4px);
-    box-shadow:
-      0 12px 32px rgba(91, 124, 250, 0.3),
-      0 4px 16px rgba(0, 0, 0, 0.6);
-  }
-  .info {
-    display: block;
-    padding: 10px 2px 0;
-    flex: none;
-    justify-content: flex-start;
-  }
-  .name {
-    font-size: 0.88rem;
-  }
-  .overview {
-    -webkit-line-clamp: 2;
-    font-size: 0.74rem;
-    margin-top: 4px;
-  }
-  .meta {
-    font-size: 0.76rem;
-    margin-top: 3px;
-  }
-  .meta.dim {
-    font-size: 0.72rem;
-  }
-  .bar {
-    margin-top: 8px;
-  }
-  .wl-remove,
-  .wl-watched,
-  .wl-unwatch {
-    top: 8px;
-    right: 8px;
-    width: 28px;
-    height: 28px;
-  }
-  .day-num {
-    font-size: 1.6rem;
-  }
-}
-@media (min-width: 1024px) {
-  .container {
-    width: 100%;
-    padding: 0 36px 100px;
-  }
-  .hero {
-    padding: 36px 0 26px;
-  }
-  .hero-name {
-    font-size: 1.7rem;
-  }
-  .stats {
-    gap: 12px;
-    padding: 20px 14px;
-    margin-bottom: 28px;
-  }
-  .stat-num {
-    font-size: 1.7rem;
-  }
-  .stat-label {
-    font-size: 0.78rem;
-  }
-  .stat-icon {
-    width: 36px;
-    height: 36px;
-  }
-  .grid {
-    grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
-    gap: 20px;
-  }
-  .name {
-    font-size: 0.9rem;
-  }
-  .overview {
-    -webkit-line-clamp: 3;
-    font-size: 0.76rem;
-  }
-  .wl-remove,
-  .wl-watched,
-  .wl-unwatch {
-    top: 10px;
-    right: 10px;
-    width: 30px;
-    height: 30px;
-  }
-  .wl-watched,
-  .wl-unwatch {
-    font-size: 0.95rem;
-  }
-}
-@media (min-width: 1280px) {
-  .container {
-    width: 100%;
-    padding: 0 40px 110px;
-  }
-  .grid {
-    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
-    gap: 22px;
-  }
-  .hero-name {
-    font-size: 1.85rem;
-  }
-}
-@media (min-width: 1600px) {
-  .container {
-    width: 100%;
-  }
-  .grid {
-    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-    gap: 24px;
-  }
-}
-.day {
-  margin-bottom: 26px;
-}
-.day-head {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 12px;
-  padding-left: 2px;
-}
-.day-num {
-  font-size: 1.8rem;
-  font-weight: 800;
-  color: #7d9dd4;
-  line-height: 1;
-  letter-spacing: -1px;
-}
-.day-mon {
-  font-size: 0.75rem;
-  color: var(--text-dim);
-}
-.day-wd {
-  font-size: 0.85rem;
-  font-weight: 600;
-  color: var(--text);
-}
-.today {
-  background: var(--accent);
-  color: #fff;
-  font-size: 0.68rem;
-  padding: 3px 9px;
-  border-radius: 999px;
-  font-weight: 700;
-  margin-left: auto;
-}
-.empty {
-  text-align: center;
-  padding: 80px 20px;
-  color: var(--text-dim);
-}
-.empty p {
-  margin-top: 14px;
-  font-size: 0.92rem;
-}
+  .modal-panel { padding: 0; align-items: stretch; justify-content: flex-start; }
+  .modal-shell { position: absolute; left: 0; right: 0; top: calc(10px + env(safe-area-inset-top)); bottom: 0; max-width: 100%; max-height: none; width: 100%; border-radius: 16px 16px 0 0; border: none; border-top: 1px solid var(--border); }
+  .modal-body { padding-bottom: env(safe-area-inset-bottom); }
+  .detail-inner { padding-top: 24px; }
+  .detail-body { padding-bottom: calc(28px + env(safe-area-inset-bottom)); }
+  .modal-close { top: 12px; right: 12px; width: 40px; height: 40px; background: rgba(13, 16, 23, 0.94); border-color: rgba(255, 255, 255, 0.24); box-shadow: 0 6px 22px rgba(0, 0, 0, 0.65), inset 0 1px 0 rgba(255, 255, 255, 0.08); }
+  .modal-close::before { inset: -12px; }
+  .modal-close:active { transform: scale(0.9); background: rgba(50, 60, 88, 0.96); }
+}
+@media (min-width: 768px) and (max-width: 1023px) { .modal-shell { max-width: min(880px, 92vw); } }
+@media (min-width: 700px) { .modal-panel { padding: 40px 24px; } }
+@keyframes modalIn { from { opacity: 0; transform: translateY(14px) scale(0.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
+.modal-loading { padding: 100px 20px; text-align: center; }
+.modal-error { padding: 80px 20px; text-align: center; color: #9db5e0; font-size: 0.9rem; }
+.detail-hero { position: relative; overflow: hidden; background: var(--surface); border-radius: 18px 18px 0 0; }
+.detail-bg { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; filter: blur(30px) saturate(1.2) var(--detail-bg-filter, brightness(0.5)); transform: scale(1.15); z-index: 0; }
+.detail-hero::after { content: ""; position: absolute; inset: 0; z-index: 1; background: var(--detail-hero-grad); }
+.detail-inner { position: relative; z-index: 2; display: flex; flex-direction: column; align-items: center; text-align: center; gap: 16px; padding: 24px 20px 24px; }
+.detail-poster { width: min(48vw, 200px); height: auto; aspect-ratio: 2/3; border-radius: 14px; object-fit: cover; flex-shrink: 0; box-shadow: 0 16px 40px var(--shadow-login); margin: 0 auto; }
+.detail-poster-ph { display: flex; align-items: center; justify-content: center; background: var(--surface-2); font-size: 2.8rem; color: var(--text-dim); width: min(48vw, 200px); aspect-ratio: 2/3; }
+.detail-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; align-items: center; width: 100%; }
+.detail-title { font-size: 1.45rem; font-weight: 800; letter-spacing: -0.4px; line-height: 1.25; color: var(--text); }
+.detail-tagline { font-size: 0.85rem; color: var(--text-dim); font-style: italic; }
+.detail-meta { display: flex; flex-wrap: wrap; gap: 10px; font-size: 0.85rem; color: var(--text-dim); justify-content: center; }
+.detail-genres { font-size: 0.82rem; color: var(--text-dim); }
+.detail-overview { font-size: 0.88rem; color: var(--text-dim); line-height: 1.55; margin-top: 4px; display: -webkit-box; -webkit-line-clamp: 5; -webkit-box-orient: vertical; overflow: hidden; text-align: center; }
+.d-status { display: flex; gap: 12px; align-items: center; background: var(--panel-grad); border: 1px solid var(--border); border-radius: 14px; padding: 12px 14px; margin-top: 8px; width: 100%; justify-content: flex-start; }
+.d-status.done { border-color: rgba(74, 222, 128, 0.3); background: rgba(74, 222, 128, 0.06); }
+.d-status-progress { flex-direction: column; align-items: stretch; gap: 10px; }
+.d-status-row { display: flex; gap: 12px; align-items: center; width: 100%; }
+.d-status-icon { width: 32px; height: 32px; border-radius: 50%; background: var(--surface-2); color: var(--text-dim); display: flex; align-items: center; justify-content: center; font-weight: 700; flex-shrink: 0; font-size: 0.95rem; }
+.d-status.done .d-status-icon { background: rgba(74, 222, 128, 0.15); color: #4ade80; }
+.d-status-body { flex: 1; min-width: 0; text-align: left; }
+.d-status-title { font-size: 0.88rem; font-weight: 600; }
+.d-status-sub { font-size: 0.76rem; color: var(--text-dim); margin-top: 2px; }
+.d-action-bar { display: inline-flex; align-items: center; gap: 2px; margin-top: 16px; padding: 4px; background: var(--pill-bg); border: 1px solid var(--pill-border); border-radius: 999px; box-shadow: var(--pill-shadow); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
+.d-act { display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; border-radius: 50%; border: none; background: transparent; color: var(--pill-fg); cursor: pointer; padding: 0; font-family: inherit; transition: background 0.18s ease, color 0.18s ease, transform 0.12s ease, box-shadow 0.18s ease; -webkit-tap-highlight-color: transparent; text-decoration: none; flex-shrink: 0; position: relative; }
+.d-act svg { display: block; pointer-events: none; }
+.d-act:hover { background: var(--pill-act-hover); color: #fff; }
+.d-act:active { transform: scale(0.9); }
+.d-act:disabled { opacity: 0.5; cursor: default; pointer-events: none; }
+.d-act-watched.active { background: linear-gradient(145deg, #8b5cf6 0%, #a78bfa 55%, #c4b5fd 100%); color: #fff; box-shadow: 0 4px 16px rgba(139, 92, 246, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.25); }
+.d-act-watched.active:hover { filter: brightness(1.1); color: #fff; }
+.d-act-wl.active { color: #c4b5fd; background: rgba(167, 139, 250, 0.12); }
+.d-act-wl.active:hover { background: rgba(167, 139, 250, 0.2); color: var(--accent); }
+.d-act-play { color: var(--pill-fg); }
+.d-act-play:hover { background: rgba(167, 139, 250, 0.15); color: var(--accent); }
+.detail-body { padding: 20px 22px 24px; }
+.d-section { margin-top: 8px; margin-bottom: 26px; }
+.d-section:last-child { margin-bottom: 0; }
+.d-section-title { font-size: 1rem; font-weight: 700; letter-spacing: 0.2px; margin-bottom: 14px; color: var(--text); display: flex; align-items: center; gap: 8px; }
+.d-section-title::before { content: ""; width: 3px; height: 16px; border-radius: 2px; background: #7d9dd4; }
+.cast-scroll { display: flex; gap: 14px; overflow-x: auto; padding-bottom: 8px; scrollbar-width: none; }
+.cast-scroll::-webkit-scrollbar { display: none; }
+.cast { flex-shrink: 0; width: 84px; text-align: center; }
+.cast-img { width: 84px; height: 84px; border-radius: 50%; object-fit: cover; background: var(--surface-2); }
+.cast-ph { display: flex; align-items: center; justify-content: center; color: var(--text-dim); font-size: 1.6rem; font-weight: 600; background: var(--soft-card-grad); }
+.cast-name { font-size: 0.75rem; font-weight: 600; margin-top: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cast-role { font-size: 0.68rem; color: var(--text-dim); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.seasons { display: flex; flex-direction: column; gap: 8px; }
+.season-item { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; transition: border-color 0.15s; }
+.season-item.open { border-color: var(--scrollbar); }
+.season-head { width: 100%; background: none; border: none; color: inherit; display: flex; align-items: center; gap: 10px; padding: 14px 16px; cursor: pointer; font-family: inherit; text-align: left; transition: background 0.15s; }
+.season-head:hover { background: var(--surface-2); }
+.season-title { font-weight: 600; font-size: 0.9rem; flex: 1; }
+.season-meta { font-size: 0.76rem; color: var(--text-dim); }
+.chev { width: 16px; height: 16px; color: var(--text-dim); transition: transform 0.2s ease; flex-shrink: 0; }
+.season-item.open .chev { transform: rotate(180deg); }
+.season-body { display: none; border-top: 1px solid var(--border); }
+.season-item.open .season-body { display: block; }
+.ep-empty { padding: 20px; text-align: center; color: var(--text-dim); font-size: 0.85rem; }
+.episode { display: flex; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--border); align-items: flex-start; transition: background 0.15s; }
+.episode:last-child { border-bottom: none; }
+.episode.clickable { cursor: pointer; }
+.episode.clickable:hover { background: var(--surface-2); }
+.episode.clickable:active { background: var(--surface-3); }
+.episode.clickable:hover .ep-title { color: #7d9dd4; }
+.episode.watched .ep-title { color: var(--text-dim); }
+.episode.watched.clickable:hover .ep-title { color: #7d9dd4; }
+.ep-num { font-family: ui-monospace, Menlo, monospace; font-size: 0.76rem; color: var(--text-dim); font-weight: 700; flex-shrink: 0; padding-top: 3px; width: 32px; letter-spacing: 0.5px; }
+.ep-body { flex: 1; min-width: 0; }
+.ep-title { font-size: 0.86rem; font-weight: 600; line-height: 1.3; }
+.ep-overview { font-size: 0.76rem; color: var(--text-dim); margin-top: 4px; line-height: 1.45; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.ep-check { color: #4ade80; font-weight: 700; flex-shrink: 0; font-size: 0.9rem; padding-top: 2px; }
+.ep-actions { flex-shrink: 0; display: flex; align-items: center; }
+.ep-watch-btn { background: rgba(52, 211, 153, 0.12); border: 1px solid rgba(52, 211, 153, 0.35); color: #6ee7b7; padding: 3px 9px; border-radius: 7px; font-size: 0.7rem; font-weight: 700; cursor: pointer; font-family: inherit; transition: all 0.15s; }
+.ep-watch-btn:hover { background: rgba(52, 211, 153, 0.25); color: #a7f3d0; }
+.ep-watch-btn:disabled { opacity: 0.6; cursor: wait; }
+.ep-watch-btn.done { background: rgba(52, 211, 153, 0.2); color: #34d399; cursor: default; }
+.modal-body .grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 16px; }
 @media (min-width: 700px) {
-  .empty {
-    padding: 120px 20px;
-  }
-}
-.modal {
-  position: fixed;
-  inset: 0;
-  z-index: 220;
-  display: none;
-}
-.modal.open {
-  display: block;
-}
-.modal-backdrop {
-  position: absolute;
-  inset: 0;
-  background: var(--overlay-strong);
-  backdrop-filter: blur(12px) saturate(1.1);
-  -webkit-backdrop-filter: blur(12px) saturate(1.1);
-  animation: fadeIn 0.2s ease;
-}
-.modal-panel {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 12px;
-  padding-top: calc(12px + env(safe-area-inset-top));
-  padding-bottom: calc(12px + env(safe-area-inset-bottom));
-  pointer-events: none;
-}
-.modal-shell {
-  pointer-events: auto;
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  width: 100%;
-  max-width: min(1120px, 100%);
-  max-height: 100%;
-  background: var(--modal-bg);
-  border: 1px solid var(--border);
-  border-radius: 18px;
-  box-shadow: 0 40px 100px rgba(0, 0, 0, 0.85);
-  animation: modalIn 0.28s cubic-bezier(0.2, 0.9, 0.3, 1);
-  overflow: hidden;
-}
-.modal-body {
-  position: relative;
-  width: 100%;
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow-y: auto;
-  overflow-x: hidden;
-  background: var(--modal-bg);
-  -webkit-overflow-scrolling: touch;
-  overscroll-behavior: contain;
-}
-.modal-close {
-  position: absolute;
-  top: 12px;
-  right: 12px;
-  z-index: 5;
-  width: 40px;
-  height: 40px;
-  border-radius: 50%;
-  background: rgba(13, 16, 23, 0.86);
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  color: #fff;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  transition:
-    background 0.15s,
-    transform 0.15s,
-    border-color 0.15s;
-  padding: 0;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.55);
-  touch-action: manipulation;
-  -webkit-tap-highlight-color: transparent;
-}
-.modal-close::before {
-  content: "";
-  position: absolute;
-  inset: -8px;
-  border-radius: 50%;
-}
-.modal-close:hover {
-  background: rgba(30, 38, 58, 0.95);
-  transform: scale(1.05);
-  border-color: rgba(255, 255, 255, 0.28);
-}
-.modal-close:active {
-  transform: scale(0.94);
-  background: rgba(50, 60, 88, 0.95);
-}
-@media (max-width: 599px) {
-  .modal-panel {
-    padding: 0;
-    align-items: stretch;
-    justify-content: flex-start;
-  }
-  .modal-shell {
-    position: absolute;
-    left: 0;
-    right: 0;
-    top: calc(10px + env(safe-area-inset-top));
-    bottom: 0;
-    max-width: 100%;
-    max-height: none;
-    width: 100%;
-    border-radius: 16px 16px 0 0;
-    border: none;
-    border-top: 1px solid var(--border);
-  }
-  .modal-body {
-    padding-bottom: env(safe-area-inset-bottom);
-  }
-  .detail-inner {
-    padding-top: 24px;
-  }
-  .detail-body {
-    padding-bottom: calc(28px + env(safe-area-inset-bottom));
-  }
-  .modal-close {
-    top: 12px;
-    right: 12px;
-    width: 40px;
-    height: 40px;
-    background: rgba(13, 16, 23, 0.94);
-    border-color: rgba(255, 255, 255, 0.24);
-    box-shadow:
-      0 6px 22px rgba(0, 0, 0, 0.65),
-      inset 0 1px 0 rgba(255, 255, 255, 0.08);
-  }
-  .modal-close::before {
-    inset: -12px;
-  }
-  .modal-close:active {
-    transform: scale(0.9);
-    background: rgba(50, 60, 88, 0.96);
-  }
-}
-@media (min-width: 768px) and (max-width: 1023px) {
-  .modal-shell {
-    max-width: min(880px, 92vw);
-  }
-}
-@media (min-width: 700px) {
-  .modal-panel {
-    padding: 40px 24px;
-  }
-}
-@keyframes modalIn {
-  from {
-    opacity: 0;
-    transform: translateY(14px) scale(0.98);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
-}
-.modal-loading {
-  padding: 100px 20px;
-  text-align: center;
-}
-.modal-error {
-  padding: 80px 20px;
-  text-align: center;
-  color: #9db5e0;
-  font-size: 0.9rem;
-}
-.detail-hero {
-  position: relative;
-  overflow: hidden;
-  background: var(--surface);
-  border-radius: 18px 18px 0 0;
-}
-.detail-bg {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  filter: blur(30px) saturate(1.2) var(--detail-bg-filter, brightness(0.5));
-  transform: scale(1.15);
-  z-index: 0;
-}
-.detail-hero::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: 1;
-  background: var(--detail-hero-grad);
-}
-.detail-inner {
-  position: relative;
-  z-index: 2;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  text-align: center;
-  gap: 16px;
-  padding: 24px 20px 24px;
-}
-.detail-poster {
-  width: min(48vw, 200px);
-  height: auto;
-  aspect-ratio: 2/3;
-  border-radius: 14px;
-  object-fit: cover;
-  flex-shrink: 0;
-  box-shadow: 0 16px 40px var(--shadow-login);
-  margin: 0 auto;
-}
-.detail-poster-ph {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: var(--surface-2);
-  font-size: 2.8rem;
-  color: var(--text-dim);
-  width: min(48vw, 200px);
-  aspect-ratio: 2/3;
-}
-.detail-info {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  align-items: center;
-  width: 100%;
-}
-.detail-title {
-  font-size: 1.45rem;
-  font-weight: 800;
-  letter-spacing: -0.4px;
-  line-height: 1.25;
-  color: var(--text);
-}
-.detail-tagline {
-  font-size: 0.85rem;
-  color: var(--text-dim);
-  font-style: italic;
-}
-.detail-meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  font-size: 0.85rem;
-  color: var(--text-dim);
-  justify-content: center;
-}
-.detail-genres {
-  font-size: 0.82rem;
-  color: var(--text-dim);
-}
-.detail-overview {
-  font-size: 0.88rem;
-  color: var(--text-dim);
-  line-height: 1.55;
-  margin-top: 4px;
-  display: -webkit-box;
-  -webkit-line-clamp: 5;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  text-align: center;
-}
-.d-status {
-  display: flex;
-  gap: 12px;
-  align-items: center;
-  background: var(--panel-grad);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  padding: 12px 14px;
-  margin-top: 8px;
-  width: 100%;
-  justify-content: flex-start;
-}
-.d-status.done {
-  border-color: rgba(74, 222, 128, 0.3);
-  background: rgba(74, 222, 128, 0.06);
-}
-.d-status-progress {
-  flex-direction: column;
-  align-items: stretch;
-  gap: 10px;
-}
-.d-status-row {
-  display: flex;
-  gap: 12px;
-  align-items: center;
-  width: 100%;
-}
-.d-status-icon {
-  width: 32px;
-  height: 32px;
-  border-radius: 50%;
-  background: var(--surface-2);
-  color: var(--text-dim);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-weight: 700;
-  flex-shrink: 0;
-  font-size: 0.95rem;
-}
-.d-status.done .d-status-icon {
-  background: rgba(74, 222, 128, 0.15);
-  color: #4ade80;
-}
-.d-status-body {
-  flex: 1;
-  min-width: 0;
-  text-align: left;
-}
-.d-status-title {
-  font-size: 0.88rem;
-  font-weight: 600;
-}
-.d-status-sub {
-  font-size: 0.76rem;
-  color: var(--text-dim);
-  margin-top: 2px;
-}
-.d-action-bar {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  margin-top: 16px;
-  padding: 4px;
-  background: var(--pill-bg);
-  border: 1px solid var(--pill-border);
-  border-radius: 999px;
-  box-shadow: var(--pill-shadow);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-}
-.d-act {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 44px;
-  height: 44px;
-  border-radius: 50%;
-  border: none;
-  background: transparent;
-  color: var(--pill-fg);
-  cursor: pointer;
-  padding: 0;
-  font-family: inherit;
-  transition:
-    background 0.18s ease,
-    color 0.18s ease,
-    transform 0.12s ease,
-    box-shadow 0.18s ease;
-  -webkit-tap-highlight-color: transparent;
-  text-decoration: none;
-  flex-shrink: 0;
-  position: relative;
-}
-.d-act svg {
-  display: block;
-  pointer-events: none;
-}
-.d-act:hover {
-  background: var(--pill-act-hover);
-  color: #fff;
-}
-.d-act:active {
-  transform: scale(0.9);
-}
-.d-act:disabled {
-  opacity: 0.5;
-  cursor: default;
-  pointer-events: none;
-}
-.d-act-watched.active {
-  background: linear-gradient(145deg, #8b5cf6 0%, #a78bfa 55%, #c4b5fd 100%);
-  color: #fff;
-  box-shadow:
-    0 4px 16px rgba(139, 92, 246, 0.5),
-    inset 0 1px 0 rgba(255, 255, 255, 0.25);
-}
-.d-act-watched.active:hover {
-  filter: brightness(1.1);
-  color: #fff;
-}
-.d-act-wl.active {
-  color: #c4b5fd;
-  background: rgba(167, 139, 250, 0.12);
-}
-.d-act-wl.active:hover {
-  background: rgba(167, 139, 250, 0.2);
-  color: #ddd6fe;
-}
-.d-act-play {
-  color: var(--pill-fg);
-}
-.d-act-play:hover {
-  background: rgba(167, 139, 250, 0.15);
-  color: #ddd6fe;
-}
-.detail-body {
-  padding: 20px 22px 24px;
-}
-.d-section {
-  margin-top: 8px;
-  margin-bottom: 26px;
-}
-.d-section:last-child {
-  margin-bottom: 0;
-}
-.d-section-title {
-  font-size: 1rem;
-  font-weight: 700;
-  letter-spacing: 0.2px;
-  margin-bottom: 14px;
-  color: var(--text);
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.d-section-title::before {
-  content: "";
-  width: 3px;
-  height: 16px;
-  border-radius: 2px;
-  background: #7d9dd4;
-}
-.cast-scroll {
-  display: flex;
-  gap: 14px;
-  overflow-x: auto;
-  padding-bottom: 8px;
-  scrollbar-width: none;
-}
-.cast-scroll::-webkit-scrollbar {
-  display: none;
-}
-.cast {
-  flex-shrink: 0;
-  width: 84px;
-  text-align: center;
-}
-.cast-img {
-  width: 84px;
-  height: 84px;
-  border-radius: 50%;
-  object-fit: cover;
-  background: var(--surface-2);
-}
-.cast-ph {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--text-dim);
-  font-size: 1.6rem;
-  font-weight: 600;
-  background: var(--soft-card-grad);
-}
-.cast-name {
-  font-size: 0.75rem;
-  font-weight: 600;
-  margin-top: 8px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.cast-role {
-  font-size: 0.68rem;
-  color: var(--text-dim);
-  margin-top: 1px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.seasons {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.season-item {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  overflow: hidden;
-  transition: border-color 0.15s;
-}
-.season-item.open {
-  border-color: var(--scrollbar);
-}
-.season-head {
-  width: 100%;
-  background: none;
-  border: none;
-  color: inherit;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 14px 16px;
-  cursor: pointer;
-  font-family: inherit;
-  text-align: left;
-  transition: background 0.15s;
-}
-.season-head:hover {
-  background: var(--surface-2);
-}
-.season-title {
-  font-weight: 600;
-  font-size: 0.9rem;
-  flex: 1;
-}
-.season-meta {
-  font-size: 0.76rem;
-  color: var(--text-dim);
-}
-.chev {
-  width: 16px;
-  height: 16px;
-  color: var(--text-dim);
-  transition: transform 0.2s ease;
-  flex-shrink: 0;
-}
-.season-item.open .chev {
-  transform: rotate(180deg);
-}
-.season-body {
-  display: none;
-  border-top: 1px solid var(--border);
-}
-.season-item.open .season-body {
-  display: block;
-}
-.ep-empty {
-  padding: 20px;
-  text-align: center;
-  color: var(--text-dim);
-  font-size: 0.85rem;
-}
-.episode {
-  display: flex;
-  gap: 12px;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--border);
-  align-items: flex-start;
-  transition: background 0.15s;
-}
-.episode:last-child {
-  border-bottom: none;
-}
-.episode.clickable {
-  cursor: pointer;
-}
-.episode.clickable:hover {
-  background: var(--surface-2);
-}
-.episode.clickable:active {
-  background: var(--surface-3);
-}
-.episode.clickable:hover .ep-title {
-  color: #7d9dd4;
-}
-.episode.watched .ep-title {
-  color: var(--text-dim);
-}
-.episode.watched.clickable:hover .ep-title {
-  color: #7d9dd4;
-}
-.ep-num {
-  font-family: ui-monospace, Menlo, monospace;
-  font-size: 0.76rem;
-  color: var(--text-dim);
-  font-weight: 700;
-  flex-shrink: 0;
-  padding-top: 3px;
-  width: 32px;
-  letter-spacing: 0.5px;
-}
-.ep-body {
-  flex: 1;
-  min-width: 0;
-}
-.ep-title {
-  font-size: 0.86rem;
-  font-weight: 600;
-  line-height: 1.3;
-}
-.ep-overview {
-  font-size: 0.76rem;
-  color: var(--text-dim);
-  margin-top: 4px;
-  line-height: 1.45;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-.ep-check {
-  color: #4ade80;
-  font-weight: 700;
-  flex-shrink: 0;
-  font-size: 0.9rem;
-  padding-top: 2px;
-}
-.ep-actions {
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-}
-.ep-watch-btn {
-  background: rgba(52, 211, 153, 0.12);
-  border: 1px solid rgba(52, 211, 153, 0.35);
-  color: #6ee7b7;
-  padding: 3px 9px;
-  border-radius: 7px;
-  font-size: 0.7rem;
-  font-weight: 700;
-  cursor: pointer;
-  font-family: inherit;
-  transition: all 0.15s;
-}
-.ep-watch-btn:hover {
-  background: rgba(52, 211, 153, 0.25);
-  color: #a7f3d0;
-}
-.ep-watch-btn:disabled {
-  opacity: 0.6;
-  cursor: wait;
-}
-.ep-watch-btn.done {
-  background: rgba(52, 211, 153, 0.2);
-  color: #34d399;
-  cursor: default;
-}
-.modal-body .grid {
-  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-  gap: 16px;
-}
-@media (min-width: 700px) {
-  .detail-inner {
-    flex-direction: row;
-    align-items: flex-start;
-    text-align: left;
-    padding: 34px;
-    gap: 30px;
-  }
-  .detail-poster {
-    width: 220px;
-    height: auto;
-    aspect-ratio: 2/3;
-    margin: 0;
-  }
-  .detail-info {
-    align-items: flex-start;
-  }
-  .detail-meta {
-    justify-content: flex-start;
-  }
-  .detail-overview {
-    text-align: left;
-  }
-  .detail-title {
-    font-size: 1.85rem;
-  }
-  .detail-overview {
-    font-size: 0.92rem;
-    -webkit-line-clamp: 6;
-  }
-  .detail-body {
-    padding: 30px 34px 34px;
-  }
-  .cast {
-    width: 96px;
-  }
-  .cast-img {
-    width: 96px;
-    height: 96px;
-  }
-  .modal-body .grid {
-    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-    gap: 20px;
-  }
-  .detail-ext-ratings {
-    justify-content: flex-start;
-  }
-  .d-action-bar {
-    align-self: flex-start;
-  }
-}
-.confirm-modal {
-  position: fixed;
-  inset: 0;
-  z-index: 320;
-  display: none;
-}
-.confirm-modal.open {
-  display: block;
-}
-.confirm-backdrop {
-  position: absolute;
-  inset: 0;
-  background: var(--overlay);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
-  animation: fadeIn 0.18s ease;
-}
-.confirm-panel {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  width: min(88vw, 340px);
-  background: var(--panel-grad);
-  border: 1px solid var(--border-strong);
-  border-radius: 18px;
-  padding: 24px 22px 18px;
-  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.8);
-  text-align: center;
-  animation: confirmIn 0.22s cubic-bezier(0.2, 0.9, 0.3, 1);
-}
-@keyframes confirmIn {
-  from {
-    opacity: 0;
-    transform: translate(-50%, -48%) scale(0.95);
-  }
-  to {
-    opacity: 1;
-    transform: translate(-50%, -50%) scale(1);
-  }
-}
-.confirm-icon {
-  width: 48px;
-  height: 48px;
-  margin: 0 auto 12px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 1.4rem;
-  background: var(--accent-soft);
-  color: var(--accent-2);
-}
-.confirm-icon.danger {
-  background: rgba(224, 85, 96, 0.14);
-  color: #ff7b85;
-}
-.confirm-icon.warn {
-  background: rgba(255, 184, 77, 0.14);
-  color: #ffb84d;
-}
-.confirm-icon.success {
-  background: rgba(52, 211, 153, 0.14);
-  color: #34d399;
-}
-.confirm-title {
-  font-size: 1.02rem;
-  font-weight: 700;
-  margin-bottom: 6px;
-  color: var(--text);
-}
-.confirm-msg {
-  font-size: 0.84rem;
-  color: var(--text-dim);
-  line-height: 1.55;
-  word-break: break-word;
-}
-.confirm-actions {
-  display: flex;
-  gap: 10px;
-  margin-top: 20px;
-}
-.confirm-btn {
-  flex: 1;
-  padding: 11px 14px;
-  border-radius: 12px;
-  font-size: 0.88rem;
-  font-weight: 700;
-  font-family: inherit;
-  cursor: pointer;
-  border: 1px solid transparent;
-  transition: all 0.15s;
-  -webkit-tap-highlight-color: transparent;
-}
-.confirm-cancel {
-  background: var(--chip-bg);
-  border-color: var(--chip-border);
-  color: var(--chip-fg);
-}
-.confirm-cancel:hover {
-  background: var(--chip-bg-hover);
-  color: var(--chip-fg-hover);
-}
-.confirm-ok {
-  background: var(--brand-grad);
-  color: #fff;
-  box-shadow: 0 6px 20px rgba(167, 139, 250, 0.3);
-}
-.confirm-ok:hover {
-  filter: brightness(1.08);
-}
-.confirm-ok.danger {
-  background: linear-gradient(135deg, #dc2626 0%, #f87171 100%);
-  box-shadow: 0 6px 20px rgba(248, 113, 113, 0.28);
-}
-.confirm-ok:disabled,
-.confirm-cancel:disabled {
-  opacity: 0.6;
-  cursor: wait;
-}
-.hero-avatar {
-  border: 2px solid rgba(167, 139, 250, 0.5);
-  padding: 0;
-  cursor: pointer;
-  font: inherit;
-  color: inherit;
-}
-.hero-avatar:hover {
-  box-shadow:
-    0 0 0 3px rgba(167, 139, 250, 0.28),
-    0 4px 20px rgba(0, 0, 0, 0.5);
-  transform: scale(1.03);
-}
-.hero-avatar:active {
-  transform: scale(0.97);
-}
-.summary-modal {
-  position: fixed;
-  inset: 0;
-  z-index: 160;
-  display: none;
-}
-.summary-modal.open {
-  display: block;
-}
-.summary-backdrop {
-  position: absolute;
-  inset: 0;
-  background: var(--overlay);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-}
-.summary-panel {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  width: min(94vw, 480px);
-  max-height: 88vh;
-  display: flex;
-  flex-direction: column;
-  background: var(--panel-grad);
-  border: 1px solid var(--border-strong);
-  border-radius: 18px;
-  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.85);
-  overflow: hidden;
-}
-.summary-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 16px 18px 10px;
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
-}
-.summary-title {
-  font-size: 1.05rem;
-  font-weight: 700;
-}
-.summary-close {
-  width: 40px;
-  height: 40px;
-  border-radius: 50%;
-  border: 1px solid var(--chip-border);
-  background: var(--chip-bg);
-  color: var(--chip-fg);
-  font-size: 1.2rem;
-  cursor: pointer;
-  font-family: inherit;
-  line-height: 1;
-}
-.summary-close:hover {
-  color: #fff;
-  border-color: var(--border-strong);
-}
-.summary-body {
-  overflow-y: auto;
-  padding: 12px 16px 20px;
-  -webkit-overflow-scrolling: touch;
-}
-@media (max-width: 599px) {
-  .summary-panel {
-    top: auto;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    transform: none;
-    width: 100%;
-    max-height: 92vh;
-    border-radius: 18px 18px 0 0;
-  }
-}
-.sum-wrap {
-  padding: 4px 0 24px;
-}
-.sum-nav {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin-bottom: 18px;
-}
-.sum-nav-btn {
-  width: 36px;
-  height: 36px;
-  border-radius: 10px;
-  border: 1px solid var(--chip-border);
-  background: var(--chip-bg);
-  color: var(--text-dim);
-  font-size: 1.2rem;
-  cursor: pointer;
-  font-family: inherit;
-  transition: all 0.15s;
-}
-.sum-nav-btn:hover {
-  color: #fff;
-  border-color: var(--border-strong);
-  background: rgba(167, 139, 250, 0.12);
-}
-.sum-nav-center {
-  flex: 1;
-  text-align: center;
-  min-width: 0;
-}
-.sum-period-tabs {
-  display: inline-flex;
-  gap: 4px;
-  background: var(--chip-bg);
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  padding: 3px;
-  margin-bottom: 8px;
-}
-.sum-period-btn {
-  border: none;
-  background: transparent;
-  color: var(--text-dim);
-  padding: 6px 14px;
-  border-radius: 999px;
-  font-size: 0.8rem;
-  font-weight: 600;
-  cursor: pointer;
-  font-family: inherit;
-}
-.sum-period-btn.active {
-  background: var(--brand-grad);
-  color: #fff;
-}
-.sum-label {
-  font-size: 1.05rem;
-  font-weight: 700;
-  letter-spacing: 0.2px;
-}
-.sum-stats {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 8px;
-  margin-bottom: 14px;
-}
-.sum-stat {
-  text-align: center;
-  background: var(--panel-grad);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  padding: 14px 6px;
-}
-.sum-stat-num {
-  font-size: 1.35rem;
-  font-weight: 800;
-  letter-spacing: -0.5px;
-  background: var(--num-grad);
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
-}
-.sum-stat-label {
-  font-size: 0.7rem;
-  color: var(--text-mute);
-  margin-top: 2px;
-}
-.sum-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 12px;
-  border-radius: 10px;
-  background: rgba(167, 139, 250, 0.1);
-  border: 1px solid rgba(167, 139, 250, 0.25);
-  color: var(--text-dim);
-  font-size: 0.82rem;
-  margin-bottom: 12px;
-}
-.sum-chip strong {
-  color: #ddd6fe;
-}
-.sum-muted {
-  font-size: 0.8rem;
-  color: var(--text-mute);
-  margin: 6px 0 12px;
-}
-.sum-block {
-  margin-top: 18px;
-}
-.sum-h3 {
-  font-size: 0.92rem;
-  font-weight: 700;
-  margin-bottom: 10px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.sum-h3::before {
-  content: "";
-  width: 3px;
-  height: 14px;
-  border-radius: 2px;
-  background: linear-gradient(180deg, #a78bfa, #7c3aed);
-}
-.sum-heat {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-}
-.sum-heat-cell {
-  width: 12px;
-  height: 12px;
-  border-radius: 3px;
-  background: rgba(255, 255, 255, 0.06);
-}
-.sum-heat-cell.lv1 {
-  background: rgba(167, 139, 250, 0.25);
-}
-.sum-heat-cell.lv2 {
-  background: rgba(167, 139, 250, 0.45);
-}
-.sum-heat-cell.lv3 {
-  background: rgba(167, 139, 250, 0.7);
-}
-.sum-heat-cell.lv4 {
-  background: #a78bfa;
-}
-.sum-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.sum-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 12px;
-  background: var(--panel-grad);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-}
-.sum-rank {
-  width: 22px;
-  height: 22px;
-  border-radius: 6px;
-  background: rgba(167, 139, 250, 0.15);
-  color: #c4b5fd;
-  font-size: 0.72rem;
-  font-weight: 800;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-}
-.sum-row-body {
-  min-width: 0;
-  flex: 1;
-}
-.sum-row-title {
-  font-size: 0.9rem;
-  font-weight: 600;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.sum-year {
-  font-weight: 500;
-  color: var(--text-mute);
-  font-size: 0.8rem;
-}
-.sum-row-meta {
-  font-size: 0.75rem;
-  color: var(--text-dim);
-  margin-top: 2px;
-}
-@media (max-width: 420px) {
-  .sum-stats {
-    gap: 6px;
-  }
-  .sum-stat {
-    padding: 12px 4px;
-  }
-  .sum-stat-num {
-    font-size: 1.15rem;
-  }
-}
-#toast-container {
-  position: fixed;
-  left: 50%;
-  bottom: calc(28px + env(safe-area-inset-bottom));
-  transform: translateX(-50%);
-  z-index: 99999;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  pointer-events: none;
-  max-width: min(92vw, 440px);
-  width: max-content;
-}
-.toast {
-  pointer-events: auto;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 11px 16px;
-  border-radius: 12px;
-  font-size: 0.86rem;
-  font-weight: 500;
-  color: var(--toast-text);
-  background: var(--toast-bg);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
-  opacity: 0;
-  transform: translateY(12px) scale(0.96);
-  transition:
-    opacity 0.22s ease,
-    transform 0.22s ease;
-  cursor: pointer;
-  line-height: 1.45;
-  word-break: break-word;
-  max-width: min(92vw, 440px);
-}
-.toast.toast-in {
-  opacity: 1;
-  transform: translateY(0) scale(1);
-}
-.toast.toast-out {
-  opacity: 0;
-  transform: translateY(8px) scale(0.96);
-}
-.toast-icon {
-  flex-shrink: 0;
-  width: 20px;
-  height: 20px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 0.72rem;
-  font-weight: 800;
-  line-height: 1;
-}
-.toast-info .toast-icon {
-  background: rgba(125, 157, 212, 0.22);
-  color: #a8c0e8;
-}
-.toast-success .toast-icon {
-  background: rgba(52, 211, 153, 0.22);
-  color: #6ee7b7;
-}
-.toast-error .toast-icon {
-  background: rgba(224, 85, 96, 0.24);
-  color: #ff8a8a;
-}
-.toast-warn .toast-icon {
-  background: rgba(255, 184, 77, 0.22);
-  color: #ffd693;
-}
-.toast-success {
-  border-color: rgba(52, 211, 153, 0.35);
-}
-.toast-error {
-  border-color: rgba(224, 85, 96, 0.35);
-}
-.toast-warn {
-  border-color: rgba(255, 184, 77, 0.35);
-}
-@media (max-width: 420px) {
-  .toast {
-    font-size: 0.82rem;
-    padding: 10px 14px;
-  }
-}
-.cast.clickable {
-  cursor: pointer;
-}
-.cast.clickable:hover .cast-img {
-  transform: translateY(-2px) scale(1.03);
-  box-shadow: 0 8px 20px rgba(167, 139, 250, 0.28);
-}
-.cast.clickable:hover .cast-name {
-  color: #c4b5fd;
-}
-.cast-img {
-  transition:
-    transform 0.2s ease,
-    box-shadow 0.2s ease;
-}
-.cast-name {
-  transition: color 0.15s ease;
-}
-.trailer-grid {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 14px;
-}
-@media (min-width: 600px) {
-  .trailer-grid {
-    grid-template-columns: repeat(2, 1fr);
-  }
-}
-.trailer-card {
-  position: relative;
-  aspect-ratio: 16/9;
-  border-radius: 12px;
-  overflow: hidden;
-  background: linear-gradient(135deg, #1a1528 0%, #0e0e10 100%);
-  cursor: pointer;
-  border: 1px solid var(--border);
-  transition:
-    border-color 0.15s,
-    transform 0.15s;
-}
-.trailer-card:hover {
-  border-color: rgba(167, 139, 250, 0.4);
-  transform: translateY(-1px);
-}
-.trailer-thumb {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-  z-index: 1;
-}
-.trailer-card.no-thumb .trailer-thumb {
-  display: none;
-}
-.trailer-play {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  width: 52px;
-  height: 52px;
-  border-radius: 50%;
-  background: rgba(8, 10, 18, 0.72);
-  border: 1px solid rgba(255, 255, 255, 0.28);
-  color: #fff;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-  transition:
-    background 0.15s,
-    transform 0.15s;
-  pointer-events: none;
-  z-index: 3;
-}
-.trailer-card:hover .trailer-play {
-  background: linear-gradient(145deg, #8b5cf6, #a78bfa);
-  transform: translate(-50%, -50%) scale(1.08);
-}
-.trailer-play svg {
-  display: block;
-  margin-left: 2px;
-}
-.trailer-name {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  padding: 22px 12px 9px;
-  font-size: 0.8rem;
-  font-weight: 600;
-  color: #fff;
-  background: linear-gradient(180deg, transparent, rgba(0, 0, 0, 0.85));
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  z-index: 3;
-}
-.trailer-card.playing .trailer-thumb,
-.trailer-card.playing .trailer-play,
-.trailer-card.playing .trailer-name {
-  display: none;
-}
-.trailer-frame {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  background: var(--surface-2);
-  z-index: 2;
-}
-.trailer-frame:empty {
-  display: none;
-}
-.trailer-frame iframe {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  border: 0;
-  display: block;
-}
-.person-modal {
-  position: fixed;
-  inset: 0;
-  z-index: 230;
-  display: none;
-}
-.person-modal.open {
-  display: block;
-}
-.person-backdrop {
-  position: absolute;
-  inset: 0;
-  background: var(--overlay);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-  animation: fadeIn 0.2s ease;
-}
-.person-panel {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  width: min(94vw, 760px);
-  max-height: 88vh;
-  display: flex;
-  flex-direction: column;
-  background: var(--panel-grad);
-  border: 1px solid var(--border-strong);
-  border-radius: 18px;
-  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.85);
-  overflow: hidden;
-  animation: modalIn 0.25s cubic-bezier(0.2, 0.9, 0.3, 1);
-}
-.person-panel-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 14px 18px;
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
-}
-.person-panel-name {
-  font-size: 1rem;
-  font-weight: 700;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  flex: 1;
-  min-width: 0;
-}
-.person-close {
-  width: 40px;
-  height: 40px;
-  flex-shrink: 0;
-  border-radius: 50%;
-  border: 1px solid var(--chip-border);
-  background: var(--chip-bg);
-  color: var(--chip-fg);
-  font-size: 1.2rem;
-  cursor: pointer;
-  font-family: inherit;
-  line-height: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.15s;
-}
-.person-close:hover {
-  color: #fff;
-  border-color: var(--border-strong);
-}
-.person-panel-body {
-  overflow-y: auto;
-  padding: 18px 20px 24px;
-  -webkit-overflow-scrolling: touch;
-  overscroll-behavior: contain;
-}
-@media (max-width: 599px) {
-  .person-panel {
-    top: auto;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    transform: none;
-    width: 100%;
-    max-height: 92vh;
-    border-radius: 18px 18px 0 0;
-  }
-}
-.person-head {
-  display: flex;
-  gap: 18px;
-  margin-bottom: 18px;
-}
-.person-photo {
-  width: 110px;
-  height: 165px;
-  border-radius: 12px;
-  object-fit: cover;
-  flex-shrink: 0;
-  background: var(--surface-2);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
-}
-.person-photo-ph {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 2rem;
-  color: var(--text-dim);
-  background: var(--soft-card-grad);
-}
-.person-info {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.person-name {
-  font-size: 1.3rem;
-  font-weight: 800;
-  letter-spacing: -0.4px;
-  line-height: 1.25;
-}
-.person-sub {
-  font-size: 0.82rem;
-  color: var(--text-dim);
-}
-.person-rows {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin-top: 4px;
-}
-.person-row {
-  font-size: 0.78rem;
-  color: var(--text-dim);
-  line-height: 1.5;
-}
-.person-row b {
-  color: var(--text);
-  font-weight: 600;
-  margin-right: 6px;
-}
-.person-bio {
-  font-size: 0.86rem;
-  color: #c0c8d6;
-  line-height: 1.65;
-  white-space: pre-line;
-  margin-bottom: 22px;
-  padding-top: 4px;
-  border-top: 1px solid var(--border);
-}
-.person-credits-title {
-  font-size: 0.95rem;
-  font-weight: 700;
-  margin-bottom: 14px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.person-credits-title::before {
-  content: "";
-  width: 3px;
-  height: 14px;
-  border-radius: 2px;
-  background: linear-gradient(180deg, #a78bfa, #7c3aed);
-}
-@media (max-width: 480px) {
-  .person-head {
-    flex-direction: column;
-    align-items: center;
-    text-align: center;
-    gap: 12px;
-  }
-  .person-info {
-    align-items: center;
-  }
-  .person-photo {
-    width: 130px;
-    height: 195px;
-  }
-  .person-rows {
-    align-items: center;
-  }
-}
-.btn-action.loading {
-  color: var(--accent-2);
-  border-color: rgba(167, 139, 250, 0.45);
-  background: rgba(167, 139, 250, 0.12);
-  pointer-events: none;
-}
-.btn-action.loading svg {
-  transform-origin: 50% 50%;
-  animation: btnSpin 0.7s linear infinite;
-}
-@keyframes btnSpin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-.btn-action.loading span::after {
-  content: "";
-  display: inline-block;
-  width: 0;
-  overflow: hidden;
-  animation: btnDots 1.2s steps(4, end) infinite;
-}
-@keyframes btnDots {
-  0% {
-    content: "";
-  }
-  25% {
-    content: ".";
-  }
-  50% {
-    content: "..";
-  }
-  75% {
-    content: "...";
-  }
-}
+  .detail-inner { flex-direction: row; align-items: flex-start; text-align: left; padding: 34px; gap: 30px; }
+  .detail-poster { width: 220px; height: auto; aspect-ratio: 2/3; margin: 0; }
+  .detail-info { align-items: flex-start; }
+  .detail-meta { justify-content: flex-start; }
+  .detail-overview { text-align: left; }
+  .detail-title { font-size: 1.85rem; }
+  .detail-overview { font-size: 0.92rem; -webkit-line-clamp: 6; }
+  .detail-body { padding: 30px 34px 34px; }
+  .cast { width: 96px; }
+  .cast-img { width: 96px; height: 96px; }
+  .modal-body .grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 20px; }
+  .detail-ext-ratings { justify-content: flex-start; }
+  .d-action-bar { align-self: flex-start; }
+}
+.confirm-modal { position: fixed; inset: 0; z-index: 320; display: none; }
+.confirm-modal.open { display: block; }
+.confirm-backdrop { position: absolute; inset: 0; background: var(--overlay); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); animation: fadeIn 0.18s ease; }
+.confirm-panel { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: min(88vw, 340px); background: var(--panel-grad); border: 1px solid var(--border-strong); border-radius: 18px; padding: 24px 22px 18px; box-shadow: 0 30px 80px rgba(0, 0, 0, 0.8); text-align: center; animation: confirmIn 0.22s cubic-bezier(0.2, 0.9, 0.3, 1); }
+@keyframes confirmIn { from { opacity: 0; transform: translate(-50%, -48%) scale(0.95); } to { opacity: 1; transform: translate(-50%, -50%) scale(1); } }
+.confirm-icon { width: 48px; height: 48px; margin: 0 auto 12px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 1.4rem; background: var(--accent-soft); color: var(--accent-2); }
+.confirm-icon.danger { background: rgba(224, 85, 96, 0.14); color: #ff7b85; }
+.confirm-icon.warn { background: rgba(255, 184, 77, 0.14); color: #ffb84d; }
+.confirm-icon.success { background: rgba(52, 211, 153, 0.14); color: #34d399; }
+.confirm-title { font-size: 1.02rem; font-weight: 700; margin-bottom: 6px; color: var(--text); }
+.confirm-msg { font-size: 0.84rem; color: var(--text-dim); line-height: 1.55; word-break: break-word; }
+.confirm-actions { display: flex; gap: 10px; margin-top: 20px; }
+.confirm-btn { flex: 1; padding: 11px 14px; border-radius: 12px; font-size: 0.88rem; font-weight: 700; font-family: inherit; cursor: pointer; border: 1px solid transparent; transition: all 0.15s; -webkit-tap-highlight-color: transparent; }
+.confirm-cancel { background: var(--chip-bg); border-color: var(--chip-border); color: var(--chip-fg); }
+.confirm-cancel:hover { background: var(--chip-bg-hover); color: var(--chip-fg-hover); }
+.confirm-ok { background: var(--brand-grad); color: #fff; box-shadow: 0 6px 20px rgba(167, 139, 250, 0.3); }
+.confirm-ok:hover { filter: brightness(1.08); }
+.confirm-ok.danger { background: linear-gradient(135deg, #dc2626 0%, #f87171 100%); box-shadow: 0 6px 20px rgba(248, 113, 113, 0.28); }
+.confirm-ok:disabled, .confirm-cancel:disabled { opacity: 0.6; cursor: wait; }
+.hero-avatar { border: 2px solid rgba(167, 139, 250, 0.5); padding: 0; cursor: pointer; font: inherit; color: inherit; }
+.hero-avatar:hover { box-shadow: 0 0 0 3px rgba(167, 139, 250, 0.28), 0 4px 20px rgba(0, 0, 0, 0.5); transform: scale(1.03); }
+.hero-avatar:active { transform: scale(0.97); }
+.summary-modal { position: fixed; inset: 0; z-index: 160; display: none; }
+.summary-modal.open { display: block; }
+.summary-backdrop { position: absolute; inset: 0; background: var(--overlay); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
+.summary-panel { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: min(94vw, 480px); max-height: 88vh; display: flex; flex-direction: column; background: var(--panel-grad); border: 1px solid var(--border-strong); border-radius: 18px; box-shadow: 0 30px 80px rgba(0, 0, 0, 0.85); overflow: hidden; }
+.summary-head { display: flex; align-items: center; justify-content: space-between; padding: 16px 18px 10px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.summary-title { font-size: 1.05rem; font-weight: 700; }
+.summary-close { width: 40px; height: 40px; border-radius: 50%; border: 1px solid var(--chip-border); background: var(--chip-bg); color: var(--chip-fg); font-size: 1.2rem; cursor: pointer; font-family: inherit; line-height: 1; }
+.summary-close:hover { color: #fff; border-color: var(--border-strong); }
+.summary-body { overflow-y: auto; padding: 12px 16px 20px; -webkit-overflow-scrolling: touch; }
+@media (max-width: 599px) { .summary-panel { top: auto; bottom: 0; left: 0; right: 0; transform: none; width: 100%; max-height: 92vh; border-radius: 18px 18px 0 0; } }
+.sum-wrap { padding: 4px 0 24px; }
+.sum-nav { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 18px; }
+.sum-nav-btn { width: 36px; height: 36px; border-radius: 10px; border: 1px solid var(--chip-border); background: var(--chip-bg); color: var(--text-dim); font-size: 1.2rem; cursor: pointer; font-family: inherit; transition: all 0.15s; }
+.sum-nav-btn:hover { color: #fff; border-color: var(--border-strong); background: rgba(167, 139, 250, 0.12); }
+.sum-nav-center { flex: 1; text-align: center; min-width: 0; }
+.sum-period-tabs { display: inline-flex; gap: 4px; background: var(--chip-bg); border: 1px solid var(--border); border-radius: 999px; padding: 3px; margin-bottom: 8px; }
+.sum-period-btn { border: none; background: transparent; color: var(--text-dim); padding: 6px 14px; border-radius: 999px; font-size: 0.8rem; font-weight: 600; cursor: pointer; font-family: inherit; }
+.sum-period-btn.active { background: var(--brand-grad); color: #fff; }
+.sum-label { font-size: 1.05rem; font-weight: 700; letter-spacing: 0.2px; }
+.sum-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 14px; }
+.sum-stat { text-align: center; background: var(--panel-grad); border: 1px solid var(--border); border-radius: 14px; padding: 14px 6px; }
+.sum-stat-num { font-size: 1.35rem; font-weight: 800; letter-spacing: -0.5px; background: var(--num-grad); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+.sum-stat-label { font-size: 0.7rem; color: var(--text-mute); margin-top: 2px; }
+.sum-chip { display: inline-flex; align-items: center; gap: 6px; padding: 8px 12px; border-radius: 10px; background: rgba(167, 139, 250, 0.1); border: 1px solid rgba(167, 139, 250, 0.25); color: var(--text-dim); font-size: 0.82rem; margin-bottom: 12px; }
+.sum-chip strong { color: var(--accent); }
+.sum-muted { font-size: 0.8rem; color: var(--text-mute); margin: 6px 0 12px; }
+.sum-block { margin-top: 18px; }
+.sum-h3 { font-size: 0.92rem; font-weight: 700; margin-bottom: 10px; display: flex; align-items: center; gap: 8px; }
+.sum-h3::before { content: ""; width: 3px; height: 14px; border-radius: 2px; background: linear-gradient(180deg, #a78bfa, #7c3aed); }
+.sum-heat { display: flex; flex-wrap: wrap; gap: 4px; }
+.sum-heat-cell { width: 12px; height: 12px; border-radius: 3px; background: rgba(255, 255, 255, 0.06); }
+.sum-heat-cell.lv1 { background: rgba(167, 139, 250, 0.25); }
+.sum-heat-cell.lv2 { background: rgba(167, 139, 250, 0.45); }
+.sum-heat-cell.lv3 { background: rgba(167, 139, 250, 0.7); }
+.sum-heat-cell.lv4 { background: #a78bfa; }
+.sum-list { display: flex; flex-direction: column; gap: 8px; }
+.sum-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; background: var(--panel-grad); border: 1px solid var(--border); border-radius: 12px; }
+.sum-rank { width: 22px; height: 22px; border-radius: 6px; background: rgba(167, 139, 250, 0.15); color: #c4b5fd; font-size: 0.72rem; font-weight: 800; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.sum-row-body { min-width: 0; flex: 1; }
+.sum-row-title { font-size: 0.9rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sum-year { font-weight: 500; color: var(--text-mute); font-size: 0.8rem; }
+.sum-row-meta { font-size: 0.75rem; color: var(--text-dim); margin-top: 2px; }
+@media (max-width: 420px) { .sum-stats { gap: 6px; } .sum-stat { padding: 12px 4px; } .sum-stat-num { font-size: 1.15rem; } }
+#toast-container { position: fixed; left: 50%; bottom: calc(28px + env(safe-area-inset-bottom)); transform: translateX(-50%); z-index: 99999; display: flex; flex-direction: column; gap: 8px; pointer-events: none; max-width: min(92vw, 440px); width: max-content; }
+.toast { pointer-events: auto; display: flex; align-items: center; gap: 10px; padding: 11px 16px; border-radius: 12px; font-size: 0.86rem; font-weight: 500; color: var(--toast-text); background: var(--toast-bg); border: 1px solid rgba(255, 255, 255, 0.1); box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); opacity: 0; transform: translateY(12px) scale(0.96); transition: opacity 0.22s ease, transform 0.22s ease; cursor: pointer; line-height: 1.45; word-break: break-word; max-width: min(92vw, 440px); }
+.toast.toast-in { opacity: 1; transform: translateY(0) scale(1); }
+.toast.toast-out { opacity: 0; transform: translateY(8px) scale(0.96); }
+.toast-icon { flex-shrink: 0; width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 0.72rem; font-weight: 800; line-height: 1; }
+.toast-info .toast-icon { background: rgba(125, 157, 212, 0.22); color: #a8c0e8; }
+.toast-success .toast-icon { background: rgba(52, 211, 153, 0.22); color: #6ee7b7; }
+.toast-error .toast-icon { background: rgba(224, 85, 96, 0.24); color: #ff8a8a; }
+.toast-warn .toast-icon { background: rgba(255, 184, 77, 0.22); color: #ffd693; }
+.toast-success { border-color: rgba(52, 211, 153, 0.35); }
+.toast-error { border-color: rgba(224, 85, 96, 0.35); }
+.toast-warn { border-color: rgba(255, 184, 77, 0.35); }
+@media (max-width: 420px) { .toast { font-size: 0.82rem; padding: 10px 14px; } }
+.cast.clickable { cursor: pointer; }
+.cast.clickable:hover .cast-img { transform: translateY(-2px) scale(1.03); box-shadow: 0 8px 20px rgba(167, 139, 250, 0.28); }
+.cast.clickable:hover .cast-name { color: #c4b5fd; }
+.cast-img { transition: transform 0.2s ease, box-shadow 0.2s ease; }
+.cast-name { transition: color 0.15s ease; }
+.trailer-grid { display: grid; grid-template-columns: 1fr; gap: 14px; }
+@media (min-width: 600px) { .trailer-grid { grid-template-columns: repeat(2, 1fr); } }
+.trailer-card { position: relative; aspect-ratio: 16/9; border-radius: 12px; overflow: hidden; background: linear-gradient(135deg, #1a1528 0%, #0e0e10 100%); cursor: pointer; border: 1px solid var(--border); transition: border-color 0.15s, transform 0.15s; }
+.trailer-card:hover { border-color: rgba(167, 139, 250, 0.4); transform: translateY(-1px); }
+.trailer-thumb { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; z-index: 1; }
+.trailer-card.no-thumb .trailer-thumb { display: none; }
+.trailer-play { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 52px; height: 52px; border-radius: 50%; background: rgba(8, 10, 18, 0.72); border: 1px solid rgba(255, 255, 255, 0.28); color: #fff; display: flex; align-items: center; justify-content: center; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); transition: background 0.15s, transform 0.15s; pointer-events: none; z-index: 3; }
+.trailer-card:hover .trailer-play { background: linear-gradient(145deg, #8b5cf6, #a78bfa); transform: translate(-50%, -50%) scale(1.08); }
+.trailer-play svg { display: block; margin-left: 2px; }
+.trailer-name { position: absolute; left: 0; right: 0; bottom: 0; padding: 22px 12px 9px; font-size: 0.8rem; font-weight: 600; color: #fff; background: linear-gradient(180deg, transparent, rgba(0, 0, 0, 0.85)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; z-index: 3; }
+.trailer-card.playing .trailer-thumb, .trailer-card.playing .trailer-play, .trailer-card.playing .trailer-name { display: none; }
+.trailer-frame { position: absolute; inset: 0; width: 100%; height: 100%; background: var(--surface-2); z-index: 2; }
+.trailer-frame:empty { display: none; }
+.trailer-frame iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; display: block; }
+.person-modal { position: fixed; inset: 0; z-index: 230; display: none; }
+.person-modal.open { display: block; }
+.person-backdrop { position: absolute; inset: 0; background: var(--overlay); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); animation: fadeIn 0.2s ease; }
+.person-panel { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: min(94vw, 760px); max-height: 88vh; display: flex; flex-direction: column; background: var(--panel-grad); border: 1px solid var(--border-strong); border-radius: 18px; box-shadow: 0 30px 80px rgba(0, 0, 0, 0.85); overflow: hidden; animation: modalIn 0.25s cubic-bezier(0.2, 0.9, 0.3, 1); }
+.person-panel-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.person-panel-name { font-size: 1rem; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.person-close { width: 40px; height: 40px; flex-shrink: 0; border-radius: 50%; border: 1px solid var(--chip-border); background: var(--chip-bg); color: var(--chip-fg); font-size: 1.2rem; cursor: pointer; font-family: inherit; line-height: 1; display: flex; align-items: center; justify-content: center; transition: all 0.15s; }
+.person-close:hover { color: #fff; border-color: var(--border-strong); }
+.person-panel-body { overflow-y: auto; padding: 18px 20px 24px; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+@media (max-width: 599px) { .person-panel { top: auto; bottom: 0; left: 0; right: 0; transform: none; width: 100%; max-height: 92vh; border-radius: 18px 18px 0 0; } }
+.person-head { display: flex; gap: 18px; margin-bottom: 18px; }
+.person-photo { width: 110px; height: 165px; border-radius: 12px; object-fit: cover; flex-shrink: 0; background: var(--surface-2); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5); }
+.person-photo-ph { display: flex; align-items: center; justify-content: center; font-size: 2rem; color: var(--text-dim); background: var(--soft-card-grad); }
+.person-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.person-name { font-size: 1.3rem; font-weight: 800; letter-spacing: -0.4px; line-height: 1.25; }
+.person-sub { font-size: 0.82rem; color: var(--text-dim); }
+.person-rows { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+.person-row { font-size: 0.78rem; color: var(--text-dim); line-height: 1.5; }
+.person-row b { color: var(--text); font-weight: 600; margin-right: 6px; }
+.person-bio { font-size: 0.86rem; color: #c0c8d6; line-height: 1.65; white-space: pre-line; margin-bottom: 22px; padding-top: 4px; border-top: 1px solid var(--border); }
+.person-credits-title { font-size: 0.95rem; font-weight: 700; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
+.person-credits-title::before { content: ""; width: 3px; height: 14px; border-radius: 2px; background: linear-gradient(180deg, #a78bfa, #7c3aed); }
+@media (max-width: 480px) { .person-head { flex-direction: column; align-items: center; text-align: center; gap: 12px; } .person-info { align-items: center; } .person-photo { width: 130px; height: 195px; } .person-rows { align-items: center; } }
+.btn-action.loading { color: var(--accent-2); border-color: rgba(167, 139, 250, 0.45); background: rgba(167, 139, 250, 0.12); pointer-events: none; }
+.btn-action.loading svg { transform-origin: 50% 50%; animation: btnSpin 0.7s linear infinite; }
+@keyframes btnSpin { to { transform: rotate(360deg); } }
+.btn-action.loading span::after { content: ""; display: inline-block; width: 0; overflow: hidden; animation: btnDots 1.2s steps(4, end) infinite; }
+@keyframes btnDots { 0% { content: ""; } 25% { content: "."; } 50% { content: ".."; } 75% { content: "..."; } }
 `;
   return __pageStylesCache;
 }
