@@ -87,7 +87,8 @@ const ASSET_ORIGINS = {
   ],
 };
 
-const TRAKT_UA = "MineTrakt/1.0";
+// 伪装成常见的 Chrome 浏览器，避开机器人识别
+const TRAKT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 const JSON_HEADERS = {
   "Content-Type": "application/json",
