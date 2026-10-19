@@ -136,7 +136,7 @@ const KV_STALE_RETENTION = 86400 * 7,
 const HOME_AUTO_REFRESH_MINUTES = 0;
 
 /* 全局版本号：改这一处即可，JS / CSS / SW 全部跟着变 */
-const APP_VERSION = "172";
+const APP_VERSION = "173";
 const APP_JS_VERSION = APP_VERSION;
 const APP_CSS_VERSION = APP_VERSION;
 
@@ -7111,9 +7111,9 @@ function renderContinueItems(upNext, mode = "grid") {
     });
   });
 
-  if (mode === "fragment") return parts.join("");
   if (mode === "hscroll") return `<div class="h-scroll">${parts.join("")}</div>`;
-  return `<div class="grid">${parts.join("")}</div>`;
+  // grid / fragment：只返回卡片 HTML，由调用方（首页分片或 list-modal）自行包 .grid
+  return parts.join("");
 }
 
 /**
