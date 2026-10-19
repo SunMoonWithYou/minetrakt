@@ -136,7 +136,7 @@ const KV_STALE_RETENTION = 86400 * 7,
 const HOME_AUTO_REFRESH_MINUTES = 0;
 
 /* 全局版本号：改这一处即可，JS / CSS / SW 全部跟着变 */
-const APP_VERSION = "171";
+const APP_VERSION = "172";
 const APP_JS_VERSION = APP_VERSION;
 const APP_CSS_VERSION = APP_VERSION;
 
@@ -7797,7 +7797,9 @@ async function handleMore(request, env, ctx) {
     const hasMore = pageCount > 0 ? page < pageCount : list.length >= limit;
 
     await attachContinueStillsForPlayback(list, env, ctx);
-    return authResp(auth, needsCookieUpdate, renderContinueItems(list, "fragment"), {
+    const mode = (url.searchParams.get("mode") || "fragment").toLowerCase();
+    const renderMode = mode === "grid" ? "grid" : (mode === "hscroll" ? "hscroll" : "fragment");
+    return authResp(auth, needsCookieUpdate, renderContinueItems(list, renderMode), {
       extra: {
         "X-Has-More": String(hasMore),
         "X-Page": String(page),
