@@ -136,7 +136,7 @@ const KV_STALE_RETENTION = 86400 * 7,
 const HOME_AUTO_REFRESH_MINUTES = 0;
 
 /* 全局版本号：改这一处即可，JS / CSS / SW 全部跟着变 */
-const APP_VERSION = "149";
+const APP_VERSION = "171";
 const APP_JS_VERSION = APP_VERSION;
 const APP_CSS_VERSION = APP_VERSION;
 
@@ -2411,6 +2411,235 @@ async function tmdbDetailCached(path, env, ctx, ttl = 86400) {
 /** 拼 TMDB 图片 URL */
 function tmdbPoster(path, size = "w185") {
   return path ? `${TMDB_IMG}/${size}${path}` : null;
+}
+
+/** 拉取整季分集剧照 Map<episode_number, url>（一次请求，带缓存） */
+async function tmdbSeasonStillMap(tmdbId, season, env, ctx) {
+  if (!env || !env.TMDB_API_KEY) return null;
+  const sid = Number(tmdbId),
+    sn = Number(season);
+  if (!Number.isFinite(sid) || sid <= 0) return null;
+  if (!Number.isFinite(sn) || sn < 0) return null;
+  const data = await tmdbDetailCached(
+    `/tv/${sid}/season/${sn}`,
+    env,
+    ctx,
+    86400 * 14,
+  );
+  if (!data || !Array.isArray(data.episodes)) return null;
+  const map = new Map();
+  for (const ep of data.episodes) {
+    if (ep && ep.episode_number != null && ep.still_path) {
+      map.set(Number(ep.episode_number), tmdbPoster(ep.still_path, "w500"));
+    }
+  }
+  return map;
+}
+
+/** 拉取 TMDB 分集剧照：优先整季缓存，再回落单集接口 */
+async function tmdbEpisodeStill(tmdbId, season, episode, env, ctx) {
+  if (!env || !env.TMDB_API_KEY) return null;
+  const sid = Number(tmdbId),
+    sn = Number(season),
+    en = Number(episode);
+  if (!Number.isFinite(sid) || sid <= 0) return null;
+  if (!Number.isFinite(sn) || sn < 0) return null;
+  if (!Number.isFinite(en) || en <= 0) return null;
+  const map = await tmdbSeasonStillMap(sid, sn, env, ctx);
+  if (map && map.has(en)) return map.get(en);
+  const data = await tmdbDetailCached(
+    `/tv/${sid}/season/${sn}/episode/${en}`,
+    env,
+    ctx,
+    86400 * 14,
+  );
+  if (data && data.still_path) return tmdbPoster(data.still_path, "w500");
+  return null;
+}
+
+/** TMDB 剧集横向背景图（backdrop），分集无图时的横向兜底 */
+async function tmdbShowBackdrop(tmdbId, env, ctx) {
+  if (!env || !env.TMDB_API_KEY) return null;
+  const sid = Number(tmdbId);
+  if (!Number.isFinite(sid) || sid <= 0) return null;
+  const data = await tmdbDetailCached(`/tv/${sid}`, env, ctx, 86400 * 7);
+  if (data && data.backdrop_path) return tmdbPoster(data.backdrop_path, "w780");
+  // 电影
+  const movie = await tmdbDetailCached(`/movie/${sid}`, env, ctx, 86400 * 7);
+  if (movie && movie.backdrop_path) return tmdbPoster(movie.backdrop_path, "w780");
+  return null;
+}
+
+/** TMDB 中文标题（tv / movie） */
+async function tmdbZhTitle(kind, tmdbId, env, ctx) {
+  if (!env || !env.TMDB_API_KEY || !tmdbId) return null;
+  const path = kind === "movie" ? `/movie/${tmdbId}` : `/tv/${tmdbId}`;
+  const data = await tmdbDetailCached(path, env, ctx, 86400 * 7);
+  if (!data) return null;
+  return (data.name || data.title || "").trim() || null;
+}
+
+/**
+ * 为继续观看原始条目挂上：
+ *  - 分集剧照 __stillUrl（优先，按季批量取）
+ *  - 无分集图时用横向 backdrop __backdropUrl
+ *  - 中文标题 __zhTitle
+ * 支持 up_next_nitro / progress.next_episode / movie。
+ */
+async function attachContinueStillsForPlayback(list, env, ctx) {
+  if (!env || !env.TMDB_API_KEY || !Array.isArray(list) || !list.length)
+    return list;
+
+  // 规范化每条的 show/ep/tmdb
+  const normalized = [];
+  for (const entry of list) {
+    if (!entry) continue;
+    if (entry.movie && entry.movie.ids && entry.movie.ids.tmdb) {
+      normalized.push({
+        entry,
+        ep: null,
+        tmdbId: entry.movie.ids.tmdb,
+        season: null,
+        number: null,
+        kind: "movie",
+      });
+      continue;
+    }
+    let ep = null,
+      show = null;
+    if (entry.episode && entry.show) {
+      ep = entry.episode;
+      show = entry.show;
+    } else if (entry.show && entry.progress && entry.progress.next_episode) {
+      ep = entry.progress.next_episode;
+      show = entry.show;
+    } else if (entry.show) {
+      show = entry.show;
+    } else {
+      continue;
+    }
+    const tmdbId = show && show.ids && show.ids.tmdb;
+    if (!tmdbId) continue;
+    const season = ep
+      ? ep.season != null
+        ? ep.season
+        : ep.season_number
+      : null;
+    const number = ep
+      ? ep.number != null
+        ? ep.number
+        : ep.episode_number
+      : null;
+    normalized.push({ entry, ep, tmdbId, season, number, kind: "tv" });
+  }
+
+  // 按 剧+季 分组拉 still map，避免每集打一次
+  const seasonKey = (id, s) => id + ":" + s;
+  const seasonMaps = new Map();
+  const needSeasons = [];
+  for (const j of normalized) {
+    if (j.kind !== "tv" || j.season == null) continue;
+    const k = seasonKey(j.tmdbId, j.season);
+    if (!seasonMaps.has(k)) {
+      seasonMaps.set(k, null);
+      needSeasons.push({ k, tmdbId: j.tmdbId, season: j.season });
+    }
+  }
+  const batch = 5;
+  for (let i = 0; i < needSeasons.length; i += batch) {
+    const slice = needSeasons.slice(i, i + batch);
+    await Promise.all(
+      slice.map(async (s) => {
+        try {
+          const map = await tmdbSeasonStillMap(s.tmdbId, s.season, env, ctx);
+          seasonMaps.set(s.k, map);
+        } catch (_) {
+          seasonMaps.set(s.k, null);
+        }
+      }),
+    );
+  }
+
+  await Promise.all(
+    normalized.map(async (j) => {
+      try {
+        if (j.kind === "tv" && j.season != null && j.number != null) {
+          const map = seasonMaps.get(seasonKey(j.tmdbId, j.season));
+          let still =
+            map && map.has(Number(j.number))
+              ? map.get(Number(j.number))
+              : null;
+          if (!still) {
+            still = await tmdbEpisodeStill(
+              j.tmdbId,
+              j.season,
+              j.number,
+              env,
+              ctx,
+            );
+          }
+          if (still) {
+            j.entry.__stillUrl = still;
+            if (j.ep) j.ep.__stillUrl = still;
+          }
+        }
+        if (!j.entry.__stillUrl) {
+          const bd = await tmdbShowBackdrop(j.tmdbId, env, ctx);
+          if (bd) j.entry.__backdropUrl = bd;
+        }
+        j.entry.__tmdbId = j.tmdbId;
+        if (j.ep) j.ep.__tmdbId = j.tmdbId;
+        const zh = await tmdbZhTitle(
+          j.kind === "movie" ? "movie" : "tv",
+          j.tmdbId,
+          env,
+          ctx,
+        );
+        if (zh) j.entry.__zhTitle = zh;
+      } catch (_) {}
+    }),
+  );
+  return list;
+}
+
+/** 待看列表：给分集条目挂 TMDB 剧照（item.__stillUrl / episode.__stillUrl） */
+async function attachWatchlistStills(list, env, ctx) {
+  if (!env || !env.TMDB_API_KEY || !Array.isArray(list) || !list.length)
+    return list;
+  const jobs = [];
+  for (const item of list) {
+    if (!item || !item.episode || !item.show) continue;
+    if (item.__stillUrl || (item.episode && item.episode.__stillUrl)) continue;
+    const ep = item.episode;
+    const show = item.show;
+    const tmdbId = show.ids && show.ids.tmdb;
+    const season = ep.season != null ? ep.season : ep.season_number;
+    const number = ep.number != null ? ep.number : ep.episode_number;
+    if (!tmdbId || season == null || number == null) continue;
+    jobs.push({ item, ep, tmdbId, season, number });
+  }
+  const batch = 6;
+  for (let i = 0; i < jobs.length; i += batch) {
+    const slice = jobs.slice(i, i + batch);
+    await Promise.all(
+      slice.map(async (j) => {
+        try {
+          const url = await tmdbEpisodeStill(
+            j.tmdbId,
+            j.season,
+            j.number,
+            env,
+            ctx,
+          );
+          if (url) {
+            j.item.__stillUrl = url;
+            if (j.ep) j.ep.__stillUrl = url;
+          }
+        } catch (_) {}
+      }),
+    );
+  }
+  return list;
 }
 
 /** 归一化 TMDB 结果为统一 item 结构 */
@@ -5042,7 +5271,7 @@ async function handleHomeData(request, env, ctx) {
             };
           }
           const r = await fetchJson(
-            `${TRAKT_API}/sync/progress/up_next_nitro?extended=full&images=poster&limit=20&intent=continuing`,
+            `${TRAKT_API}/sync/progress/up_next_nitro?extended=full&images=poster,screenshot,fanart&limit=20&intent=continuing`,
           );
           dbg.items = Array.isArray(r)
             ? r.length
@@ -5225,6 +5454,7 @@ async function handleHomeData(request, env, ctx) {
   if (wantPlayback) {
     const pbList = Array.isArray(playback) ? playback : [];
     try {
+      await attachContinueStillsForPlayback(pbList, env, ctx);
       result.playbackHScrollHtml = renderContinueItems(pbList, "hscroll");
     } catch {
       result.playbackHScrollHtml =
@@ -5368,8 +5598,9 @@ async function handleHomeData(request, env, ctx) {
       } else if (!watchlist.length) {
         result.watchlistHtml = emptyWatchlistHtml();
       } else {
-        const list = watchlist,
-          firstPage = list.slice(0, WATCHLIST_PAGE_SIZE),
+        const list = watchlist;
+        await attachWatchlistStills(list, env, ctx);
+        const firstPage = list.slice(0, WATCHLIST_PAGE_SIZE),
           hasMore = list.length > WATCHLIST_PAGE_SIZE,
           cardsHtml = renderWatchlistItems(firstPage, env),
           moreHtml = hasMore
@@ -5817,7 +6048,7 @@ async function handleSeason(request, env, ctx) {
   return authResp(
     auth,
     needsCookieUpdate,
-    renderSeasonEpisodes(seasonProgress, tmdbSeason, seasonNum, slug, traktEpisodes),
+    renderSeasonEpisodes(seasonProgress, tmdbSeason, seasonNum, slug, traktEpisodes, tmdbId),
     { extra: { "Cache-Control": CC_NO_STORE } },
   );
 }
@@ -6106,12 +6337,31 @@ async function handleApiDetail(request, env, ctx) {
 /** 从 Trakt 实体的 images.poster 中提取海报 URL */
 function posterOfTrakt(obj) {
   if (!obj || !obj.images) return null;
-  const p = obj.images.poster;
-  if (!p || !Array.isArray(p) || !p.length) return null;
-  if (typeof p[0] === "string") return p[0];
-  if (typeof p[0] === "object")
-    return p[0].medium || p[0].thumb || p[0].full || null;
-  return null;
+  const pick = (arr) => {
+    if (!arr || !Array.isArray(arr) || !arr.length) return null;
+    if (typeof arr[0] === "string") return arr[0];
+    if (typeof arr[0] === "object")
+      return arr[0].full || arr[0].medium || arr[0].thumb || null;
+    return null;
+  };
+  return (
+    pick(obj.images.poster) ||
+    pick(obj.images.screenshot) ||
+    pick(obj.images.screenshots) ||
+    pick(obj.images.fanart) ||
+    null
+  );
+}
+
+/** 继续观看取图：优先分集截图，其次剧集/电影海报 */
+function continueImageOf(item) {
+  if (!item) return null;
+  return (
+    posterOfTrakt(item.episode) ||
+    posterOfTrakt(item.show) ||
+    posterOfTrakt(item.movie) ||
+    null
+  );
 }
 
 /**
@@ -6171,10 +6421,19 @@ function buildBaseItem(traktItem) {
     base.tagClass = "episode";
     base.title = s.title || "";
     base.overview = s.overview || "";
-    base.poster = posterOfTrakt(s);
+    // 有分集时优先分集图，避免被剧海报盖住
+    const epPoster =
+      (e && (e.__stillUrl || posterOfTrakt(e))) ||
+      (traktItem.__stillUrl || null);
+    base.poster = epPoster || posterOfTrakt(s);
+    base.hasPoster = !!base.poster;
     base.line1 =
       e.season != null && e.number != null
-        ? `S${pad(e.season)}E${pad(e.number)}${e.title ? " · " + e.title : ""}`
+        ? `第 ${e.season} 季 第 ${e.number} 集${
+            e.title && !/^Episode\s*\d+$/i.test(String(e.title).trim())
+              ? " · " + e.title
+              : ""
+          }`
         : s.year
           ? String(s.year)
           : "";
@@ -6191,10 +6450,12 @@ function buildBaseItem(traktItem) {
         : s.ids && s.ids.trakt
           ? String(s.ids.trakt)
           : null;
+    // 已有分集图时不挂 enrichKey 的海报覆盖；仍可 enrichment 但前端会跳过海报
     if (s.ids && s.ids.tmdb) base.enrichKey = "tv:tmdb:" + s.ids.tmdb;
     else if (s.ids && s.ids.tvdb) base.enrichKey = "tv:tvdb:" + s.ids.tvdb;
     else if (s.title)
       base.enrichKey = "tv:title:" + s.title + ":" + (s.year || "");
+    if (epPoster) base.lockPoster = true;
   } else if (kind === "season") {
     const se = traktItem.season || {},
       s = traktItem.show || {};
@@ -6407,7 +6668,8 @@ function mediaItem(opts) {
     ? `<div class="cal-action-row">${calendarBtns}</div>`
     : "";
 
-  return `<div class="item${clickable}"${dataAttrs}${enrichAttrs}${style}>${removeHtml}${watchedHtml}${unwatchHtml}<div class="poster">${opts.poster ? `<img src="${opts.poster}" loading="lazy" alt="">` : `<div class="poster-ph"><span>${opts.tagClass === "movie" ? "🎬" : "📺"}</span></div>`}${playHtml}${dropHtml}</div><div class="info"><div class="name-row"><span class="name">${esc(opts.title)}</span>${tagHtml}</div>${opts.line1 ? `<div class="meta">${esc(opts.line1)}</div>` : ""}${opts.overview ? `<div class="overview">${esc(opts.overview)}</div>` : ""}${opts.line2 ? `<div class="meta dim">${esc(opts.line2)}</div>` : ""}${bar}${calendarBtnHtml}</div></div>`;
+  const lockPosterAttr = opts.lockPoster || opts.hasPoster ? ` data-lock-poster="1"` : "";
+  return `<div class="item${clickable}"${dataAttrs}${enrichAttrs}${lockPosterAttr}${style}>${removeHtml}${watchedHtml}${unwatchHtml}<div class="poster">${opts.poster ? `<img src="${opts.poster}" loading="lazy" alt="">` : `<div class="poster-ph"><span>${opts.tagClass === "movie" ? "🎬" : "📺"}</span></div>`}${playHtml}${dropHtml}</div><div class="info"><div class="name-row"><span class="name">${esc(opts.title)}</span>${tagHtml}</div>${opts.line1 ? `<div class="meta">${esc(opts.line1)}</div>` : ""}${opts.overview ? `<div class="overview">${esc(opts.overview)}</div>` : ""}${opts.line2 ? `<div class="meta dim">${esc(opts.line2)}</div>` : ""}${bar}${calendarBtnHtml}</div></div>`;
 }
 
 /**
@@ -6485,8 +6747,18 @@ function renderWatchlistItems(items, env) {
             : null,
         removeId = e.traktId;
 
+      const poster =
+        item.__stillUrl ||
+        (item.episode && item.episode.__stillUrl) ||
+        e.poster;
+      const lockPoster = !!(
+        item.__stillUrl ||
+        (item.episode && item.episode.__stillUrl) ||
+        e.lockPoster
+      );
+
       return mediaItem({
-        poster: e.poster,
+        poster,
         tag: e.tag,
         tagClass: e.tagClass,
         title: e.title,
@@ -6499,6 +6771,8 @@ function renderWatchlistItems(items, env) {
         enrichKey: e.enrichKey,
         removeType,
         removeId,
+        lockPoster,
+        hasPoster: !!poster,
       });
     })
     .filter(Boolean)
@@ -6508,28 +6782,61 @@ function renderWatchlistItems(items, env) {
 /** 构造 Infuse 深链 */
 function buildInfuseHrefForContinue(item) {
   if (!item) return null;
+
+  const pickTmdb = (...cands) => {
+    for (const v of cands) {
+      const n = Number(v);
+      if (Number.isFinite(n) && n > 0) return Math.floor(n);
+    }
+    return null;
+  };
+
+  // 电影
   const movie = item.movie;
-  if (movie && movie.ids && movie.ids.tmdb) {
-    return `infuse://movie/${movie.ids.tmdb}`;
+  if (movie) {
+    const mid = pickTmdb(
+      item.__tmdbId,
+      movie.ids && movie.ids.tmdb,
+      movie.tmdb,
+    );
+    if (mid) return `infuse://movie/${mid}?play`;
+    return null;
   }
 
-  const show = item.show;
-  const tmdbId = show && show.ids && show.ids.tmdb;
-  if (!tmdbId) return null;
-
+  // 剧集 / 分集
+  const show = item.show || {};
   const ep =
     item.episode || (item.progress && item.progress.next_episode) || null;
-  const season = ep ? (ep.season != null ? ep.season : ep.season_number) : null;
+  const tmdbId = pickTmdb(
+    item.__tmdbId,
+    show.ids && show.ids.tmdb,
+    show.tmdb,
+    ep && ep.ids && ep.ids.tmdb, // 极少情况：有时只有集级 id，仍尽量用
+  );
+  if (!tmdbId) return null;
+
+  const season = ep
+    ? ep.season != null
+      ? ep.season
+      : ep.season_number
+    : null;
   const number = ep
     ? ep.number != null
       ? ep.number
       : ep.episode_number
     : null;
-
-  if (season != null && number != null) {
-    return `infuse://series/${tmdbId}-${season}-${number}`;
+  const s = Number(season);
+  const e = Number(number);
+  // 有集号：跳到该集（不带 ?play，避免没资源时乱播）
+  // 仅有季/无集：跳到该季
+  // 都没有：跳到第 1 季（纯 series/{id} 部分剧无法打开）
+  if (Number.isFinite(s) && s >= 0 && Number.isFinite(e) && e > 0) {
+    return `infuse://series/${tmdbId}-${Math.floor(s)}-${Math.floor(e)}`;
   }
-  return `infuse://series/${tmdbId}`;
+  if (Number.isFinite(s) && s >= 0) {
+    return `infuse://series/${tmdbId}-${Math.floor(s)}`;
+  }
+  return `infuse://series/${tmdbId}-1`;
 }
 
 /**
@@ -6546,16 +6853,28 @@ function renderContinueItems(upNext, mode = "grid") {
   if (Array.isArray(upNext)) {
     for (const entry of upNext) {
       if (entry.episode) {
+        if (entry.__tmdbId && entry.show && entry.show.ids && !entry.show.ids.tmdb) {
+          entry.show.ids.tmdb = entry.__tmdbId;
+        }
         items.push({
           source: "playback",
           sortKey: entry.paused_at || entry.last_watched_at || "",
           raw: entry,
+          stillUrl: entry.__stillUrl || (entry.episode && entry.episode.__stillUrl) || null,
+          backdropUrl: entry.__backdropUrl || null,
+          zhTitle: entry.__zhTitle || null,
         });
       } else if (entry.show && entry.progress && entry.progress.next_episode) {
         const completed = entry.progress.completed;
         if (typeof completed === "number" && completed <= 0) continue;
 
         const next = entry.progress.next_episode;
+        const showObj = entry.show || {};
+        // 确保深链能读到 tmdb
+        if (entry.__tmdbId) {
+          if (!showObj.ids) showObj.ids = {};
+          if (!showObj.ids.tmdb) showObj.ids.tmdb = entry.__tmdbId;
+        }
         items.push({
           source: "upnext",
           sortKey: entry.last_watched_at || entry.progress.last_watched_at || "",
@@ -6565,16 +6884,26 @@ function renderContinueItems(upNext, mode = "grid") {
           },
           raw: {
             type: "episode",
-            show: entry.show,
+            show: showObj,
             episode: next,
             progress: null,
+            __stillUrl: entry.__stillUrl || (next && next.__stillUrl) || null,
+            __backdropUrl: entry.__backdropUrl || null,
+            __zhTitle: entry.__zhTitle || null,
+            __tmdbId: entry.__tmdbId || (showObj.ids && showObj.ids.tmdb) || null,
           },
+          stillUrl: entry.__stillUrl || (next && next.__stillUrl) || null,
+          backdropUrl: entry.__backdropUrl || null,
+          zhTitle: entry.__zhTitle || null,
         });
       } else if (entry.movie) {
         items.push({
           source: "playback",
-          sortKey: entry.last_watched_at || "",
+          sortKey: entry.last_watched_at || entry.paused_at || "",
           raw: entry,
+          stillUrl: entry.__stillUrl || null,
+          backdropUrl: entry.__backdropUrl || null,
+          zhTitle: entry.__zhTitle || null,
         });
       }
     }
@@ -6592,13 +6921,29 @@ function renderContinueItems(upNext, mode = "grid") {
     const delay = Math.min(i, 24) * 20,
       item = it.raw,
       ep = item.episode || {},
-      epTag =
-        ep.season != null && ep.number != null
-          ? `S${pad(ep.season)}E${pad(ep.number)}`
-          : "",
+      show = item.show || {},
+      isMovie = !!(item.movie && !item.episode),
       playPct =
         typeof item.progress === "number" ? Math.round(item.progress) : null,
-      e = buildBaseItem(item);
+      e = buildBaseItem(item),
+      coverImg =
+        it.stillUrl ||
+        item.__stillUrl ||
+        (item.episode && item.episode.__stillUrl) ||
+        it.backdropUrl ||
+        item.__backdropUrl ||
+        // 继续观看卡片：不要用竖版剧海报（会被 16:9 裁成「假横图」）
+        posterOfTrakt(item.episode) ||
+        null;
+
+    // 仅当完全没有横图时，才退回剧海报 / enrich 海报
+    if (!coverImg) {
+      coverImg =
+        it.backdropUrl ||
+        item.__backdropUrl ||
+        continueImageOf(item) ||
+        e.poster;
+    }
 
     let barPct = playPct;
     if (barPct == null && it.showProgress && it.showProgress.aired > 0) {
@@ -6611,14 +6956,72 @@ function renderContinueItems(upNext, mode = "grid") {
       );
     }
 
-    const subLine =
-      it.showProgress && it.showProgress.aired > 0
-        ? `已看 ${it.showProgress.completed} / ${it.showProgress.aired} 集`
-        : playPct != null
-          ? `已看 ${playPct}%`
-          : epTag
-            ? `下一集 ${epTag}`
-            : "下一集";
+    // 集数：优先用分集信息；up_next 若与进度不一致，用 completed+1 校正
+    let epSeason = ep.season != null ? ep.season : ep.season_number;
+    let epNumber = ep.number != null ? ep.number : ep.episode_number;
+    if (
+      it.source === "upnext" &&
+      it.showProgress &&
+      typeof it.showProgress.completed === "number" &&
+      it.showProgress.completed >= 0 &&
+      typeof it.showProgress.aired === "number" &&
+      it.showProgress.aired > 0
+    ) {
+      const expect = it.showProgress.completed + 1;
+      // 单季长篇常见：进度 288/290 → 应显示第 289 集
+      if (
+        expect >= 1 &&
+        expect <= it.showProgress.aired &&
+        (epNumber == null || Number(epNumber) !== expect)
+      ) {
+        // 仅当 next 明显跳号时校正（差 1 集以上，或 next 大于已播数）
+        if (
+          epNumber == null ||
+          Number(epNumber) > expect ||
+          Number(epNumber) > it.showProgress.aired
+        ) {
+          if (epSeason == null) epSeason = 1;
+          epNumber = expect;
+        }
+      }
+    }
+    let epLabel = "";
+    if (epSeason != null && epNumber != null) {
+      epLabel = `第${epSeason}季·${epNumber}集`;
+    }
+
+    // 标题：中文剧名（不含集数）
+    const showTitle =
+      it.zhTitle ||
+      item.__zhTitle ||
+      e.title ||
+      (show.title || "") ||
+      (item.movie && item.movie.title) ||
+      "";
+
+    // 播放中用「正在看」，待看下一集用「下一集」
+    let watchingLine = "";
+    if (epLabel) {
+      watchingLine =
+        it.source === "upnext" ? `下一集 ${epLabel}` : `正在看 ${epLabel}`;
+    } else if (isMovie && playPct != null) {
+      watchingLine = `已看 ${playPct}%`;
+    } else if (it.showProgress && it.showProgress.aired > 0) {
+      watchingLine = `已看 ${it.showProgress.completed}/${it.showProgress.aired} 集`;
+    }
+
+    // 海报角标进度文案
+    let progressLabel = "";
+    if (playPct != null) {
+      progressLabel = `已看 ${playPct}%`;
+    } else if (it.showProgress && it.showProgress.aired > 0) {
+      progressLabel = `已看 ${it.showProgress.completed}/${it.showProgress.aired} 集`;
+    } else if (epLabel) {
+      progressLabel = epLabel;
+    }
+
+    // 观看日期
+    const relTime = fmtRelative(it.sortKey) || "";
 
     let watchedType = null,
       watchedId = null;
@@ -6632,14 +7035,70 @@ function renderContinueItems(upNext, mode = "grid") {
 
     const playHref = buildInfuseHrefForContinue(item);
 
+    // 弃看：仅剧集
+    const dropShowId =
+      !isMovie && show.ids && show.ids.trakt ? String(show.ids.trakt) : null;
+
+    // 继续观看专用横向卡片（hscroll / fragment）
+    if (mode === "hscroll" || mode === "fragment") {
+      const dataAttrs =
+        e.detailType && e.detailId
+          ? ` data-detail-type="${esc(e.detailType)}" data-detail-id="${esc(e.detailId)}" role="button" tabindex="0"`
+          : "";
+      const enrichAttrs = e.enrichKey
+        ? ` data-enrich-key="${esc(e.enrichKey)}"`
+        : "";
+      const clickable = e.detailType && e.detailId ? " clickable" : "";
+      const style = delay ? ` style="animation-delay:${delay}ms"` : "";
+      const posterHtml = coverImg
+        ? `<img src="${esc(coverImg)}" loading="lazy" alt="">`
+        : `<div class="poster-ph"><span>${isMovie ? "🎬" : "📺"}</span></div>`;
+      const playHtml = playHref
+        ? `<a class="poster-play" href="${esc(playHref)}" rel="noopener" aria-label="在 Infuse 中播放" title="在 Infuse 中播放" onclick="event.stopPropagation()"><svg viewBox="0 0 24 24" width="26" height="26" fill="currentColor" stroke="none"><path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11.04-6.86a1 1 0 0 0 0-1.72L9.5 4.28A1 1 0 0 0 8 5.14z"/></svg></a>`
+        : "";
+      const overlayHtml = progressLabel
+        ? `<div class="cw-overlay">${esc(progressLabel)}</div>`
+        : "";
+      const barHtml =
+        barPct != null
+          ? `<div class="cw-bar"><div class="cw-bar-fill" style="width:${barPct}%"></div></div>`
+          : "";
+      const menuHtml = dropShowId
+        ? `<button class="cw-more" type="button" data-cw-menu data-cw-drop-id="${esc(dropShowId)}" data-cw-name="${esc(showTitle)}" aria-label="更多操作" title="更多"><svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><circle cx="5" cy="12" r="2.2"/><circle cx="12" cy="12" r="2.2"/><circle cx="19" cy="12" r="2.2"/></svg></button>`
+        : "";
+      const watchedHtml =
+        watchedType && watchedId
+          ? `<button class="wl-watched" type="button" data-watched-type="${esc(watchedType)}" data-watched-id="${esc(String(watchedId))}" aria-label="标记为已看" title="标记为已看">✓</button>`
+          : "";
+
+      const lockAttr =
+        item.__stillUrl ||
+        (item.episode && item.episode.__stillUrl) ||
+        item.__backdropUrl ||
+        coverImg
+          ? ` data-lock-poster="1"`
+          : "";
+      return `<div class="cw-card item${clickable}"${dataAttrs}${enrichAttrs}${lockAttr}${style}>${watchedHtml}<div class="cw-poster">${posterHtml}${overlayHtml}${barHtml}${playHtml}</div><div class="cw-info"><div class="cw-title-row"><span class="cw-title">${esc(showTitle)}</span>${menuHtml}</div>${watchingLine ? `<div class="cw-watching">${esc(watchingLine)}</div>` : ""}${relTime ? `<div class="cw-meta">${esc(relTime)}</div>` : ""}</div></div>`;
+    }
+
+    // grid 模式仍走通用 mediaItem
+    const subLine =
+      it.showProgress && it.showProgress.aired > 0
+        ? `已看 ${it.showProgress.completed} / ${it.showProgress.aired} 集`
+        : playPct != null
+          ? `已看 ${playPct}%`
+          : epLabel
+            ? epLabel
+            : "下一集";
+
     return mediaItem({
-      poster: e.poster,
+      poster: coverImg || e.poster,
       tag: e.tag,
       tagClass: e.tagClass,
-      title: e.title,
+      title: (watchingLine ? `${showTitle} ${watchingLine.replace('正在看 ', '')}` : showTitle) || e.title,
       overview: e.overview,
-      line1: e.line1,
-      line2: subLine,
+      line1: epLabel && showTitle ? epLabel : e.line1,
+      line2: relTime || subLine,
       pct: barPct,
       delay,
       detailType: e.detailType,
@@ -6648,6 +7107,7 @@ function renderContinueItems(upNext, mode = "grid") {
       watchedType,
       watchedId,
       playHref,
+      dropShowId,
     });
   });
 
@@ -6874,23 +7334,30 @@ function renderDetailFragment(d) {
 
   let infuseHref = "";
   if (isMovie && tmdb && tmdb.id) {
-    infuseHref = `infuse://movie/${tmdb.id}`;
+    infuseHref = `infuse://movie/${tmdb.id}?play`;
   } else if (!isMovie && tmdb && tmdb.id) {
-    const ne = firstUnwatchedEpisode(userProgress);
-    const neSeason = ne
-      ? ne.season != null
-        ? ne.season
-        : ne.season_number
-      : null;
-    const neNumber = ne
-      ? ne.number != null
-        ? ne.number
-        : ne.episode_number
-      : null;
-    infuseHref =
-      neSeason != null && neNumber != null
-        ? `infuse://series/${tmdb.id}-${neSeason}-${neNumber}`
-        : `infuse://series/${tmdb.id}`;
+    // 详情顶栏：跳到「季」（series/{id} 部分剧打不开；series/{id}-{季}-{集} 更稳）
+    // 不落到具体集、不带 ?play
+    let seasonForLink = 1;
+    try {
+      const ne = firstUnwatchedEpisode(userProgress);
+      const s = ne
+        ? ne.season != null
+          ? ne.season
+          : ne.season_number
+        : null;
+      if (s != null && Number(s) >= 0) seasonForLink = Number(s);
+      else if (userProgress && Array.isArray(userProgress.seasons)) {
+        for (let i = userProgress.seasons.length - 1; i >= 0; i--) {
+          const ss = userProgress.seasons[i];
+          if (ss && ss.number != null && (ss.completed > 0 || ss.aired > 0)) {
+            seasonForLink = Number(ss.number);
+            break;
+          }
+        }
+      }
+    } catch (_) {}
+    infuseHref = `infuse://series/${tmdb.id}-${seasonForLink}`;
   }
   if (infuseHref)
     barBtns += `<a class="d-act d-act-play" href="${esc(infuseHref)}" rel="noopener" title="在 Infuse 中查看">${iconPlay}</a>`;
@@ -6984,6 +7451,7 @@ function renderDetailFragment(d) {
                   s.season_number,
                   showSlug,
                   isOpen ? initialTraktEpisodes : [],
+                  tmdb && tmdb.id,
                 )
               : "",
           loadedAttr = isOpen && bodyContent ? ' data-loaded="1"' : "";
@@ -7010,6 +7478,7 @@ function renderSeasonEpisodes(
   seasonNum,
   showSlug,
   traktEpisodes,
+  tmdbShowId,
 ) {
   if (
     !tmdbSeason ||
@@ -7027,6 +7496,14 @@ function renderSeasonEpisodes(
     traktEpisodes.forEach((e) => {
       if (e && e.number != null) traktMap.set(e.number, e);
     });
+
+  const fmtAirDate = (d) => {
+    if (!d) return "";
+    // TMDB: YYYY-MM-DD → 2023 年 07 月 02 日
+    const m = String(d).match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (!m) return d;
+    return `${m[1]} 年 ${m[2]} 月 ${m[3]} 日`;
+  };
 
   return tmdbSeason.episodes
     .map((ep) => {
@@ -7047,13 +7524,67 @@ function renderSeasonEpisodes(
       const attrs = traktUrl
         ? ` data-trakt-url="${esc(traktUrl)}" role="link" tabindex="0" title="在 Trakt 中打开"`
         : "";
-      const actionHtml = isWatched
-        ? '<div class="ep-check">✓</div>'
-        : epId
-          ? `<button class="ep-watch-btn" type="button" data-episode-id="${esc(String(epId))}" data-episode-title="${esc(ep.name || "")}" title="标记本集已看">标记已看</button>`
-          : "";
+      // 播放图标 + 文字状态（已看 / 未看）
+      const iconPlay = `<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M8 5.14v14l11-7-11-7z"/></svg>`;
 
-      return `<div class="episode${isWatched ? " watched" : ""}${clickable}"${attrs}><div class="ep-num">E${pad(num)}</div><div class="ep-body"><div class="ep-title">${esc(ep.name || "")}</div>${ep.overview ? `<div class="ep-overview">${esc(ep.overview)}</div>` : ""}</div><div class="ep-actions">${actionHtml}</div></div>`;
+      let playHtml = "";
+      const sid = Number(tmdbShowId);
+      if (Number.isFinite(sid) && sid > 0 && num != null) {
+        const href = `infuse://series/${Math.floor(sid)}-${Number(seasonNum)}-${Number(num)}?play`;
+        playHtml = `<a class="ep-play-btn" href="${esc(href)}" rel="noopener" title="在 Infuse 中播放" aria-label="播放" onclick="event.stopPropagation()">${iconPlay}</a>`;
+      }
+      const watchHtml = isWatched
+        ? `<span class="ep-status watched" title="已看">已看</span>`
+        : epId
+          ? `<button class="ep-status unwatched ep-watch-btn" type="button" data-episode-id="${esc(String(epId))}" data-episode-title="${esc(ep.name || "")}" title="标记本集已看">未看</button>`
+          : `<span class="ep-status unwatched">未看</span>`;
+      const actionHtml = `${playHtml}${watchHtml}`;
+
+      const still = ep.still_path
+        ? tmdbPoster(ep.still_path, "w300")
+        : null;
+      const stillHtml = still
+        ? `<img class="ep-still" src="${esc(still)}" loading="lazy" alt="">`
+        : `<div class="ep-still ep-still-ph">📺</div>`;
+
+      let title = (ep.name || "").trim();
+      // 避免「289 第289集」这种重复
+      if (
+        !title ||
+        /^Episode\s*\d+$/i.test(title) ||
+        /^第\s*\d+\s*集$/.test(title)
+      ) {
+        title = `第 ${num} 集`;
+      }
+      // 标题本身就是「第N集」时，左侧集号仍显示数字，右侧不再重复拼数字前缀
+      const vote =
+        typeof ep.vote_average === "number" && ep.vote_average > 0
+          ? ep.vote_average.toFixed(1)
+          : null;
+      const runtime =
+        typeof ep.runtime === "number" && ep.runtime > 0
+          ? `${ep.runtime}m`
+          : "";
+      const air = fmtAirDate(ep.air_date);
+      const metaParts = [];
+      if (vote != null)
+        metaParts.push(
+          `<span class="ep-vote">★ ${vote}</span>`,
+        );
+      if (air) metaParts.push(`<span>${esc(air)}</span>`);
+      if (runtime) metaParts.push(`<span>${esc(runtime)}</span>`);
+      const metaHtml = metaParts.length
+        ? `<div class="ep-meta">${metaParts.join('<span class="ep-dot">·</span>')}</div>`
+        : "";
+
+      const titleIsGeneric =
+        !title ||
+        /^第\s*\d+\s*集$/.test(title) ||
+        /^Episode\s*\d+$/i.test(title);
+      const titleHtml = titleIsGeneric
+        ? `<span class="ep-title">第 ${num} 集</span>`
+        : `<span class="ep-num">${num}</span><span class="ep-title">${esc(title)}</span>`;
+      return `<div class="episode${isWatched ? " watched" : ""}${clickable}"${attrs}><div class="ep-still-wrap">${stillHtml}${isWatched ? '<span class="ep-still-badge">已看</span>' : ""}</div><div class="ep-body"><div class="ep-head"><div class="ep-title-line">${titleHtml}</div><div class="ep-actions">${actionHtml}</div></div>${metaHtml}${ep.overview ? `<div class="ep-overview">${esc(ep.overview)}</div>` : ""}</div></div>`;
     })
     .join("");
 }
@@ -7238,7 +7769,7 @@ async function handleMore(request, env, ctx) {
         try {
           for (let i = 0; i < 3; i++) {
             r = await fetchT(
-              `${TRAKT_API}/sync/progress/up_next_nitro?extended=full&images=poster&limit=${limit}&page=${page}&intent=continuing`,
+              `${TRAKT_API}/sync/progress/up_next_nitro?extended=full&images=poster,screenshot,fanart&limit=${limit}&page=${page}&intent=continuing`,
               { headers },
               9000,
             );
@@ -7265,6 +7796,7 @@ async function handleMore(request, env, ctx) {
     const pageCount = data.pageCount || 0;
     const hasMore = pageCount > 0 ? page < pageCount : list.length >= limit;
 
+    await attachContinueStillsForPlayback(list, env, ctx);
     return authResp(auth, needsCookieUpdate, renderContinueItems(list, "fragment"), {
       extra: {
         "X-Has-More": String(hasMore),
@@ -7288,6 +7820,7 @@ async function handleMore(request, env, ctx) {
         ? start + WATCHLIST_PAGE_SIZE < merged.length
         : false;
 
+    await attachWatchlistStills(slice, env, ctx);
     return authResp(auth, needsCookieUpdate, renderWatchlistItems(slice, env), {
       extra: {
         "X-Has-More": String(hasMore),
@@ -7524,19 +8057,19 @@ function splashCriticalCss() {
 .splash-name{color:var(--splash-name-b,#a8b2c4);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:1.25rem;font-weight:800}
 .spinner{width:28px;height:28px;border:3px solid var(--spinner-track,#212735);border-top-color:var(--spinner-active,#7d9dd4);border-radius:50%;animation:spin .8s linear infinite;margin:4px auto}
 @keyframes spin{to{transform:rotate(360deg)}}
-.container{max-width:none;width:100%;margin:0 auto;padding:0 16px calc(80px + env(safe-area-inset-bottom))}
-.hero{display:flex;justify-content:space-between;align-items:center;padding:calc(16px + env(safe-area-inset-top)) 0 16px;gap:12px}
+.container{max-width:none;width:100%;margin:0 auto;padding:0 16px calc(72px + env(safe-area-inset-bottom))}
+.hero{display:flex;justify-content:space-between;align-items:center;padding:calc(6px + env(safe-area-inset-top)) 0 4px;gap:8px}
 .hero-left{display:flex;align-items:center;gap:12px;min-width:0}
 .hero-avatar{width:48px;height:48px;border-radius:50%;overflow:hidden;flex-shrink:0;background:var(--surface-2,#16161a);border:2px solid var(--avatar-ring,rgba(167,139,250,.45))}
 .hero-name{font-size:1.3rem;font-weight:800;color:var(--text,#f4f4f5);margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .updated-at{font-size:.72rem;color:var(--text-mute,#71717a);margin:0}
 .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;background:var(--surface,#0e0e10);border:1px solid var(--border,rgba(255,255,255,.08));border-radius:16px;padding:14px 8px;margin-bottom:20px;min-height:88px}
-.tabs{display:flex;gap:4px;margin-bottom:18px}
+.tabs{display:flex;gap:4px;margin-bottom:2px}
 .tab{flex:1;background:transparent;border:none;color:var(--text-dim,#a1a1aa);padding:9px 2px;border-radius:999px;font-size:.75rem;font-weight:600;display:flex;align-items:center;justify-content:center;gap:5px}
 .tab.active{background:var(--brand-grad,linear-gradient(135deg,#7c3aed,#a78bfa));color:#fff}
 .pane{display:none}.pane.active{display:block}
-.home-section{margin-bottom:20px}
-.home-section-title{font-size:.95rem;font-weight:700;color:var(--text,#f4f4f5);margin:0 0 10px}
+.home-section{margin-bottom:14px}
+.home-section-title{font-size:.95rem;font-weight:700;color:var(--text,#f4f4f5);margin:0 0 6px}
 .h-scroll{display:flex;gap:12px;overflow-x:auto;padding:4px 0 10px;-webkit-overflow-scrolling:touch}
 .pane-loading{padding:40px 20px;text-align:center}
 .btn-action{display:inline-flex;align-items:center;gap:6px;background:var(--hover-bg,rgba(255,255,255,.04));color:var(--text-dim,#a1a1aa);border:1px solid var(--border,rgba(255,255,255,.08));padding:8px 12px;border-radius:10px;font-size:.8rem}
@@ -7653,7 +8186,177 @@ async function loadMoreWatchlist(btn){return __loadMore(btn,'#watchlist-grid','/
 window.loadMoreWatchlist=loadMoreWatchlist;
 async function __loadMore(btn,gridSel,url){btn.disabled=true;btn.textContent='加载中…';try{const r=await fetch(url);if(!r.ok)throw new Error('HTTP '+r.status);const html=await r.text();const grid=document.querySelector(gridSel);if(grid)grid.insertAdjacentHTML('beforeend',html);if(window.__scheduleEnrich)window.__scheduleEnrich();if(r.headers.get('X-Has-More')==='true'){btn.dataset.page=parseInt(btn.dataset.page||'2')+1;btn.disabled=false;btn.textContent='加载更多';}else{btn.textContent='已经到底啦';btn.disabled=true;btn.style.opacity='0.5';btn.style.cursor='default';}}catch(e){btn.textContent='加载失败，点击重试';btn.disabled=false;}}
 document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-wl-remove-id]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.wlRemoveType,id=btn.dataset.wlRemoveId;if(!type||!id)return;const item=btn.closest('.item'),nameEl=item?item.querySelector('.name'):null,name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'🗑',title:'移除待看',message:'确定要把「'+(name||'该条目')+'」从待看列表移除吗？',okText:'移除',tone:'danger'})))return;const prevText=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueWrite(async()=>{const r=await fetch('/api/watchlist/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type,id})});if(!r.ok){let errMsg='HTTP '+r.status,cooling=0,source='';try{const j=await r.json();if(j&&j.error)errMsg=j.error;if(j&&j.cooling)cooling=Number(j.cooling)||0;if(j&&j.source)source=j.source;if(cooling)errMsg+='（冷却 '+cooling+' 秒）';}catch(e){}var err=new Error(errMsg);err.cooling=cooling;err.source=source;throw err;}__fadeRemoveCard(btn.closest('.item'));__toast('已从待看列表移除',{type:'success'});});}catch(err){btn.disabled=false;btn.textContent=prevText;__errToast('移除失败',err);}},true);
-document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-drop-show-id]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const id=btn.dataset.dropShowId;if(!id)return;const item=btn.closest('.item'),nameEl=item?item.querySelector('.name'):null,name=nameEl?nameEl.textContent.trim():'';if(!(await __confirm({icon:'🗑',title:'弃看剧集',message:'确定要弃看「'+(name||'该剧')+'」吗？它将从追剧日历和继续观看中移除，观看历史会保留。',okText:'弃看',tone:'danger'})))return;btn.disabled=true;btn.style.opacity='0.5';try{await __enqueueTrakt(async()=>{const r=await fetch('/api/drop-show',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:Number(id)})});if(!r.ok){let errMsg='HTTP '+r.status,cooling=0;try{const j=await r.json();if(j&&j.error)errMsg=j.error;if(j&&j.cooling)cooling=Number(j.cooling)||0;if(cooling)errMsg+='（冷却 '+cooling+' 秒）';}catch(e){const t=await r.text().catch(()=>'');if(t)errMsg+=' '+t;}var err=new Error(errMsg);err.cooling=cooling;throw err;}try{var ds=JSON.parse(localStorage.getItem('mt:dropped')||'[]');if(!Array.isArray(ds))ds=[];if(ds.indexOf(String(id))<0)ds.push(String(id));localStorage.setItem('mt:dropped',JSON.stringify(ds.slice(-200)));}catch(e){}const pane=document.getElementById('calendar')||document;const cards=pane.querySelectorAll('[data-drop-show-id="'+id+'"]');cards.forEach(function(b){const card=b.closest('.item');if(card)__fadeRemoveCard(card);});__toast('已弃看该剧集',{type:'success'});if(window.__loadedParts){delete window.__loadedParts.calendar;delete window.__loadedParts.playback;delete window.__loadedParts.all;}try{fetch('/api/home-data?part=calendar',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.json():null;}).then(function(d){if(!d||!d.calendarHtml)return;var cal=document.getElementById('calendar');if(!cal)return;cal.innerHTML=d.calendarHtml;try{var dropped=JSON.parse(localStorage.getItem('mt:dropped')||'[]');if(Array.isArray(dropped)&&dropped.length){dropped.forEach(function(did){cal.querySelectorAll('[data-drop-show-id="'+did+'"]').forEach(function(b){var card=b.closest('.item');if(card){var day=card.closest('.day');card.remove();if(day&&!day.querySelector('.item'))day.remove();}});});}}catch(e){}if(window.__scheduleEnrich)window.__scheduleEnrich();}).catch(function(){});}catch(e){}});}catch(err){btn.disabled=false;btn.style.opacity='';__errToast('弃看失败',err);}},true);
+
+/* 继续观看三点菜单 → 全局操作表（挂 body，手机不会被裁切） */
+function __ensureCwSheet(){
+  var el=document.getElementById('cw-sheet');
+  if(el)return el;
+  el=document.createElement('div');
+  el.id='cw-sheet';
+  el.className='cw-sheet';
+  el.innerHTML='<div class="cw-sheet-backdrop" data-cw-sheet-close="1"></div><div class="cw-sheet-panel" role="menu"><div class="cw-sheet-title" id="cw-sheet-title"></div><button type="button" class="cw-sheet-item danger" id="cw-sheet-drop">弃看剧集</button><button type="button" class="cw-sheet-item cw-sheet-cancel" data-cw-sheet-close="1">取消</button></div>';
+  document.body.appendChild(el);
+  el.addEventListener('click',function(ev){
+    if(ev.target.closest('[data-cw-sheet-close]')){__closeCwSheet();return;}
+  });
+  var dropBtn=el.querySelector('#cw-sheet-drop');
+  if(dropBtn){
+    dropBtn.addEventListener('click',function(ev){
+      ev.preventDefault();
+      ev.stopPropagation();
+      var id=el.dataset.dropShowId;
+      var name=el.dataset.cwName||'';
+      if(!id){__closeCwSheet();return;}
+      __closeCwSheet();
+      // 等操作表关闭后再确认，避免层叠与误触
+      setTimeout(function(){
+        if(typeof __dropShowById==='function') __dropShowById(id,name);
+      },80);
+    });
+  }
+  return el;
+}
+function __openCwSheet(id,name){
+  var el=__ensureCwSheet();
+  el.dataset.dropShowId=id||'';
+  el.dataset.cwName=name||'';
+  var t=el.querySelector('#cw-sheet-title');
+  if(t)t.textContent=name||'更多操作';
+  el.style.display='';
+  el.classList.add('open');
+  document.body.style.overflow='hidden';
+}
+function __closeCwSheet(){
+  var el=document.getElementById('cw-sheet');
+  if(!el)return;
+  el.classList.remove('open');
+  el.style.display='none';
+  document.body.style.overflow='';
+  // 下一帧恢复，避免残留遮罩挡点击
+  requestAnimationFrame(function(){
+    if(!el.classList.contains('open')) el.style.display='';
+  });
+}
+document.addEventListener('click',function(e){
+  var more=e.target.closest('.cw-more');
+  if(!more)return;
+  e.preventDefault();
+  e.stopPropagation();
+  var id=more.getAttribute('data-cw-drop-id');
+  if(!id)return;
+  var name=more.getAttribute('data-cw-name')||'';
+  if(!name){
+    var card=more.closest('.cw-card');
+    var te=card?card.querySelector('.cw-title'):null;
+    if(te)name=(te.textContent||'').split(/\s+第/)[0];
+  }
+  __openCwSheet(id,name);
+},true);
+document.addEventListener('keydown',function(e){
+  if(e.key==='Escape')__closeCwSheet();
+});
+
+
+/* 弃看剧集：统一入口，供日历按钮 / 继续观看操作表调用 */
+async function __dropShowById(id, name){
+  id=String(id||'').trim();
+  if(!id)return;
+  name=(name||'').trim();
+  if(!(await __confirm({icon:'🗑',title:'弃看剧集',message:'确定要弃看「'+(name||'该剧')+'」吗？它将从追剧日历和继续观看中移除，观看历史会保留。',okText:'弃看',tone:'danger'})))return;
+  try{
+    await __enqueueTrakt(async()=>{
+      const r=await fetch('/api/drop-show',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:Number(id)})});
+      if(!r.ok){
+        let errMsg='HTTP '+r.status,cooling=0;
+        try{
+          const j=await r.json();
+          if(j&&j.error)errMsg=j.error;
+          if(j&&j.cooling)cooling=Number(j.cooling)||0;
+          if(cooling)errMsg+='（冷却 '+cooling+' 秒）';
+        }catch(e){
+          const t=await r.text().catch(()=>'');
+          if(t)errMsg+=' '+t;
+        }
+        var err=new Error(errMsg);
+        err.cooling=cooling;
+        throw err;
+      }
+      try{
+        var ds=JSON.parse(localStorage.getItem('mt:dropped')||'[]');
+        if(!Array.isArray(ds))ds=[];
+        if(ds.indexOf(String(id))<0)ds.push(String(id));
+        localStorage.setItem('mt:dropped',JSON.stringify(ds.slice(-200)));
+      }catch(e){}
+      // 继续观看卡片
+      document.querySelectorAll('.cw-card [data-cw-drop-id="'+id+'"]').forEach(function(b){
+        const card=b.closest('.item');
+        if(card)__fadeRemoveCard(card);
+      });
+      // 日历等旧按钮
+      document.querySelectorAll('[data-drop-show-id="'+id+'"]').forEach(function(b){
+        const card=b.closest('.item');
+        if(card)__fadeRemoveCard(card);
+      });
+      __toast('已弃看该剧集',{type:'success'});
+      if(window.__loadedParts){
+        delete window.__loadedParts.calendar;
+        delete window.__loadedParts.playback;
+        delete window.__loadedParts.all;
+      }
+      try{
+        fetch('/api/home-data?part=calendar',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.json():null;}).then(function(d){
+          if(!d||!d.calendarHtml)return;
+          var cal=document.getElementById('calendar');
+          if(!cal)return;
+          cal.innerHTML=d.calendarHtml;
+          try{
+            var dropped=JSON.parse(localStorage.getItem('mt:dropped')||'[]');
+            if(Array.isArray(dropped)&&dropped.length){
+              dropped.forEach(function(did){
+                cal.querySelectorAll('[data-drop-show-id="'+did+'"]').forEach(function(b){
+                  var card=b.closest('.item');
+                  if(card){
+                    var day=card.closest('.day');
+                    card.remove();
+                    if(day&&!day.querySelector('.item'))day.remove();
+                  }
+                });
+              });
+            }
+          }catch(e){}
+          if(window.__scheduleEnrich)window.__scheduleEnrich();
+        }).catch(function(){});
+        fetch('/api/home-data?part=playback',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.json():null;}).then(function(d){
+          if(!d||!d.playbackHScrollHtml)return;
+          var el=document.getElementById('playback-hscroll');
+          if(el)el.innerHTML=d.playbackHScrollHtml;
+          if(window.__scheduleEnrich)window.__scheduleEnrich();
+        }).catch(function(){});
+      }catch(e){}
+    });
+  }catch(err){
+    __errToast('弃看失败',err);
+  }
+}
+window.__dropShowById=__dropShowById;
+
+document.addEventListener('click',async(e)=>{
+  const btn=e.target.closest('[data-drop-show-id]');
+  if(!btn)return;
+  // 忽略操作表内部、隐藏伪按钮
+  if(btn.closest('#cw-sheet'))return;
+  if(btn.style&&btn.style.opacity==='0')return;
+  e.preventDefault();
+  e.stopPropagation();
+  if(btn.disabled)return;
+  const id=btn.dataset.dropShowId;
+  if(!id)return;
+  const item=btn.closest('.item');
+  const nameEl=item?(item.querySelector('.cw-title')||item.querySelector('.name')):null;
+  const name=nameEl?nameEl.textContent.trim().split(/\s+第/)[0]:'';
+  await __dropShowById(id,name);
+},true);
+
 document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-watched-id]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.watchedType,id=btn.dataset.watchedId;if(!type||!id)return;const item=btn.closest('.item'),nameEl=item?item.querySelector('.name'):null,name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'✓',title:'标记为已观看',message:'确定要把「'+(name||'该条目')+'」标记为已观看吗？',okText:'标记',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueTrakt(async()=>{const r=await fetch('/api/mark-watched',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type,id})});if(!r.ok){let errMsg='HTTP '+r.status,cooling=0;try{const j=await r.json();if(j&&j.error)errMsg=j.error;if(j&&j.cooling)cooling=Number(j.cooling)||0;if(cooling)errMsg+='（冷却 '+cooling+' 秒）';}catch(e){}var err=new Error(errMsg);err.cooling=cooling;throw err;}__fadeRemoveCard(btn.closest('.item'));__toast('已标记为已观看',{type:'success'});});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('标记失败',err);}},true);
 document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-unwatch-id]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.unwatchType,id=btn.dataset.unwatchId;if(!type||!id)return;const item=btn.closest('.item'),nameEl=item?item.querySelector('.name'):null,name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'↺',title:'取消观看',message:'确定要取消「'+(name||'该条目')+'」的观看记录吗？',okText:'取消观看',tone:'warn'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueTrakt(async()=>{const r=await fetch('/api/unmark-watched',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type,id})});if(!r.ok){let errMsg='HTTP '+r.status,cooling=0;try{const j=await r.json();if(j&&j.error)errMsg=j.error;if(j&&j.cooling)cooling=Number(j.cooling)||0;if(cooling)errMsg+='（冷却 '+cooling+' 秒）';}catch(e){}var err=new Error(errMsg);err.cooling=cooling;throw err;}__fadeRemoveCard(btn.closest('.item'));__toast('已取消观看记录',{type:'success'});});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('取消失败',err);}},true);
 var __searchTimer=null,__searchSeq=0;
@@ -7813,14 +8516,14 @@ function closeShowCal(){var modal=document.getElementById('show-cal-modal');if(m
 function calShiftMonth(delta){var m=__showCal.month+delta,y=__showCal.year;while(m<0){m+=12;y--;}while(m>11){m-=12;y++;}__showCal.month=m;__showCal.year=y;renderShowCal();}window.calShiftMonth=calShiftMonth;
 function renderShowCal(){var titleEl=document.getElementById('show-cal-month'),gridEl=document.getElementById('show-cal-grid'),detailEl=document.getElementById('show-cal-detail');if(!titleEl||!gridEl)return;var y=__showCal.year,m=__showCal.month;titleEl.textContent=y+' 年 '+(m+1)+' 月';var firstDow=new Date(Date.UTC(y,m,1)).getUTCDay(),daysInMonth=new Date(Date.UTC(y,m+1,0)).getUTCDate(),todayStr=__bjDay(new Date().toISOString()),html='',i;for(i=0;i<firstDow;i++){html+='<div class="sc-day sc-empty"></div>';}for(var d=1;d<=daysInMonth;d++){var dayStr=y+'-'+__pad2(m+1)+'-'+__pad2(d),eps=__showCal.byDay[dayStr]||[],cls='sc-day';if(eps.length){if(dayStr===todayStr)cls+=' sc-has sc-today-day';else if(dayStr<todayStr)cls+=' sc-has sc-past';else cls+=' sc-has sc-future';}var badge=eps.length?'<span class="sc-badge">'+eps.length+'</span>':'';html+='<div class="'+cls+'" data-day="'+dayStr+'"><span class="sc-num">'+d+'</span>'+badge+'</div>';}gridEl.innerHTML=html;detailEl.innerHTML='';var days=gridEl.querySelectorAll('.sc-day[data-day]');for(var j=0;j<days.length;j++){(function(el){el.addEventListener('click',function(){var day=el.getAttribute('data-day'),arr=__showCal.byDay[day]||[];if(!arr.length)return;var all=gridEl.querySelectorAll('.sc-day');for(var q=0;q<all.length;q++)all[q].classList.remove('sc-active');el.classList.add('sc-active');var dh='';for(var e=0;e<arr.length;e++){var ep=arr[e];dh+='<div class="sc-ep"><span class="sc-ep-tag">S'+__pad2(ep.season)+'E'+__pad2(ep.number)+'</span><span class="sc-ep-title">'+__escShowCal(ep.title||'')+'</span></div>';}detailEl.innerHTML=dh;});})(days[j]);}}
 document.addEventListener('click',function(e){var btn=e.target.closest('[data-cal-show-id]');if(!btn)return;e.preventDefault();e.stopPropagation();openShowCalendar(btn.getAttribute('data-cal-show-id'),btn.getAttribute('data-cal-show-name')||'',btn.getAttribute('data-cal-show-tmdb')||'');},true);
-document.addEventListener('click',async(e)=>{const btn=e.target.closest('.ep-watch-btn');if(!btn)return;e.preventDefault();e.stopPropagation();const episodeId=btn.dataset.episodeId;if(!episodeId)return;if(!(await __confirm({icon:'✓',title:'标记本集已看',message:'确定要把这一集标记为已看吗？',okText:'标记',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueTrakt(async()=>{const r=await fetch('/api/mark-watched',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'episode',id:episodeId})});if(!r.ok){let errMsg='HTTP '+r.status,cooling=0;try{const j=await r.json();if(j&&j.error)errMsg=j.error;if(j&&j.cooling)cooling=Number(j.cooling)||0;if(cooling)errMsg+='（冷却 '+cooling+' 秒）';}catch(e){}var err=new Error(errMsg);err.cooling=cooling;throw err;}btn.textContent='✓';btn.classList.add('done');__toast('已标记本集',{type:'success'});const parts=location.pathname.split('/').filter(Boolean);if(parts[0]==='detail'&&parts.length===3){setTimeout(()=>openDetail(parts[1],parts[2],false),400);}});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('标记失败',err);}},true);
+document.addEventListener('click',async(e)=>{const btn=e.target.closest('.ep-watch-btn');if(!btn)return;e.preventDefault();e.stopPropagation();const episodeId=btn.dataset.episodeId;if(!episodeId)return;if(!(await __confirm({icon:'✓',title:'标记本集已看',message:'确定要把这一集标记为已看吗？',okText:'标记',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueTrakt(async()=>{const r=await fetch('/api/mark-watched',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'episode',id:episodeId})});if(!r.ok){let errMsg='HTTP '+r.status,cooling=0;try{const j=await r.json();if(j&&j.error)errMsg=j.error;if(j&&j.cooling)cooling=Number(j.cooling)||0;if(cooling)errMsg+='（冷却 '+cooling+' 秒）';}catch(e){}var err=new Error(errMsg);err.cooling=cooling;throw err;}btn.textContent='已看';btn.classList.add('done');btn.classList.add('watched');btn.classList.remove('unwatched');btn.disabled=true;__toast('已标记本集',{type:'success'});const parts=location.pathname.split('/').filter(Boolean);if(parts[0]==='detail'&&parts.length===3){setTimeout(()=>openDetail(parts[1],parts[2],false),400);}});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('标记失败',err);}},true);
 document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-mark-movie]');if(!btn)return;e.preventDefault();e.stopPropagation();const id=btn.dataset.markMovie;if(!id)return;if(!(await __confirm({icon:'✓',title:'标记已观看',message:'确定要把这部电影标记为已观看吗？',okText:'标记',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueTrakt(async()=>{const r=await fetch('/api/mark-watched',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'movie',id})});if(!r.ok){let errMsg='HTTP '+r.status,cooling=0;try{const j=await r.json();if(j&&j.error)errMsg=j.error;if(j&&j.cooling)cooling=Number(j.cooling)||0;if(cooling)errMsg+='（冷却 '+cooling+' 秒）';}catch(e){}var err=new Error(errMsg);err.cooling=cooling;throw err;}btn.textContent='✓ 已标记';btn.classList.add('done');__toast('已标记为已观看',{type:'success'});const parts=location.pathname.split('/').filter(Boolean);if(parts[0]==='detail'&&parts.length===3){setTimeout(()=>openDetail(parts[1],parts[2],false),400);}if(window.__refreshStats)window.__refreshStats();});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('标记失败',err);}},true);
 document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-unmark-movie]');if(!btn)return;e.preventDefault();e.stopPropagation();const id=btn.dataset.unmarkMovie;if(!id)return;if(!(await __confirm({icon:'↺',title:'取消观看',message:'确定要取消这部电影的观看记录吗？',okText:'取消观看',tone:'warn'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueTrakt(async()=>{const r=await fetch('/api/unmark-watched',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'movie',id})});if(!r.ok){let errMsg='HTTP '+r.status,cooling=0;try{const j=await r.json();if(j&&j.error)errMsg=j.error;if(j&&j.cooling)cooling=Number(j.cooling)||0;if(cooling)errMsg+='（冷却 '+cooling+' 秒）';}catch(e){}var err=new Error(errMsg);err.cooling=cooling;throw err;}btn.textContent='已取消';__toast('已取消观看记录',{type:'success'});const parts=location.pathname.split('/').filter(Boolean);if(parts[0]==='detail'&&parts.length===3){setTimeout(()=>openDetail(parts[1],parts[2],false),400);}if(window.__refreshStats)window.__refreshStats();});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('取消失败',err);}},true);
 document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-mark-season-all]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const showId=btn.dataset.markSeasonAll,season=btn.dataset.seasonNum;if(!showId||season==null||season==='undefined')return;if(!(await __confirm({icon:'✓',title:'标记本季已看',message:'确定要把第 '+season+' 季所有已播出集数标记为已看吗？',okText:'标记',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueTrakt(async()=>{const r=await fetch('/api/mark-season-watched',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({showId,season:Number(season)})});let data={};try{data=await r.json();}catch(e){}if(!r.ok){let errMsg=(data&&data.error)||('HTTP '+r.status);if(data&&data.cooling)errMsg+='（冷却 '+data.cooling+' 秒）';var err=new Error(errMsg);err.cooling=data&&data.cooling;throw err;}if(data&&data.marked===0){btn.disabled=false;btn.textContent=prev;__toast(data.message||'本季暂无可标记的已播出集数',{type:'warn'});return;}btn.textContent='✓ 已标记';btn.classList.add('done');__toast('已标记本季 '+(data&&data.marked?data.marked:0)+' 集',{type:'success'});const parts=location.pathname.split('/').filter(Boolean);if(parts[0]==='detail'&&parts.length===3){setTimeout(()=>openDetail(parts[1],parts[2],false),400);}if(window.__refreshStats)window.__refreshStats();});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('标记失败',err);}},true);
 let __enrichTimer=null;const __enrichPromises=new Map();
 function __scheduleEnrich(){if(__enrichTimer)return;__enrichTimer=setTimeout(__runEnrich,60);}window.__scheduleEnrich=__scheduleEnrich;
 async function __runEnrich(){__enrichTimer=null;const els=[...document.querySelectorAll('[data-enrich-key]')];if(!els.length)return;const byKey=new Map();for(const el of els){const k=el.dataset.enrichKey;if(!k)continue;if(!byKey.has(k))byKey.set(k,[]);byKey.get(k).push(el);el.removeAttribute('data-enrich-key');}if(!byKey.size)return;const needFetch=[];for(const[k,group]of byKey.entries()){const existing=__enrichPromises.get(k);if(existing){existing.then(d=>{if(d)group.forEach(el=>__applyEnrich(el,d));});}else{needFetch.push(k);}}if(!needFetch.length)return;const items=needFetch.map(k=>({key:k}));const batchPromise=fetch('/api/enrich',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items})}).then(r=>(r.ok?r.json():{})).catch(()=>({}));for(const k of needFetch){const perKey=batchPromise.then(data=>(data&&data[k])||null);__enrichPromises.set(k,perKey);perKey.then(d=>{if(d)byKey.get(k).forEach(el=>__applyEnrich(el,d));});}if(__enrichPromises.size>400){const arr=[...__enrichPromises.keys()];for(let i=0;i<200;i++)__enrichPromises.delete(arr[i]);}}
-function __applyEnrich(el,d){const posterBox=el.querySelector('.poster');if(posterBox&&d.poster){const cur=posterBox.querySelector('img, .poster-ph');if(cur&&cur.tagName==='IMG'){if(cur.src!==d.poster)cur.src=d.poster;}else if(cur){const img=document.createElement('img');img.src=d.poster;img.loading='lazy';img.alt='';cur.replaceWith(img);}}if(d.title){const nameEl=el.querySelector('.name');if(nameEl)nameEl.textContent=d.title;}if(d.overview){const info=el.querySelector('.info');if(info){let ov=info.querySelector('.overview');if(!ov){ov=document.createElement('div');ov.className='overview';const meta=info.querySelector('.meta');if(meta&&meta.nextSibling)info.insertBefore(ov,meta.nextSibling);else info.appendChild(ov);}ov.textContent=d.overview;}}}
+function __applyEnrich(el,d){const posterBox=el.querySelector('.cw-poster')||el.querySelector('.poster');const locked=el.getAttribute('data-lock-poster')==='1';if(posterBox&&d.poster&&!locked){const cur=posterBox.querySelector('img, .poster-ph');if(cur&&cur.tagName==='IMG'){if(cur.src!==d.poster)cur.src=d.poster;}else if(cur){const img=document.createElement('img');img.src=d.poster;img.loading='lazy';img.alt='';cur.replaceWith(img);}}if(d.title){const nameEl=el.querySelector('.name');if(nameEl)nameEl.textContent=d.title;const cwTitle=el.querySelector('.cw-title');if(cwTitle)cwTitle.textContent=d.title;}if(d.overview){const info=el.querySelector('.info');if(info){let ov=info.querySelector('.overview');if(!ov){ov=document.createElement('div');ov.className='overview';const meta=info.querySelector('.meta');if(meta&&meta.nextSibling)info.insertBefore(ov,meta.nextSibling);else info.appendChild(ov);}ov.textContent=d.overview;}}}
 window.__summaryState={period:'month',ref:''};
 function __sumEsc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function __sumDefaultRef(period){var d=new Date(Date.now()+8*3600*1000);if(period==='year')return String(d.getUTCFullYear());return d.toISOString().slice(0,7);}
@@ -8009,7 +8712,7 @@ img { display: block; max-width: 100%; }
 .log-details { margin-top: 18px; text-align: left; }
 .log-details summary { cursor: pointer; font-size: 0.76rem; color: var(--text-dim); padding: 4px 0; user-select: none; }
 .log-box { font-family: ui-monospace, Menlo, monospace; font-size: 0.7rem; color: var(--text-dim); background: var(--surface-3); border: 1px solid var(--border); border-radius: 8px; padding: 10px; max-height: 160px; overflow: auto; margin-top: 6px; line-height: 1.6; }
-.hero { display: flex; justify-content: space-between; align-items: center; padding: calc(20px + env(safe-area-inset-top)) 0 20px; gap: 16px; }
+.hero { display: flex; justify-content: space-between; align-items: center; padding: calc(8px + env(safe-area-inset-top)) 0 6px; gap: 10px; }
 .hero-left { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .hero-avatar { width: 50px; height: 50px; border-radius: 50%; overflow: hidden; flex-shrink: 0; background: var(--surface-2); border: 2px solid var(--avatar-ring); box-shadow: 0 0 0 3px var(--accent-soft), 0 4px 20px var(--shadow-avatar); }
 .hero-avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
@@ -8035,27 +8738,27 @@ img { display: block; max-width: 100%; }
 #btn-theme svg { transition: opacity 0.2s ease, transform 0.2s ease; }
 #btn-theme .theme-icon { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
 @media (max-width: 420px) { .btn-action span { display: none; } .btn-action { padding: 9px; } .hero-actions { gap: 6px; } }
-.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; background: var(--panel-grad); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 18px 10px; margin-bottom: 24px; box-shadow: var(--shadow-card), inset 0 1px 0 rgba(255, 255, 255, 0.04); position: relative; overflow: hidden; }
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; background: var(--panel-grad); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 8px 6px; margin-bottom: 8px; box-shadow: var(--shadow-card), inset 0 1px 0 rgba(255, 255, 255, 0.04); position: relative; overflow: hidden; }
 .stats::before { content: ""; position: absolute; top: 0; left: 10%; right: 10%; height: 1px; background: linear-gradient(90deg, transparent, rgba(167, 139, 250, 0.35), transparent); }
 .stat { position: relative; text-align: center; display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 6px 2px; border-radius: 12px; transition: background 0.2s ease; }
 .stat:hover { background: rgba(255, 255, 255, 0.025); }
 .stat + .stat::before { content: ""; position: absolute; left: -4px; top: 18%; bottom: 18%; width: 1px; background: linear-gradient(180deg, transparent, rgba(255, 255, 255, 0.08), transparent); }
-.stat-icon { width: 30px; height: 30px; border-radius: 9px; display: flex; align-items: center; justify-content: center; margin-bottom: 4px; transition: transform 0.25s ease, box-shadow 0.25s ease; }
+.stat-icon { width: 26px; height: 26px; border-radius: 8px; display: flex; align-items: center; justify-content: center; margin-bottom: 2px; transition: transform 0.25s ease, box-shadow 0.25s ease; }
 .stat:hover .stat-icon { transform: translateY(-1px) scale(1.06); }
 .stat-movie .stat-icon { background: linear-gradient(135deg, rgba(167, 139, 250, 0.18), rgba(167, 139, 250, 0.06)); color: #c4b5fd; box-shadow: 0 4px 14px rgba(167, 139, 250, 0.18), inset 0 0 0 1px rgba(167, 139, 250, 0.18); }
 .stat-show .stat-icon { background: linear-gradient(135deg, rgba(96, 165, 250, 0.18), rgba(96, 165, 250, 0.06)); color: #93c5fd; box-shadow: 0 4px 14px rgba(96, 165, 250, 0.18), inset 0 0 0 1px rgba(96, 165, 250, 0.18); }
 .stat-episode .stat-icon { background: linear-gradient(135deg, rgba(52, 211, 153, 0.18), rgba(52, 211, 153, 0.06)); color: #6ee7b7; box-shadow: 0 4px 14px rgba(52, 211, 153, 0.18), inset 0 0 0 1px rgba(52, 211, 153, 0.18); }
 .stat-hours .stat-icon { background: linear-gradient(135deg, rgba(251, 191, 36, 0.18), rgba(251, 191, 36, 0.06)); color: #fcd34d; box-shadow: 0 4px 14px rgba(251, 191, 36, 0.18), inset 0 0 0 1px rgba(251, 191, 36, 0.18); }
-.stat-num { font-size: 1.35rem; font-weight: 800; letter-spacing: -0.6px; line-height: 1.15; background: var(--num-grad); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+.stat-num { font-size: 1.2rem; font-weight: 800; letter-spacing: -0.6px; line-height: 1.1; background: var(--num-grad); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
 .stat-label { font-size: 0.7rem; color: var(--text-mute); font-weight: 500; }
-.tabs { display: flex; gap: 4px; margin-bottom: 6px; }
-.top-sticky { position: sticky; top: 0; z-index: 40; margin: 0 -16px; padding: 0 16px 4px; background: var(--sticky-bg); backdrop-filter: blur(18px) saturate(1.2); -webkit-backdrop-filter: blur(18px) saturate(1.2); border-bottom: 1px solid var(--sticky-border); box-shadow: var(--sticky-shadow); }
-.top-sticky .hero { padding-top: calc(12px + env(safe-area-inset-top)); padding-bottom: 6px; }
-.top-sticky .stats { margin-bottom: 8px; }
+.tabs { display: flex; gap: 4px; margin-bottom: 2px; }
+.top-sticky { position: sticky; top: 0; z-index: 40; margin: 0 -16px; padding: 0 16px 2px; background: var(--sticky-bg); backdrop-filter: blur(18px) saturate(1.2); -webkit-backdrop-filter: blur(18px) saturate(1.2); border-bottom: 1px solid var(--sticky-border); box-shadow: var(--sticky-shadow); }
+.top-sticky .hero { padding-top: calc(6px + env(safe-area-inset-top)); padding-bottom: 2px; }
+.top-sticky .stats { margin-bottom: 4px; }
 @media (min-width: 768px) { .top-sticky { margin: 0 -28px; padding: 0 28px 8px; } }
 @media (min-width: 1024px) { .top-sticky { margin: 0 -36px; padding: 0 36px 8px; } }
 @media (min-width: 1280px) { .top-sticky { margin: 0 -40px; padding: 0 40px 8px; } }
-.tab { flex: 1 1 0; min-width: 0; background: transparent; border: none; color: var(--text-dim); padding: 9px 2px; border-radius: 999px; font-size: 0.75rem; font-weight: 600; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: center; display: flex; align-items: center; justify-content: center; gap: 5px; transition: color 0.2s ease, background 0.2s ease; font-family: inherit; outline: none !important; }
+.tab { flex: 1 1 0; min-width: 0; background: transparent; border: none; color: var(--text-dim); padding: 7px 2px; border-radius: 999px; font-size: 0.75rem; font-weight: 600; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: center; display: flex; align-items: center; justify-content: center; gap: 5px; transition: color 0.2s ease, background 0.2s ease; font-family: inherit; outline: none !important; }
 .tab svg { flex-shrink: 0; opacity: 0.9; }
 .tab span { overflow: hidden; text-overflow: ellipsis; }
 .tab:hover { color: var(--text); background: rgba(255, 255, 255, 0.06); }
@@ -8115,42 +8818,42 @@ img { display: block; max-width: 100%; }
 .search-input::placeholder { color: var(--text-mute); }
 .trending-head { display: flex; align-items: center; gap: 8px; font-size: 0.88rem; font-weight: 700; color: var(--text); margin: 4px 0 14px; padding-left: 2px; letter-spacing: 0.2px; }
 .trending-head::before { content: ""; width: 3px; height: 14px; border-radius: 2px; background: linear-gradient(180deg, #f97316, #ef4444); }
-.home-section { margin-bottom: 24px; }
-.home-section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.home-section { margin-bottom: 12px; }
+.home-section-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
 .home-section-title { font-size: 1rem; font-weight: 700; letter-spacing: 0.2px; display: flex; align-items: center; gap: 8px; }
 .home-section-title::before { content: ""; width: 3px; height: 16px; border-radius: 2px; background: linear-gradient(180deg, #a78bfa, #7c3aed); }
 .home-more-btn { background: transparent; border: none; color: var(--text-dim); font-size: 0.82rem; font-weight: 600; cursor: pointer; font-family: inherit; padding: 6px 10px; border-radius: 8px; transition: all 0.15s; display: inline-flex; align-items: center; gap: 4px; }
 .home-more-btn:hover { color: var(--accent-2); background: rgba(167, 139, 250, 0.1); }
 .home-more-btn svg { transition: transform 0.2s ease; }
-.platform-section { margin-bottom: 24px; }
-.platform-rows { display: flex; flex-direction: column; gap: 12px; }
+.platform-section { margin-bottom: 14px; }
+.platform-rows { display: flex; flex-direction: column; gap: 8px; }
 .platform-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.platform-cards { display: flex; gap: 12px; overflow-x: auto; padding: 4px 2px 10px; -webkit-overflow-scrolling: touch; scrollbar-width: none; flex: 1; min-width: 0; scroll-snap-type: x proximity; }
+.platform-cards { display: flex; gap: 10px; overflow-x: auto; padding: 2px 2px 6px; -webkit-overflow-scrolling: touch; scrollbar-width: none; flex: 1; min-width: 0; scroll-snap-type: x proximity; }
 .platform-cards::-webkit-scrollbar { display: none; }
-.platform-card { flex: 0 0 auto; width: min(46vw, 190px); height: 92px; border: none; border-radius: 18px; background: var(--platform-card-grad); box-shadow: 0 10px 28px var(--shadow-card), inset 0 1px 0 var(--hover-bg-strong); display: flex; align-items: stretch; padding: 0; cursor: pointer; overflow: hidden; position: relative; scroll-snap-align: start; transition: transform 0.18s ease, box-shadow 0.18s ease; -webkit-tap-highlight-color: transparent; font: inherit; color: var(--platform-card-text); }
+.platform-card { flex: 0 0 auto; width: min(42vw, 168px); height: 74px; border: none; border-radius: 14px; background: var(--platform-card-grad); box-shadow: 0 8px 20px var(--shadow-card), inset 0 1px 0 var(--hover-bg-strong); display: flex; align-items: stretch; padding: 0; cursor: pointer; overflow: hidden; position: relative; scroll-snap-align: start; transition: transform 0.18s ease, box-shadow 0.18s ease; -webkit-tap-highlight-color: transparent; font: inherit; color: var(--platform-card-text); }
 .platform-card:hover { transform: translateY(-3px); box-shadow: 0 16px 36px var(--platform-shadow-hover), inset 0 1px 0 var(--hover-bg-strong); }
 .platform-card:active { transform: scale(0.985); }
-.platform-card-left { flex: 0 0 42%; max-width: 42%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0; padding: 8px 4px 8px 8px; z-index: 2; position: relative; }
-.platform-card-logo { width: 46px; height: 46px; border-radius: 0; object-fit: contain; object-position: center; flex-shrink: 0; box-shadow: none; background: transparent; padding: 0; box-sizing: border-box; display: block; }
+.platform-card-left { flex: 0 0 40%; max-width: 40%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0; padding: 6px 2px 6px 6px; z-index: 2; position: relative; }
+.platform-card-logo { width: 36px; height: 36px; border-radius: 0; object-fit: contain; object-position: center; flex-shrink: 0; box-shadow: none; background: transparent; padding: 0; box-sizing: border-box; display: block; }
 .platform-card-name { display: none; }
 .platform-card-right { flex: 1; position: relative; min-width: 0; overflow: hidden; }
-.platform-card-posters { position: absolute; right: -6px; top: 50%; transform: translateY(-50%); width: 112px; height: 82px; }
-.platform-card-poster { position: absolute; width: 40px; height: 60px; border-radius: 8px; object-fit: cover; box-shadow: 0 5px 12px rgba(0, 0, 0, 0.28); border: 1.5px solid rgba(255, 255, 255, 0.95); background: #c5c9d0; top: 50%; margin-top: -30px; }
+.platform-card-posters { position: absolute; right: -4px; top: 50%; transform: translateY(-50%); width: 96px; height: 66px; }
+.platform-card-poster { position: absolute; width: 32px; height: 48px; border-radius: 6px; object-fit: cover; box-shadow: 0 4px 10px rgba(0, 0, 0, 0.28); border: 1.5px solid rgba(255, 255, 255, 0.95); background: #c5c9d0; top: 50%; margin-top: -24px; }
 .platform-card-poster-ph { background: linear-gradient(145deg, #d0d4db 0%, #b8bec8 100%); }
-.platform-card-poster.p0 { right: 6px; z-index: 5; transform: rotate(8deg); }
-.platform-card-poster.p1 { right: 26px; z-index: 4; transform: rotate(3deg); }
-.platform-card-poster.p2 { right: 46px; z-index: 3; transform: rotate(-4deg); }
-.platform-card-poster.p3 { right: 66px; z-index: 2; transform: rotate(-10deg); }
+.platform-card-poster.p0 { right: 4px; z-index: 5; transform: rotate(8deg); }
+.platform-card-poster.p1 { right: 20px; z-index: 4; transform: rotate(3deg); }
+.platform-card-poster.p2 { right: 36px; z-index: 3; transform: rotate(-4deg); }
+.platform-card-poster.p3 { right: 52px; z-index: 2; transform: rotate(-10deg); }
 @media (min-width: 768px) {
-  .platform-card { width: 340px; height: 128px; border-radius: 24px; }
-  .platform-card-logo { width: 72px; height: 72px; border-radius: 0; padding: 0; }
-  .platform-card-posters { width: 180px; height: 116px; }
-  .platform-card-poster { width: 64px; height: 96px; margin-top: -48px; border-radius: 11px; }
-  .platform-card-poster.p0 { right: 10px; } .platform-card-poster.p1 { right: 40px; } .platform-card-poster.p2 { right: 70px; } .platform-card-poster.p3 { right: 100px; }
-  .platform-cards { gap: 14px; }
+  .platform-card { width: 260px; height: 96px; border-radius: 16px; }
+  .platform-card-logo { width: 48px; height: 48px; border-radius: 0; padding: 0; }
+  .platform-card-posters { width: 140px; height: 88px; }
+  .platform-card-poster { width: 48px; height: 72px; margin-top: -36px; border-radius: 8px; }
+  .platform-card-poster.p0 { right: 8px; } .platform-card-poster.p1 { right: 30px; } .platform-card-poster.p2 { right: 52px; } .platform-card-poster.p3 { right: 74px; }
+  .platform-cards { gap: 12px; }
 }
 .h-scroll-wrap { margin: 0 -16px; padding: 0 16px; }
-.h-scroll { display: flex; gap: 12px; overflow-x: auto; padding: 4px 0 12px; -webkit-overflow-scrolling: touch; scrollbar-width: none; scroll-snap-type: x proximity; }
+.h-scroll { display: flex; gap: 12px; overflow-x: auto; padding: 2px 0 8px; -webkit-overflow-scrolling: touch; scrollbar-width: none; scroll-snap-type: x proximity; }
 .h-scroll::-webkit-scrollbar { display: none; }
 .h-scroll-empty { padding: 30px 0; text-align: center; }
 .h-scroll .item { flex: 0 0 auto; width: 132px; display: flex; flex-direction: column; gap: 0; padding: 0; border-radius: 12px; background: transparent; border: none; overflow: visible; animation: none; box-shadow: none; scroll-snap-align: start; transform: none; }
@@ -8162,7 +8865,243 @@ img { display: block; max-width: 100%; }
 .h-scroll .item .name { font-size: 0.82rem; line-height: 1.3; }
 .h-scroll .item .overview { display: none; }
 .h-scroll .item .meta { font-size: 0.72rem; margin-top: 2px; color: var(--text-dim); }
+
 .h-scroll .item .meta.dim { font-size: 0.7rem; }
+
+/* 继续观看卡片（接近主流视频 App 样式） */
+.h-scroll .cw-card {
+  flex: 0 0 auto;
+  width: 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 0;
+  border-radius: 12px;
+  background: transparent;
+  border: none;
+  overflow: visible;
+  scroll-snap-align: start;
+  position: relative;
+}
+.h-scroll .cw-card:hover { background: transparent; border: none; box-shadow: none; transform: none; }
+.h-scroll .cw-card.clickable:active { transform: scale(0.97); }
+.cw-poster {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16/9;
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--surface-2);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+}
+.cw-poster img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.cw-poster .poster-ph {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 2rem;
+  color: var(--text-dim);
+  background: var(--soft-card-grad, var(--surface-2));
+}
+.cw-overlay {
+  position: absolute;
+  left: 8px;
+  bottom: 12px;
+  z-index: 2;
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: #fff;
+  text-shadow: 0 1px 4px rgba(0,0,0,0.85);
+  background: rgba(0,0,0,0.45);
+  padding: 3px 8px;
+  border-radius: 6px;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  max-width: calc(100% - 16px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cw-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  background: rgba(255,255,255,0.18);
+  z-index: 3;
+}
+.cw-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #a78bfa, #7c3aed);
+  border-radius: 0 2px 2px 0;
+}
+.cw-info {
+  padding: 6px 2px 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.cw-title-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 2px;
+  min-width: 0;
+  position: relative;
+  line-height: 1.25;
+}
+.cw-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.82rem;
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--text);
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+.cw-watching {
+  font-size: 0.72rem;
+  font-weight: 500;
+  line-height: 1.25;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cw-meta {
+  margin-top: 0;
+  font-size: 0.68rem;
+  line-height: 1.25;
+  color: var(--text-mute, var(--text-dim));
+}
+.cw-more {
+  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
+  margin: -8px -8px 0 0;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  font-family: inherit;
+  transition: color 0.15s, background 0.15s;
+  -webkit-tap-highlight-color: transparent;
+  position: relative;
+  z-index: 6;
+  touch-action: manipulation;
+}
+.cw-more::before {
+  content: "";
+  position: absolute;
+  inset: -6px;
+  border-radius: 50%;
+}
+.cw-more:hover, .cw-more:active { color: var(--text); background: rgba(255,255,255,0.1); }
+/* 全局操作表：挂在 body，不被任何滚动容器裁切 */
+.cw-sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 500;
+  display: none;
+}
+.cw-sheet.open { display: block; }
+.cw-sheet-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0,0,0,0.55);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+.cw-sheet-panel {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+  background: var(--panel-grad, #1a1d27);
+  border: 1px solid var(--border-strong, rgba(255,255,255,0.12));
+  border-radius: 16px;
+  box-shadow: 0 16px 48px rgba(0,0,0,0.65);
+  padding: 8px;
+  animation: cwSheetIn 0.2s cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+@keyframes cwSheetIn {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.cw-sheet-title {
+  font-size: 0.78rem;
+  color: var(--text-dim);
+  padding: 8px 14px 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cw-sheet-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 1rem;
+  font-weight: 600;
+  font-family: inherit;
+  padding: 16px 14px;
+  border-radius: 12px;
+  cursor: pointer;
+  min-height: 48px;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.cw-sheet-item:active { background: rgba(255,255,255,0.08); }
+.cw-sheet-item.danger { color: #ff8a8a; }
+.cw-sheet-cancel {
+  margin-top: 4px;
+  border-top: 1px solid var(--border, rgba(255,255,255,0.08));
+  color: var(--text-dim);
+  font-weight: 500;
+}
+@media (min-width: 700px) {
+  .cw-sheet-panel {
+    left: 50%;
+    right: auto;
+    bottom: auto;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    width: min(340px, 92vw);
+    animation: cwSheetInCenter 0.2s cubic-bezier(0.2, 0.9, 0.3, 1);
+  }
+  @keyframes cwSheetInCenter {
+    from { opacity: 0; transform: translate(-50%, -48%) scale(0.96); }
+    to { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  }
+}
+.cw-card .wl-watched {
+  top: 6px;
+  right: 6px;
+}
+@media (min-width: 768px) {
+  .h-scroll .cw-card { width: 260px; }
+  .cw-title { font-size: 0.86rem; }
+}
+
 .h-scroll .item .bar { margin-top: 6px; }
 .h-scroll .item .wl-watched, .h-scroll .item .wl-remove, .h-scroll .item .wl-drop, .h-scroll .item .wl-unwatch { top: 6px; right: 6px; width: 24px; height: 24px; font-size: 0.75rem; }
 .h-scroll .item .cal-action-row, .h-scroll .item .cal-open-btn { display: none; }
@@ -8253,11 +9192,11 @@ img { display: block; max-width: 100%; }
   .poster { width: 72px; height: 108px; }
 }
 @media (min-width: 768px) {
-  .container { width: 100%; padding: 0 28px calc(88px + env(safe-area-inset-bottom)); }
-  .hero { padding: 28px 0 22px; gap: 12px; }
+  .container { width: 100%; padding: 0 28px calc(76px + env(safe-area-inset-bottom)); }
+  .hero { padding: 12px 0 8px; gap: 8px; }
   .hero-avatar { width: 56px; height: 56px; }
   .hero-name { font-size: 1.55rem; }
-  .stats { gap: 10px; padding: 18px 12px; margin-bottom: 24px; }
+  .stats { gap: 6px; padding: 10px 8px; margin-bottom: 8px; }
   .stat-num { font-size: 1.5rem; }
   .stat-label { font-size: 0.76rem; }
   .stat-icon { width: 34px; height: 34px; border-radius: 10px; }
@@ -8281,9 +9220,9 @@ img { display: block; max-width: 100%; }
 }
 @media (min-width: 1024px) {
   .container { width: 100%; padding: 0 36px 100px; }
-  .hero { padding: 36px 0 26px; }
+  .hero { padding: 14px 0 8px; }
   .hero-name { font-size: 1.7rem; }
-  .stats { gap: 12px; padding: 20px 14px; margin-bottom: 28px; }
+  .stats { gap: 8px; padding: 12px 10px; margin-bottom: 10px; }
   .stat-num { font-size: 1.7rem; }
   .stat-label { font-size: 0.78rem; }
   .stat-icon { width: 36px; height: 36px; }
@@ -8302,7 +9241,7 @@ img { display: block; max-width: 100%; }
   .container { width: 100%; }
   .grid { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 24px; }
 }
-.day { margin-bottom: 26px; }
+.day { margin-bottom: 18px; }
 .day-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; padding-left: 2px; }
 .day-num { font-size: 1.8rem; font-weight: 800; color: #7d9dd4; line-height: 1; letter-spacing: -1px; }
 .day-mon { font-size: 0.75rem; color: var(--text-dim); }
@@ -8390,10 +9329,11 @@ img { display: block; max-width: 100%; }
 .season-meta { font-size: 0.76rem; color: var(--text-dim); }
 .chev { width: 16px; height: 16px; color: var(--text-dim); transition: transform 0.2s ease; flex-shrink: 0; }
 .season-item.open .chev { transform: rotate(180deg); }
-.season-body { display: none; border-top: 1px solid var(--border); }
+.season-body { display: none; border-top: 1px solid var(--border); background: rgba(0,0,0,0.12); }
 .season-item.open .season-body { display: block; }
+.season-body .episode:first-child { border-top: none; }
 .ep-empty { padding: 20px; text-align: center; color: var(--text-dim); font-size: 0.85rem; }
-.episode { display: flex; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--border); align-items: flex-start; transition: background 0.15s; }
+.episode { display: flex; gap: 14px; padding: 14px; border-bottom: 1px solid var(--border); align-items: stretch; transition: background 0.15s; }
 .episode:last-child { border-bottom: none; }
 .episode.clickable { cursor: pointer; }
 .episode.clickable:hover { background: var(--surface-2); }
@@ -8401,16 +9341,78 @@ img { display: block; max-width: 100%; }
 .episode.clickable:hover .ep-title { color: #7d9dd4; }
 .episode.watched .ep-title { color: var(--text-dim); }
 .episode.watched.clickable:hover .ep-title { color: #7d9dd4; }
-.ep-num { font-family: ui-monospace, Menlo, monospace; font-size: 0.76rem; color: var(--text-dim); font-weight: 700; flex-shrink: 0; padding-top: 3px; width: 32px; letter-spacing: 0.5px; }
-.ep-body { flex: 1; min-width: 0; }
-.ep-title { font-size: 0.86rem; font-weight: 600; line-height: 1.3; }
-.ep-overview { font-size: 0.76rem; color: var(--text-dim); margin-top: 4px; line-height: 1.45; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-.ep-check { color: #4ade80; font-weight: 700; flex-shrink: 0; font-size: 0.9rem; padding-top: 2px; }
-.ep-actions { flex-shrink: 0; display: flex; align-items: center; }
-.ep-watch-btn { background: rgba(52, 211, 153, 0.12); border: 1px solid rgba(52, 211, 153, 0.35); color: #6ee7b7; padding: 3px 9px; border-radius: 7px; font-size: 0.7rem; font-weight: 700; cursor: pointer; font-family: inherit; transition: all 0.15s; }
-.ep-watch-btn:hover { background: rgba(52, 211, 153, 0.25); color: #a7f3d0; }
+.ep-still-wrap { position: relative; flex-shrink: 0; width: 140px; border-radius: 10px; overflow: hidden; background: var(--surface-2); aspect-ratio: 16/9; align-self: flex-start; }
+.ep-still { width: 100%; height: 100%; object-fit: cover; display: block; }
+.ep-still-ph { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; font-size: 1.6rem; color: var(--text-dim); background: var(--soft-card-grad, var(--surface-2)); }
+.ep-still-badge { position: absolute; top: 6px; left: 6px; font-size: 0.65rem; font-weight: 700; padding: 2px 6px; border-radius: 6px; background: rgba(52, 211, 153, 0.9); color: #052e1c; }
+.ep-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.ep-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.ep-title-line { display: flex; align-items: baseline; gap: 8px; min-width: 0; flex: 1; }
+.ep-num { font-family: ui-monospace, Menlo, monospace; font-size: 0.95rem; color: var(--text-dim); font-weight: 800; flex-shrink: 0; letter-spacing: 0.3px; }
+.ep-title { font-size: 0.95rem; font-weight: 700; line-height: 1.35; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ep-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 0.75rem; color: var(--text-dim); margin-top: 2px; }
+.ep-vote { display: inline-flex; align-items: center; gap: 3px; padding: 1px 7px; border-radius: 999px; background: rgba(167, 139, 250, 0.14); color: #c4b5fd; font-weight: 700; font-size: 0.72rem; }
+.ep-dot { opacity: 0.45; }
+.ep-overview { font-size: 0.8rem; color: var(--text-dim); margin-top: 4px; line-height: 1.55; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.ep-actions {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.ep-play-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: rgba(167, 139, 250, 0.16);
+  border: 1px solid rgba(167, 139, 250, 0.28);
+  color: #c4b5fd;
+  text-decoration: none;
+  transition: background 0.15s, transform 0.12s;
+  -webkit-tap-highlight-color: transparent;
+}
+.ep-play-btn:hover { background: rgba(167, 139, 250, 0.28); color: #ddd6fe; }
+.ep-play-btn:active { transform: scale(0.94); }
+.ep-status {
+  font-size: 0.78rem;
+  font-weight: 600;
+  white-space: nowrap;
+  line-height: 1;
+  padding: 0;
+  border: none;
+  background: none;
+  font-family: inherit;
+}
+.ep-status.watched {
+  color: #4ade80;
+  cursor: default;
+}
+.ep-status.unwatched {
+  color: var(--text-dim);
+}
+button.ep-status.unwatched {
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+button.ep-status.unwatched:hover {
+  color: #6ee7b7;
+}
+@media (max-width: 520px) {
+  .episode { gap: 10px; padding: 12px; }
+  .ep-still-wrap { width: 112px; }
+  .ep-title { font-size: 0.88rem; white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .ep-overview { -webkit-line-clamp: 2; font-size: 0.76rem; }
+}
 .ep-watch-btn:disabled { opacity: 0.6; cursor: wait; }
-.ep-watch-btn.done { background: rgba(52, 211, 153, 0.2); color: #34d399; cursor: default; }
+.ep-status.done,
+.ep-watch-btn.done {
+  color: #4ade80 !important;
+  cursor: default;
+}
 .modal-body .grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 16px; }
 @media (min-width: 700px) {
   .detail-inner { flex-direction: row; align-items: flex-start; text-align: left; padding: 34px; gap: 30px; }
@@ -8427,7 +9429,7 @@ img { display: block; max-width: 100%; }
   .detail-ext-ratings { justify-content: flex-start; }
   .d-action-bar { align-self: flex-start; }
 }
-.confirm-modal { position: fixed; inset: 0; z-index: 320; display: none; }
+.confirm-modal { position: fixed; inset: 0; z-index: 620; display: none; }
 .confirm-modal.open { display: block; }
 .confirm-backdrop { position: absolute; inset: 0; background: var(--overlay); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); animation: fadeIn 0.18s ease; }
 .confirm-panel { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: min(88vw, 340px); background: var(--panel-grad); border: 1px solid var(--border-strong); border-radius: 18px; padding: 24px 22px 18px; box-shadow: 0 30px 80px rgba(0, 0, 0, 0.8); text-align: center; animation: confirmIn 0.22s cubic-bezier(0.2, 0.9, 0.3, 1); }
