@@ -27,6 +27,18 @@
  *   · force=1 绕过缓存；失败回退旧 KV，绝不写脏数据
  *   · 上游 429 时按用户标记冷却期
  *
+ * KV 用量（v176 优化，详见各函数注释）：
+ *   · /api/enrich 要求登录 + 单 IP 限流 + key 白名单，批量 20 条
+ *   · enrich 结果按 4 个桶聚合读写：20 条 ≈ 4 读 4 写（原来 20/20）
+ *     桶内容在进程内复用 2 分钟：一次开页 6 批卡片只读 4 次
+ *   · 继续观看补图缓存 pbi:<uid>、待看补图缓存 wli:<uid>：稳态 1 读 0 写
+ *   · 失败结果写 miss 记录（missTtl），不再每次重读 KV + 回源
+ *   · 榜单类公开接口套 Cache API，命中时完全不进 KV
+ *   · 平台预览 10 个平台合并为 1 个 key：plat:pv:v1，且不跟随「刷新」
+ *   · 不再维护 lu:<uid>，更新时间由 playback 缓存年龄推导
+ *   · last-good 副本 7 天写一次；平台分页上限 5 页
+ *   → 一次「打开首页 + 强制刷新」约 17 读 / 6 写（v173 时约 258 读 / 175 写）
+ *
  * 主题：
  *   dark / light / system 三态，localStorage 键 mt:theme。
  *   THEME_BOOT_SCRIPT 内联在 <head> 最前同步执行，防首帧闪烁。
@@ -123,20 +135,23 @@ const PAGE_SIZE = 20,
   PROFILE_KV_TTL = 7200,
   ENTITY_KV_TTL = 86400,
   SEASON_KV_TTL = 86400,
-  DOUBAN_KV_TTL = 64800,
-  THEATER_KV_TTL = 64800,
-  GUDUO_KV_TTL = 64800,
-  PLATFORM_KV_TTL = 64800;
+  /* 外部榜单（豆瓣 / 剧场 / 骨朵 / 平台）统一 24 小时更新一次 */
+  DOUBAN_KV_TTL = 86400,
+  THEATER_KV_TTL = 86400,
+  GUDUO_KV_TTL = 86400,
+  PLATFORM_KV_TTL = 86400;
 
 /* KV 物理保留策略 */
 const KV_STALE_RETENTION = 86400 * 7,
   LAST_GOOD_KV_TTL = 86400 * 7;
 
-/* 0 = 关闭定时/回前台自动刷新，只靠手动点「刷新」更新数据（省 KV 写入） */
-const HOME_AUTO_REFRESH_MINUTES = 0;
+/* 停留在页面时自动刷新的间隔（分钟）：只刷 Trakt 数据（继续观看 / 资料 / 统计），
+   豆瓣 / 骨朵 / 剧场 / 平台不跟随，各自按 24 小时 TTL 自然更新。
+   走非 force 链路：有缓存读缓存、没缓存才回源，不产生额外写入。设为 0 可关闭。 */
+const HOME_AUTO_REFRESH_MINUTES = 10;
 
 /* 全局版本号：改这一处即可，JS / CSS / SW 全部跟着变 */
-const APP_VERSION = "173";
+const APP_VERSION = "181";
 const APP_JS_VERSION = APP_VERSION;
 const APP_CSS_VERSION = APP_VERSION;
 
@@ -145,14 +160,107 @@ const CC_NO_STORE = "no-store";
 const CT_JSON = "application/json; charset=utf-8";
 const CT_HTML = "text/html; charset=utf-8";
 
+/* 用户维度缓存的通用参数（ttl 由调用方给） */
+const CACHE_USER_LONG = {
+  missTtl: 60,
+  swr: true,
+  unwrap: true,
+  edgeTtl: 300,
+  jitter: 300,
+};
+const CACHE_USER_META = {
+  missTtl: 180,
+  swr: true,
+  edgeTtl: 300,
+  jitter: 300,
+};
+
 /** 统一 JSON 响应构造 */
-function jsonResp(data, headers) {
+function jsonResp(data, headers, status) {
   return new Response(JSON.stringify(data), {
+    status: status || 200,
     headers: Object.assign(
       { "Content-Type": CT_JSON, "Cache-Control": CC_NO_STORE },
       headers || {},
     ),
   });
+}
+
+/**
+ * Cache API 边缘缓存包装（只用于公开 GET 接口）。
+ * 命中时请求不会进入业务逻辑，也就不会产生任何 KV 读。
+ * force=1 时跳过读取，但会把新结果写回标准 key。
+ */
+async function edgeCached(request, ctx, ttlSec, fn) {
+  if (request.method !== "GET") return fn();
+  let cache = null;
+  try {
+    cache = caches.default;
+  } catch {
+    return fn();
+  }
+  if (!cache) return fn();
+
+  const url = new URL(request.url);
+  const bypass = url.searchParams.get("force") === "1";
+  const keyUrl = new URL(url.toString());
+  keyUrl.searchParams.delete("force");
+  const cacheKey = new Request(keyUrl.toString(), { method: "GET" });
+
+  if (!bypass) {
+    try {
+      const hit = await cache.match(cacheKey);
+      if (hit) return hit;
+    } catch {}
+  }
+
+  const resp = await fn();
+  if (
+    resp &&
+    resp.ok &&
+    ctx &&
+    typeof ctx.waitUntil === "function" &&
+    resp.status === 200
+  ) {
+    try {
+      const clone = resp.clone();
+      const h = new Headers(clone.headers);
+      h.set("Cache-Control", `public, max-age=${ttlSec}`);
+      ctx.waitUntil(
+        cache.put(
+          cacheKey,
+          new Response(clone.body, { status: 200, headers: h }),
+        ),
+      );
+    } catch {}
+  }
+  return resp;
+}
+
+/* /api/enrich 的轻量限流：单 IP 每分钟 20 次（正常浏览最多 2~3 次） */
+const __enrichHits = new Map();
+/* enrich 桶内容的进程内短缓存（key: 桶号） */
+const __enrichBucketMem = new Map();
+function allowEnrich(request) {
+  const ip =
+    request.headers.get("CF-Connecting-IP") ||
+    request.headers.get("X-Forwarded-For") ||
+    "unknown";
+  const now = Date.now();
+  const arr = (__enrichHits.get(ip) || []).filter((t) => now - t < 60000);
+  if (arr.length >= 20) {
+    __enrichHits.set(ip, arr);
+    return false;
+  }
+  arr.push(now);
+  __enrichHits.set(ip, arr);
+  if (__enrichHits.size > 2000) {
+    for (const [k, v] of __enrichHits) {
+      const last = v && v.length ? v[v.length - 1] : 0;
+      if (!last || now - last > 60000) __enrichHits.delete(k);
+    }
+  }
+  return true;
 }
 
 /* 缓存 key 构造器 */
@@ -171,18 +279,23 @@ const CK = {
   watchlistVersion: (u) => `wlv:${u}`,
   omdb: (id) => `omdb:${id}`,
   enrich: (k) => `e:${k}`,
+  enrichBucket: (b) => `eb:v1:${b}`,
+  /* 继续观看补图结果（剧照 / backdrop / 中文标题），避免每次重查 TMDB */
+  pbImages: (u) => `pbi:${u}`,
+  /* 待看列表补图结果（分集剧照） */
+  wlImages: (u) => `wli:${u}`,
   trend: (p) => `trend:day:${p}`,
   tmdb: (p) => `td:${p}`,
   douban: "douban:v1:all",
   theater: "theater:v1:all",
   guduo: "guduo:v1:all",
   platform: (id, page, media) => `plat:${id}:${media}:p${page}`,
+  /* 首页平台预览：10 个平台合并成一个 key */
+  platformPreviews: "plat:pv:v1",
   uidRt: (rt) => `uid:rt:${rt}`,
   uidAt: (at) => `uid:at:${at}`,
   moreHistory: (u, p) => `more:hist:${u}:p${p}`,
   morePlayback: (u, p, l) => `more:pb:${u}:p${p}:l${l}`,
-  /* 用户维度：最近一次 Trakt API 成功时间（毫秒） */
-  userUpdatedAt: (u) => `lu:${u}`,
   /* 「最后一次成功数据」兜底副本（key 不含日期/版本号） */
   lastGood: {
     playback: (u) => `lg:pb:${u}`,
@@ -193,71 +306,6 @@ const CK = {
     watchlist: (u, s = "added") => `lg:wl:${u}:${s}`,
   },
 };
-
-/**
- * 记录「该用户最近一次 Trakt 请求成功」的时间（独立 key，与业务缓存解耦）。
- * 仅在确实打到上游且成功时调用。
- * 内存照写，KV 加 1h 节流
- */
-function markUserUpdatedAt(env, ctx, userKey) {
-  if (!userKey || userKey === "anon" || !env) return;
-  const key = CK.userUpdatedAt(userKey);
-  const ts = Date.now();
-  const payload = { data: { ts }, _ts: ts };
-  kvMemSet(key, payload, KV_MEM_TTL);
-  if (!env.TMDB_CACHE || kvIsDown()) return;
-
-  const guard = "lu:" + key;
-  const last = __kvLastPut.get(guard) || 0;
-  if (last && ts - last < KV_MIN_PUT_INTERVAL_MS) return;   // ← 新增
-  __kvLastPut.set(guard, ts);                               // ← 新增
-
-  const p = env.TMDB_CACHE.put(key, JSON.stringify(payload), {
-    expirationTtl: 86400 * 90,
-  })
-    .then(() => kvMarkUp())
-    .catch(() => kvMarkDown());
-  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
-}
-
-/** 读取用户最近一次 Trakt 成功时间（毫秒时间戳），没有则 null */
-async function getUserUpdatedAt(env, ctx, userKey) {
-  if (!userKey || userKey === "anon") return null;
-  const key = CK.userUpdatedAt(userKey);
-  const mem = kvMemGet(key);
-  if (mem && mem !== KV_MISS) {
-    const ts =
-      mem.data && mem.data.ts != null
-        ? Number(mem.data.ts)
-        : mem.ts != null
-          ? Number(mem.ts)
-          : mem._ts != null
-            ? Number(mem._ts)
-            : NaN;
-    if (Number.isFinite(ts) && ts > 0) return ts;
-  }
-  if (!env || !env.TMDB_CACHE || kvIsDown()) return null;
-  try {
-    const raw = await env.TMDB_CACHE.get(key, { type: "json", cacheTtl: 600 });
-    kvMarkUp();
-    if (!raw) return null;
-    const ts =
-      raw.data && raw.data.ts != null
-        ? Number(raw.data.ts)
-        : raw.ts != null
-          ? Number(raw.ts)
-          : raw._ts != null
-            ? Number(raw._ts)
-            : NaN;
-    if (Number.isFinite(ts) && ts > 0) {
-      kvMemSet(key, { data: { ts }, _ts: ts }, KV_MEM_TTL);
-      return ts;
-    }
-  } catch {
-    kvMarkDown();
-  }
-  return null;
-}
 
 /** 带超时的 fetch（Trakt 请求统一经过出网闸门） */
 async function fetchT(url, opts = {}, ms = 8000) {
@@ -462,7 +510,18 @@ const KV_MEM_TTL = 1800000,
   KV_DOWN_COOLDOWN_MS = 30000;
 
 const KV_MIN_PUT_INTERVAL_MS = 3600000;
-const LAST_GOOD_MIN_PUT_INTERVAL_MS = 24 * 3600000;
+/* last-good 是兜底副本，没必要频繁刷：7 天一次足够，直接砍掉一半写放大 */
+const LAST_GOOD_MIN_PUT_INTERVAL_MS = 7 * 24 * 3600000;
+/* enrich 聚合桶：同一桶内的条目合并成一次写，把 N 写压到 O(桶数)。
+   桶数越少写越省，但单 value 越大、并发覆盖概率越高；
+   4 个桶 + 每桶 500 条是「写量」和「读延迟」的折中。 */
+const ENRICH_BUCKETS = 4;
+const ENRICH_BUCKET_TTL = 86400 * 30;
+const ENRICH_BUCKET_MAX = 500;
+/* 单次 /api/enrich 最多处理的条目数（原来是 80，等于一次 80 次写） */
+const ENRICH_BATCH_MAX = 20;
+/* 桶内容在进程内的短缓存：一次开页会发 6 批，没必要每批都把 4 个桶重读一遍 */
+const ENRICH_BUCKET_MEM_TTL = 120000;
 const DEFAULT_JITTER_SEC = 600;
 const __KV_LASTPUT_MAX = 5000;
 
@@ -1011,6 +1070,12 @@ async function cachedJSON(
 
     const fb = await fallbackChain();
     if (fb.found) return unwrap ? fb.val : { data: fb.val };
+
+    /* 失败/空结果写一条短命 miss 记录（内存 30s + KV missTtl）。
+       否则每次请求都会重新读一次 KV 再打上游；而「读不存在的 key」同样计费。 */
+    if (!memOnly && missTtl >= KV_MIN_PUT_TTL) {
+      kvPutJSON(env, ctx, key, { miss: 1, _ts: Date.now() }, missTtl, false);
+    }
     markSource(null, null);
     return null;
   });
@@ -1199,6 +1264,8 @@ export default {
     if (path === "/app.css") return handleAppCss();
     if (path === "/app.js") return handleAppJs(request);
     if (path === "/favicon.ico") return Response.redirect(FAVICON_URL, 302);
+    /* Trakt 头像代理：部分地区直连 media.trakt.tv 会失败，走 Cloudflare 兜一层 */
+    if (path === "/avatar") return handleAvatar(request, ctx);
     if (path === "/manifest.webmanifest") return handleManifest();
     if (path === "/sw.js") return handleServiceWorker();
 
@@ -1214,16 +1281,38 @@ export default {
     if (path === "/api/detail-extras")
       return handleDetailExtras(request, env, ctx);
     if (path === "/api/person") return handlePerson(request, env, ctx);
-    if (path === "/api/enrich" && request.method === "POST")
+    if (path === "/api/enrich" && request.method === "POST") {
+      /* 这个接口一次能触发几十次 KV 读写，必须要求登录 + 限流 */
+      const A = await authed(request, env, ctx);
+      if (!A.ok) return A.response;
+      if (!allowEnrich(request)) {
+        return Response.json(
+          { error: "请求过于频繁，请稍后再试" },
+          { status: 429, headers: { "Retry-After": "60" } },
+        );
+      }
       return handleEnrich(request, env, ctx);
+    }
     if (path === "/api/search") return handleSearch(request, env, ctx);
     if (path === "/api/trending") return handleTrending(request, env, ctx);
-    if (path === "/api/douban-list") return handleDoubanList(request, env, ctx);
+    /* 榜单类接口都是公开数据，外面套一层 Cache API：
+       命中时请求根本不会进 KV，挡掉爬虫和重复刷新 */
+    if (path === "/api/douban-list")
+      return edgeCached(request, ctx, 600, () =>
+        handleDoubanList(request, env, ctx),
+      );
     if (path === "/api/theater-list")
-      return handleTheaterList(request, env, ctx);
-    if (path === "/api/guduo-list") return handleGuduoList(request, env, ctx);
+      return edgeCached(request, ctx, 600, () =>
+        handleTheaterList(request, env, ctx),
+      );
+    if (path === "/api/guduo-list")
+      return edgeCached(request, ctx, 600, () =>
+        handleGuduoList(request, env, ctx),
+      );
     if (path === "/api/platform-list")
-      return handlePlatformList(request, env, ctx);
+      return edgeCached(request, ctx, 900, () =>
+        handlePlatformList(request, env, ctx),
+      );
 
     if (path === "/api/watchlist/add" && request.method === "POST")
       return handleWatchlistAdd(request, env, ctx);
@@ -1251,6 +1340,60 @@ export default {
     return handleHome(request, env, ctx);
   },
 };
+
+/**
+ * 头像代理：只放行 media.trakt.tv 的用户头像，避免变成开放代理。
+ * 结果在边缘缓存 1 天，命中时不会回源。
+ */
+async function handleAvatar(request, ctx) {
+  const raw = new URL(request.url).searchParams.get("u") || "";
+  let target;
+  try {
+    target = new URL(raw);
+  } catch {
+    return new Response("bad url", { status: 400 });
+  }
+  if (
+    target.protocol !== "https:" ||
+    target.hostname !== "media.trakt.tv" ||
+    !target.pathname.startsWith("/images/users/")
+  )
+    return new Response("forbidden", { status: 403 });
+
+  let cache = null;
+  try {
+    cache = caches.default;
+  } catch {}
+  const cacheKey = new Request(target.toString(), { method: "GET" });
+  if (cache) {
+    try {
+      const hit = await cache.match(cacheKey);
+      if (hit) return hit;
+    } catch {}
+  }
+
+  let r;
+  try {
+    r = await fetch(target.toString(), {
+      headers: { "User-Agent": TRAKT_UA, Referer: "https://trakt.tv/" },
+    });
+  } catch {
+    return new Response("bad gateway", { status: 502 });
+  }
+  if (!r.ok) return new Response("not found", { status: 404 });
+
+  const resp = new Response(r.body, {
+    status: 200,
+    headers: {
+      "Content-Type": r.headers.get("Content-Type") || "image/jpeg",
+      "Cache-Control": "public, max-age=86400, immutable",
+    },
+  });
+  if (cache && ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(cache.put(cacheKey, resp.clone()).catch(() => {}));
+  }
+  return resp;
+}
 
 /** 静态资源处理：回源到 ASSET_ORIGINS，caches.default 缓存一年 */
 async function handleAsset(path, ctx) {
@@ -1642,10 +1785,6 @@ async function traktSyncAction(
   }
 
   if (typeof afterOk === "function") await afterOk(auth, headers, env, ctx);
-  try {
-    const uk = await getStableUserId(auth, headers, env, ctx).catch(() => null);
-    if (uk) markUserUpdatedAt(env, ctx, uk);
-  } catch {}
   const result = await r.json().catch(() => null);
   return authJson(auth, needsCookieUpdate, { ok: true, result });
 }
@@ -1887,9 +2026,6 @@ async function handlePoll(request, env, ctx) {
     if (rt) kvMemSet(CK.uidRt(rt.slice(0, 32)), traktId, KV_MEM_TTL);
     if (at) kvMemSet(CK.uidAt(at.slice(0, 24)), traktId, KV_MEM_TTL);
 
-    try {
-      markUserUpdatedAt(env, ctx, userKey);
-    } catch {}
     /* 清掉继续观看等内存缓存，避免登录后仍显示旧用户数据；资料/统计已写入 KV 不删 */
     try {
       const pbKey = CK.playback(userKey);
@@ -1903,11 +2039,7 @@ async function handlePoll(request, env, ctx) {
 
     const cookieHeaders = [buildCookie(auth, traktId)];
     try {
-      let avatarUrl = "";
-      const imgs = meProfile && meProfile.images;
-      if (imgs && imgs.avatar)
-        avatarUrl =
-          imgs.avatar.full || imgs.avatar.medium || imgs.avatar.thumb || "";
+      const avatarUrl = pickAvatar(meProfile).url;
       const displayName =
         (meProfile && (meProfile.name || meProfile.username)) || "";
       if (displayName || avatarUrl)
@@ -2208,6 +2340,41 @@ function readProfileHint(request) {
   }
 }
 
+/**
+ * 从 Trakt profile 里取头像。
+ * Trakt 返回的是 images.avatar.{full,medium,thumb}，没有顶层 avatar 字段；
+ * 这里同时兼容两种结构，并把 medium/thumb 作为加载失败时的备选。
+ */
+function pickAvatar(profile) {
+  const out = { url: "", alts: [] };
+  if (!profile || typeof profile !== "object") return out;
+  const collect = (a) => {
+    if (!a) return;
+    if (typeof a === "string") {
+      if (!out.url) out.url = a;
+      out.alts.push(a);
+      return;
+    }
+    if (typeof a === "object") {
+      const full = a.full || "",
+        med = a.medium || "",
+        th = a.thumb || "";
+      if (!out.url) out.url = full || med || th || "";
+      if (med) out.alts.push(med);
+      if (th) out.alts.push(th);
+    }
+  };
+  collect(profile.images && profile.images.avatar);
+  collect(profile.avatar);
+  const seen = new Set();
+  out.alts = out.alts.filter((u) => {
+    if (!u || u === out.url || seen.has(u)) return false;
+    seen.add(u);
+    return true;
+  });
+  return out;
+}
+
 /** 写用户资料提示 Cookie（非敏感，不带 HttpOnly） */
 function buildProfileCookie(profile) {
   const data = { name: profile.name || "", avatar: profile.avatar || "" };
@@ -2457,16 +2624,20 @@ async function tmdbEpisodeStill(tmdbId, season, episode, env, ctx) {
   return null;
 }
 
-/** TMDB 剧集横向背景图（backdrop），分集无图时的横向兜底 */
-async function tmdbShowBackdrop(tmdbId, env, ctx) {
+/**
+ * TMDB 横向背景图（backdrop），分集无图时的兜底。
+ * kind 已知时先查对应类型，避免电影条目每次都白查一次 /tv/<id>（多一次 KV 读写）。
+ */
+async function tmdbShowBackdrop(tmdbId, env, ctx, kind) {
   if (!env || !env.TMDB_API_KEY) return null;
   const sid = Number(tmdbId);
   if (!Number.isFinite(sid) || sid <= 0) return null;
-  const data = await tmdbDetailCached(`/tv/${sid}`, env, ctx, 86400 * 7);
+  const primary = kind === "movie" ? "movie" : "tv";
+  const other = primary === "movie" ? "tv" : "movie";
+  const data = await tmdbDetailCached(`/${primary}/${sid}`, env, ctx, 86400 * 7);
   if (data && data.backdrop_path) return tmdbPoster(data.backdrop_path, "w780");
-  // 电影
-  const movie = await tmdbDetailCached(`/movie/${sid}`, env, ctx, 86400 * 7);
-  if (movie && movie.backdrop_path) return tmdbPoster(movie.backdrop_path, "w780");
+  const alt = await tmdbDetailCached(`/${other}/${sid}`, env, ctx, 86400 * 7);
+  if (alt && alt.backdrop_path) return tmdbPoster(alt.backdrop_path, "w780");
   return null;
 }
 
@@ -2480,29 +2651,102 @@ async function tmdbZhTitle(kind, tmdbId, env, ctx) {
 }
 
 /**
+ * 读取「图片映射」缓存（继续观看 pbi / 待看 wli 共用）。
+ * 结构：{ items: { "<key>": { s: stillUrl, b: backdrop, t: zhTitle } } }
+ */
+async function loadImageMap(env, key) {
+  let map = kvMemGet(key);
+  if (map === KV_MISS || (map !== undefined && typeof map !== "object"))
+    map = undefined;
+  if (map !== undefined) return map;
+
+  let raw = null;
+  if (env && env.TMDB_CACHE && !kvIsDown()) {
+    try {
+      raw = await env.TMDB_CACHE.get(key, { type: "json", cacheTtl: 600 });
+      kvMarkUp();
+    } catch {
+      kvMarkDown();
+    }
+  }
+  const v = raw && raw.items !== undefined ? raw.items : raw;
+  const out = v && typeof v === "object" ? v : {};
+  kvMemSet(key, out, KV_MEM_TTL);
+  return out;
+}
+
+/** 回写图片映射：超过 400 条按插入顺序淘汰最旧的 */
+function saveImageMap(env, ctx, key, map, ttl) {
+  const ks = Object.keys(map);
+  if (ks.length > 400) {
+    for (let i = 0; i < ks.length - 400; i++) delete map[ks[i]];
+  }
+  kvPutJSON(env, ctx, key, { items: map }, ttl || 1800, false);
+}
+
+/**
+ * 继续观看补图的稳定键（剧集按 剧+季+集，电影按 trakt id）
+ */
+function pbImageKey(entry) {
+  if (!entry) return null;
+  if (entry.movie && entry.movie.ids && entry.movie.ids.trakt != null)
+    return "m:" + entry.movie.ids.trakt;
+  const show = entry.show;
+  if (!show || !show.ids || show.ids.trakt == null) return null;
+  const ep =
+    entry.episode || (entry.progress && entry.progress.next_episode) || null;
+  const s = ep ? (ep.season != null ? ep.season : ep.season_number) : "";
+  const n = ep ? (ep.number != null ? ep.number : ep.episode_number) : "";
+  return "s:" + show.ids.trakt + ":" + s + ":" + n;
+}
+
+/** 命中补图缓存则直接挂到条目上，返回 true */
+function applyPbImage(j, imgMap) {
+  const rec = j.k ? imgMap[j.k] : null;
+  if (!rec) return false;
+  if (rec.s) {
+    j.entry.__stillUrl = rec.s;
+    if (j.ep) j.ep.__stillUrl = rec.s;
+  }
+  if (rec.b) j.entry.__backdropUrl = rec.b;
+  if (rec.t) j.entry.__zhTitle = rec.t;
+  j.entry.__tmdbId = j.tmdbId;
+  if (j.ep) j.ep.__tmdbId = j.tmdbId;
+  return true;
+}
+
+/**
  * 为继续观看原始条目挂上：
  *  - 分集剧照 __stillUrl（优先，按季批量取）
  *  - 无分集图时用横向 backdrop __backdropUrl
  *  - 中文标题 __zhTitle
  * 支持 up_next_nitro / progress.next_episode / movie。
+ *
+ * 补图结果整体缓存在 pbi:<user>：稳态下每次请求只多 1 次 KV 读，
+ * 而不是 20 条 × 2~3 个 TMDB key 全部重查一遍。
  */
-async function attachContinueStillsForPlayback(list, env, ctx) {
+async function attachContinueStillsForPlayback(list, env, ctx, userKey) {
   if (!env || !env.TMDB_API_KEY || !Array.isArray(list) || !list.length)
     return list;
 
-  // 规范化每条的 show/ep/tmdb
+  const imgKey = CK.pbImages(userKey || "anon");
+  const imgMap = await loadImageMap(env, imgKey);
+
+  // 规范化每条的 show/ep/tmdb；命中补图缓存的直接挂上，不再回源
   const normalized = [];
   for (const entry of list) {
     if (!entry) continue;
     if (entry.movie && entry.movie.ids && entry.movie.ids.tmdb) {
-      normalized.push({
+      const j = {
         entry,
         ep: null,
         tmdbId: entry.movie.ids.tmdb,
         season: null,
         number: null,
         kind: "movie",
-      });
+        k: pbImageKey(entry),
+      };
+      if (!applyPbImage(j, imgMap)) normalized.push(j);
       continue;
     }
     let ep = null,
@@ -2530,8 +2774,19 @@ async function attachContinueStillsForPlayback(list, env, ctx) {
         ? ep.number
         : ep.episode_number
       : null;
-    normalized.push({ entry, ep, tmdbId, season, number, kind: "tv" });
+    const j = {
+      entry,
+      ep,
+      tmdbId,
+      season,
+      number,
+      kind: "tv",
+      k: pbImageKey(entry),
+    };
+    if (!applyPbImage(j, imgMap)) normalized.push(j);
   }
+
+  if (!normalized.length) return list;
 
   // 按 剧+季 分组拉 still map，避免每集打一次
   const seasonKey = (id, s) => id + ":" + s;
@@ -2584,7 +2839,7 @@ async function attachContinueStillsForPlayback(list, env, ctx) {
           }
         }
         if (!j.entry.__stillUrl) {
-          const bd = await tmdbShowBackdrop(j.tmdbId, env, ctx);
+          const bd = await tmdbShowBackdrop(j.tmdbId, env, ctx, j.kind);
           if (bd) j.entry.__backdropUrl = bd;
         }
         j.entry.__tmdbId = j.tmdbId;
@@ -2599,13 +2854,33 @@ async function attachContinueStillsForPlayback(list, env, ctx) {
       } catch (_) {}
     }),
   );
+
+  /* 把新补到的结果并回 pbi:<user>，下次直接命中（1 次 KV 读） */
+  let dirty = false;
+  for (const j of normalized) {
+    if (!j.k) continue;
+    const rec = {};
+    if (j.entry.__stillUrl) rec.s = j.entry.__stillUrl;
+    if (j.entry.__backdropUrl) rec.b = j.entry.__backdropUrl;
+    if (j.entry.__zhTitle) rec.t = j.entry.__zhTitle;
+    if (rec.s || rec.b || rec.t) {
+      imgMap[j.k] = rec;
+      dirty = true;
+    }
+  }
+  if (dirty) saveImageMap(env, ctx, imgKey, imgMap);
+
   return list;
 }
 
 /** 待看列表：给分集条目挂 TMDB 剧照（item.__stillUrl / episode.__stillUrl） */
-async function attachWatchlistStills(list, env, ctx) {
+async function attachWatchlistStills(list, env, ctx, userKey) {
   if (!env || !env.TMDB_API_KEY || !Array.isArray(list) || !list.length)
     return list;
+
+  const imgKey = CK.wlImages(userKey || "anon");
+  const imgMap = await loadImageMap(env, imgKey);
+
   const jobs = [];
   for (const item of list) {
     if (!item || !item.episode || !item.show) continue;
@@ -2616,9 +2891,16 @@ async function attachWatchlistStills(list, env, ctx) {
     const season = ep.season != null ? ep.season : ep.season_number;
     const number = ep.number != null ? ep.number : ep.episode_number;
     if (!tmdbId || season == null || number == null) continue;
-    jobs.push({ item, ep, tmdbId, season, number });
+    const k = pbImageKey(item);
+    if (k && imgMap[k] && imgMap[k].s) {
+      item.__stillUrl = imgMap[k].s;
+      if (ep) ep.__stillUrl = imgMap[k].s;
+      continue;
+    }
+    jobs.push({ item, ep, tmdbId, season, number, k });
   }
   const batch = 6;
+  let dirty = false;
   for (let i = 0; i < jobs.length; i += batch) {
     const slice = jobs.slice(i, i + batch);
     await Promise.all(
@@ -2634,11 +2916,17 @@ async function attachWatchlistStills(list, env, ctx) {
           if (url) {
             j.item.__stillUrl = url;
             if (j.ep) j.ep.__stillUrl = url;
+            if (j.k) {
+              imgMap[j.k] = { s: url };
+              dirty = true;
+            }
           }
         } catch (_) {}
       }),
     );
   }
+
+  if (dirty) saveImageMap(env, ctx, imgKey, imgMap);
   return list;
 }
 
@@ -3472,21 +3760,67 @@ async function fetchPlatformDiscover(plat, media, page, env) {
     return db.localeCompare(da);
   });
 
-  return { items: out, totalPages: Math.min(20, maxPages) };
+  return { items: out, totalPages: Math.min(5, maxPages) };
+}
+
+/**
+ * 首页「流媒体平台」预览：10 个平台的海报合并成 1 个 key。
+ * 旧版前端发 10 个请求 → 10 个 key → 10 次 KV 读；现在 1 个请求 → 1 个 key。
+ */
+async function loadPlatformPreviews(env, ctx, force) {
+  const cacheKey = CK.platformPreviews;
+
+  if (!force) {
+    const mem = kvMemGet(cacheKey);
+    if (mem && mem.items && typeof mem.items === "object") return mem.items;
+    const raw = await kvGetJSON(env, cacheKey, false, 900, 600);
+    if (raw && raw !== KV_MISS && raw !== KV_ERR) {
+      const v = raw.data !== undefined ? raw.data : raw;
+      if (v && v.items && typeof v.items === "object") {
+        kvMemSet(cacheKey, v, KV_MEM_TTL);
+        return v.items;
+      }
+    }
+  }
+
+  const items = {};
+  const queue = HOME_PLATFORM_IDS.filter((pid) => PLATFORMS[pid]);
+  const worker = async () => {
+    while (queue.length) {
+      const pid = queue.shift();
+      try {
+        const r = await fetchPlatformDiscover(PLATFORMS[pid], "all", 1, env);
+        items[pid] = (r.items || [])
+          .filter((x) => x.poster)
+          .slice(0, 5)
+          .map((x) => x.poster.replace("/w185", "/w342"));
+      } catch {
+        items[pid] = [];
+      }
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker(), worker()]);
+
+  const payload = { items };
+  kvMemSet(cacheKey, payload, KV_MEM_TTL);
+  /* 平台海报同属第三方数据，跟平台列表一样 24 小时更新一次 */
+  kvPutJSON(env, ctx, cacheKey, payload, PLATFORM_KV_TTL, false, !!force);
+  return items;
 }
 
 async function handlePlatformList(request, env, ctx) {
   const url = new URL(request.url);
   const id = (url.searchParams.get("id") || "").trim().toLowerCase();
   const mode = url.searchParams.get("mode") || "grid";
-  const media = url.searchParams.get("media") || "all";
+  /* media 白名单：否则任意取值都会生成一个新缓存 key */
+  const rawMedia = (url.searchParams.get("media") || "all").toLowerCase();
+  const media = rawMedia === "movie" || rawMedia === "tv" ? rawMedia : "all";
   const force = url.searchParams.get("force") === "1";
   const page = Math.max(
     1,
-    Math.min(20, parseInt(url.searchParams.get("page") || "1", 10) || 1),
+    Math.min(5, parseInt(url.searchParams.get("page") || "1", 10) || 1),
   );
 
-  const plat = PLATFORMS[id];
   const outHeadersHtml = {
     "Content-Type": CT_HTML,
     "Cache-Control": CC_API,
@@ -3496,11 +3830,19 @@ async function handlePlatformList(request, env, ctx) {
     "Cache-Control": CC_API,
   };
 
+  /* 首页一次拿全部平台海报（新前端只发这一个请求） */
+  if (mode === "previews") {
+    if (!env.TMDB_API_KEY)
+      return jsonResp({ items: {} }, outHeadersJson);
+    const items = await loadPlatformPreviews(env, ctx, force);
+    return jsonResp({ items }, outHeadersJson);
+  }
+
+  const plat = PLATFORMS[id];
+
   if (!plat) {
     if (mode === "json" || mode === "preview")
-      return new Response(JSON.stringify({ error: "unknown", items: [] }), {
-        headers: outHeadersJson,
-      });
+      return jsonResp({ error: "unknown", items: [] }, outHeadersJson);
     return new Response('<div class="empty"><p>未知平台</p></div>', {
       headers: outHeadersHtml,
     });
@@ -3508,34 +3850,37 @@ async function handlePlatformList(request, env, ctx) {
 
   if (!env.TMDB_API_KEY) {
     if (mode === "json" || mode === "preview")
-      return new Response(JSON.stringify({ error: "no tmdb", items: [] }), {
-        headers: outHeadersJson,
-      });
+      return jsonResp({ error: "no tmdb", items: [] }, outHeadersJson);
     return new Response('<div class="empty"><p>未配置 TMDB</p></div>', {
       headers: outHeadersHtml,
     });
   }
 
-  const cacheMedia = mode === "preview" ? "preview" : media;
-  const cachePage = mode === "preview" ? 1 : page;
+  /* 兼容旧前端：单平台预览也从聚合缓存里取 */
+  if (mode === "preview") {
+    const all = await loadPlatformPreviews(env, ctx, force);
+    let posters = Array.isArray(all[id]) ? all[id] : null;
+    if (!posters) {
+      try {
+        const r = await fetchPlatformDiscover(plat, "all", 1, env);
+        posters = (r.items || [])
+          .filter((x) => x.poster)
+          .slice(0, 5)
+          .map((x) => x.poster.replace("/w185", "/w342"));
+      } catch {
+        posters = [];
+      }
+    }
+    return jsonResp({ id, name: plat.name, posters }, outHeadersJson);
+  }
 
   const data = await cachedJSON(
     env,
     ctx,
-    CK.platform(id, cachePage, cacheMedia),
-    async () => {
-      if (mode === "preview") {
-        const r = await fetchPlatformDiscover(plat, "all", 1, env);
-        const posters = (r.items || [])
-          .filter((x) => x.poster)
-          .slice(0, 5)
-          .map((x) => x.poster.replace("/w185", "/w342"));
-        return { items: posters, totalPages: 1, name: plat.name };
-      }
-      return fetchPlatformDiscover(plat, media, page, env);
-    },
+    CK.platform(id, page, media),
+    () => fetchPlatformDiscover(plat, media, page, env),
     {
-      ttl: TREND_KV_TTL,
+      ttl: PLATFORM_KV_TTL,
       missTtl: 600,
       swr: force ? false : 57600,
       jitter: 300,
@@ -3544,13 +3889,6 @@ async function handlePlatformList(request, env, ctx) {
       revalidate: !!force,
     },
   );
-
-  if (mode === "preview") {
-    const posters = data && Array.isArray(data.items) ? data.items : [];
-    return new Response(JSON.stringify({ id, name: plat.name, posters }), {
-      headers: outHeadersJson,
-    });
-  }
 
   const list =
     data && Array.isArray(data.items)
@@ -3900,9 +4238,10 @@ async function getWatchlist(
     },
   );
   if (sourceTracker) sourceTracker.debug = debug;
-  if (Array.isArray(data) && data.length) return data;
+  /* 空数组也是 Trakt 的有效回答，直接返回，不再多读一次 lg:wl */
+  if (Array.isArray(data)) return data;
 
-  /* 当前版本为空时直接读 lg:wl */
+  /* 只有回源彻底失败（data 为 null）时才读 lg:wl 兜底 */
   if (env.TMDB_CACHE && !kvIsDown()) {
     try {
       const lgKey = CK.lastGood.watchlist(prefix, sort);
@@ -3928,7 +4267,7 @@ async function getWatchlist(
       kvMarkDown();
     }
   }
-  return Array.isArray(data) ? data : null;
+  return null;
 }
 
 /** 提取 watchlist 中所有条目的 TMDB ID */
@@ -3963,11 +4302,9 @@ async function handleSearch(request, env, ctx) {
     outHeaders["Set-Cookie"] = buildCookie(auth, auth.trakt_id);
 
   if (!q)
-    return new Response(JSON.stringify({ items: [] }), { headers: outHeaders });
+    return jsonResp({ items: [] }, outHeaders);
   if (!env.TMDB_API_KEY)
-    return new Response(JSON.stringify({ items: [], error: "no tmdb key" }), {
-      headers: outHeaders,
-    });
+    return jsonResp({ items: [], error: "no tmdb key" }, outHeaders);
 
   const wantMovie = typeFilter === "all" || typeFilter === "movie";
   const wantShow = typeFilter === "all" || typeFilter === "show";
@@ -3998,9 +4335,7 @@ async function handleSearch(request, env, ctx) {
   }
   merged.sort((a, b) => b.popularity - a.popularity);
 
-  return new Response(JSON.stringify({ items: merged.slice(0, 30) }), {
-    headers: outHeaders,
-  });
+  return jsonResp({ items: merged.slice(0, 30) }, outHeaders);
 }
 
 /** TMDB 今日趋势，走 6 小时缓存 */
@@ -5283,12 +5618,8 @@ async function handleHomeData(request, env, ctx) {
         },
         {
           ...opts({
+            ...CACHE_USER_LONG,
             ttl: PLAYBACK_KV_TTL,
-            missTtl: 60,
-            swr: true,
-            unwrap: true,
-            edgeTtl: 300,
-            jitter: 300,
           }),
           sourceTracker: playbackSrc,
           lastGoodKey: CK.lastGood.playback(userKey),
@@ -5329,12 +5660,8 @@ async function handleHomeData(request, env, ctx) {
           return r;
         },
         opts({
+          ...CACHE_USER_LONG,
           ttl: HISTORY_KV_TTL,
-          missTtl: 60,
-          swr: true,
-          unwrap: true,
-          edgeTtl: 300,
-          jitter: 300,
           sourceTracker: historySrc,
           lastGoodKey: CK.lastGood.history(userKey, 1),
         }),
@@ -5386,11 +5713,8 @@ async function handleHomeData(request, env, ctx) {
         },
         {
           ...opts({
+            ...CACHE_USER_META,
             ttl: PROFILE_KV_TTL,
-            missTtl: 180,
-            swr: true,
-            edgeTtl: 300,
-            jitter: 300,
           }),
           sourceTracker: metaSrc,
 //          lastGoodKey: CK.lastGood.profile(userKey),
@@ -5407,11 +5731,8 @@ async function handleHomeData(request, env, ctx) {
           return s && !s.__error ? s : null;
         },
         opts({
+          ...CACHE_USER_META,
           ttl: STATS_KV_TTL,
-          missTtl: 180,
-          swr: true,
-          edgeTtl: 300,
-          jitter: 300,
 //          lastGoodKey: CK.lastGood.stats(userKey),
         }),
       );
@@ -5444,17 +5765,15 @@ async function handleHomeData(request, env, ctx) {
     historySrc,
   ];
   const anyLive = liveSources.some((s) => s && s.fromCache === false);
-  if (anyLive) markUserUpdatedAt(env, ctx, userKey);
-
-  const userUpdatedAt = anyLive
-    ? Date.now()
-    : await getUserUpdatedAt(env, ctx, userKey);
+  /* 不再单独维护 lu:<uid>：非 live 时前端直接用 playback 缓存年龄（playbackAgeSec），
+     省掉每次请求 1 次 KV 读 + 每 6 小时 1 次写 */
+  const userUpdatedAt = anyLive ? Date.now() : null;
   if (userUpdatedAt) result.userUpdatedAt = userUpdatedAt;
 
   if (wantPlayback) {
     const pbList = Array.isArray(playback) ? playback : [];
     try {
-      await attachContinueStillsForPlayback(pbList, env, ctx);
+      await attachContinueStillsForPlayback(pbList, env, ctx, userKey);
       result.playbackHScrollHtml = renderContinueItems(pbList, "hscroll");
     } catch {
       result.playbackHScrollHtml =
@@ -5507,16 +5826,18 @@ async function handleHomeData(request, env, ctx) {
           ? Math.round(stats.episodes.minutes / 60)
           : 0;
 
-    let avatarUrl = "";
+    let avatarUrl = "",
+      avatarAlts = [];
     try {
-      const imgs = profile && !profile.__error && profile.images;
-      if (imgs && imgs.avatar)
-        avatarUrl =
-          imgs.avatar.full || imgs.avatar.medium || imgs.avatar.thumb || "";
+      const av = pickAvatar(profile);
+      avatarUrl = av.url;
+      avatarAlts = av.alts;
     } catch {}
 
     result.name = displayName;
     result.avatar = avatarUrl || null;
+    /* medium / thumb 作为前端加载失败时的备选尺寸 */
+    result.avatarAlt = avatarAlts;
     result.statsHtml = renderStatsHtml({
       movie: movieCount,
       show: showCount,
@@ -5599,7 +5920,7 @@ async function handleHomeData(request, env, ctx) {
         result.watchlistHtml = emptyWatchlistHtml();
       } else {
         const list = watchlist;
-        await attachWatchlistStills(list, env, ctx);
+        await attachWatchlistStills(list, env, ctx, userKey);
         const firstPage = list.slice(0, WATCHLIST_PAGE_SIZE),
           hasMore = list.length > WATCHLIST_PAGE_SIZE,
           cardsHtml = renderWatchlistItems(firstPage, env),
@@ -5664,7 +5985,7 @@ async function handleHomeData(request, env, ctx) {
     };
   }
 
-  return new Response(JSON.stringify(result), { headers: outHeaders });
+  return jsonResp(result, outHeaders);
 }
 
 /** 非流式渲染首页 shell（保留兼容） */
@@ -5682,6 +6003,20 @@ function renderHomeShell(initialDetail, profileHint) {
   );
 }
 
+/* 首页「流媒体平台」展示的 10 个平台，前后端共用这一份 id 列表 */
+const HOME_PLATFORM_IDS = [
+  "netflix",
+  "disney",
+  "hbomax",
+  "appletv",
+  "prime",
+  "iqiyi",
+  "youku",
+  "tencent",
+  "mgtv",
+  "bilibili",
+];
+
 /** 首页平台卡（数据取自 PLATFORMS，两行分组展示） */
 function renderPlatformRows() {
   const card = (p) =>
@@ -5690,19 +6025,7 @@ function renderPlatformRows() {
   const row = (list) =>
     `<div class="platform-row"><div class="platform-cards">${list.map(card).join("")}</div></div>`;
 
-  const ids = [
-    "netflix",
-    "disney",
-    "hbomax",
-    "appletv",
-    "prime",
-    "iqiyi",
-    "youku",
-    "tencent",
-    "mgtv",
-    "bilibili",
-  ];
-  const cards = ids.map((id) => PLATFORMS[id]).filter(Boolean);
+  const cards = HOME_PLATFORM_IDS.map((id) => PLATFORMS[id]).filter(Boolean);
   return `<div class="platform-rows">${row(cards.slice(0, 5))}${row(cards.slice(5))}</div>`;
 }
 
@@ -5716,7 +6039,7 @@ function renderHomeSkeleton(initialDetail, profileHint) {
     profileHint && profileHint.name ? esc(profileHint.name) : "…";
   const heroAvatarHtml =
     profileHint && profileHint.avatar
-      ? `<img src="${esc(profileHint.avatar)}" alt="" style="width:100%;height:100%;object-fit:cover;display:block">`
+      ? `<img src="${esc(profileHint.avatar)}" alt="" referrerpolicy="no-referrer" style="width:100%;height:100%;object-fit:cover;display:block">`
       : `<span class="hero-avatar-ph">👤</span>`;
 
   const section = (id, title, extraHtml) =>
@@ -6516,62 +6839,212 @@ function parseEnrichKey(key) {
 }
 
 /**
- * 富化单条：通过 TMDB 补中文标题、海报、简介。
- * 按 enrichKey 的 source 分别走 tmdb / imdb / tvdb / title 搜索。
+ * enrichKey 合法性校验：只接受受控格式，避免被枚举出无限多新 key。
  */
-async function enrichOne(key, env, ctx) {
+const ENRICH_KEY_RE =
+  /^(?:movie|tv):(?:tmdb:\d{1,10}|imdb:tt\d{1,10}|tvdb:\d{1,10}|title:[^\n\r]{1,80})$/;
+
+/** 失败结果的桶内有效期（10 分钟） */
+const ENRICH_MISS_TTL = 600000;
+
+/** 回源：通过 TMDB 补中文标题、海报、简介（不做缓存） */
+async function fetchEnrichData(key, env) {
   if (!env.TMDB_API_KEY) return null;
   const parsed = parseEnrichKey(key);
   if (!parsed) return null;
 
-  return cachedJSON(
-    env,
-    ctx,
-    CK.enrich(key),
-    async () => {
-      const { kind, source } = parsed;
-      let d = null;
+  const { kind, source } = parsed;
+  let d = null;
 
-      if (source === "tmdb")
-        d = await tmdbGet(tmdbUrl(`/${kind}/${parsed.value}`, env));
-      else if (source === "imdb") {
-        const find = await tmdbGet(
-          tmdbUrl(`/find/${parsed.value}`, env, { external_source: "imdb_id" }),
-        );
-        if (find) {
-          const arr = kind === "movie" ? find.movie_results : find.tv_results;
-          if (arr && arr.length)
-            d = await tmdbGet(tmdbUrl(`/${kind}/${arr[0].id}`, env));
-        }
-      } else if (source === "tvdb") {
-        const find = await tmdbGet(
-          tmdbUrl(`/find/${parsed.value}`, env, { external_source: "tvdb_id" }),
-        );
-        if (find && find.tv_results && find.tv_results.length)
-          d = await tmdbGet(tmdbUrl(`/tv/${find.tv_results[0].id}`, env));
-      } else if (source === "title") {
-        const extra = { query: parsed.title };
-        if (parsed.year) extra.year = parsed.year;
-        const search = await tmdbGet(tmdbUrl(`/search/${kind}`, env, extra));
-        if (search && search.results && search.results.length)
-          d = await tmdbGet(tmdbUrl(`/${kind}/${search.results[0].id}`, env));
+  if (source === "tmdb")
+    d = await tmdbGet(tmdbUrl(`/${kind}/${parsed.value}`, env));
+  else if (source === "imdb") {
+    const find = await tmdbGet(
+      tmdbUrl(`/find/${parsed.value}`, env, { external_source: "imdb_id" }),
+    );
+    if (find) {
+      const arr = kind === "movie" ? find.movie_results : find.tv_results;
+      if (arr && arr.length)
+        d = await tmdbGet(tmdbUrl(`/${kind}/${arr[0].id}`, env));
+    }
+  } else if (source === "tvdb") {
+    const find = await tmdbGet(
+      tmdbUrl(`/find/${parsed.value}`, env, { external_source: "tvdb_id" }),
+    );
+    if (find && find.tv_results && find.tv_results.length)
+      d = await tmdbGet(tmdbUrl(`/tv/${find.tv_results[0].id}`, env));
+  } else if (source === "title") {
+    const extra = { query: parsed.title };
+    if (parsed.year) extra.year = parsed.year;
+    const search = await tmdbGet(tmdbUrl(`/search/${kind}`, env, extra));
+    if (search && search.results && search.results.length)
+      d = await tmdbGet(tmdbUrl(`/${kind}/${search.results[0].id}`, env));
+  }
+
+  return d && (d.title || d.name)
+    ? {
+        title: d.title || d.name || "",
+        overview: d.overview || "",
+        poster: d.poster_path ? tmdbPoster(d.poster_path) : null,
       }
+    : null;
+}
 
-      return d && (d.title || d.name)
-        ? {
-            title: d.title || d.name || "",
-            overview: d.overview || "",
-            poster: d.poster_path ? tmdbPoster(d.poster_path) : null,
-          }
-        : null;
-    },
-    { ttl: TMDB_KV_TTL, missTtl: 3600 },
-  );
+/** 从桶里取一条：null=命中但确认无数据，undefined=未命中/已过期 */
+function __bucketGet(items, key) {
+  const rec = items[key];
+  if (!rec) return undefined;
+  const age = Date.now() - (Number(rec.ts) || 0);
+  if (rec.m) return age < ENRICH_MISS_TTL ? null : undefined;
+  if (age > ENRICH_BUCKET_TTL * 1000) return undefined;
+  return { title: rec.t || "", overview: rec.o || "", poster: rec.p || null };
+}
+
+/**
+ * 批量富化：按桶聚合读写。
+ * 读：每批最多「涉及的桶数」次 KV get（原来是一条一次）
+ * 写：每批最多「涉及的桶数」次 KV put（原来是一条一次）
+ */
+async function enrichBatch(keys, env, ctx) {
+  const out = {};
+  if (!env || !env.TMDB_API_KEY) {
+    for (const k of keys) out[k] = null;
+    return out;
+  }
+
+  const pending = [];
+  const keyBucket = new Map();
+
+  for (const key of keys) {
+    const mem = kvMemGet(CK.enrich(key));
+    if (mem !== undefined && mem !== KV_MISS) {
+      out[key] =
+        mem && mem.miss ? null : mem && mem.data !== undefined ? mem.data : mem;
+      continue;
+    }
+    keyBucket.set(key, stableJitter(key, ENRICH_BUCKETS));
+    pending.push(key);
+  }
+  if (!pending.length) return out;
+
+  /* 1) 每个涉及的桶只读一次；2 分钟内同进程复用，避免逐批重读 */
+  const bucketData = new Map();
+  const bucketIds = [...new Set(keyBucket.values())];
+  const nowB = Date.now();
+  for (const b of bucketIds) {
+    const mem = __enrichBucketMem.get(b);
+    if (mem && mem.exp > nowB) bucketData.set(b, mem.items);
+  }
+  const missBuckets = bucketIds.filter((b) => !bucketData.has(b));
+  if (missBuckets.length && env.TMDB_CACHE && !kvIsDown()) {
+    await Promise.all(
+      missBuckets.map(async (b) => {
+        try {
+          const raw = await env.TMDB_CACHE.get(CK.enrichBucket(b), {
+            type: "json",
+            cacheTtl: 600,
+          });
+          const items =
+            raw && raw.items && typeof raw.items === "object" ? raw.items : {};
+          bucketData.set(b, items);
+          __enrichBucketMem.set(b, {
+            items,
+            exp: Date.now() + ENRICH_BUCKET_MEM_TTL,
+          });
+          kvMarkUp();
+        } catch {
+          bucketData.set(b, {});
+          kvMarkDown();
+        }
+      }),
+    );
+  }
+  for (const b of bucketIds) if (!bucketData.has(b)) bucketData.set(b, {});
+
+  const needFetch = [];
+  for (const key of pending) {
+    const hit = __bucketGet(bucketData.get(keyBucket.get(key)), key);
+    if (hit !== undefined) {
+      out[key] = hit;
+      kvMemSet(CK.enrich(key), hit, KV_MEM_TTL);
+    } else {
+      needFetch.push(key);
+    }
+  }
+
+  /* 2) 只对真正缺失的条目回源，并发上限 6 */
+  const queue = needFetch.slice();
+  const results = new Map();
+  const worker = async () => {
+    while (queue.length) {
+      const key = queue.shift();
+      try {
+        results.set(key, await fetchEnrichData(key, env));
+      } catch {
+        results.set(key, null);
+      }
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker(), worker(), worker()]);
+
+  /* 3) 结果合并回各自的桶，每个桶最多写一次 */
+  const dirty = new Set();
+  for (const [key, val] of results) {
+    const b = keyBucket.get(key);
+    const items = bucketData.get(b) || {};
+    if (val) {
+      items[key] = {
+        t: val.title || "",
+        o: val.overview || "",
+        p: val.poster || null,
+        ts: Date.now(),
+      };
+    } else {
+      items[key] = { m: 1, ts: Date.now() };
+    }
+    bucketData.set(b, items);
+    dirty.add(b);
+    out[key] = val;
+    kvMemSet(CK.enrich(key), val || { miss: 1 }, val ? KV_MEM_TTL : 30000);
+  }
+
+  /* 4) 桶内条目过多时按时间淘汰，避免单个 value 膨胀 */
+  for (const b of dirty) {
+    const items = bucketData.get(b);
+    const ks = Object.keys(items);
+    if (ks.length > ENRICH_BUCKET_MAX) {
+      ks.sort((x, y) => (items[x].ts || 0) - (items[y].ts || 0));
+      for (let i = 0; i < ks.length - ENRICH_BUCKET_MAX; i++) delete items[ks[i]];
+    }
+    const payload = JSON.stringify({ v: 1, items });
+    __enrichBucketMem.set(b, {
+      items,
+      exp: Date.now() + ENRICH_BUCKET_MEM_TTL,
+    });
+    const p = env.TMDB_CACHE
+      ? env.TMDB_CACHE
+          .put(CK.enrichBucket(b), payload, {
+            expirationTtl: ENRICH_BUCKET_TTL,
+          })
+          .then(() => kvMarkUp())
+          .catch(() => kvMarkDown())
+      : Promise.resolve();
+    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
+  }
+
+  return out;
+}
+
+/** 单条富化（保留给内部其它调用方） */
+async function enrichOne(key, env, ctx) {
+  const r = await enrichBatch([key], env, ctx);
+  return r[key] != null ? r[key] : null;
 }
 
 /**
  * 批量富化 API。
- * 前端一次性把所有 data-enrich-key 元素提交，后端并发处理。
+ * 前端按 20 条一批提交；后端做格式校验 + 桶聚合，
+ * 把「一条一次 KV 读写」压成「一桶一次」。
  */
 async function handleEnrich(request, env, ctx) {
   let body;
@@ -6584,32 +7057,25 @@ async function handleEnrich(request, env, ctx) {
   const rawItems = Array.isArray(body.items) ? body.items : [];
   if (!rawItems.length) return Response.json({});
 
-  const limited = rawItems.slice(0, 80),
-    out = {},
-    seen = new Set(),
-    tasks = [];
-
-  for (const it of limited) {
+  const seen = new Set();
+  const keys = [];
+  for (const it of rawItems) {
     const key = it && it.key;
-    if (!key || seen.has(key)) continue;
+    if (typeof key !== "string" || !key || key.length > 120) continue;
+    if (!ENRICH_KEY_RE.test(key)) continue;
+    if (seen.has(key)) continue;
     seen.add(key);
-    tasks.push(
-      enrichOne(key, env, ctx)
-        .then((d) => {
-          out[key] = d;
-        })
-        .catch(() => {
-          out[key] = null;
-        }),
-    );
+    keys.push(key);
+    if (keys.length >= ENRICH_BATCH_MAX) break;
   }
+  if (!keys.length) return Response.json({});
 
-  await Promise.all(tasks);
+  const out = await enrichBatch(keys, env, ctx);
 
   return new Response(JSON.stringify(out), {
     headers: {
       "Content-Type": CT_JSON,
-      "Cache-Control": "public, max-age=600",
+      "Cache-Control": "private, max-age=300",
     },
   });
 }
@@ -7796,7 +8262,7 @@ async function handleMore(request, env, ctx) {
     const pageCount = data.pageCount || 0;
     const hasMore = pageCount > 0 ? page < pageCount : list.length >= limit;
 
-    await attachContinueStillsForPlayback(list, env, ctx);
+    await attachContinueStillsForPlayback(list, env, ctx, userKey);
     const mode = (url.searchParams.get("mode") || "fragment").toLowerCase();
     const renderMode = mode === "grid" ? "grid" : (mode === "hscroll" ? "hscroll" : "fragment");
     return authResp(auth, needsCookieUpdate, renderContinueItems(list, renderMode), {
@@ -7822,7 +8288,7 @@ async function handleMore(request, env, ctx) {
         ? start + WATCHLIST_PAGE_SIZE < merged.length
         : false;
 
-    await attachWatchlistStills(slice, env, ctx);
+    await attachWatchlistStills(slice, env, ctx, userKey);
     return authResp(auth, needsCookieUpdate, renderWatchlistItems(slice, env), {
       extra: {
         "X-Has-More": String(hasMore),
@@ -8086,10 +8552,10 @@ function splashCriticalCss() {
  * · forceRefresh 手动刷新：串行 + 动态间隔防 429
  * ============================================================ */
 function getBootstrapScript() {
-  return `(function(){var __CFG=window.__HOME_CONFIG__||{};if(!__CFG.loggedIn)return;window.__HOME_CONFIG__=null;if(__CFG.initialDetail)window.__initialDetail=__CFG.initialDetail;if(!window.__splashT0)window.__splashT0=Date.now();window.__splashHidden=false;window.__hideSplash=function(force){try{if(window.__splashHidden)return;window.__splashHidden=true;var el=document.getElementById('splash');if(!el)return;var wait=force?0:Math.max(0,120-(Date.now()-(window.__splashT0||Date.now())));setTimeout(function(){try{el.classList.add('hide');setTimeout(function(){try{if(el&&el.parentNode)el.parentNode.removeChild(el);}catch(e){}},280);}catch(e){}},wait);}catch(e){}};setTimeout(function(){if(window.__hideSplash)window.__hideSplash();},80);function lsGet(k){try{var v=localStorage.getItem(k);if(!v)return null;var o=JSON.parse(v);if(o&&o._exp&&o._exp<Date.now()){try{localStorage.removeItem(k);}catch(e){}return null;}return o&&o.data?o.data:null;}catch(e){return null;}}function lsSet(k,d,ttlSec){try{localStorage.setItem(k,JSON.stringify({data:d,_exp:Date.now()+ttlSec*1000}));}catch(e){try{localStorage.removeItem(k);}catch(e2){}}}window.__lsGet=lsGet;window.__lsSet=lsSet;function setHTML(sel,html){var el=typeof sel==='string'?document.querySelector(sel):sel;if(el)el.innerHTML=html||'';}window.__setHTML=setHTML;function applyAvatar(url){if(!url)return;var av=document.getElementById('hero-avatar');if(!av)return;var img=document.createElement('img');img.src=url;img.alt='';img.width=56;img.height=56;img.decoding='async';img.onerror=function(){av.innerHTML='<span class="hero-avatar-ph">👤</span>';};av.innerHTML='';av.appendChild(img);}function __setUpdatedAt(source,ageSec){var el=document.getElementById('updated-at');if(!el)return;var p=function(n){return(n<10?'0':'')+n;};var label='';if(typeof ageSec==='number'&&isFinite(ageSec)&&ageSec>=0){var d=new Date(Date.now()-ageSec*1000);label='更新于 '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());}else if(source==='live'){label='已更新';}else{return;}el.textContent=label;el.classList.remove('flash','src-live','src-cache');void el.offsetWidth;el.classList.add('flash');if(source==='live')el.classList.add('src-live');else if(source==='cache')el.classList.add('src-cache');}function applyPlayback(d,isCache){if(!d)return;if(d.playbackHScrollHtml)setHTML('#playback-hscroll',d.playbackHScrollHtml);var src=isCache?'cache':(d.playbackSource||'');var age=null;if(d.userUpdatedAt){age=Math.max(0,Math.round((Date.now()-Number(d.userUpdatedAt))/1000));src=src||'cache';}else if(d._dataTs)age=Math.max(0,Math.round((Date.now()-d._dataTs)/1000));else if(typeof d.playbackAgeSec==='number'&&isFinite(d.playbackAgeSec))age=Math.max(0,d.playbackAgeSec);else if(src==='live')age=0;if(typeof age==='number'){try{d._dataTs=Date.now()-age*1000;}catch(e){}if(d.userUpdatedAt)try{d._dataTs=Number(d.userUpdatedAt);}catch(e){}}__setUpdatedAt(src,age);if(window.__scheduleEnrich)window.__scheduleEnrich();}window.__applyPlayback=applyPlayback;function applyMeta(d,isCache){if(!d)return;var n=document.getElementById('hero-name');if(n&&d.name)n.textContent=d.name;applyAvatar(d.avatar);if(d.statsHtml)setHTML('#stats-box',d.statsHtml);if(!isCache)try{lsSet('mt:meta',d,1800);}catch(e){}}window.__applyMeta=applyMeta;var __homeDataLoading=false;
-function fetchPart(part,force){return fetch('/api/home-data?part='+encodeURIComponent(part)+(force?'&force=1':''),{credentials:'same-origin',cache:'no-store'}).then(function(r){if(r.status===401){return r.json().catch(function(){return{};}).then(function(d){var msg=(d&&d.error)||'登录已失效，请重新登录';try{sessionStorage.setItem('mt:relogin',msg);}catch(e){}if(window.__toast)window.__toast(msg,{type:'warn',duration:2200});setTimeout(function(){location.href='/login';},1000);return null;});}if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){if(!d)return null;if(d.login){location.href='/login';return null;}return d;});}window.__fetchPart=fetchPart;var __loadedParts={};function loadPartOnce(part){if(__loadedParts[part])return Promise.resolve(__loadedParts[part]);return fetchPart(part).then(function(d){__loadedParts[part]=d;return d;});}window.__loadPartOnce=loadPartOnce;window.__loadedParts=__loadedParts;function loadHomeData(opts){opts=opts||{};var silent=!!opts.silent;if(__homeDataLoading&&!silent)return;__homeDataLoading=true;__lastRefreshAt=Date.now();function onPlayback(d,isCache){if(!d)return;applyPlayback(d,isCache);if(!isCache){try{lsSet('mt:pb',d,900);}catch(e){}if(!silent&&window.__initialDetail){var s=window.__initialDetail,idx=s.indexOf('/');if(idx>0&&window.openDetail)openDetail(s.slice(0,idx),s.slice(idx+1),false);window.__initialDetail=null;}}if(!silent&&window.__hideSplash)window.__hideSplash(true);}if(!silent){var cachedPb=lsGet('mt:pb');if(cachedPb){try{onPlayback(cachedPb,true);}catch(e){}}else if(window.__earlyPbApplied&&window.__hideSplash){window.__hideSplash(true);}}var pPlayback;if(!silent&&window.__primaryBootP){pPlayback=window.__primaryBootP.then(function(d){window.__primaryBootP=null;if(d){onPlayback(d,false);return d;}return fetchPart('playback').then(function(x){onPlayback(x,false);return x;});}).catch(function(){return fetchPart('playback').then(function(x){onPlayback(x,false);return x;});});}else{pPlayback=fetchPart('playback').then(function(x){onPlayback(x,false);return x;});}pPlayback=pPlayback.catch(function(){if(!silent){setHTML('#playback-hscroll','<div class="empty"><p>暂时无法从 Trakt 拉取数据<br><span style="font-size:.82rem;opacity:.75">可能是官方限流或网络异常，请过几分钟再试</span></p><p style="margin-top:12px"><button class="btn-ghost" onclick="location.reload()">重试</button></p></div>');if(window.__hideSplash)window.__hideSplash(true);}});Promise.resolve(pPlayback).then(function(){__homeDataLoading=false;if(!silent){var cachedMeta=lsGet('mt:meta');if(cachedMeta)setTimeout(function(){try{applyMeta(cachedMeta,true);}catch(e){}},0);}var runMeta=function(){fetchPart('meta').then(function(d){applyMeta(d,false);}).catch(function(){});};if(window.requestIdleCallback)requestIdleCallback(runMeta,{timeout:800});else setTimeout(runMeta,80);});}var __refreshTick=0;function silentRefresh(){if(document.hidden)return;var __m=document.getElementById('modal');if(__m&&__m.classList.contains('open'))return;__refreshTick++;__lastRefreshAt=Date.now();fetchPart('playback').then(function(d){applyPlayback(d);try{lsSet('mt:pb',d,900);}catch(e){}}).catch(function(){});if(__refreshTick%4===0)fetchPart('meta').then(function(d){applyMeta(d,false);}).catch(function(){});}window.__refreshStats=silentRefresh;
-window.forceRefresh=async function(){if(window.__forceRefreshing)return;window.__forceRefreshing=true;try{localStorage.removeItem('mt:pb');localStorage.removeItem('mt:meta');}catch(e){}var btn=document.getElementById('btn-refresh');var span=btn&&btn.querySelector('span');var oldText=span?span.textContent:'刷新';if(btn)btn.classList.add('loading');if(span)span.textContent='刷新中';var okCount=0,cacheCount=0,failCount=0,cooling=0,hitLimit=false;var GAP_OK=1200,GAP_LIMIT=1500;try{var wanted=['playback','meta'];var loaded=window.__loadedParts||{};['history'].forEach(function(p){if(loaded[p])wanted.push(p);});for(var i=0;i<wanted.length;i++){if(hitLimit)break;var part=wanted[i];if(i>0){var gap=cooling>0?GAP_LIMIT:GAP_OK;await new Promise(function(r){setTimeout(r,gap);});}var d=null;try{d=await __enqueueTrakt(function(){return fetchPart(part,true);});}catch(e){d=null;}if(!d){failCount++;continue;}var isCache=false;if(part==='playback'&&d.playbackSource==='cache')isCache=true;if(part==='meta'&&d.metaSource==='cache')isCache=true;if(isCache)cacheCount++;else okCount++;if(part==='playback'){applyPlayback(d);try{lsSet('mt:pb',d,900);}catch(e){}}else if(part==='meta'){applyMeta(d,false);}else if(part==='watchlist'||part==='calendar'||part==='history'){__applyPart(part,d);__savePartSnap(part,d);}window.__loadedParts[part]=d;if(__partFailed(d)){try{delete window.__loadedParts[part];}catch(e){}}if(d.rateLimited||(d.cooling&&d.cooling>0)){hitLimit=true;cooling=Math.max(cooling,Number(d.cooling)||0);}else if(isCache&&(part==='playback'||part==='meta')){hitLimit=true;}}try{if(window.__reloadDoubanSections)window.__reloadDoubanSections(true);}catch(e){}if(failCount&&!okCount&&!cacheCount){__errToast('刷新失败',new Error('无法连接 Trakt，请检查网络后重试'));}else if(hitLimit){var msg=cooling>0?('Trakt 官方限流，本地冷却中约 '+cooling+' 秒。期间已用缓存，请勿反复刷新'):'未能从 Trakt 拉取新数据，已显示本地缓存（可能是限流或上游暂不可用）';__toast(msg,{type:'warn',duration:4200});}else if(failCount||cacheCount){__toast('已刷新（含豆瓣/热榜/平台；部分可能仍是缓存）',{type:'warn',duration:2800});}else{__toast('已刷新（含豆瓣/热榜/平台）',{type:'success',duration:1800});}if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){__errToast('刷新失败',e);}finally{if(btn)btn.classList.remove('loading');if(span)span.textContent=oldText;window.__forceRefreshing=false;}};
-function startHomeData(){loadHomeData({silent:false});}if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',startHomeData);}else{startHomeData();}var REFRESH_MS=${HOME_AUTO_REFRESH_MINUTES}*60*1000;var __lastRefreshAt=Date.now();if(REFRESH_MS>0){setInterval(silentRefresh,REFRESH_MS);document.addEventListener('visibilitychange',function(){if(document.hidden)return;if(Date.now()-__lastRefreshAt>=REFRESH_MS)silentRefresh();});}})();`;
+  return `(function(){var __CFG=window.__HOME_CONFIG__||{};if(!__CFG.loggedIn)return;window.__HOME_CONFIG__=null;if(__CFG.initialDetail)window.__initialDetail=__CFG.initialDetail;if(!window.__splashT0)window.__splashT0=Date.now();window.__splashHidden=false;window.__hideSplash=function(force){try{if(window.__splashHidden)return;window.__splashHidden=true;var el=document.getElementById('splash');if(!el)return;var wait=force?0:Math.max(0,120-(Date.now()-(window.__splashT0||Date.now())));setTimeout(function(){try{el.classList.add('hide');setTimeout(function(){try{if(el&&el.parentNode)el.parentNode.removeChild(el);}catch(e){}},280);}catch(e){}},wait);}catch(e){}};setTimeout(function(){if(window.__hideSplash)window.__hideSplash();},80);function lsGet(k){try{var v=localStorage.getItem(k);if(!v)return null;var o=JSON.parse(v);if(o&&o._exp&&o._exp<Date.now()){try{localStorage.removeItem(k);}catch(e){}return null;}return o&&o.data?o.data:null;}catch(e){return null;}}function lsSet(k,d,ttlSec){try{localStorage.setItem(k,JSON.stringify({data:d,_exp:Date.now()+ttlSec*1000}));}catch(e){try{localStorage.removeItem(k);}catch(e2){}}}window.__lsGet=lsGet;window.__lsSet=lsSet;function setHTML(sel,html){var el=typeof sel==='string'?document.querySelector(sel):sel;if(el)el.innerHTML=html||'';}window.__setHTML=setHTML;function applyAvatar(url,alts){if(!url)return;var av=document.getElementById('hero-avatar');if(!av)return;var list=[url];if(alts&&alts.length){for(var a=0;a<alts.length;a++){if(alts[a]&&alts[a]!==url)list.push(alts[a]);}}list.push('/avatar?u='+encodeURIComponent(url));var i=0;function next(){if(i>=list.length){av.innerHTML='<span class="hero-avatar-ph">👤</span>';return;}var src=list[i++];var img=document.createElement('img');img.onerror=next;img.alt='';img.width=56;img.height=56;img.decoding='async';img.setAttribute('referrerpolicy','no-referrer');img.src=src;av.innerHTML='';av.appendChild(img);}next();}function __setUpdatedAt(source,ageSec){var el=document.getElementById('updated-at');if(!el)return;var p=function(n){return(n<10?'0':'')+n;};var label='';if(typeof ageSec==='number'&&isFinite(ageSec)&&ageSec>=0){var d=new Date(Date.now()-ageSec*1000);label='更新于 '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());}else if(source==='live'){label='已更新';}else{return;}el.textContent=label;el.classList.remove('flash','src-live','src-cache');void el.offsetWidth;el.classList.add('flash');if(source==='live')el.classList.add('src-live');else if(source==='cache')el.classList.add('src-cache');}function applyPlayback(d,isCache){if(!d)return;if(d.playbackHScrollHtml)setHTML('#playback-hscroll',d.playbackHScrollHtml);var src=isCache?'cache':(d.playbackSource||'');var age=null;if(d.userUpdatedAt){age=Math.max(0,Math.round((Date.now()-Number(d.userUpdatedAt))/1000));src=src||'cache';}else if(d._dataTs)age=Math.max(0,Math.round((Date.now()-d._dataTs)/1000));else if(typeof d.playbackAgeSec==='number'&&isFinite(d.playbackAgeSec))age=Math.max(0,d.playbackAgeSec);else if(src==='live')age=0;if(typeof age==='number'){try{d._dataTs=Date.now()-age*1000;}catch(e){}if(d.userUpdatedAt)try{d._dataTs=Number(d.userUpdatedAt);}catch(e){}}__setUpdatedAt(src,age);if(window.__scheduleEnrich)window.__scheduleEnrich();}window.__applyPlayback=applyPlayback;function applyMeta(d,isCache){if(!d)return;var n=document.getElementById('hero-name');if(n&&d.name)n.textContent=d.name;applyAvatar(d.avatar,d.avatarAlt);if(d.statsHtml)setHTML('#stats-box',d.statsHtml);if(!isCache)try{lsSet('mt:meta',d,1800);}catch(e){}}window.__applyMeta=applyMeta;var __homeDataLoading=false;
+function fetchPart(part,force){return fetch('/api/home-data?part='+encodeURIComponent(part)+(force?'&force=1':''),{credentials:'same-origin',cache:'no-store'}).then(function(r){if(r.status===401){return r.json().catch(function(){return{};}).then(function(d){var msg=(d&&d.error)||'登录已失效，请重新登录';try{sessionStorage.setItem('mt:relogin',msg);}catch(e){}if(window.__toast)window.__toast(msg,{type:'warn',duration:2200});setTimeout(function(){location.href='/login';},1000);return null;});}if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){if(!d)return null;if(d.login){location.href='/login';return null;}return d;});}window.__fetchPart=fetchPart;var __loadedParts={};function loadPartOnce(part){if(__loadedParts[part])return Promise.resolve(__loadedParts[part]);return fetchPart(part).then(function(d){__loadedParts[part]=d;return d;});}window.__loadPartOnce=loadPartOnce;window.__loadedParts=__loadedParts;function loadHomeData(opts){opts=opts||{};var silent=!!opts.silent;if(__homeDataLoading&&!silent)return;__homeDataLoading=true;__lastRefreshAt=Date.now();function onPlayback(d,isCache){if(!d)return;applyPlayback(d,isCache);if(!isCache){try{lsSet('mt:pb',d,900);}catch(e){}if(!silent&&window.__initialDetail){var s=window.__initialDetail,idx=s.indexOf('/');if(idx>0&&window.openDetail)openDetail(s.slice(0,idx),s.slice(idx+1),false);window.__initialDetail=null;}}if(!silent&&window.__hideSplash)window.__hideSplash(true);}if(!silent){var cachedPb=lsGet('mt:pb');if(cachedPb){try{onPlayback(cachedPb,true);}catch(e){}}else if(window.__earlyPbApplied&&window.__hideSplash){window.__hideSplash(true);}}var pPlayback;if(!silent&&window.__primaryBootP){pPlayback=window.__primaryBootP.then(function(d){window.__primaryBootP=null;if(d){onPlayback(d,false);return d;}return fetchPart('playback').then(function(x){onPlayback(x,false);return x;});}).catch(function(){return fetchPart('playback').then(function(x){onPlayback(x,false);return x;});});}else{pPlayback=fetchPart('playback').then(function(x){onPlayback(x,false);return x;});}pPlayback=pPlayback.catch(function(){if(!silent){setHTML('#playback-hscroll','<div class="empty"><p>暂时无法从 Trakt 拉取数据<br><span style="font-size:.82rem;opacity:.75">可能是官方限流或网络异常，请过几分钟再试</span></p><p style="margin-top:12px"><button class="btn-ghost" onclick="location.reload()">重试</button></p></div>');if(window.__hideSplash)window.__hideSplash(true);}});Promise.resolve(pPlayback).then(function(){__homeDataLoading=false;if(!silent){var cachedMeta=lsGet('mt:meta');if(cachedMeta)setTimeout(function(){try{applyMeta(cachedMeta,true);}catch(e){}},0);}var runMeta=function(){fetchPart('meta').then(function(d){applyMeta(d,false);}).catch(function(){});};if(window.requestIdleCallback)requestIdleCallback(runMeta,{timeout:800});else setTimeout(runMeta,80);});}var __refreshTick=0,__lastUserAct=Date.now(),__lastBoardReload=Date.now();['scroll','click','touchstart','keydown'].forEach(function(t){window.addEventListener(t,function(){__lastUserAct=Date.now();},{passive:true});});function silentRefresh(){if(document.hidden)return;var __m=document.getElementById('modal');if(__m&&__m.classList.contains('open'))return;__refreshTick++;__lastRefreshAt=Date.now();fetchPart('playback').then(function(d){applyPlayback(d);try{lsSet('mt:pb',d,900);}catch(e){}}).catch(function(){});fetchPart('meta').then(function(d){applyMeta(d,false);}).catch(function(){});if(Date.now()-__lastBoardReload>86400000){__lastBoardReload=Date.now();if(window.__reloadDoubanSections)window.__reloadDoubanSections(false);if(window.__scheduleEnrich)window.__scheduleEnrich();}}window.__refreshStats=silentRefresh;
+window.forceRefresh=async function(){if(window.__forceRefreshing)return;window.__forceRefreshing=true;try{localStorage.removeItem('mt:pb');localStorage.removeItem('mt:meta');}catch(e){}var btn=document.getElementById('btn-refresh');var span=btn&&btn.querySelector('span');var oldText=span?span.textContent:'刷新';if(btn)btn.classList.add('loading');if(span)span.textContent='刷新中';var okCount=0,cacheCount=0,failCount=0,cooling=0,hitLimit=false;var GAP_OK=1200,GAP_LIMIT=1500;try{var wanted=['playback','meta'];var loaded=window.__loadedParts||{};['history'].forEach(function(p){if(loaded[p])wanted.push(p);});for(var i=0;i<wanted.length;i++){if(hitLimit)break;var part=wanted[i];if(i>0){var gap=cooling>0?GAP_LIMIT:GAP_OK;await new Promise(function(r){setTimeout(r,gap);});}var d=null;try{d=await __enqueueTrakt(function(){return fetchPart(part,true);});}catch(e){d=null;}if(!d){failCount++;continue;}var isCache=false;if(part==='playback'&&d.playbackSource==='cache')isCache=true;if(part==='meta'&&d.metaSource==='cache')isCache=true;if(isCache)cacheCount++;else okCount++;if(part==='playback'){applyPlayback(d);try{lsSet('mt:pb',d,900);}catch(e){}}else if(part==='meta'){applyMeta(d,false);}else if(part==='watchlist'||part==='calendar'||part==='history'){__applyPart(part,d);__savePartSnap(part,d);}window.__loadedParts[part]=d;if(__partFailed(d)){try{delete window.__loadedParts[part];}catch(e){}}if(d.rateLimited||(d.cooling&&d.cooling>0)){hitLimit=true;cooling=Math.max(cooling,Number(d.cooling)||0);}else if(isCache&&(part==='playback'||part==='meta')){hitLimit=true;}}/* 豆瓣/骨朵/剧场不再跟随「刷新」：它们的 TTL 是 24 小时，按自然过期更新 */if(failCount&&!okCount&&!cacheCount){__errToast('刷新失败',new Error('无法连接 Trakt，请检查网络后重试'));}else if(hitLimit){var msg=cooling>0?('Trakt 官方限流，本地冷却中约 '+cooling+' 秒。期间已用缓存，请勿反复刷新'):'未能从 Trakt 拉取新数据，已显示本地缓存（可能是限流或上游暂不可用）';__toast(msg,{type:'warn',duration:4200});}else if(failCount||cacheCount){__toast('已刷新（含豆瓣/热榜/平台；部分可能仍是缓存）',{type:'warn',duration:2800});}else{__toast('已刷新（含豆瓣/热榜/平台）',{type:'success',duration:1800});}if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){__errToast('刷新失败',e);}finally{if(btn)btn.classList.remove('loading');if(span)span.textContent=oldText;window.__forceRefreshing=false;}};
+function startHomeData(){loadHomeData({silent:false});}if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',startHomeData);}else{startHomeData();}var REFRESH_MS=${HOME_AUTO_REFRESH_MINUTES}*60*1000;var __lastRefreshAt=Date.now();if(REFRESH_MS>0){setInterval(function(){if(Date.now()-__lastUserAct<60000)return;silentRefresh();},REFRESH_MS);document.addEventListener('visibilitychange',function(){if(document.hidden)return;if(Date.now()-__lastRefreshAt>=REFRESH_MS)silentRefresh();});}})();`;
 }
 
 /**
@@ -8455,31 +8921,43 @@ document.addEventListener("click",function(e){
   if(id)window.openPlatformList(id);
 });
 (function loadPlatformPreviews(){
+  var busy=false;
+  function paint(el,posters){
+    var html="";
+    for(var i=0;i<4;i++){
+      if(posters[i]){
+        html+='<img class="platform-card-poster p'+i+'" src="'+posters[i]+'" alt="" loading="lazy">';
+      }else{
+        html+='<span class="platform-card-poster p'+i+' platform-card-poster-ph"></span>';
+      }
+    }
+    el.innerHTML=html;
+  }
   function run(force){
     var nodes=document.querySelectorAll("[data-plat-posters]");
     if(!nodes.length)return;
-    nodes.forEach(function(el){
-      var id=el.getAttribute("data-plat-posters");
-      if(!id)return;
-      if(!force&&el.dataset.loaded==="1")return;
-      el.dataset.loaded="1";
-      fetch("/api/platform-list?id="+encodeURIComponent(id)+"&mode=preview"+(force?"&force=1":""))
-        .then(function(r){return r.ok?r.json():null;})
-        .then(function(d){
-          var posters=(d&&d.posters)||[];
-          if(!posters.length)return;
-          var html="";
-          for(var i=0;i<4;i++){
-            if(posters[i]){
-              html+='<img class="platform-card-poster p'+i+'" src="'+posters[i]+'" alt="" loading="lazy">';
-            }else{
-              html+='<span class="platform-card-poster p'+i+' platform-card-poster-ph"></span>';
-            }
-          }
-          el.innerHTML=html;
-        })
-        .catch(function(){});
-    });
+    var need=0;
+    for(var i=0;i<nodes.length;i++){if(force||nodes[i].dataset.loaded!=="1")need++;}
+    if(!need&&!force)return;
+    if(busy)return;
+    busy=true;
+    /* 10 个平台一次拿完：一个请求、一个 KV key */
+    fetch("/api/platform-list?mode=previews"+(force?"&force=1":""))
+      .then(function(r){return r.ok?r.json():null;})
+      .then(function(d){
+        var items=(d&&d.items)||{};
+        for(var i=0;i<nodes.length;i++){
+          var el=nodes[i],id=el.getAttribute("data-plat-posters");
+          var posters=(id&&items[id])||[];
+          el.dataset.loaded="1";
+          if(posters.length)paint(el,posters);
+        }
+      })
+      .catch(function(){
+        /* 失败要允许 1.2s / 3s 的补拉，否则海报会一直空白 */
+        for(var i=0;i<nodes.length;i++)nodes[i].dataset.loaded="0";
+      })
+      .then(function(){busy=false;});
   }
   window.__reloadPlatformPreviews=function(force){run(!!force);};
   if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",function(){run(false);});
@@ -8489,9 +8967,27 @@ document.addEventListener("click",function(e){
 })();
 window.closeListModal=function(){var modal=document.getElementById('list-modal');if(!modal)return;modal.classList.remove('open');document.body.style.overflow='';};
 document.addEventListener('keydown',function(e){if(e.key==='Escape'){var m=document.getElementById('list-modal');if(m&&m.classList.contains('open')){window.closeListModal();return;}}});
-async function loadGuduoHScroll(category,force){category=category||'all';var el=document.getElementById('guduo-hscroll');if(!el)return;el.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';try{var r=await fetch('/api/guduo-list?mode=hscroll&category='+encodeURIComponent(category)+(force?'&force=1':''));var html=r.ok?await r.text():'';var tmp=document.createElement('div');tmp.innerHTML=html;var inner=tmp.querySelector('.h-scroll');if(inner)el.innerHTML=inner.innerHTML;else if(html)el.innerHTML=html;else el.innerHTML='<div class="h-scroll-empty"><span class="spinner"></span></div>';if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){el.innerHTML='<div class="h-scroll-empty"><p>加载失败</p></div>';}}async function loadGuduoHomeTabs(){var tabsBox=document.getElementById('guduo-home-tabs');if(!tabsBox||tabsBox.dataset.loaded==='1')return;try{var r=await fetch('/api/guduo-list?mode=categories');var d=r.ok?await r.json():{categories:[]};var cats=(d&&d.categories)||[];if(!cats.length){}cats=cats.length?cats:['剧集','电影','动漫','综艺'];var html='<button class="theater-filter-tab active" data-category="all">全部</button>';for(var i=0;i<cats.length;i++){var p=cats[i];html+='<button class="theater-filter-tab" data-category="'+__esc(p)+'">'+__esc(p)+'</button>';}tabsBox.innerHTML=html;tabsBox.style.display='';tabsBox.dataset.loaded='1';tabsBox.addEventListener('click',function(e){var btn=e.target.closest('.theater-filter-tab');if(!btn)return;tabsBox.querySelectorAll('.theater-filter-tab').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');loadGuduoHScroll(btn.getAttribute('data-category')||'all');});}catch(e){}}async function loadTheaterHScroll(platform,force){platform=platform||'all';var el=document.getElementById('theater-hscroll');if(!el)return;el.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';try{var r=await fetch('/api/theater-list?mode=hscroll&platform='+encodeURIComponent(platform)+(force?'&force=1':''));var html=r.ok?await r.text():'';var tmp=document.createElement('div');tmp.innerHTML=html;var inner=tmp.querySelector('.h-scroll');if(inner)el.innerHTML=inner.innerHTML;else if(html)el.innerHTML=html;else el.innerHTML='<div class="h-scroll-empty"><span class="spinner"></span></div>';if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){el.innerHTML='<div class="h-scroll-empty"><p>加载失败</p></div>';}}
+async function __loadHScroll(elId,url,keepId){
+  var el=document.getElementById(elId);
+  if(!el)return;
+  el.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';
+  try{
+    var r=await fetch(url);
+    var html=r.ok?await r.text():'';
+    if(!html){el.innerHTML='<div class="h-scroll-empty"><span class="spinner"></span></div>';return;}
+    if(keepId){
+      el.outerHTML=html.replace('class="h-scroll"','class="h-scroll" id="'+elId+'"');
+    }else{
+      var tmp=document.createElement('div');tmp.innerHTML=html;
+      var inner=tmp.querySelector('.h-scroll');
+      el.innerHTML=inner?inner.innerHTML:html;
+    }
+    if(window.__scheduleEnrich)window.__scheduleEnrich();
+  }catch(e){el.innerHTML='<div class="h-scroll-empty"><p>加载失败</p></div>';}
+}
+async function loadGuduoHScroll(category,force){category=category||'all';return __loadHScroll('guduo-hscroll','/api/guduo-list?mode=hscroll&category='+encodeURIComponent(category)+(force?'&force=1':''));}async function loadGuduoHomeTabs(){var tabsBox=document.getElementById('guduo-home-tabs');if(!tabsBox||tabsBox.dataset.loaded==='1')return;try{var r=await fetch('/api/guduo-list?mode=categories');var d=r.ok?await r.json():{categories:[]};var cats=(d&&d.categories)||[];if(!cats.length){}cats=cats.length?cats:['剧集','电影','动漫','综艺'];var html='<button class="theater-filter-tab active" data-category="all">全部</button>';for(var i=0;i<cats.length;i++){var p=cats[i];html+='<button class="theater-filter-tab" data-category="'+__esc(p)+'">'+__esc(p)+'</button>';}tabsBox.innerHTML=html;tabsBox.style.display='';tabsBox.dataset.loaded='1';tabsBox.addEventListener('click',function(e){var btn=e.target.closest('.theater-filter-tab');if(!btn)return;tabsBox.querySelectorAll('.theater-filter-tab').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');loadGuduoHScroll(btn.getAttribute('data-category')||'all');});}catch(e){}}async function loadTheaterHScroll(platform,force){platform=platform||'all';return __loadHScroll('theater-hscroll','/api/theater-list?mode=hscroll&platform='+encodeURIComponent(platform)+(force?'&force=1':''));}
 async function loadTheaterHomeTabs(){var tabsBox=document.getElementById('theater-home-tabs');if(!tabsBox||tabsBox.dataset.loaded==='1')return;try{var r=await fetch('/api/theater-list?mode=platforms');var d=r.ok?await r.json():{platforms:[]};var platforms=(d&&d.platforms)||[];if(!platforms.length)return;var html='<button class="theater-filter-tab active" data-platform="all">全部</button>';for(var i=0;i<platforms.length;i++){var p=platforms[i];html+='<button class="theater-filter-tab" data-platform="'+__esc(p)+'">'+__esc(p)+'</button>';}tabsBox.innerHTML=html;tabsBox.style.display='';tabsBox.dataset.loaded='1';tabsBox.addEventListener('click',function(e){var btn=e.target.closest('.theater-filter-tab');if(!btn)return;tabsBox.querySelectorAll('.theater-filter-tab').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');loadTheaterHScroll(btn.dataset.platform);});}catch(e){}}
-(function(){var sections=[['douban-domestic','domestic'],['douban-hktw','hktw'],['douban-jpkr','jpkr'],['douban-western','western']];function loadOne(id,section,force){var el=document.getElementById(id+'-hscroll');if(!el)return;var q='/api/douban-list?section='+section+'&mode=hscroll'+(force?'&force=1':'');fetch(q).then(function(r){return r.ok?r.text():'';}).then(function(html){if(html)el.outerHTML=html.replace('class="h-scroll"','class="h-scroll" id="'+id+'-hscroll"');if(window.__scheduleEnrich)window.__scheduleEnrich();}).catch(function(){});}function start(force){sections.forEach(function(pair){loadOne(pair[0],pair[1],force);});var guduoTab=document.querySelector('#guduo-home-tabs .theater-filter-tab.active');var guduoCat=guduoTab?guduoTab.getAttribute('data-category')||'all':'all';var theaterTab=document.querySelector('#theater-home-tabs .theater-filter-tab.active');var theaterPlat=theaterTab?theaterTab.getAttribute('data-platform')||'all':'all';loadGuduoHScroll(guduoCat,force);if(force){var gt=document.getElementById('guduo-home-tabs');if(gt)gt.dataset.loaded='0';var tt=document.getElementById('theater-home-tabs');if(tt)tt.dataset.loaded='0';}loadGuduoHomeTabs();loadTheaterHScroll(theaterPlat,force);loadTheaterHomeTabs();if(window.__reloadPlatformPreviews)window.__reloadPlatformPreviews(force);}if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',function(){start(false);});else start(false);window.__reloadDoubanSections=start;})();
+(function(){var sections=[['douban-domestic','domestic'],['douban-hktw','hktw'],['douban-jpkr','jpkr'],['douban-western','western']];function loadOne(id,section,force){return __loadHScroll(id+'-hscroll','/api/douban-list?section='+section+'&mode=hscroll'+(force?'&force=1':''),true);}function start(force){sections.forEach(function(pair){loadOne(pair[0],pair[1],force);});var guduoTab=document.querySelector('#guduo-home-tabs .theater-filter-tab.active');var guduoCat=guduoTab?guduoTab.getAttribute('data-category')||'all':'all';var theaterTab=document.querySelector('#theater-home-tabs .theater-filter-tab.active');var theaterPlat=theaterTab?theaterTab.getAttribute('data-platform')||'all':'all';loadGuduoHScroll(guduoCat,force);if(force){var gt=document.getElementById('guduo-home-tabs');if(gt)gt.dataset.loaded='0';var tt=document.getElementById('theater-home-tabs');if(tt)tt.dataset.loaded='0';}loadGuduoHomeTabs();loadTheaterHScroll(theaterPlat,force);loadTheaterHomeTabs();/* 平台预览不跟随「刷新」：10 个平台各自按 24h TTL 自然更新 */if(window.__reloadPlatformPreviews)window.__reloadPlatformPreviews(false);}if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',function(){start(false);});else start(false);window.__reloadDoubanSections=start;})();
 let modalLoadingId=0;window.__lastDetailType=null;window.__lastDetailId=null;async function openDetail(type,id,push=true){const modal=document.getElementById('modal'),body=document.getElementById('modal-body');if(!modal||!body)return;if(window.__stopTrailers)window.__stopTrailers();window.__lastDetailType=type;window.__lastDetailId=id;modal.classList.add('open');document.body.style.overflow='hidden';if(push&&location.pathname!=='/detail/'+type+'/'+id)history.pushState({detail:true},'','/detail/'+type+'/'+id);const reqId=++modalLoadingId;body.innerHTML='<div class="modal-loading"><div class="spinner"></div></div>';body.scrollTop=0;try{const r=await fetch('/api/detail?type='+encodeURIComponent(type)+'&id='+encodeURIComponent(id));if(reqId!==modalLoadingId)return;if(!r.ok)throw new Error('HTTP '+r.status);body.innerHTML=await r.text();if(window.__detailDeferLoad)window.__detailDeferLoad(type);}catch(e){if(reqId!==modalLoadingId)return;body.innerHTML='<div class="modal-error"><p>加载失败，请稍后重试</p><button class="btn-ghost" type="button" style="margin-top:14px" onclick="window.__retryDetail&&window.__retryDetail()">重试</button></div>';}}window.openDetail=openDetail;
 window.__retryDetail=function(){if(window.__lastDetailType&&window.__lastDetailId)openDetail(window.__lastDetailType,window.__lastDetailId,false);};
 function __loadSeasonBody(body,head){if(!body||!head)return;if(body.dataset.loaded||body.dataset.loading)return;body.dataset.loading='1';body.innerHTML='<div class="modal-loading" style="padding:24px"><div class="spinner"></div></div>';fetch('/api/season?show='+encodeURIComponent(head.dataset.show||'')+'&season='+encodeURIComponent(head.dataset.season)+'&tmdb='+encodeURIComponent(head.dataset.tmdb)+'&slug='+encodeURIComponent(head.dataset.slug||'')).then(function(r){return r.ok?r.text():'';}).then(function(html){body.innerHTML=html;body.dataset.loaded='1';delete body.dataset.loading;}).catch(function(){body.innerHTML='<div class="modal-error" style="padding:20px">加载失败</div>';delete body.dataset.loading;});}
@@ -8524,7 +9020,7 @@ document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-u
 document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-mark-season-all]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const showId=btn.dataset.markSeasonAll,season=btn.dataset.seasonNum;if(!showId||season==null||season==='undefined')return;if(!(await __confirm({icon:'✓',title:'标记本季已看',message:'确定要把第 '+season+' 季所有已播出集数标记为已看吗？',okText:'标记',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueTrakt(async()=>{const r=await fetch('/api/mark-season-watched',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({showId,season:Number(season)})});let data={};try{data=await r.json();}catch(e){}if(!r.ok){let errMsg=(data&&data.error)||('HTTP '+r.status);if(data&&data.cooling)errMsg+='（冷却 '+data.cooling+' 秒）';var err=new Error(errMsg);err.cooling=data&&data.cooling;throw err;}if(data&&data.marked===0){btn.disabled=false;btn.textContent=prev;__toast(data.message||'本季暂无可标记的已播出集数',{type:'warn'});return;}btn.textContent='✓ 已标记';btn.classList.add('done');__toast('已标记本季 '+(data&&data.marked?data.marked:0)+' 集',{type:'success'});const parts=location.pathname.split('/').filter(Boolean);if(parts[0]==='detail'&&parts.length===3){setTimeout(()=>openDetail(parts[1],parts[2],false),400);}if(window.__refreshStats)window.__refreshStats();});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('标记失败',err);}},true);
 let __enrichTimer=null;const __enrichPromises=new Map();
 function __scheduleEnrich(){if(__enrichTimer)return;__enrichTimer=setTimeout(__runEnrich,60);}window.__scheduleEnrich=__scheduleEnrich;
-async function __runEnrich(){__enrichTimer=null;const els=[...document.querySelectorAll('[data-enrich-key]')];if(!els.length)return;const byKey=new Map();for(const el of els){const k=el.dataset.enrichKey;if(!k)continue;if(!byKey.has(k))byKey.set(k,[]);byKey.get(k).push(el);el.removeAttribute('data-enrich-key');}if(!byKey.size)return;const needFetch=[];for(const[k,group]of byKey.entries()){const existing=__enrichPromises.get(k);if(existing){existing.then(d=>{if(d)group.forEach(el=>__applyEnrich(el,d));});}else{needFetch.push(k);}}if(!needFetch.length)return;const items=needFetch.map(k=>({key:k}));const batchPromise=fetch('/api/enrich',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items})}).then(r=>(r.ok?r.json():{})).catch(()=>({}));for(const k of needFetch){const perKey=batchPromise.then(data=>(data&&data[k])||null);__enrichPromises.set(k,perKey);perKey.then(d=>{if(d)byKey.get(k).forEach(el=>__applyEnrich(el,d));});}if(__enrichPromises.size>400){const arr=[...__enrichPromises.keys()];for(let i=0;i<200;i++)__enrichPromises.delete(arr[i]);}}
+async function __runEnrich(){__enrichTimer=null;const els=[...document.querySelectorAll('[data-enrich-key]')];if(!els.length)return;const byKey=new Map();for(const el of els){const k=el.dataset.enrichKey;if(!k)continue;if(!byKey.has(k))byKey.set(k,[]);byKey.get(k).push(el);el.removeAttribute('data-enrich-key');}if(!byKey.size)return;const needFetch=[];for(const[k,group]of byKey.entries()){const existing=__enrichPromises.get(k);if(existing){existing.then(d=>{if(d)group.forEach(el=>__applyEnrich(el,d));});}else{needFetch.push(k);}}if(!needFetch.length)return;/* 每批 20 条串行发，避免一次请求触发几十次 KV 读写 */for(let bi=0;bi<needFetch.length;bi+=20){const chunk=needFetch.slice(bi,bi+20);const batchPromise=fetch('/api/enrich',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items:chunk.map(function(k){return{key:k};})})}).then(function(r){return r.ok?r.json():{};}).catch(function(){return{};});for(const k of chunk){const perKey=batchPromise.then(function(data){return(data&&data[k])||null;});__enrichPromises.set(k,perKey);perKey.then(function(d){if(d)byKey.get(k).forEach(function(el){__applyEnrich(el,d);});});}}if(__enrichPromises.size>400){const arr=[...__enrichPromises.keys()];for(let i=0;i<200;i++)__enrichPromises.delete(arr[i]);}}
 function __applyEnrich(el,d){const posterBox=el.querySelector('.cw-poster')||el.querySelector('.poster');const locked=el.getAttribute('data-lock-poster')==='1';if(posterBox&&d.poster&&!locked){const cur=posterBox.querySelector('img, .poster-ph');if(cur&&cur.tagName==='IMG'){if(cur.src!==d.poster)cur.src=d.poster;}else if(cur){const img=document.createElement('img');img.src=d.poster;img.loading='lazy';img.alt='';cur.replaceWith(img);}}if(d.title){const nameEl=el.querySelector('.name');if(nameEl)nameEl.textContent=d.title;const cwTitle=el.querySelector('.cw-title');if(cwTitle)cwTitle.textContent=d.title;}if(d.overview){const info=el.querySelector('.info');if(info){let ov=info.querySelector('.overview');if(!ov){ov=document.createElement('div');ov.className='overview';const meta=info.querySelector('.meta');if(meta&&meta.nextSibling)info.insertBefore(ov,meta.nextSibling);else info.appendChild(ov);}ov.textContent=d.overview;}}}
 window.__summaryState={period:'month',ref:''};
 function __sumEsc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
@@ -8847,7 +9343,8 @@ img { display: block; max-width: 100%; }
 .platform-card-poster.p2 { right: 36px; z-index: 3; transform: rotate(-4deg); }
 .platform-card-poster.p3 { right: 52px; z-index: 2; transform: rotate(-10deg); }
 @media (min-width: 768px) {
-  .platform-card { width: 260px; height: 96px; border-radius: 16px; }
+  /* 宽屏：5 张均分填满整行；容器装不下 5×260 时保持 260px 并横向滚动 */
+  .platform-card { flex: 1 1 260px; min-width: 260px; width: auto; height: 96px; border-radius: 16px; }
   .platform-card-logo { width: 48px; height: 48px; border-radius: 0; padding: 0; }
   .platform-card-posters { width: 140px; height: 88px; }
   .platform-card-poster { width: 48px; height: 72px; margin-top: -36px; border-radius: 8px; }
