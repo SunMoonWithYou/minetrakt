@@ -95,7 +95,7 @@ const KV_STALE_RETENTION = 86400 * 7,
 
 const HOME_AUTO_REFRESH_MINUTES = 10;
 
-const APP_VERSION = "290";
+const APP_VERSION = "292";
 const APP_JS_VERSION = APP_VERSION;
 const APP_CSS_VERSION = APP_VERSION;
 
@@ -2828,7 +2828,7 @@ function calendarToLocalContinue(
 ) {
   if (!Array.isArray(calendar) || !calendar.length) return [];
   const now = nowMs != null ? nowMs : Date.now();
-  // 即将：未来 12h；正在播：开播后约 2h；已播出未看：开播后 2h～24h
+  // 即将：未来 6h；正在播：开播后约 2h；已播出未看：开播后 2h～24h
   const upcomingWindowMs = 6 * 3600 * 1000;
   const airingWindowMs = 2 * 3600 * 1000;
   const airedWindowMs = 24 * 3600 * 1000;
@@ -2855,10 +2855,9 @@ function calendarToLocalContinue(
     const epid = ep.ids && ep.ids.trakt;
     if (sid == null) continue;
     if (dropped && dropped.has(Number(sid))) continue;
-    // 已看过这一集 → 不展示
     if (epid != null && watched && watched.has(Number(epid))) continue;
 
-    let status = null; // upcoming | airing | aired
+    let status = null;
     if (fa > now) {
       if (fa - now <= upcomingWindowMs) status = "upcoming";
     } else {
@@ -6614,7 +6613,6 @@ async function handleHomeData(request, env, ctx) {
     : Promise.resolve(null);
   let pbBypass = force;
   let sigBaselineNeeded = false;
-  // 与上次 Trakt 活动签名一致 → 无需重绘继续观看
   let activityUnchanged = false;
   if (wantPlayback && !force) {
     try {
@@ -6720,12 +6718,7 @@ async function handleHomeData(request, env, ctx) {
             };
           }
 
-          const userState = await getUserStateBundle(
-            headers,
-            env,
-            ctx,
-            userKey,
-          );
+          const userState = await getUserStateBundle(headers, env, ctx, userKey);
           const droppedSet = droppedStateToSet(userState);
           const watchedEpIds = watchedStateToSet(userState.watched);
           const hideMapRaw = userState.hideMap || {};
@@ -6813,6 +6806,7 @@ async function handleHomeData(request, env, ctx) {
         const todayBJ = new Date(Date.now() + 8 * 3600 * 1000)
           .toISOString()
           .slice(0, 10);
+          
         const userState2 = await getUserStateBundle(headers, env, ctx, userKey);
         const droppedSet = droppedStateToSet(userState2);
         const freshWatched = watchedStateToSet(userState2.watched);
@@ -6826,6 +6820,7 @@ async function handleHomeData(request, env, ctx) {
           false,
           null,
         ).catch(() => null);
+
         const hideMap =
           hideMapRaw &&
           typeof hideMapRaw === "object" &&
@@ -6884,13 +6879,10 @@ async function handleHomeData(request, env, ctx) {
           } catch {}
         }
 
-        // 与 merge 规则一致：去掉过期暂停 / 无进度的已看集
         if (Array.isArray(playback) && freshWatched) {
           playback = filterContinueEntries(playback, freshWatched);
         }
-      } catch (e) {
-        /* 注入失败不影响主列表 */
-      }
+      } catch (e) {}
     });
   }
 
@@ -7002,9 +6994,7 @@ async function handleHomeData(request, env, ctx) {
         opts({
           ...CACHE_USER_META,
           ttl: STATS_KV_TTL,
-          lastGoodKey: CK.lastGood.stats
-            ? CK.lastGood.stats(userKey)
-            : "lg:stats:" + userKey,
+          lastGoodKey: CK.lastGood.stats ? CK.lastGood.stats(userKey) : "lg:stats:" + userKey,
         }),
       );
     });
@@ -7045,9 +7035,7 @@ async function handleHomeData(request, env, ctx) {
   if (wantPlayback) {
     const pbList = Array.isArray(playback) ? playback : [];
     try {
-      await attachContinueStillsForPlayback(pbList, env, ctx, userKey, {
-        maxFetch: 20,
-      });
+      await attachContinueStillsForPlayback(pbList, env, ctx, userKey, { maxFetch: 20 });
       result.playbackHScrollHtml = renderContinueItems(pbList, "hscroll");
     } catch {
       result.playbackHScrollHtml =
@@ -7064,90 +7052,50 @@ async function handleHomeData(request, env, ctx) {
     let playbackDataTs = 0;
     let playbackTsSource = null;
 
-    // 数据更新时间 = 从 Trakt 拉到并写入缓存的时间（不是 last_watched）
-    if (userUpdatedAt) {
-      playbackDataTs = Number(userUpdatedAt) || 0;
-      playbackAgeSec = Math.max(
-        0,
-        Math.round((Date.now() - playbackDataTs) / 1000),
-      );
-      playbackTsSource = "live";
-    } else if (typeof playbackSrc.age === "number") {
-      playbackAgeSec = playbackSrc.age || 0;
-      playbackDataTs = Date.now() - playbackAgeSec * 1000;
-      playbackTsSource = "cache-age";
-    }
+    // 优先获取内存缓存中真正的写入时间戳（只有数据真正改变时才会变）
     try {
       const mem = kvMemGet(CK.playback(userKey));
       if (mem && mem._ts) {
         playbackDataTs = mem._ts;
-        playbackAgeSec = Math.max(
-          0,
-          Math.round((Date.now() - playbackDataTs) / 1000),
-        );
-        playbackTsSource = userUpdatedAt ? "live" : "cache-ts";
+        playbackAgeSec = Math.max(0, Math.round((Date.now() - playbackDataTs) / 1000));
+        playbackTsSource = "mem-ts";
       }
     } catch {}
+
+    // 如果内存中没有，通过 tracker 获取的时间推算
+    if (!playbackDataTs && typeof playbackSrc.age === "number") {
+      playbackAgeSec = playbackSrc.age || 0;
+      playbackDataTs = Date.now() - playbackAgeSec * 1000;
+      playbackTsSource = "age";
+    }
+
+    // 如果确实发生了新写入（fromCache === false 且 age === 0），更新为当前时间
+    if (playbackSrc.fromCache === false && playbackSrc.age === 0) {
+      playbackDataTs = Date.now();
+      playbackAgeSec = 0;
+      playbackTsSource = "live-write";
+    }
+
+    // 保底
+    if (!playbackDataTs) {
+      playbackDataTs = userUpdatedAt || Date.now();
+      playbackAgeSec = Math.max(0, Math.round((Date.now() - playbackDataTs) / 1000));
+      playbackTsSource = "fallback";
+    }
 
     result.playbackAgeSec = playbackAgeSec;
     result.playbackDataTs = playbackDataTs || null;
     result.playbackTsSource = playbackTsSource;
 
-    // 继续观看 / 播放进度 同步时间（内存 → KV → 缓存 _ts，保证多端尽量一致）
-    let pauseUpdatedAt = null;
-    let continueUpdatedAt = null;
-    try {
-      const metaMem = __cwTimeMem.get(userKey);
-      if (metaMem) {
-        if (metaMem.pauseUpdatedAt)
-          pauseUpdatedAt = Number(metaMem.pauseUpdatedAt) || null;
-        if (metaMem.continueUpdatedAt)
-          continueUpdatedAt = Number(metaMem.continueUpdatedAt) || null;
-      }
-    } catch {}
-    try {
-      if (playback && playback.__cwMeta) {
-        if (playback.__cwMeta.pauseUpdatedAt)
-          pauseUpdatedAt =
-            Number(playback.__cwMeta.pauseUpdatedAt) || pauseUpdatedAt;
-        if (playback.__cwMeta.continueUpdatedAt)
-          continueUpdatedAt =
-            Number(playback.__cwMeta.continueUpdatedAt) || continueUpdatedAt;
-      }
-    } catch {}
-    if (!pauseUpdatedAt || !continueUpdatedAt) {
-      try {
-        const memMeta = kvMemGet("cwmeta:" + userKey);
-        const m =
-          memMeta && memMeta.data && typeof memMeta.data === "object"
-            ? memMeta.data
-            : memMeta;
-        if (m && typeof m === "object") {
-          if (!pauseUpdatedAt && m.pauseUpdatedAt)
-            pauseUpdatedAt = Number(m.pauseUpdatedAt) || null;
-          if (!continueUpdatedAt && m.continueUpdatedAt)
-            continueUpdatedAt = Number(m.continueUpdatedAt) || null;
-        }
-      } catch {}
-    }
-    if (!continueUpdatedAt && playbackDataTs)
-      continueUpdatedAt = playbackDataTs;
-    if (!pauseUpdatedAt && playbackDataTs) pauseUpdatedAt = playbackDataTs;
-    if (userUpdatedAt) {
-      if (!pauseUpdatedAt) pauseUpdatedAt = userUpdatedAt;
-      if (!continueUpdatedAt) continueUpdatedAt = userUpdatedAt;
-      try {
-        __cwTimeMem.set(userKey, {
-          pauseUpdatedAt: pauseUpdatedAt || userUpdatedAt,
-          continueUpdatedAt: continueUpdatedAt || userUpdatedAt,
-        });
-      } catch {}
-    }
-    result.pauseUpdatedAt = pauseUpdatedAt || null;
-    result.continueUpdatedAt = continueUpdatedAt || null;
+    // 多端统一同步时间：直接复用 playback 数据本身的写入时间戳，不新增任何 KV 写入
+    const lastSyncAt = playbackDataTs || userUpdatedAt || null;
+    
+    result.pauseUpdatedAt = lastSyncAt;
+    result.continueUpdatedAt = lastSyncAt;
+    result.lastSyncAt = lastSyncAt;
+    
     result.syncMeta = {
-      pause: pauseUpdatedAt || null,
-      continue: continueUpdatedAt || null,
+      lastSyncAt: lastSyncAt,
       dataTs: playbackDataTs || null,
       source: result.playbackSource || null,
     };
@@ -7238,7 +7186,7 @@ async function handleHomeData(request, env, ctx) {
         env,
         ctx,
         CK.histImages(userKey),
-        20,
+        20
       ).catch(() => {});
 
       let historyPageCount = 1;
@@ -7273,13 +7221,12 @@ async function handleHomeData(request, env, ctx) {
           });
         }
       }
-
       await attachEntityPosters(
         calFiltered,
         env,
         ctx,
         CK.calImages(userKey),
-        20,
+        20
       ).catch(() => {});
       result.calendarHtml = renderCalendarPage(calFiltered, env, {});
     } catch {
@@ -7295,9 +7242,7 @@ async function handleHomeData(request, env, ctx) {
         result.watchlistHtml = emptyWatchlistHtml();
       } else {
         const list = watchlist;
-        await attachWatchlistStills(list, env, ctx, userKey, {
-          maxFetch: WATCHLIST_PAGE_SIZE,
-        });
+        await attachWatchlistStills(list, env, ctx, userKey, { maxFetch: WATCHLIST_PAGE_SIZE });
         const firstPage = list.slice(0, WATCHLIST_PAGE_SIZE),
           hasMore = list.length > WATCHLIST_PAGE_SIZE,
           cardsHtml = renderWatchlistItems(firstPage, env),
@@ -10515,117 +10460,106 @@ function splashCriticalCss() {
  * ============================================================================= */
 /** 前端主脚本字符串（/app.js） */
 function getBootstrapScript() {
-  return `(function(){var __CFG=window.__HOME_CONFIG__||{};if(!__CFG.loggedIn)return;window.__HOME_CONFIG__=null;if(__CFG.initialDetail)window.__initialDetail=__CFG.initialDetail;if(!window.__splashT0)window.__splashT0=Date.now();window.__splashHidden=false;window.__hideSplash=function(force){try{if(window.__splashHidden)return;window.__splashHidden=true;var el=document.getElementById('splash');if(!el)return;var wait=force?0:Math.max(0,120-(Date.now()-(window.__splashT0||Date.now())));setTimeout(function(){try{el.classList.add('hide');setTimeout(function(){try{if(el&&el.parentNode)el.parentNode.removeChild(el);}catch(e){}},280);}catch(e){}},wait);}catch(e){}};setTimeout(function(){if(window.__hideSplash)window.__hideSplash();},80);function lsGet(k){try{var v=localStorage.getItem(k);if(!v)return null;var o=JSON.parse(v);if(o&&o._exp&&o._exp<Date.now()){try{localStorage.removeItem(k);}catch(e){}return null;}return o&&o.data?o.data:null;}catch(e){return null;}}function lsSet(k,d,ttlSec){try{localStorage.setItem(k,JSON.stringify({data:d,_exp:Date.now()+ttlSec*1000}));}catch(e){try{localStorage.removeItem(k);}catch(e2){}}}window.__lsGet=lsGet;window.__lsSet=lsSet;function setHTML(sel,html){var el=typeof sel==='string'?document.querySelector(sel):sel;if(el)el.innerHTML=html||'';}window.__setHTML=setHTML;function applyAvatar(url,alts){if(!url)return;var av=document.getElementById('hero-avatar');if(!av)return;var list=[url];if(alts&&alts.length){for(var a=0;a<alts.length;a++){if(alts[a]&&alts[a]!==url)list.push(alts[a]);}}list.push('/avatar?u='+encodeURIComponent(url));var i=0;function next(){if(i>=list.length){av.innerHTML='<span class="hero-avatar-ph">👤</span>';return;}var src=list[i++];var img=document.createElement('img');img.onerror=next;img.alt='';img.width=56;img.height=56;img.decoding='async';img.setAttribute('referrerpolicy','no-referrer');img.src=src;av.innerHTML='';av.appendChild(img);}next();}function __fmtFull(ts){
+  return `(function(){var __CFG=window.__HOME_CONFIG__||{};if(!__CFG.loggedIn)return;window.__HOME_CONFIG__=null;if(__CFG.initialDetail)window.__initialDetail=__CFG.initialDetail;if(!window.__splashT0)window.__splashT0=Date.now();window.__splashHidden=false;window.__hideSplash=function(force){try{if(window.__splashHidden)return;window.__splashHidden=true;var el=document.getElementById('splash');if(!el)return;var wait=force?0:Math.max(0,120-(Date.now()-(window.__splashT0||Date.now())));setTimeout(function(){try{el.classList.add('hide');setTimeout(function(){try{if(el&&el.parentNode)el.parentNode.removeChild(el);}catch(e){}},280);}catch(e){}},wait);}catch(e){}};setTimeout(function(){if(window.__hideSplash)window.__hideSplash();},80);function lsGet(k){try{var v=localStorage.getItem(k);if(!v)return null;var o=JSON.parse(v);if(o&&o._exp&&o._exp<Date.now()){try{localStorage.removeItem(k);}catch(e){}return null;}return o&&o.data?o.data:null;}catch(e){return null;}}function lsSet(k,d,ttlSec){try{localStorage.setItem(k,JSON.stringify({data:d,_exp:Date.now()+ttlSec*1000}));}catch(e){try{localStorage.removeItem(k);}catch(e2){}}}window.__lsGet=lsGet;window.__lsSet=lsSet;function setHTML(sel,html){var el=typeof sel==='string'?document.querySelector(sel):sel;if(el)el.innerHTML=html||'';}window.__setHTML=setHTML;function applyAvatar(url,alts){if(!url)return;var av=document.getElementById('hero-avatar');if(!av)return;var list=[url];if(alts&&alts.length){for(var a=0;a<alts.length;a++){if(alts[a]&&alts[a]!==url)list.push(alts[a]);}}list.push('/avatar?u='+encodeURIComponent(url));var i=0;function next(){if(i>=list.length){av.innerHTML='<span class="hero-avatar-ph">👤</span>';return;}var src=list[i++];var img=document.createElement('img');img.onerror=next;img.alt='';img.width=56;img.height=56;img.decoding='async';img.setAttribute('referrerpolicy','no-referrer');img.src=src;av.innerHTML='';av.appendChild(img);}next();}
+function __fmtFull(ts){
   var d=new Date(ts);if(isNaN(d.getTime()))return'';
   var p=function(n){return(n<10?'0':'')+n;};
-  // 鼠标悬浮的完整提示，去掉了秒，保留到分钟即可
   return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());
 }
-/** 顶栏短时间：优先相对时间，极度节省空间 */
 function __fmtShort(ts){
   var d=new Date(ts);
   if(isNaN(d.getTime()))return'';
   var p=function(n){return(n<10?'0':'')+n;};
   var now=new Date();
   var diff=now.getTime()-d.getTime();
-  
-  // 1分钟内
   if(diff<60000) return '刚刚';
-  // 1小时内
   if(diff<3600000) return Math.floor(diff/60000)+'分钟前';
-  
   var hm=p(d.getHours())+':'+p(d.getMinutes());
-  
-  // 今天
   if(d.getFullYear()===now.getFullYear()&&d.getMonth()===now.getMonth()&&d.getDate()===now.getDate()){
     return hm;
   }
-  
-  // 昨天
   var yesterday=new Date(now.getTime()-86400000);
   if(d.getFullYear()===yesterday.getFullYear()&&d.getMonth()===yesterday.getMonth()&&d.getDate()===yesterday.getDate()){
     return '昨天 '+hm;
   }
-  
-  // 今年
   if(d.getFullYear()===now.getFullYear()){
     return (d.getMonth()+1)+'月'+d.getDate()+'日';
   }
-  
-  // 往年
   return d.getFullYear()+'-'+(d.getMonth()+1)+'-'+d.getDate();
 }
-/** 内存中保存：暂停记录 / 继续观看 的数据更新时间 */
-window.__mtCwTimes=window.__mtCwTimes||{pause:null,continue:null};
+window.__mtSyncAt = window.__mtSyncAt || null;
 function __rememberCwTimes(d){
   if(!d)return;
-  var sm=d.syncMeta||null;
-  var p=d.pauseUpdatedAt!=null?Number(d.pauseUpdatedAt):(sm&&sm.pause!=null?Number(sm.pause):null);
-  var c=d.continueUpdatedAt!=null?Number(d.continueUpdatedAt):(sm&&sm.continue!=null?Number(sm.continue):null);
-  if(p&&isFinite(p)&&p>0)window.__mtCwTimes.pause=p;
-  if(c&&isFinite(c)&&c>0)window.__mtCwTimes.continue=c;
-  try{
-    var payload={pause:window.__mtCwTimes.pause,continue:window.__mtCwTimes.continue,_exp:Date.now()+86400e3*7};
-    localStorage.setItem('mt:cwTimes',JSON.stringify(payload));
-  }catch(e){}
+  var ts = d.lastSyncAt || d.continueUpdatedAt || d.pauseUpdatedAt || d.userUpdatedAt;
+  if(ts && isFinite(ts) && ts>0){
+    window.__mtSyncAt = Number(ts);
+    try{var payload={ts:window.__mtSyncAt, _exp:Date.now()+86400e3*30};localStorage.setItem('mt:syncAt', JSON.stringify(payload));}catch(e){}
+  }
 }
 function __loadCwTimesFromLs(){
-  try{
-    var v=localStorage.getItem('mt:cwTimes');
-    if(!v)return;
-    var o=JSON.parse(v);
-    if(!o||(o._exp&&o._exp<Date.now()))return;
-    if(o.pause&&isFinite(Number(o.pause)))window.__mtCwTimes.pause=Number(o.pause);
-    if(o.continue&&isFinite(Number(o.continue)))window.__mtCwTimes.continue=Number(o.continue);
-  }catch(e){}
+  try{var v=localStorage.getItem('mt:syncAt');if(!v)return;var o=JSON.parse(v);if(!o||(o._exp&&o._exp<Date.now()))return;if(o.ts&&isFinite(Number(o.ts)))window.__mtSyncAt=Number(o.ts);}catch(e){}
 }
 __loadCwTimesFromLs();
-/**
- * 展示规则：取「暂停记录」「继续观看」中较新的时间；
- * 两者都没有 → 浏览器本地时间。
- * 文案区分：暂停 / 继续观看 / 本地，格式 YYYY-MM-DD HH:mm:ss
- */
 function __setUpdatedAt(source,ageSec,dataTs){
   var el=document.getElementById('updated-at');
   if(!el)return;
-  var pauseTs=window.__mtCwTimes&&window.__mtCwTimes.pause?Number(window.__mtCwTimes.pause):null;
-  var contTs=window.__mtCwTimes&&window.__mtCwTimes.continue?Number(window.__mtCwTimes.continue):null;
-  // 若本次传入了明确 dataTs，按 source 记入对应桶（兼容旧调用）
-  if(dataTs!=null&&isFinite(Number(dataTs))&&Number(dataTs)>0){
-    var t=Number(dataTs);
-    if(source==='pause'){window.__mtCwTimes.pause=t;pauseTs=t;}
-    else if(source==='continue'||source==='live'||source==='manual'||source==='auto'||source==='cache'){
-      // 默认记为继续观看同步时间；暂停时间若为空则一并填上
-      window.__mtCwTimes.continue=t;contTs=t;
-      if(!pauseTs){window.__mtCwTimes.pause=t;pauseTs=t;}
-    }
-    try{__rememberCwTimes({pauseUpdatedAt:window.__mtCwTimes.pause,continueUpdatedAt:window.__mtCwTimes.continue});}catch(e){}
+  var best=null;
+  if(dataTs!=null && isFinite(Number(dataTs)) && Number(dataTs)>0){
+    best=Number(dataTs);
+    window.__mtSyncAt=best;
+  } else if(window.__mtSyncAt){
+    best=window.__mtSyncAt;
+  } else {
+    best=Date.now();
   }
-  var best=null,kind='本机';
-  if(pauseTs&&contTs){
-    if(pauseTs>=contTs){best=pauseTs;kind='进度';}
-    else{best=contTs;kind='列表';}
-  }else if(pauseTs){best=pauseTs;kind='进度';}
-  else if(contTs){best=contTs;kind='列表';}
-  else{best=Date.now();kind='本机';}
   window.__lastDataUpdateAt=best;
-  window.__lastDataUpdateKind=kind;
-  el.textContent=kind+' · '+__fmtShort(best);
-  el.title='播放进度：'+(pauseTs?__fmtFull(pauseTs):'暂无')+' | 继续观看：'+(contTs?__fmtFull(contTs):'暂无')+' | 本机：'+__fmtFull(Date.now());
+  el.textContent='进度已同步 · '+__fmtShort(best);
+  el.title='最后同步时间：'+__fmtFull(best);
   el.classList.remove('flash','src-live','src-cache');
   void el.offsetWidth;
   el.classList.add('flash');
-  if(kind==='本机')el.classList.add('src-cache');
+  if(source==='cache') el.classList.add('src-cache');
   else el.classList.add('src-live');
-}function applyPlayback(d,isCache){if(!d)return;if(d.playbackHScrollHtml){window.__lastPbHtml=d.playbackHScrollHtml;setHTML('#playback-hscroll',d.playbackHScrollHtml);}try{__rememberCwTimes(d);}catch(e){}var src=isCache?'cache':(d.playbackSource||'');var age=null;if(d.playbackDataTs){age=Math.max(0,Math.round((Date.now()-Number(d.playbackDataTs))/1000));try{d._dataTs=Number(d.playbackDataTs);}catch(e){}}else if(d.userUpdatedAt){age=Math.max(0,Math.round((Date.now()-Number(d.userUpdatedAt))/1000));src=src||'cache';try{d._dataTs=Number(d.userUpdatedAt);}catch(e){}}else if(d._dataTs)age=Math.max(0,Math.round((Date.now()-d._dataTs)/1000));else if(typeof d.playbackAgeSec==='number'&&isFinite(d.playbackAgeSec)){age=Math.max(0,d.playbackAgeSec);try{d._dataTs=Date.now()-age*1000;}catch(e){}}var dataTs=(d&&d.continueUpdatedAt)?Number(d.continueUpdatedAt):(d&&d.playbackDataTs)?Number(d.playbackDataTs):(d&&d._dataTs)?Number(d._dataTs):(d&&d.userUpdatedAt)?Number(d.userUpdatedAt):null;if(isCache){__setUpdatedAt('cache',age,dataTs);}else if(window.__manualRefreshPending){__setUpdatedAt('manual',age,dataTs);window.__manualRefreshPending=false;}else if(src==='live'){__setUpdatedAt('live',age,dataTs);}else{__setUpdatedAt(src||'cache',age,dataTs);}if(window.__scheduleEnrich)window.__scheduleEnrich();}
-window.__applyPlayback=applyPlayback;try{__setUpdatedAt('boot');}catch(e){}function applyMeta(d,isCache){if(!d)return;var n=document.getElementById('hero-name');if(n&&d.name)n.textContent=d.name;applyAvatar(d.avatar,d.avatarAlt);if(d.statsHtml)setHTML('#stats-box',d.statsHtml);if(!isCache)try{lsSet('mt:meta',d,604800);}catch(e){}}window.__applyMeta=applyMeta;var __homeDataLoading=false;
+}
+function applyPlayback(d,isCache){
+  if(!d)return;
+  if(d.playbackHScrollHtml){window.__lastPbHtml=d.playbackHScrollHtml;setHTML('#playback-hscroll',d.playbackHScrollHtml);}
+  try{__rememberCwTimes(d);}catch(e){}
+  var src=isCache?'cache':(d.playbackSource||'');
+  var age=null;
+  var dataTs = d.lastSyncAt || d.continueUpdatedAt || d.pauseUpdatedAt || d.userUpdatedAt || d._dataTs;
+  if(dataTs) {
+    try{d._dataTs=Number(dataTs);}catch(e){}
+    age=Math.max(0,Math.round((Date.now()-Number(dataTs))/1000));
+  } else if(d.playbackDataTs){
+    try{d._dataTs=Number(d.playbackDataTs);}catch(e){}
+    age=Math.max(0,Math.round((Date.now()-Number(d.playbackDataTs))/1000));
+  } else if(typeof d.playbackAgeSec==='number'&&isFinite(d.playbackAgeSec)){
+    age=Math.max(0,d.playbackAgeSec);
+    try{d._dataTs=Date.now()-age*1000;}catch(e){}
+  }
+  if(isCache){
+    __setUpdatedAt('cache',age,dataTs);
+  } else if(window.__manualRefreshPending){
+    __setUpdatedAt('manual',age,dataTs);
+    window.__manualRefreshPending=false;
+  } else {
+    __setUpdatedAt(src||'live',age,dataTs);
+  }
+  if(window.__scheduleEnrich)window.__scheduleEnrich();
+}
+window.__applyPlayback=applyPlayback;
+try{
+  if(window.__mtSyncAt) __setUpdatedAt('boot',null,window.__mtSyncAt);
+  else __setUpdatedAt('boot');
+}catch(e){}
+function applyMeta(d,isCache){if(!d)return;var n=document.getElementById('hero-name');if(n&&d.name)n.textContent=d.name;applyAvatar(d.avatar,d.avatarAlt);if(d.statsHtml)setHTML('#stats-box',d.statsHtml);if(!isCache)try{lsSet('mt:meta',d,604800);}catch(e){}}window.__applyMeta=applyMeta;var __homeDataLoading=false;
 function fetchPart(part,force,live){return fetch('/api/home-data?part='+encodeURIComponent(part)+(force?'&force=1':'')+(live?'&live=1':''),{credentials:'same-origin',cache:'no-store'}).then(function(r){if(r.status===401){return r.json().catch(function(){return{};}).then(function(d){var msg=(d&&d.error)||'登录已失效，请重新登录';try{sessionStorage.setItem('mt:relogin',msg);}catch(e){}if(window.__toast)window.__toast(msg,{type:'warn',duration:2200});setTimeout(function(){location.href='/login';},1000);return null;});}if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){if(!d)return null;if(d.login){location.href='/login';return null;}return d;});}window.__fetchPart=fetchPart;var __loadedParts={};function loadPartOnce(part){if(__loadedParts[part])return Promise.resolve(__loadedParts[part]);return fetchPart(part).then(function(d){__loadedParts[part]=d;return d;});}window.__loadPartOnce=loadPartOnce;window.__loadedParts=__loadedParts;function loadHomeData(opts){
   opts=opts||{};
   var silent=!!opts.silent;
   if(__homeDataLoading&&!silent)return;
   __homeDataLoading=true;
   __lastRefreshAt=Date.now();
-  /** 首页继续观看加载状态：loading | cache | live | error */
   var bootState=silent?'loading':'loading';
   function setBootState(s){bootState=s;try{window.__homeBootState=s;}catch(e){}}
   function finishSplash(){if(!silent&&window.__hideSplash)window.__hideSplash(true);}
