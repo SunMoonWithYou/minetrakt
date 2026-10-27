@@ -1,37 +1,3 @@
-/**
- * MineTrakt — Cloudflare Worker 单文件应用（前后端一体）
- *
- * ============================================================================
- * 功能概览
- * ============================================================================
- * - Trakt：OAuth / 设备码登录，同步观看进度、待看、日历、历史、统计
- * - 继续观看：暂停进度 + up_next + 日历「即将播出」；首页横滑约 20 条，
- *   「查看更多」分页每页 20，可加载更多；过期暂停按剧级 last_watched 丢弃
- * - 元数据：TMDB / OMDB / 豆瓣 / 平台剧场 / 骨朵；详情页评分、演员、预告片
- * - 缓存：Worker 内存 + CF KV（TMDB_CACHE）；写有最小间隔，热点 key 更短
- * - 限流：Trakt 请求全局/用户节流，429 冷却；活动签名避免无变化时重绘
- * - 前端：首页分 part 懒加载、10 分钟静默检查、强制刷新、主题切换
- *
- * ============================================================================
- * 源码结构（自上而下，约 1 万行）
- * ============================================================================
- *  1. 常量与配置（API、TTL、主题、资源 URL）
- *  2. HTTP / Trakt 封装（fetchT、traktGate、429 处理）
- *  3. KV / 内存缓存（kvMem*、kvGet/PutJSON、cachedJSON、SWR）
- *  4. Service Worker 脚本字符串 + Worker 路由 export default
- *  5. 鉴权与 Cookie（device code、poll、refresh token）
- *  6. 业务：home-data、more、详情、watchlist/mark/hide/drop 等 API
- *  7. 继续观看合并过滤（mergeContinueLists、过期暂停、即将播出注入）
- *  8. 服务端 HTML 片段渲染（卡片、详情、历史…）
- *  9. 页面壳 + splash / launch
- * 10. 前端 bootstrap（字符串内 JS：刷新、弹窗、待看、预告片…）
- * 11. pageStyles() 全站 CSS
- *
- * 注意：模板字符串内的 CSS / 内联前端脚本请保持原样，强行断行会破坏字符串导致 SyntaxError。
- * 外层 Worker 逻辑已 Prettier 格式化；主要函数已加注释。
- * 版本号：APP_VERSION（同时用于 app.js / app.css 缓存戳）。
- */
-
 /* =============================================================================
  * 1. 常量与配置（API 地址、TTL、主题、资源）
  * ============================================================================= */
@@ -82,7 +48,6 @@ const ASSET_ORIGINS = {
 };
 
 let __chromeMajorCached = 0;
-/** 按时间粗估 Chrome 主版本，用于 Trakt 请求 UA */
 function chromeMajorForUA() {
   if (__chromeMajorCached) return __chromeMajorCached;
   const ANCHOR_MAJOR = 120;
@@ -116,13 +81,13 @@ const PAGE_SIZE = 20,
   MISS_KV_TTL = 300,
   HISTORY_KV_TTL = 5400,
   PLAYBACK_KV_TTL = 5400,
-  STATS_KV_TTL = 3600,
-  PROFILE_KV_TTL = 7200,
+  STATS_KV_TTL = 604800,
+  PROFILE_KV_TTL = 86400,
   ENTITY_KV_TTL = 86400,
   SEASON_KV_TTL = 86400,
-  DOUBAN_KV_TTL = 86400,
+  DOUBAN_KV_TTL = 21600,
   THEATER_KV_TTL = 86400,
-  GUDUO_KV_TTL = 86400,
+  GUDUO_KV_TTL = 21600,
   PLATFORM_KV_TTL = 86400;
 
 const KV_STALE_RETENTION = 86400 * 7,
@@ -130,7 +95,7 @@ const KV_STALE_RETENTION = 86400 * 7,
 
 const HOME_AUTO_REFRESH_MINUTES = 10;
 
-const APP_VERSION = "271";
+const APP_VERSION = "290";
 const APP_JS_VERSION = APP_VERSION;
 const APP_CSS_VERSION = APP_VERSION;
 
@@ -152,6 +117,28 @@ const CACHE_USER_META = {
   edgeTtl: 300,
   jitter: 300,
 };
+
+/** 用户进度类缓存默认项（可再覆盖） */
+function cacheUser(extra) {
+  return Object.assign({}, CACHE_USER_LONG, extra || {});
+}
+/** 用户元数据类缓存默认项 */
+function cacheUserMeta(extra) {
+  return Object.assign({}, CACHE_USER_META, extra || {});
+}
+/** 公开只读资源缓存默认项 */
+function cachePublic(ttl, extra) {
+  return Object.assign(
+    {
+      ttl: ttl != null ? ttl : 86400,
+      missTtl: 600,
+      swr: true,
+      unwrap: true,
+      jitter: 300,
+    },
+    extra || {},
+  );
+}
 
 /** 返回 JSON Response，可附带自定义 headers / status */
 function jsonResp(data, headers, status) {
@@ -538,6 +525,9 @@ const DEFAULT_JITTER_SEC = 600;
 const __KV_LASTPUT_MAX = 5000;
 
 const __kvLastPut = new Map();
+/** 用户继续观看/暂停记录的最近更新时间（Worker 内存） */
+const __cwTimeMem = new Map(); // userKey -> { pauseUpdatedAt, continueUpdatedAt }
+
 const __kvMem = new Map(),
   __kvMemExp = new Map(),
   __kvInflight = new Map();
@@ -2532,20 +2522,22 @@ function userCacheKeys(userKey) {
 /** 强制刷新时删除用户首页相关 KV */
 function bustHomeUserCaches(userKey, env, ctx) {
   if (!userKey) return;
+
   const { exact, prefix } = userCacheKeys(userKey);
+  const exact2 = [...exact, userStateCacheKey(userKey)];
 
   for (const k of [...__kvMem.keys()]) {
-    if (exact.includes(k) || prefix.some((p) => k.startsWith(p))) {
+    if (exact2.includes(k) || prefix.some((p) => k.startsWith(p))) {
       __kvMem.delete(k);
       __kvMemExp.delete(k);
     }
   }
   for (const k of [...__kvLastPut.keys()]) {
-    if (exact.includes(k) || prefix.some((p) => k.startsWith(p))) {
+    if (exact2.includes(k) || prefix.some((p) => k.startsWith(p))) {
       __kvLastPut.delete(k);
     }
   }
-  for (const k of exact) {
+  for (const k of exact2) {
     __kvLastPut.delete(k);
     __kvLastPut.delete("lgput:" + k);
   }
@@ -2564,12 +2556,9 @@ function bustHomeUserCaches(userKey, env, ctx) {
       CK.morePlayback(userKey, 1, 30),
       CK.watchedEpisodes(userKey),
       CK.cwHide(userKey),
+      userStateCacheKey(userKey),
     ];
-    const p = Promise.all(
-      fixedKeys.map((k) => env.TMDB_CACHE.delete(k).catch(() => {})),
-    );
-    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
-    else p.catch(() => {});
+    safeDeleteKvKeys(env, ctx, fixedKeys);
   }
 }
 
@@ -2712,28 +2701,92 @@ async function tmdbZhTitle(kind, tmdbId, env, ctx) {
   return (data.name || data.title || "").trim() || null;
 }
 
-/** 从 KV 读图片映射表 */
+const IMG_MAP_KV_TTL = 86400 * 30;
+const IMG_MAP_MIN_PUT_INTERVAL_MS = 10 * 60 * 1000;
+const __IMG_MAP_LAST_PUT = new Map();
+
+/**
+ * 读取图片映射表：内存 → KV。
+ * 避免冷启动后继续观看/历史/日历/待看反复逐条读 TMDB detail。
+ */
 async function loadImageMap(env, key) {
-  // 纯 mem，KV 里即使有也不读（避免歧义）
-  let map = kvMemGet(key);
-  if (map === KV_MISS || (map !== undefined && typeof map !== "object"))
-    map = undefined;
-  if (map !== undefined) return map;
-  // 冷启后第一次：返回空 map，靠 tmdbDetailCached 现补
-  // 但 tmdbDetailCached 本身有 KV，所以第二次就命中，不重复打 TMDB
-  const out = {};
-  kvMemSet(key, out, KV_MEM_TTL); // 30 分钟
-  return out;
+  if (!key) return {};
+
+  const mem = kvMemGet(key);
+  if (mem !== undefined) {
+    if (mem === KV_MISS) return {};
+    const v = mem && mem.data !== undefined ? mem.data : mem;
+    return v && typeof v === "object" && !Array.isArray(v) ? v : {};
+  }
+
+  if (!env || !env.TMDB_CACHE || kvIsDown()) {
+    const out = {};
+    kvMemSet(key, { data: out, _ts: Date.now() }, KV_MEM_TTL);
+    return out;
+  }
+
+  try {
+    const raw = await env.TMDB_CACHE.get(key, {
+      type: "json",
+      cacheTtl: 600,
+    });
+    kvMarkUp();
+    const v = raw && raw.data !== undefined ? raw.data : raw;
+    const out = v && typeof v === "object" && !Array.isArray(v) ? v : {};
+    kvMemSet(
+      key,
+      { data: out, _ts: (raw && raw._ts) || Date.now() },
+      KV_MEM_TTL,
+    );
+    return out;
+  } catch {
+    kvMarkDown();
+    const out = {};
+    kvMemSet(key, { data: out, _ts: Date.now() }, KV_MEM_TTL);
+    return out;
+  }
 }
 
-/** 写图片映射表 */
+/**
+ * 写入图片映射表：内存立即写，KV 最多 10 分钟写一次。
+ * 原实现是空函数，导致每个新 isolate 都重新补图。
+ */
 function saveImageMap(env, ctx, key, map) {
-  // 什么都不做，mem 层已经在 attachXxx 里通过 kvMemSet 维护
-  // 保留函数签名，避免调用处改动
+  if (!key || !map || typeof map !== "object") return;
+
   const ks = Object.keys(map);
   if (ks.length > 400) {
     for (let i = 0; i < ks.length - 400; i++) delete map[ks[i]];
   }
+
+  const now = Date.now();
+  const payload = { data: map, _ts: now, _ttl: IMG_MAP_KV_TTL };
+  kvMemSet(key, payload, KV_MEM_TTL);
+
+  if (!env || !env.TMDB_CACHE || kvIsDown()) return;
+
+  const last = __IMG_MAP_LAST_PUT.get(key) || 0;
+  if (last && now - last < IMG_MAP_MIN_PUT_INTERVAL_MS) return;
+  __IMG_MAP_LAST_PUT.set(key, now);
+
+  if (__IMG_MAP_LAST_PUT.size > 1000) {
+    const it = __IMG_MAP_LAST_PUT.keys();
+    for (let i = 0; i < 200; i++) {
+      const k = it.next().value;
+      if (k) __IMG_MAP_LAST_PUT.delete(k);
+    }
+  }
+
+  const p = env.TMDB_CACHE.put(key, JSON.stringify(payload), {
+    expirationTtl: IMG_MAP_KV_TTL + KV_STALE_RETENTION,
+  })
+    .then(() => kvMarkUp())
+    .catch(() => {
+      kvMarkDown();
+    });
+
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
+  else p.catch(() => {});
 }
 
 /** 继续观看条目的图片缓存 key */
@@ -2775,7 +2828,10 @@ function calendarToLocalContinue(
 ) {
   if (!Array.isArray(calendar) || !calendar.length) return [];
   const now = nowMs != null ? nowMs : Date.now();
-  const windowMs = 6 * 3600 * 1000;
+  // 即将：未来 12h；正在播：开播后约 2h；已播出未看：开播后 2h～24h
+  const upcomingWindowMs = 6 * 3600 * 1000;
+  const airingWindowMs = 2 * 3600 * 1000;
+  const airedWindowMs = 24 * 3600 * 1000;
   const dropped =
     droppedIds instanceof Set
       ? droppedIds
@@ -2793,21 +2849,33 @@ function calendarToLocalContinue(
     if (!item || !item.show || !item.episode) continue;
     const fa = item.first_aired ? Date.parse(item.first_aired) : NaN;
     if (!Number.isFinite(fa)) continue;
-    if (fa < now || fa - now > windowMs) continue;
     const show = item.show;
     const ep = item.episode;
     const sid = show.ids && show.ids.trakt;
     const epid = ep.ids && ep.ids.trakt;
     if (sid == null) continue;
     if (dropped && dropped.has(Number(sid))) continue;
+    // 已看过这一集 → 不展示
     if (epid != null && watched && watched.has(Number(epid))) continue;
+
+    let status = null; // upcoming | airing | aired
+    if (fa > now) {
+      if (fa - now <= upcomingWindowMs) status = "upcoming";
+    } else {
+      const ago = now - fa;
+      if (ago <= airingWindowMs) status = "airing";
+      else if (ago <= airedWindowMs) status = "aired";
+    }
+    if (!status) continue;
+
     const entry = {
       show,
       episode: ep,
       paused_at: item.first_aired,
       last_watched_at: item.first_aired,
-      __localAired: true,
-      __localUpcoming: true,
+      __localUpcoming: status === "upcoming",
+      __localAired: status === "aired" || status === "airing",
+      __localAirStatus: status,
       __firstAired: item.first_aired,
     };
     if (
@@ -3087,10 +3155,18 @@ function applyRewatchFlags(list, watchedEpIds) {
   return list;
 }
 
-/** 批量为继续观看补 still/海报 */
-async function attachContinueStillsForPlayback(list, env, ctx, userKey) {
+async function attachContinueStillsForPlayback(
+  list,
+  env,
+  ctx,
+  userKey,
+  opts = {},
+) {
   if (!env || !env.TMDB_API_KEY || !Array.isArray(list) || !list.length)
     return list;
+
+  const maxFetch =
+    opts.maxFetch != null ? Math.max(0, Number(opts.maxFetch) || 0) : 20;
 
   const imgKey = CK.pbImages(userKey || "anon");
   const imgMap = await loadImageMap(env, imgKey);
@@ -3098,6 +3174,7 @@ async function attachContinueStillsForPlayback(list, env, ctx, userKey) {
   const normalized = [];
   for (const entry of list) {
     if (!entry) continue;
+
     if (entry.movie && entry.movie.ids && entry.movie.ids.tmdb) {
       const j = {
         entry,
@@ -3108,9 +3185,12 @@ async function attachContinueStillsForPlayback(list, env, ctx, userKey) {
         kind: "movie",
         k: pbImageKey(entry),
       };
-      if (!applyPbImage(j, imgMap)) normalized.push(j);
+      if (!applyPbImage(j, imgMap) && normalized.length < maxFetch) {
+        normalized.push(j);
+      }
       continue;
     }
+
     let ep = null,
       show = null;
     if (entry.episode && entry.show) {
@@ -3124,8 +3204,10 @@ async function attachContinueStillsForPlayback(list, env, ctx, userKey) {
     } else {
       continue;
     }
+
     const tmdbId = show && show.ids && show.ids.tmdb;
     if (!tmdbId) continue;
+
     const season = ep
       ? ep.season != null
         ? ep.season
@@ -3136,6 +3218,7 @@ async function attachContinueStillsForPlayback(list, env, ctx, userKey) {
         ? ep.number
         : ep.episode_number
       : null;
+
     const j = {
       entry,
       ep,
@@ -3145,7 +3228,9 @@ async function attachContinueStillsForPlayback(list, env, ctx, userKey) {
       kind: "tv",
       k: pbImageKey(entry),
     };
-    if (!applyPbImage(j, imgMap)) normalized.push(j);
+    if (!applyPbImage(j, imgMap) && normalized.length < maxFetch) {
+      normalized.push(j);
+    }
   }
 
   if (!normalized.length) return list;
@@ -3153,6 +3238,7 @@ async function attachContinueStillsForPlayback(list, env, ctx, userKey) {
   const seasonKey = (id, s) => id + ":" + s;
   const seasonMaps = new Map();
   const needSeasons = [];
+
   for (const j of normalized) {
     if (j.kind !== "tv" || j.season == null) continue;
     const k = seasonKey(j.tmdbId, j.season);
@@ -3161,6 +3247,7 @@ async function attachContinueStillsForPlayback(list, env, ctx, userKey) {
       needSeasons.push({ k, tmdbId: j.tmdbId, season: j.season });
     }
   }
+
   const batch = 5;
   for (let i = 0; i < needSeasons.length; i += batch) {
     const slice = needSeasons.slice(i, i + batch);
@@ -3203,6 +3290,7 @@ async function attachContinueStillsForPlayback(list, env, ctx, userKey) {
         }
         j.entry.__tmdbId = j.tmdbId;
         if (j.ep) j.ep.__tmdbId = j.tmdbId;
+
         const zh = await tmdbZhTitle(
           j.kind === "movie" ? "movie" : "tv",
           j.tmdbId,
@@ -3242,9 +3330,11 @@ async function attachContinueStillsForPlayback(list, env, ctx, userKey) {
 }
 
 /** 为历史/列表条目补海报 */
-async function attachEntityPosters(list, env, ctx, imgKey) {
+async function attachEntityPosters(list, env, ctx, imgKey, maxFetch = 30) {
   if (!env || !Array.isArray(list) || !list.length) return list;
   if (!env.TMDB_API_KEY) return list;
+
+  const limit = maxFetch != null ? Math.max(0, Number(maxFetch) || 0) : 30;
 
   const map = await loadImageMap(env, imgKey);
   let dirty = false;
@@ -3256,6 +3346,7 @@ async function attachEntityPosters(list, env, ctx, imgKey) {
     if (!entity) continue;
     const tmdbId = entity.ids && entity.ids.tmdb;
     if (!tmdbId) continue;
+
     const isMovie = !!item.movie;
     const kind = isMovie ? "movie" : "tv";
     const k = (isMovie ? "m:" : "s:") + tmdbId;
@@ -3265,6 +3356,8 @@ async function attachEntityPosters(list, env, ctx, imgKey) {
       item.__posterUrl = map[k].p;
       continue;
     }
+
+    if (jobs.length >= limit) continue;
     jobs.push({ item, entity, tmdbId, kind, k });
   }
 
@@ -3300,8 +3393,13 @@ async function attachEntityPosters(list, env, ctx, imgKey) {
 }
 
 /** 待看列表补图 */
-async function attachWatchlistStills(list, env, ctx, userKey) {
+async function attachWatchlistStills(list, env, ctx, userKey, opts = {}) {
   if (!env || !Array.isArray(list) || !list.length) return list;
+
+  const maxFetch =
+    opts.maxFetch != null
+      ? Math.max(0, Number(opts.maxFetch) || 0)
+      : WATCHLIST_PAGE_SIZE;
 
   const imgKey = CK.wlImages(userKey || "anon");
   const imgMap = await loadImageMap(env, imgKey);
@@ -3309,6 +3407,7 @@ async function attachWatchlistStills(list, env, ctx, userKey) {
 
   if (env.TMDB_API_KEY) {
     const posterJobs = [];
+
     for (const item of list) {
       if (!item) continue;
       const movie = item.movie;
@@ -3328,8 +3427,10 @@ async function attachWatchlistStills(list, env, ctx, userKey) {
         continue;
       }
 
+      if (posterJobs.length >= maxFetch) continue;
       posterJobs.push({ item, entity, tmdbId, kind, k });
     }
+
     for (let i = 0; i < posterJobs.length; i += 6) {
       const slice = posterJobs.slice(i, i + 6);
       await Promise.all(
@@ -3360,24 +3461,30 @@ async function attachWatchlistStills(list, env, ctx, userKey) {
 
   if (env.TMDB_API_KEY) {
     const jobs = [];
+
     for (const item of list) {
       if (!item || !item.episode || !item.show) continue;
       if (item.__stillUrl || (item.episode && item.episode.__stillUrl))
         continue;
+
       const ep = item.episode;
       const show = item.show;
       const tmdbId = show.ids && show.ids.tmdb;
       const season = ep.season != null ? ep.season : ep.season_number;
       const number = ep.number != null ? ep.number : ep.episode_number;
       if (!tmdbId || season == null || number == null) continue;
+
       const k = pbImageKey(item);
       if (k && imgMap[k] && imgMap[k].s) {
         item.__stillUrl = imgMap[k].s;
         ep.__stillUrl = imgMap[k].s;
         continue;
       }
+
+      if (jobs.length >= maxFetch) continue;
       jobs.push({ item, ep, tmdbId, season, number, k });
     }
+
     for (let i = 0; i < jobs.length; i += 6) {
       const slice = jobs.slice(i, i + 6);
       await Promise.all(
@@ -3433,6 +3540,37 @@ function mapTmdbItem(r, typeHint) {
   };
 }
 
+/** 豆瓣/骨朵榜单：空数据不写 KV */
+function isUsableBoardPayload(data) {
+  if (data == null) return false;
+  if (Array.isArray(data)) return data.length > 0;
+  if (typeof data !== "object") return false;
+  try {
+    const keys = Object.keys(data);
+    if (!keys.length) return false;
+    for (const k of keys) {
+      const v = data[k];
+      if (Array.isArray(v) && v.length > 0) return true;
+      if (v && typeof v === "object" && !Array.isArray(v)) {
+        const sub = Object.keys(v);
+        if (sub.length) {
+          for (const sk of sub) {
+            const sv = v[sk];
+            if (Array.isArray(sv) && sv.length > 0) return true;
+            if (sv && typeof sv === "object") return true;
+            if (sv != null && sv !== "") return true;
+          }
+        }
+      } else if (v != null && v !== "" && !Array.isArray(v)) {
+        return true;
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 /** 拉取豆瓣热榜原始数据 */
 async function getDoubanRaw(env, ctx, force) {
   return cachedJSON(
@@ -3443,7 +3581,10 @@ async function getDoubanRaw(env, ctx, force) {
       try {
         const r = await fetchT(DOUBAN_API, {}, 10000);
         if (!r.ok) return null;
-        return await r.json();
+        const data = await r.json();
+        // 空数据不写 KV（返回 null → 走 error/fallback，不 writeFresh）
+        if (!isUsableBoardPayload(data)) return null;
+        return data;
       } catch {
         return null;
       }
@@ -3451,7 +3592,8 @@ async function getDoubanRaw(env, ctx, force) {
     {
       ttl: DOUBAN_KV_TTL,
       missTtl: 600,
-      swr: force ? false : 57600,
+      // 约一半 TTL 起后台刷新，硬过期 6h
+      swr: force ? false : true,
       jitter: 300,
       bypass: !!force,
       revalidate: !!force,
@@ -3648,10 +3790,16 @@ function walkNode(node, platform, out) {
   }
 }
 
+function normalizeTheaterPlatformName(name) {
+  if (!name) return "";
+  const s = String(name).trim();
+  if (s === "玛卡巴卡的悬疑剧") return "悬疑剧";
+  return s;
+}
+
 function theaterPlatformOf(x) {
   if (!x) return "";
-  if (x.__platform)
-    return x.__platform === "玛卡巴卡的悬疑剧" ? "悬疑剧" : x.__platform;
+  if (x.__platform) return normalizeTheaterPlatformName(x.__platform);
 
   const candidates = [
     x.platform,
@@ -3668,8 +3816,7 @@ function theaterPlatformOf(x) {
   ];
   for (const c of candidates) {
     if (typeof c === "string" && c.trim()) {
-      const s = c.trim();
-      return s === "玛卡巴卡的悬疑剧" ? "悬疑剧" : s;
+      return normalizeTheaterPlatformName(c);
     }
   }
   return "";
@@ -3817,6 +3964,29 @@ async function handleTheaterList(request, env, ctx) {
     );
   }
 
+  if (mode === "previews") {
+    const names =
+      typeof THEATER_PLATFORMS !== "undefined" &&
+      Array.isArray(THEATER_PLATFORMS)
+        ? THEATER_PLATFORMS
+        : getTheaterPlatforms(data).map((n) => ({ id: n, name: n }));
+    const previews = {};
+    for (const p of names) {
+      const key = p.id || p.name || p;
+      const items = pickTheaterSection(data, key);
+      previews[key] = items
+        .map((x) => x.poster)
+        .filter(Boolean)
+        .slice(0, 4);
+    }
+    return new Response(JSON.stringify({ previews }), {
+      headers: {
+        "Content-Type": CT_JSON,
+        "Cache-Control": CC_API,
+      },
+    });
+  }
+
   const html = renderTheaterItems(pickTheaterSection(data, platform));
   return listResp(html, mode, outHeaders);
 }
@@ -3831,7 +4001,9 @@ async function getGuduoRaw(env, ctx, force) {
       try {
         const r = await fetchT(GUDUO_API, {}, 10000);
         if (!r.ok) return null;
-        return await r.json();
+        const data = await r.json();
+        if (!isUsableBoardPayload(data)) return null;
+        return data;
       } catch {
         return null;
       }
@@ -3839,7 +4011,7 @@ async function getGuduoRaw(env, ctx, force) {
     {
       ttl: GUDUO_KV_TTL,
       missTtl: 600,
-      swr: force ? false : 57600,
+      swr: force ? false : true,
       jitter: 300,
       bypass: !!force,
       revalidate: !!force,
@@ -4917,13 +5089,11 @@ async function handleMarkWatched(request, env, ctx) {
         __kvLastPut.delete(k);
       }
 
-      if (env && env.TMDB_CACHE) {
-        const p = Promise.all(
-          keysToBust.map((k) => env.TMDB_CACHE.delete(k).catch(() => {})),
-        );
-        if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
-        else p.catch(() => {});
-      }
+      safeDeleteKvKeys(
+        env,
+        ctx,
+        keysToBust.concat([userStateCacheKey(userKey)]),
+      );
 
       bustHomeUserCaches(userKey, env, ctx);
     },
@@ -5168,6 +5338,7 @@ async function handleHideContinue(request, env, ctx) {
   map[String(showId)] = { s, e, at: hideAt };
   kvMemSet(CK.cwHide(userKey), { data: map, _ts: hideAt }, 86400 * 30 * 1000);
   putCwHideMap(env, ctx, userKey, map);
+  bustUserStateBundle(userKey, env, ctx);
 
   if (userKey) {
     for (const k of [...__kvMem.keys()]) {
@@ -5181,16 +5352,12 @@ async function handleHideContinue(request, env, ctx) {
         __kvMemExp.delete(k);
       }
     }
-    if (env && env.TMDB_CACHE) {
-      const dels = [
-        CK.playback(userKey),
-        CK.morePlayback(userKey, 1, 20),
-        CK.morePlayback(userKey, 1, 30),
-      ].map((k) => env.TMDB_CACHE.delete(k).catch(() => {}));
-      if (ctx && typeof ctx.waitUntil === "function")
-        ctx.waitUntil(Promise.all(dels));
-      else Promise.all(dels).catch(() => {});
-    }
+    safeDeleteKvKeys(env, ctx, [
+      CK.playback(userKey),
+      CK.morePlayback(userKey, 1, 20),
+      CK.morePlayback(userKey, 1, 30),
+      userStateCacheKey(userKey),
+    ]);
   }
 
   return authJson(auth, needsCookieUpdate, {
@@ -5291,12 +5458,12 @@ async function handleDropShow(request, env, ctx) {
     __droppedShowIdsMem.set(dropKey, { ids: nextIds, ts: Date.now() });
 
     if (env && env.TMDB_CACHE) {
-      const dels = [calKey, CK.playback(userKey), `act:${userKey}`].map((k) =>
-        env.TMDB_CACHE.delete(k).catch(() => {}),
-      );
-      if (ctx && typeof ctx.waitUntil === "function")
-        ctx.waitUntil(Promise.all(dels));
-      else Promise.all(dels).catch(() => {});
+      safeDeleteKvKeys(env, ctx, [
+        calKey,
+        CK.playback(userKey),
+        `act:${userKey}`,
+        userStateCacheKey(userKey),
+      ]);
     }
   }
 
@@ -5409,21 +5576,28 @@ async function handleSummary(request, env, ctx) {
   }
 
   const cacheKey = `sum2:${userKey}:${period}:${ref}`;
+  // 写入 KV（不要 memOnly），冷启动/限流时也能显示上次成功的小结
   const data = await cachedJSON(
     env,
     ctx,
     cacheKey,
     () => buildSummary(headers, period, ref, env, ctx, userKey),
     {
-      ttl: 21600,
-      missTtl: 600,
-      swr: 10800,
-      memOnly: true,
+      ttl: 604800, // 7 天
+      missTtl: 300,
+      swr: 86400, // 过期后 1 天内仍可 SWR 后台刷新
+      unwrap: true,
       jitter: 600,
+      lastGoodKey: "lg:" + cacheKey,
     },
   );
 
-  return authJson(auth, needsCookieUpdate, data || { error: "empty" });
+  if (!data || data.__error) {
+    return authJson(auth, needsCookieUpdate, {
+      error: (data && data.__error) || "empty",
+    });
+  }
+  return authJson(auth, needsCookieUpdate, data);
 }
 
 function summaryRange(period, ref) {
@@ -5993,6 +6167,135 @@ async function getDroppedShowIds(headers, env, ctx, userKey) {
   return new Set();
 }
 
+const USER_STATE_KV_TTL = 300;
+
+function userStateCacheKey(userKey) {
+  return `us:v1:${userKey || "anon"}`;
+}
+
+function droppedStateToSet(state) {
+  const arr = state && Array.isArray(state.droppedIds) ? state.droppedIds : [];
+  return new Set(arr.map(Number).filter(Number.isFinite));
+}
+
+function watchedStateToSet(watched) {
+  const ids =
+    watched && Array.isArray(watched.ids)
+      ? watched.ids
+      : Array.isArray(watched)
+        ? watched
+        : [];
+  const set = new Set(ids.map(Number).filter(Number.isFinite));
+  if (watched && watched.showLastAt && typeof watched.showLastAt === "object") {
+    set.__showLastAt = watched.showLastAt;
+  }
+  return set;
+}
+
+/**
+ * 聚合用户状态：弃看 + 已看集 + 继续观看隐藏表。
+ * 冷启动从 3 个 KV 读降为 1 个；写操作后调用 bustUserStateBundle。
+ */
+async function getUserStateBundle(headers, env, ctx, userKey, force = false) {
+  const key = userStateCacheKey(userKey);
+
+  const data = await cachedJSON(
+    env,
+    ctx,
+    key,
+    async () => {
+      const [droppedSet, watchedRaw, hideMapRaw] = await Promise.all([
+        getDroppedShowIds(headers, env, ctx, userKey).catch(() => new Set()),
+        getWatchedEpisodeIds(headers, env, ctx, userKey).catch(() => null),
+        getCwHideMap(env, ctx, userKey).catch(() => ({})),
+      ]);
+
+      let watched = { ids: [], showLastAt: {} };
+      if (watchedRaw instanceof Set) {
+        watched = {
+          ids: [...watchedRaw].map(Number),
+          showLastAt: watchedRaw.__showLastAt || {},
+        };
+      } else if (watchedRaw && Array.isArray(watchedRaw.ids)) {
+        watched = {
+          ids: watchedRaw.ids.map(Number),
+          showLastAt: watchedRaw.showLastAt || {},
+        };
+      } else if (Array.isArray(watchedRaw)) {
+        watched = { ids: watchedRaw.map(Number), showLastAt: {} };
+      }
+
+      return {
+        droppedIds: droppedSet ? [...droppedSet].map(Number) : [],
+        watched,
+        hideMap:
+          hideMapRaw &&
+          typeof hideMapRaw === "object" &&
+          !Array.isArray(hideMapRaw)
+            ? hideMapRaw
+            : {},
+      };
+    },
+    {
+      ttl: USER_STATE_KV_TTL,
+      missTtl: 60,
+      swr: true,
+      edgeTtl: 120,
+      jitter: 60,
+      unwrap: true,
+      bypass: !!force,
+      revalidate: !!force,
+      minWriteGapMs: 5 * 60 * 1000,
+    },
+  );
+
+  if (!data) {
+    return {
+      droppedIds: [],
+      watched: { ids: [], showLastAt: {} },
+      hideMap: {},
+    };
+  }
+  return data;
+}
+
+function bustUserStateBundle(userKey, env, ctx) {
+  if (!userKey) return;
+  const key = userStateCacheKey(userKey);
+  __kvMem.delete(key);
+  __kvMemExp.delete(key);
+  __kvMemStale.delete(key);
+  __kvLastPut.delete(key);
+
+  safeDeleteKvKeys(env, ctx, [seasonKey, userStateCacheKey(userKey)]);
+}
+
+/**
+ * 统一批量删除 KV，清理内存、去重、不阻塞主流程。
+ */
+function safeDeleteKvKeys(env, ctx, keys) {
+  const list = [...new Set((keys || []).filter(Boolean))];
+  if (!list.length) return;
+
+  for (const k of list) {
+    __kvMem.delete(k);
+    __kvMemExp.delete(k);
+    __kvMemStale.delete(k);
+    __kvLastPut.delete(k);
+  }
+
+  if (!env || !env.TMDB_CACHE) return;
+
+  const p = Promise.allSettled(list.map((k) => env.TMDB_CACHE.delete(k)))
+    .then(() => kvMarkUp())
+    .catch(() => {
+      kvMarkDown();
+    });
+
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
+  else p.catch(() => {});
+}
+
 /**
  * 已看剧集 ID 集合 + 各剧最新观看时间（用于剔除过期暂停）。
  * 返回 Set of episode trakt ids，并挂 __showLastAt: { [showTraktId]: ms }。
@@ -6417,11 +6720,15 @@ async function handleHomeData(request, env, ctx) {
             };
           }
 
-          const [droppedSet, watchedEpIds, hideMapRaw] = await Promise.all([
-            getDroppedShowIds(headers, env, ctx, userKey).catch(() => null),
-            getWatchedEpisodeIds(headers, env, ctx, userKey).catch(() => null),
-            getCwHideMap(env, ctx, userKey).catch(() => ({})),
-          ]);
+          const userState = await getUserStateBundle(
+            headers,
+            env,
+            ctx,
+            userKey,
+          );
+          const droppedSet = droppedStateToSet(userState);
+          const watchedEpIds = watchedStateToSet(userState.watched);
+          const hideMapRaw = userState.hideMap || {};
           const hideMap =
             hideMapRaw &&
             typeof hideMapRaw === "object" &&
@@ -6458,17 +6765,44 @@ async function handleHomeData(request, env, ctx) {
           applyRewatchFlags(merged, watchedEpIds);
           dbg.items = merged.length;
           dbg.dropped = droppedSet ? droppedSet.size : 0;
+          {
+            const nowTs = Date.now();
+            const meta = {
+              pauseUpdatedAt: nowTs,
+              continueUpdatedAt: nowTs,
+            };
+            try {
+              __cwTimeMem.set(userKey, meta);
+            } catch {}
+            try {
+              kvMemSet("cwmeta:" + userKey, { data: meta }, 86400 * 14 * 1000);
+            } catch {}
+            try {
+              kvPutJSON(
+                env,
+                ctx,
+                "cwmeta:" + userKey,
+                { data: meta },
+                86400 * 14,
+                false,
+                true,
+              );
+            } catch {}
+            Object.defineProperty(merged, "__cwMeta", {
+              value: meta,
+              enumerable: false,
+            });
+          }
           return merged;
         },
-        {
+        cacheUser({
           ...(pbBypass
             ? { bypass: true, revalidate: true, memOnlyOnBypass: !force }
             : { revalidate: false, swr: false }),
-          ...CACHE_USER_LONG,
           ttl: PLAYBACK_KV_TTL,
           sourceTracker: playbackSrc,
           lastGoodKey: CK.lastGood.playback(userKey),
-        },
+        }),
       );
       try {
         if (!Array.isArray(playback)) playback = [];
@@ -6479,20 +6813,19 @@ async function handleHomeData(request, env, ctx) {
         const todayBJ = new Date(Date.now() + 8 * 3600 * 1000)
           .toISOString()
           .slice(0, 10);
-        const [droppedSet, freshWatched, hideMapRaw, cal] = await Promise.all([
-          getDroppedShowIds(headers, env, ctx, userKey).catch(() => null),
-          getWatchedEpisodeIds(headers, env, ctx, userKey).catch(() => null),
-          getCwHideMap(env, ctx, userKey).catch(() => ({})),
-          getCalendarCached(
-            todayBJ,
-            headers,
-            env,
-            ctx,
-            userKey,
-            false,
-            null,
-          ).catch(() => null),
-        ]);
+        const userState2 = await getUserStateBundle(headers, env, ctx, userKey);
+        const droppedSet = droppedStateToSet(userState2);
+        const freshWatched = watchedStateToSet(userState2.watched);
+        const hideMapRaw = userState2.hideMap || {};
+        const cal = await getCalendarCached(
+          todayBJ,
+          headers,
+          env,
+          ctx,
+          userKey,
+          false,
+          null,
+        ).catch(() => null);
         const hideMap =
           hideMapRaw &&
           typeof hideMapRaw === "object" &&
@@ -6669,6 +7002,9 @@ async function handleHomeData(request, env, ctx) {
         opts({
           ...CACHE_USER_META,
           ttl: STATS_KV_TTL,
+          lastGoodKey: CK.lastGood.stats
+            ? CK.lastGood.stats(userKey)
+            : "lg:stats:" + userKey,
         }),
       );
     });
@@ -6709,7 +7045,9 @@ async function handleHomeData(request, env, ctx) {
   if (wantPlayback) {
     const pbList = Array.isArray(playback) ? playback : [];
     try {
-      await attachContinueStillsForPlayback(pbList, env, ctx, userKey);
+      await attachContinueStillsForPlayback(pbList, env, ctx, userKey, {
+        maxFetch: 20,
+      });
       result.playbackHScrollHtml = renderContinueItems(pbList, "hscroll");
     } catch {
       result.playbackHScrollHtml =
@@ -6724,15 +7062,20 @@ async function handleHomeData(request, env, ctx) {
 
     let playbackAgeSec = 0;
     let playbackDataTs = 0;
+    let playbackTsSource = null;
+
+    // 数据更新时间 = 从 Trakt 拉到并写入缓存的时间（不是 last_watched）
     if (userUpdatedAt) {
       playbackDataTs = Number(userUpdatedAt) || 0;
       playbackAgeSec = Math.max(
         0,
         Math.round((Date.now() - playbackDataTs) / 1000),
       );
+      playbackTsSource = "live";
     } else if (typeof playbackSrc.age === "number") {
       playbackAgeSec = playbackSrc.age || 0;
       playbackDataTs = Date.now() - playbackAgeSec * 1000;
+      playbackTsSource = "cache-age";
     }
     try {
       const mem = kvMemGet(CK.playback(userKey));
@@ -6742,20 +7085,87 @@ async function handleHomeData(request, env, ctx) {
           0,
           Math.round((Date.now() - playbackDataTs) / 1000),
         );
+        playbackTsSource = userUpdatedAt ? "live" : "cache-ts";
       }
     } catch {}
+
     result.playbackAgeSec = playbackAgeSec;
     result.playbackDataTs = playbackDataTs || null;
+    result.playbackTsSource = playbackTsSource;
 
-    result.playbackDebug = {
+    // 继续观看 / 播放进度 同步时间（内存 → KV → 缓存 _ts，保证多端尽量一致）
+    let pauseUpdatedAt = null;
+    let continueUpdatedAt = null;
+    try {
+      const metaMem = __cwTimeMem.get(userKey);
+      if (metaMem) {
+        if (metaMem.pauseUpdatedAt)
+          pauseUpdatedAt = Number(metaMem.pauseUpdatedAt) || null;
+        if (metaMem.continueUpdatedAt)
+          continueUpdatedAt = Number(metaMem.continueUpdatedAt) || null;
+      }
+    } catch {}
+    try {
+      if (playback && playback.__cwMeta) {
+        if (playback.__cwMeta.pauseUpdatedAt)
+          pauseUpdatedAt =
+            Number(playback.__cwMeta.pauseUpdatedAt) || pauseUpdatedAt;
+        if (playback.__cwMeta.continueUpdatedAt)
+          continueUpdatedAt =
+            Number(playback.__cwMeta.continueUpdatedAt) || continueUpdatedAt;
+      }
+    } catch {}
+    if (!pauseUpdatedAt || !continueUpdatedAt) {
+      try {
+        const memMeta = kvMemGet("cwmeta:" + userKey);
+        const m =
+          memMeta && memMeta.data && typeof memMeta.data === "object"
+            ? memMeta.data
+            : memMeta;
+        if (m && typeof m === "object") {
+          if (!pauseUpdatedAt && m.pauseUpdatedAt)
+            pauseUpdatedAt = Number(m.pauseUpdatedAt) || null;
+          if (!continueUpdatedAt && m.continueUpdatedAt)
+            continueUpdatedAt = Number(m.continueUpdatedAt) || null;
+        }
+      } catch {}
+    }
+    if (!continueUpdatedAt && playbackDataTs)
+      continueUpdatedAt = playbackDataTs;
+    if (!pauseUpdatedAt && playbackDataTs) pauseUpdatedAt = playbackDataTs;
+    if (userUpdatedAt) {
+      if (!pauseUpdatedAt) pauseUpdatedAt = userUpdatedAt;
+      if (!continueUpdatedAt) continueUpdatedAt = userUpdatedAt;
+      try {
+        __cwTimeMem.set(userKey, {
+          pauseUpdatedAt: pauseUpdatedAt || userUpdatedAt,
+          continueUpdatedAt: continueUpdatedAt || userUpdatedAt,
+        });
+      } catch {}
+    }
+    result.pauseUpdatedAt = pauseUpdatedAt || null;
+    result.continueUpdatedAt = continueUpdatedAt || null;
+    result.syncMeta = {
+      pause: pauseUpdatedAt || null,
+      continue: continueUpdatedAt || null,
+      dataTs: playbackDataTs || null,
       source: result.playbackSource || null,
-      ageSec: result.playbackAgeSec,
-      dataTs: result.playbackDataTs,
-      userUpdatedAt: userUpdatedAt || null,
-      items: Array.isArray(playback) ? playback.length : null,
-      lastActivity: actSig && actSig.playbackTs ? actSig.playbackTs : null,
-      ...(playbackSrc.debug || {}),
     };
+
+    if (url.searchParams.get("debug") === "1") {
+      result.playbackDebug = {
+        source: result.playbackSource || null,
+        ageSec: result.playbackAgeSec,
+        dataTs: result.playbackDataTs,
+        tsSource: playbackTsSource,
+        pauseUpdatedAt: result.pauseUpdatedAt,
+        continueUpdatedAt: result.continueUpdatedAt,
+        userUpdatedAt: userUpdatedAt || null,
+        items: Array.isArray(playback) ? playback.length : null,
+        lastActivity: actSig && actSig.playbackTs ? actSig.playbackTs : null,
+        ...(playbackSrc.debug || {}),
+      };
+    }
   }
 
   if (wantMeta) {
@@ -6823,12 +7233,12 @@ async function handleHomeData(request, env, ctx) {
           ? history.items
           : null;
 
-      // ★ 修复：服务端补图，让观看记录不依赖客户端 enrich
       await attachEntityPosters(
         historyItems,
         env,
         ctx,
         CK.histImages(userKey),
+        20,
       ).catch(() => {});
 
       let historyPageCount = 1;
@@ -6863,12 +7273,13 @@ async function handleHomeData(request, env, ctx) {
           });
         }
       }
-      // ★ 修复：服务端补图，让追剧日历不依赖客户端 enrich
+
       await attachEntityPosters(
         calFiltered,
         env,
         ctx,
         CK.calImages(userKey),
+        20,
       ).catch(() => {});
       result.calendarHtml = renderCalendarPage(calFiltered, env, {});
     } catch {
@@ -6884,7 +7295,9 @@ async function handleHomeData(request, env, ctx) {
         result.watchlistHtml = emptyWatchlistHtml();
       } else {
         const list = watchlist;
-        await attachWatchlistStills(list, env, ctx, userKey);
+        await attachWatchlistStills(list, env, ctx, userKey, {
+          maxFetch: WATCHLIST_PAGE_SIZE,
+        });
         const firstPage = list.slice(0, WATCHLIST_PAGE_SIZE),
           hasMore = list.length > WATCHLIST_PAGE_SIZE,
           cardsHtml = renderWatchlistItems(firstPage, env),
@@ -6965,15 +7378,95 @@ const HOME_PLATFORM_IDS = [
   "bilibili",
 ];
 
+/** 平台剧场入口（与流媒体同款卡片展示） */
+const THEATER_PLATFORMS = [
+  {
+    id: "X剧场",
+    name: "X剧场",
+    logo: "https://picui.ogmua.cn/s1/2026/10/26/6adece729dcad.webp",
+  },
+  {
+    id: "迷雾剧场",
+    name: "迷雾剧场",
+    logo: "https://picui.ogmua.cn/s1/2026/10/26/6adece725757e.webp",
+  },
+  {
+    id: "白夜剧场",
+    name: "白夜剧场",
+    logo: "https://picui.ogmua.cn/s1/2026/10/26/6adece7195f5a.webp",
+  },
+  {
+    id: "正午阳光",
+    name: "正午阳光",
+    logo: "https://picui.ogmua.cn/s1/2026/10/26/6adece7452614.webp",
+  },
+  {
+    id: "大家剧场",
+    name: "大家剧场",
+    logo: "https://picui.ogmua.cn/s1/2026/10/26/6adece757f1ff.webp",
+  },
+  {
+    id: "微尘剧场",
+    name: "微尘剧场",
+    logo: "https://picui.ogmua.cn/s1/2026/10/26/6adece75743b9.webp",
+  },
+  {
+    id: "恋恋剧场",
+    name: "恋恋剧场",
+    logo: "https://picui.ogmua.cn/s1/2026/10/26/6adece7551af6.webp",
+  },
+  {
+    id: "生花剧场",
+    name: "生花剧场",
+    logo: "https://picui.ogmua.cn/s1/2026/10/26/6adece73ce3ac.webp",
+  },
+  {
+    id: "板凳单元",
+    name: "板凳单元",
+    logo: "https://picui.ogmua.cn/s1/2026/10/26/6adece72a3dc6.webp",
+  },
+  {
+    id: "小逗剧场",
+    name: "小逗剧场",
+    logo: "https://picui.ogmua.cn/s1/2026/10/26/6adece763f652.webp",
+  },
+  {
+    id: "十分剧场",
+    name: "十分剧场",
+    logo: "https://picui.ogmua.cn/s1/2026/10/26/6adece76b8b4e.webp",
+  },
+  {
+    id: "横屏短剧",
+    name: "横屏短剧",
+    logo: "https://picui.ogmua.cn/s1/2026/10/26/6adece7501e53.webp",
+  },
+  {
+    id: "萤火单元",
+    name: "萤火单元",
+    logo: "https://picui.ogmua.cn/s1/2026/10/26/6adece733387d.webp",
+  },
+  {
+    id: "悬疑剧",
+    name: "悬疑剧",
+    logo: "https://picui.ogmua.cn/s1/2026/10/26/6adece732b0ad.webp",
+  },
+];
+
+function renderPlatformCard(p, extraAttr) {
+  const attr = extraAttr || `data-platform-id="${esc(p.id)}"`;
+  return `<button type="button" class="platform-card" ${attr} title="${esc(p.name)}"><div class="platform-card-left"><img class="platform-card-logo" src="${esc(p.logo)}" alt="" loading="lazy"><span class="platform-card-name">${esc(p.name)}</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="${esc(p.id)}"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button>`;
+}
+
 function renderPlatformRows() {
-  const card = (p) =>
-    `<button type="button" class="platform-card" data-platform-id="${p.id}" title="${p.name}"><div class="platform-card-left"><img class="platform-card-logo" src="${p.logo}" alt="" loading="lazy"><span class="platform-card-name">${p.name}</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="${p.id}"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button>`;
-
-  const row = (list) =>
-    `<div class="platform-row"><div class="platform-cards">${list.map(card).join("")}</div></div>`;
-
   const cards = HOME_PLATFORM_IDS.map((id) => PLATFORMS[id]).filter(Boolean);
-  return `<div class="platform-rows">${row(cards.slice(0, 5))}${row(cards.slice(5))}</div>`;
+  // 单行横向滚动
+  return `<div class="platform-rows"><div class="platform-row"><div class="platform-cards">${cards.map((p) => renderPlatformCard(p)).join("")}</div></div></div>`;
+}
+
+function renderTheaterPlatformRows() {
+  return `<div class="platform-rows theater-platform-rows"><div class="platform-row"><div class="platform-cards">${THEATER_PLATFORMS.map(
+    (p) => renderPlatformCard(p, `data-theater-platform="${esc(p.id)}"`),
+  ).join("")}</div></div></div>`;
 }
 
 /** 首页骨架 HTML */
@@ -6992,7 +7485,7 @@ function renderHomeSkeleton(initialDetail, profileHint) {
   const section = (id, title, extraHtml) =>
     `<div class="home-section"><div class="home-section-head"><h2 class="home-section-title">${title}</h2><button class="home-more-btn" type="button" onclick="openListModal('${id}')"><span>查看更多</span><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg></button></div>${extraHtml || ""}<div class="h-scroll-wrap"><div class="h-scroll" id="${id}-hscroll"><div class="pane-loading"><div class="spinner"></div></div></div></div></div>`;
 
-  return `<div class="container"><div class="top-sticky"><header class="hero"><div class="hero-left"><button type="button" class="hero-avatar" id="hero-avatar" title="观看小结" aria-label="打开观看小结">${heroAvatarHtml}</button><div class="hero-text"><h1 class="hero-name" id="hero-name">${heroName}</h1><p class="updated-at" id="updated-at" title="最近一次有数据变化的更新"></p></div></div><div class="hero-actions"><button class="btn-action" id="btn-refresh" onclick="forceRefresh()" title="刷新观看数据（豆瓣/热榜/平台等按日缓存，到期自动更新）"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg><span>刷新</span></button><button class="btn-action" id="btn-theme" onclick="cycleTheme()" title="主题：深色" aria-label="切换主题：深色"><span class="theme-icon" id="theme-icon"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></span><span>主题</span></button><button class="btn-action" id="btn-logout" onclick="logout()" title="退出登录"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg><span>退出</span></button></div></header><div class="stats" id="stats-box">${renderStatsHtml(null)}</div><nav class="tabs"><button class="tab active" data-tab="playback"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9.5 21v-6h5v6"/></svg><span>首页</span></button><button class="tab" data-tab="watchlist"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg><span>待看</span></button><button class="tab" data-tab="calendar"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg><span>日历</span></button><button class="tab" data-tab="history"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/></svg><span>记录</span></button><button class="tab" data-tab="search"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg><span>搜索</span></button></nav></div><section id="playback" class="pane active">${section("playback", "继续观看")}<div class="home-section platform-section"><div class="home-section-head"><h2 class="home-section-title">流媒体平台</h2></div>${renderPlatformRows()}${section("guduo", "骨朵热榜", '<div class="theater-home-tabs" id="guduo-home-tabs" style="display:none"></div>')}${section("theater", "平台剧场", '<div class="theater-home-tabs" id="theater-home-tabs" style="display:none"></div>')}${section("douban-domestic", "豆瓣热播国产剧")}${section("douban-hktw", "豆瓣热播港台剧")}${section("douban-jpkr", "豆瓣热播日韩剧")}${section("douban-western", "豆瓣热播欧美剧")}</section><section id="watchlist" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="calendar" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="history" class="pane"><div class="grid"></div><div id="history-more"></div></section><section id="search" class="pane"><div class="search-bar"><input id="search-input" class="search-input" type="search" placeholder="搜索电影 / 剧集" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></div><div id="search-results" class="grid"></div></section><div class="app-version">MineTrakt v${APP_JS_VERSION}</div></div><div id="list-modal" class="list-modal"><div class="list-modal-backdrop" onclick="closeListModal()"></div><div class="list-modal-panel"><div class="list-modal-head"><h3 class="list-modal-title" id="list-modal-title"></h3><button type="button" class="list-modal-close" onclick="closeListModal()" aria-label="关闭">×</button></div><div class="list-modal-body" id="list-modal-body"></div></div></div><div id="summary-modal" class="summary-modal" style="display:none" role="dialog" aria-modal="true" aria-label="观看小结"><div class="summary-backdrop" onclick="window.__closeSummary()"></div><div class="summary-panel"><div class="summary-head"><h2 class="summary-title">观看小结</h2><button type="button" class="summary-close" onclick="window.__closeSummary()" aria-label="关闭">×</button></div><div id="summary-modal-body" class="summary-body"><div class="pane-loading"><div class="spinner"></div></div></div></div></div><div id="person-modal" class="person-modal"><div class="person-backdrop" onclick="closePerson()"></div><div class="person-panel"><div class="person-panel-head"><div class="person-panel-name" id="person-modal-name"></div><button class="person-close" onclick="closePerson()" aria-label="关闭">×</button></div><div class="person-panel-body" id="person-modal-body"></div></div></div><div id="confirm-modal" class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title" style="display:none"><div class="confirm-backdrop"></div><div class="confirm-panel"><div class="confirm-icon" id="confirm-icon">?</div><div class="confirm-title" id="confirm-title"></div><div class="confirm-msg" id="confirm-msg"></div><div class="confirm-actions"><button class="confirm-btn confirm-cancel" id="confirm-cancel" type="button">取消</button><button class="confirm-btn confirm-ok" id="confirm-ok" type="button">确定</button></div></div></div><div id="modal" class="modal"><div class="modal-backdrop" onclick="closeDetail()"></div><div class="modal-panel"><div class="modal-shell"><button class="modal-close" onclick="closeDetail()" aria-label="关闭"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button><div class="modal-body" id="modal-body"></div></div></div></div><div id="show-cal-modal" class="show-cal-modal"><div class="show-cal-backdrop" onclick="closeShowCal()"></div><div class="show-cal-panel"><div class="show-cal-head"><div class="show-cal-name" id="show-cal-name"></div><button class="show-cal-close" onclick="closeShowCal()" aria-label="关闭">×</button></div><div class="show-cal-info" id="show-cal-info"></div><div class="show-cal-nav"><button onclick="calShiftMonth(-1)" aria-label="上个月">‹</button><div id="show-cal-month">—</div><button onclick="calShiftMonth(1)" aria-label="下个月">›</button></div><div class="show-cal-weekdays"><span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span></div><div class="show-cal-grid" id="show-cal-grid"></div><div class="show-cal-legend"><span class="legend-item"><i class="legend-dot legend-past"></i>已播出</span><span class="legend-item"><i class="legend-dot legend-today"></i>今天</span><span class="legend-item"><i class="legend-dot legend-future"></i>待播出</span></div><div class="show-cal-detail" id="show-cal-detail"></div></div></div><script src="/app.js?v=${APP_JS_VERSION}" defer><\/script>${boot}`;
+  return `<div class="container"><div class="top-sticky"><header class="hero"><div class="hero-left"><button type="button" class="hero-avatar" id="hero-avatar" title="观看小结" aria-label="打开观看小结">${heroAvatarHtml}</button><div class="hero-text"><h1 class="hero-name" id="hero-name">${heroName}</h1><p class="updated-at" id="updated-at" title="最近一次有数据变化的更新"></p></div></div><div class="hero-actions"><button class="btn-action" id="btn-refresh" onclick="forceRefresh()" title="刷新观看数据（豆瓣/热榜/平台等按日缓存，到期自动更新）"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg><span>刷新</span></button><button class="btn-action" id="btn-theme" onclick="cycleTheme()" title="主题：深色" aria-label="切换主题：深色"><span class="theme-icon" id="theme-icon"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></span><span>主题</span></button><button class="btn-action" id="btn-logout" onclick="logout()" title="退出登录"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg><span>退出</span></button></div></header><div class="stats" id="stats-box">${renderStatsHtml(null)}</div><nav class="tabs"><button class="tab active" data-tab="playback"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9.5 21v-6h5v6"/></svg><span>首页</span></button><button class="tab" data-tab="watchlist"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg><span>待看</span></button><button class="tab" data-tab="calendar"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg><span>日历</span></button><button class="tab" data-tab="history"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/></svg><span>记录</span></button><button class="tab" data-tab="search"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg><span>搜索</span></button></nav></div><section id="playback" class="pane active">${section("playback", "继续观看")}<div class="home-section platform-section"><div class="home-section-head"><h2 class="home-section-title">流媒体平台</h2></div>${renderPlatformRows()}<div class="home-section theater-platform-section"><div class="home-section-head"><h2 class="home-section-title">平台剧场</h2></div>${renderTheaterPlatformRows()}</div>${section("guduo", "骨朵热榜", '<div class="theater-home-tabs" id="guduo-home-tabs" style="display:none"></div>')}${section("douban-domestic", "豆瓣热播国产剧")}${section("douban-hktw", "豆瓣热播港台剧")}${section("douban-jpkr", "豆瓣热播日韩剧")}${section("douban-western", "豆瓣热播欧美剧")}</section><section id="watchlist" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="calendar" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="history" class="pane"><div class="grid"></div><div id="history-more"></div></section><section id="search" class="pane"><div class="search-bar"><input id="search-input" class="search-input" type="search" placeholder="搜索电影 / 剧集" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></div><div id="search-results" class="grid"></div></section><div class="app-version">MineTrakt v${APP_JS_VERSION}</div></div><div id="list-modal" class="list-modal"><div class="list-modal-backdrop" onclick="closeListModal()"></div><div class="list-modal-panel"><div class="list-modal-head"><h3 class="list-modal-title" id="list-modal-title"></h3><button type="button" class="list-modal-close" onclick="closeListModal()" aria-label="关闭">×</button></div><div class="list-modal-body" id="list-modal-body"></div></div></div><div id="summary-modal" class="summary-modal" style="display:none" role="dialog" aria-modal="true" aria-label="观看小结"><div class="summary-backdrop" onclick="window.__closeSummary()"></div><div class="summary-panel"><div class="summary-head"><h2 class="summary-title">观看小结</h2><button type="button" class="summary-close" onclick="window.__closeSummary()" aria-label="关闭">×</button></div><div id="summary-modal-body" class="summary-body"><div class="pane-loading"><div class="spinner"></div></div></div></div></div><div id="person-modal" class="person-modal"><div class="person-backdrop" onclick="closePerson()"></div><div class="person-panel"><div class="person-panel-head"><div class="person-panel-name" id="person-modal-name"></div><button class="person-close" onclick="closePerson()" aria-label="关闭">×</button></div><div class="person-panel-body" id="person-modal-body"></div></div></div><div id="confirm-modal" class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title" style="display:none"><div class="confirm-backdrop"></div><div class="confirm-panel"><div class="confirm-icon" id="confirm-icon">?</div><div class="confirm-title" id="confirm-title"></div><div class="confirm-msg" id="confirm-msg"></div><div class="confirm-actions"><button class="confirm-btn confirm-cancel" id="confirm-cancel" type="button">取消</button><button class="confirm-btn confirm-ok" id="confirm-ok" type="button">确定</button></div></div></div><div id="modal" class="modal"><div class="modal-backdrop" onclick="closeDetail()"></div><div class="modal-panel"><div class="modal-shell"><button class="modal-close" onclick="closeDetail()" aria-label="关闭"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button><div class="modal-body" id="modal-body"></div></div></div></div><div id="show-cal-modal" class="show-cal-modal"><div class="show-cal-backdrop" onclick="closeShowCal()"></div><div class="show-cal-panel"><div class="show-cal-head"><div class="show-cal-name" id="show-cal-name"></div><button class="show-cal-close" onclick="closeShowCal()" aria-label="关闭">×</button></div><div class="show-cal-info" id="show-cal-info"></div><div class="show-cal-nav"><button onclick="calShiftMonth(-1)" aria-label="上个月">‹</button><div id="show-cal-month">—</div><button onclick="calShiftMonth(1)" aria-label="下个月">›</button></div><div class="show-cal-weekdays"><span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span></div><div class="show-cal-grid" id="show-cal-grid"></div><div class="show-cal-legend"><span class="legend-item"><i class="legend-dot legend-past"></i>已播出</span><span class="legend-item"><i class="legend-dot legend-today"></i>今天</span><span class="legend-item"><i class="legend-dot legend-future"></i>待播出</span></div><div class="show-cal-detail" id="show-cal-detail"></div></div></div><script src="/app.js?v=${APP_JS_VERSION}" defer><\/script>${boot}`;
 }
 
 async function handleDetailExtras(request, env, ctx) {
@@ -8621,6 +9114,8 @@ function renderContinueItems(upNext, mode = "grid") {
     );
     let airTimeStr = "";
     let airRemainStr = "";
+    let airStatus =
+      item.__localAirStatus || (it.raw && it.raw.__localAirStatus) || "";
     if (isLocalUp) {
       const faIso =
         item.__firstAired ||
@@ -8631,23 +9126,48 @@ function renderContinueItems(upNext, mode = "grid") {
       if (Number.isFinite(faMs)) {
         const bj = new Date(faMs + 8 * 3600 * 1000);
         airTimeStr = `${String(bj.getUTCHours()).padStart(2, "0")}:${String(bj.getUTCMinutes()).padStart(2, "0")}`;
-        const diffMin = Math.max(0, Math.round((faMs - Date.now()) / 60000));
-        if (diffMin < 1) airRemainStr = "即将开始";
-        else if (diffMin < 60) airRemainStr = `还有 ${diffMin} 分钟`;
-        else {
-          const h = Math.floor(diffMin / 60);
-          const m = diffMin % 60;
-          airRemainStr = m ? `还有 ${h} 小时 ${m} 分钟` : `还有 ${h} 小时`;
+        const nowMs = Date.now();
+        if (!airStatus) {
+          if (faMs > nowMs) airStatus = "upcoming";
+          else if (nowMs - faMs <= 2 * 3600 * 1000) airStatus = "airing";
+          else airStatus = "aired";
+        }
+        if (airStatus === "upcoming") {
+          const diffMin = Math.max(0, Math.round((faMs - nowMs) / 60000));
+          if (diffMin < 1) airRemainStr = "马上播出";
+          else if (diffMin < 60) airRemainStr = `${diffMin} 分钟后`;
+          else {
+            const h = Math.floor(diffMin / 60);
+            const m = diffMin % 60;
+            airRemainStr = m ? `${h} 小时 ${m} 分后` : `${h} 小时后`;
+          }
+        } else if (airStatus === "airing") {
+          airRemainStr = "正在播出";
+        } else {
+          const agoMin = Math.max(0, Math.round((nowMs - faMs) / 60000));
+          if (agoMin < 60) airRemainStr = `${agoMin} 分钟前播出`;
+          else {
+            const h = Math.floor(agoMin / 60);
+            airRemainStr = `${h} 小时前播出`;
+          }
         }
       }
     }
+    const airStatusLabel =
+      airStatus === "airing"
+        ? "正在播出"
+        : airStatus === "aired"
+          ? "已播出"
+          : isLocalUp
+            ? "即将播出"
+            : "";
 
     let watchingLine = "";
     if (epLabel) {
       if (isLocalUp) {
         watchingLine = airTimeStr
-          ? `${epLabel} · 今天 ${airTimeStr} 播出`
-          : `即将播出 ${epLabel}${totalSuffix}`;
+          ? `${epLabel} · ${airStatusLabel} ${airTimeStr}`
+          : `${airStatusLabel} ${epLabel}${totalSuffix}`;
       } else if (it.source === "upnext") {
         watchingLine = `下一集 ${epLabel}${totalSuffix}`;
       } else if (item.__isRewatch) {
@@ -8662,8 +9182,9 @@ function renderContinueItems(upNext, mode = "grid") {
     }
 
     let progressLabel = "";
-    if (isLocalUp && airTimeStr) {
-      progressLabel = `今天 ${airTimeStr}`;
+    if (isLocalUp) {
+      progressLabel = airStatusLabel || "即将播出";
+      if (airTimeStr) progressLabel = `${progressLabel} ${airTimeStr}`;
     } else if (playPct != null) {
       progressLabel = `已看 ${playPct}%`;
     } else if (it.showProgress && it.showProgress.aired > 0) {
@@ -8673,7 +9194,7 @@ function renderContinueItems(upNext, mode = "grid") {
     }
 
     const relTime = isLocalUp
-      ? airRemainStr || "即将播出"
+      ? airRemainStr || airStatusLabel || "即将播出"
       : fmtRelative(it.sortKey) || "";
 
     let watchedType = null,
@@ -8768,20 +9289,6 @@ function renderContinueItems(upNext, mode = "grid") {
 
   if (mode === "hscroll") return parts.join("");
   return parts.join("");
-}
-
-function localAirStatus(firstAiredIso, nowMs) {
-  const t = firstAiredIso ? Date.parse(firstAiredIso) : NaN;
-  if (!Number.isFinite(t))
-    return { kind: "unknown", label: "", timeStr: "", airedAt: 0 };
-  const now = nowMs != null ? nowMs : Date.now();
-  const bj = new Date(t + 8 * 3600 * 1000);
-  const timeStr = `${String(bj.getUTCHours()).padStart(2, "0")}:${String(bj.getUTCMinutes()).padStart(2, "0")}`;
-  const diff = t - now;
-  if (diff <= 0) return { kind: "aired", label: "已播出", timeStr, airedAt: t };
-  if (diff <= 30 * 60 * 1000)
-    return { kind: "soon", label: "即将播出", timeStr, airedAt: t };
-  return { kind: "upcoming", label: timeStr, timeStr, airedAt: t };
 }
 
 function renderCalendarPage(calendar, env, zhTitles) {
@@ -9420,36 +9927,42 @@ async function injectLocalUpcomingIntoContinue(
   limit = 60,
 ) {
   if (!Array.isArray(list)) list = [];
-  // 先去掉旧的本地即将播出标记，再按当前日历重算
   list = list.filter((e) => !isLocalAirEntry(e));
+
   try {
     const todayBJ = new Date(Date.now() + 8 * 3600 * 1000)
       .toISOString()
       .slice(0, 10);
-    const [droppedSet, freshWatched, hideMapRaw, cal] = await Promise.all([
-      getDroppedShowIds(headers, env, ctx, userKey).catch(() => null),
-      getWatchedEpisodeIds(headers, env, ctx, userKey).catch(() => null),
-      getCwHideMap(env, ctx, userKey).catch(() => ({})),
-      getCalendarCached(todayBJ, headers, env, ctx, userKey, false, null).catch(
-        () => null,
-      ),
-    ]);
+
+    const userState = await getUserStateBundle(headers, env, ctx, userKey);
+    const droppedSet = droppedStateToSet(userState);
+    const freshWatched = watchedStateToSet(userState.watched);
     const hideMap =
-      hideMapRaw && typeof hideMapRaw === "object" && !Array.isArray(hideMapRaw)
-        ? hideMapRaw
+      userState.hideMap &&
+      typeof userState.hideMap === "object" &&
+      !Array.isArray(userState.hideMap)
+        ? userState.hideMap
         : {};
+
+    const cal = await getCalendarCached(
+      todayBJ,
+      headers,
+      env,
+      ctx,
+      userKey,
+      false,
+      null,
+    ).catch(() => null);
+
     applyRewatchFlags(list, freshWatched);
 
-    const localUpcoming =
-      freshWatched !== null
-        ? calendarToLocalContinue(
-            cal,
-            Date.now(),
-            droppedSet,
-            freshWatched,
-            hideMap,
-          )
-        : [];
+    const localUpcoming = calendarToLocalContinue(
+      cal,
+      Date.now(),
+      droppedSet,
+      freshWatched,
+      hideMap,
+    );
 
     if (localUpcoming && localUpcoming.length) {
       list = mergeContinueLists(
@@ -9468,6 +9981,7 @@ async function injectLocalUpcomingIntoContinue(
     list = filterContinueEntries(list, freshWatched);
     applyRewatchFlags(list, freshWatched);
   } catch {}
+
   return Array.isArray(list) ? list : [];
 }
 
@@ -9519,12 +10033,12 @@ async function handleMore(request, env, ctx) {
     if (!data || !Array.isArray(data.items))
       return new Response("", { status: 502 });
     const pageCount = data.pageCount || 1;
-    // ★ 修复：服务端补图
     await attachEntityPosters(
       data.items,
       env,
       ctx,
       CK.histImages(userKey),
+      PAGE_SIZE,
     ).catch(() => {});
     return authResp(
       auth,
@@ -9618,29 +10132,20 @@ async function handleMore(request, env, ctx) {
 
         let items = upNextItems;
         if (page === 1) {
-          let droppedSet = null;
-          try {
-            droppedSet = await getDroppedShowIds(headers, env, ctx, userKey);
-          } catch {
-            droppedSet = null;
-          }
-          let watchedEpIds = null;
-          try {
-            watchedEpIds = await getWatchedEpisodeIds(
-              headers,
-              env,
-              ctx,
-              userKey,
-            );
-          } catch {
-            watchedEpIds = null;
-          }
-          let hideMap = {};
-          try {
-            hideMap = await getCwHideMap(env, ctx, userKey);
-          } catch {
-            hideMap = {};
-          }
+          const userState = await getUserStateBundle(
+            headers,
+            env,
+            ctx,
+            userKey,
+          );
+          const droppedSet = droppedStateToSet(userState);
+          const watchedEpIds = watchedStateToSet(userState.watched);
+          const hideMap =
+            userState.hideMap &&
+            typeof userState.hideMap === "object" &&
+            !Array.isArray(userState.hideMap)
+              ? userState.hideMap
+              : {};
           // limit 用满，不再压成 20
           items = mergeContinueLists(
             pausedItems,
@@ -9725,7 +10230,9 @@ async function handleMore(request, env, ctx) {
       !fromFallback &&
       (pageCount > 0 ? page < pageCount : list.length >= limit);
 
-    await attachContinueStillsForPlayback(list, env, ctx, userKey);
+    await attachContinueStillsForPlayback(list, env, ctx, userKey, {
+      maxFetch: limit,
+    });
     const mode = (url.searchParams.get("mode") || "fragment").toLowerCase();
     const renderMode =
       mode === "grid" ? "grid" : mode === "hscroll" ? "hscroll" : "fragment";
@@ -9757,7 +10264,9 @@ async function handleMore(request, env, ctx) {
         ? start + WATCHLIST_PAGE_SIZE < merged.length
         : false;
 
-    await attachWatchlistStills(slice, env, ctx, userKey);
+    await attachWatchlistStills(slice, env, ctx, userKey, {
+      maxFetch: WATCHLIST_PAGE_SIZE,
+    });
     return authResp(auth, needsCookieUpdate, renderWatchlistItems(slice, env), {
       extra: {
         "X-Has-More": String(hasMore),
@@ -10006,36 +10515,173 @@ function splashCriticalCss() {
  * ============================================================================= */
 /** 前端主脚本字符串（/app.js） */
 function getBootstrapScript() {
-  return `(function(){var __CFG=window.__HOME_CONFIG__||{};if(!__CFG.loggedIn)return;window.__HOME_CONFIG__=null;if(__CFG.initialDetail)window.__initialDetail=__CFG.initialDetail;if(!window.__splashT0)window.__splashT0=Date.now();window.__splashHidden=false;window.__hideSplash=function(force){try{if(window.__splashHidden)return;window.__splashHidden=true;var el=document.getElementById('splash');if(!el)return;var wait=force?0:Math.max(0,120-(Date.now()-(window.__splashT0||Date.now())));setTimeout(function(){try{el.classList.add('hide');setTimeout(function(){try{if(el&&el.parentNode)el.parentNode.removeChild(el);}catch(e){}},280);}catch(e){}},wait);}catch(e){}};setTimeout(function(){if(window.__hideSplash)window.__hideSplash();},80);function lsGet(k){try{var v=localStorage.getItem(k);if(!v)return null;var o=JSON.parse(v);if(o&&o._exp&&o._exp<Date.now()){try{localStorage.removeItem(k);}catch(e){}return null;}return o&&o.data?o.data:null;}catch(e){return null;}}function lsSet(k,d,ttlSec){try{localStorage.setItem(k,JSON.stringify({data:d,_exp:Date.now()+ttlSec*1000}));}catch(e){try{localStorage.removeItem(k);}catch(e2){}}}window.__lsGet=lsGet;window.__lsSet=lsSet;function setHTML(sel,html){var el=typeof sel==='string'?document.querySelector(sel):sel;if(el)el.innerHTML=html||'';}window.__setHTML=setHTML;function applyAvatar(url,alts){if(!url)return;var av=document.getElementById('hero-avatar');if(!av)return;var list=[url];if(alts&&alts.length){for(var a=0;a<alts.length;a++){if(alts[a]&&alts[a]!==url)list.push(alts[a]);}}list.push('/avatar?u='+encodeURIComponent(url));var i=0;function next(){if(i>=list.length){av.innerHTML='<span class="hero-avatar-ph">👤</span>';return;}var src=list[i++];var img=document.createElement('img');img.onerror=next;img.alt='';img.width=56;img.height=56;img.decoding='async';img.setAttribute('referrerpolicy','no-referrer');img.src=src;av.innerHTML='';av.appendChild(img);}next();}function __fmtHm(ts){var d=new Date(ts),p=function(n){return(n<10?'0':'')+n;};return p(d.getHours())+':'+p(d.getMinutes());}
+  return `(function(){var __CFG=window.__HOME_CONFIG__||{};if(!__CFG.loggedIn)return;window.__HOME_CONFIG__=null;if(__CFG.initialDetail)window.__initialDetail=__CFG.initialDetail;if(!window.__splashT0)window.__splashT0=Date.now();window.__splashHidden=false;window.__hideSplash=function(force){try{if(window.__splashHidden)return;window.__splashHidden=true;var el=document.getElementById('splash');if(!el)return;var wait=force?0:Math.max(0,120-(Date.now()-(window.__splashT0||Date.now())));setTimeout(function(){try{el.classList.add('hide');setTimeout(function(){try{if(el&&el.parentNode)el.parentNode.removeChild(el);}catch(e){}},280);}catch(e){}},wait);}catch(e){}};setTimeout(function(){if(window.__hideSplash)window.__hideSplash();},80);function lsGet(k){try{var v=localStorage.getItem(k);if(!v)return null;var o=JSON.parse(v);if(o&&o._exp&&o._exp<Date.now()){try{localStorage.removeItem(k);}catch(e){}return null;}return o&&o.data?o.data:null;}catch(e){return null;}}function lsSet(k,d,ttlSec){try{localStorage.setItem(k,JSON.stringify({data:d,_exp:Date.now()+ttlSec*1000}));}catch(e){try{localStorage.removeItem(k);}catch(e2){}}}window.__lsGet=lsGet;window.__lsSet=lsSet;function setHTML(sel,html){var el=typeof sel==='string'?document.querySelector(sel):sel;if(el)el.innerHTML=html||'';}window.__setHTML=setHTML;function applyAvatar(url,alts){if(!url)return;var av=document.getElementById('hero-avatar');if(!av)return;var list=[url];if(alts&&alts.length){for(var a=0;a<alts.length;a++){if(alts[a]&&alts[a]!==url)list.push(alts[a]);}}list.push('/avatar?u='+encodeURIComponent(url));var i=0;function next(){if(i>=list.length){av.innerHTML='<span class="hero-avatar-ph">👤</span>';return;}var src=list[i++];var img=document.createElement('img');img.onerror=next;img.alt='';img.width=56;img.height=56;img.decoding='async';img.setAttribute('referrerpolicy','no-referrer');img.src=src;av.innerHTML='';av.appendChild(img);}next();}function __fmtFull(ts){
+  var d=new Date(ts);if(isNaN(d.getTime()))return'';
+  var p=function(n){return(n<10?'0':'')+n;};
+  // 鼠标悬浮的完整提示，去掉了秒，保留到分钟即可
+  return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());
+}
+/** 顶栏短时间：优先相对时间，极度节省空间 */
+function __fmtShort(ts){
+  var d=new Date(ts);
+  if(isNaN(d.getTime()))return'';
+  var p=function(n){return(n<10?'0':'')+n;};
+  var now=new Date();
+  var diff=now.getTime()-d.getTime();
+  
+  // 1分钟内
+  if(diff<60000) return '刚刚';
+  // 1小时内
+  if(diff<3600000) return Math.floor(diff/60000)+'分钟前';
+  
+  var hm=p(d.getHours())+':'+p(d.getMinutes());
+  
+  // 今天
+  if(d.getFullYear()===now.getFullYear()&&d.getMonth()===now.getMonth()&&d.getDate()===now.getDate()){
+    return hm;
+  }
+  
+  // 昨天
+  var yesterday=new Date(now.getTime()-86400000);
+  if(d.getFullYear()===yesterday.getFullYear()&&d.getMonth()===yesterday.getMonth()&&d.getDate()===yesterday.getDate()){
+    return '昨天 '+hm;
+  }
+  
+  // 今年
+  if(d.getFullYear()===now.getFullYear()){
+    return (d.getMonth()+1)+'月'+d.getDate()+'日';
+  }
+  
+  // 往年
+  return d.getFullYear()+'-'+(d.getMonth()+1)+'-'+d.getDate();
+}
+/** 内存中保存：暂停记录 / 继续观看 的数据更新时间 */
+window.__mtCwTimes=window.__mtCwTimes||{pause:null,continue:null};
+function __rememberCwTimes(d){
+  if(!d)return;
+  var sm=d.syncMeta||null;
+  var p=d.pauseUpdatedAt!=null?Number(d.pauseUpdatedAt):(sm&&sm.pause!=null?Number(sm.pause):null);
+  var c=d.continueUpdatedAt!=null?Number(d.continueUpdatedAt):(sm&&sm.continue!=null?Number(sm.continue):null);
+  if(p&&isFinite(p)&&p>0)window.__mtCwTimes.pause=p;
+  if(c&&isFinite(c)&&c>0)window.__mtCwTimes.continue=c;
+  try{
+    var payload={pause:window.__mtCwTimes.pause,continue:window.__mtCwTimes.continue,_exp:Date.now()+86400e3*7};
+    localStorage.setItem('mt:cwTimes',JSON.stringify(payload));
+  }catch(e){}
+}
+function __loadCwTimesFromLs(){
+  try{
+    var v=localStorage.getItem('mt:cwTimes');
+    if(!v)return;
+    var o=JSON.parse(v);
+    if(!o||(o._exp&&o._exp<Date.now()))return;
+    if(o.pause&&isFinite(Number(o.pause)))window.__mtCwTimes.pause=Number(o.pause);
+    if(o.continue&&isFinite(Number(o.continue)))window.__mtCwTimes.continue=Number(o.continue);
+  }catch(e){}
+}
+__loadCwTimesFromLs();
 /**
- * 只显示一个时间：最近一次「有数据变化」的更新。
- * source: auto | manual | live | cache
- * 无变化（auto + unchanged）不要调用，避免无意义刷新时间。
+ * 展示规则：取「暂停记录」「继续观看」中较新的时间；
+ * 两者都没有 → 浏览器本地时间。
+ * 文案区分：暂停 / 继续观看 / 本地，格式 YYYY-MM-DD HH:mm:ss
  */
-function __setUpdatedAt(source,ageSec){
+function __setUpdatedAt(source,ageSec,dataTs){
   var el=document.getElementById('updated-at');
   if(!el)return;
-  var now=Date.now();
-  var ts=now;
-  if(typeof ageSec==='number'&&isFinite(ageSec)&&ageSec>=0)ts=now-ageSec*1000;
-  var kind='';
-  if(source==='auto')kind='自动';
-  else if(source==='manual'||source==='live')kind='刷新';
-  else if(source==='cache')kind='缓存';
-  else kind='更新';
-  // 仅当这次不比已显示的更旧时才改写
-  if(window.__lastDataUpdateAt&&ts<window.__lastDataUpdateAt-1000)return;
-  window.__lastDataUpdateAt=ts;
+  var pauseTs=window.__mtCwTimes&&window.__mtCwTimes.pause?Number(window.__mtCwTimes.pause):null;
+  var contTs=window.__mtCwTimes&&window.__mtCwTimes.continue?Number(window.__mtCwTimes.continue):null;
+  // 若本次传入了明确 dataTs，按 source 记入对应桶（兼容旧调用）
+  if(dataTs!=null&&isFinite(Number(dataTs))&&Number(dataTs)>0){
+    var t=Number(dataTs);
+    if(source==='pause'){window.__mtCwTimes.pause=t;pauseTs=t;}
+    else if(source==='continue'||source==='live'||source==='manual'||source==='auto'||source==='cache'){
+      // 默认记为继续观看同步时间；暂停时间若为空则一并填上
+      window.__mtCwTimes.continue=t;contTs=t;
+      if(!pauseTs){window.__mtCwTimes.pause=t;pauseTs=t;}
+    }
+    try{__rememberCwTimes({pauseUpdatedAt:window.__mtCwTimes.pause,continueUpdatedAt:window.__mtCwTimes.continue});}catch(e){}
+  }
+  var best=null,kind='本机';
+  if(pauseTs&&contTs){
+    if(pauseTs>=contTs){best=pauseTs;kind='进度';}
+    else{best=contTs;kind='列表';}
+  }else if(pauseTs){best=pauseTs;kind='进度';}
+  else if(contTs){best=contTs;kind='列表';}
+  else{best=Date.now();kind='本机';}
+  window.__lastDataUpdateAt=best;
   window.__lastDataUpdateKind=kind;
-  el.textContent=kind+' · '+__fmtHm(ts);
+  el.textContent=kind+' · '+__fmtShort(best);
+  el.title='播放进度：'+(pauseTs?__fmtFull(pauseTs):'暂无')+' | 继续观看：'+(contTs?__fmtFull(contTs):'暂无')+' | 本机：'+__fmtFull(Date.now());
   el.classList.remove('flash','src-live','src-cache');
   void el.offsetWidth;
   el.classList.add('flash');
-  if(source==='manual'||source==='live')el.classList.add('src-live');
-  else if(source==='cache')el.classList.add('src-cache');
-}function applyPlayback(d,isCache){if(!d)return;if(d.playbackHScrollHtml){window.__lastPbHtml=d.playbackHScrollHtml;setHTML('#playback-hscroll',d.playbackHScrollHtml);}var src=isCache?'cache':(d.playbackSource||'');var age=null;if(d.playbackDataTs){age=Math.max(0,Math.round((Date.now()-Number(d.playbackDataTs))/1000));try{d._dataTs=Number(d.playbackDataTs);}catch(e){}}else if(d.userUpdatedAt){age=Math.max(0,Math.round((Date.now()-Number(d.userUpdatedAt))/1000));src=src||'cache';try{d._dataTs=Number(d.userUpdatedAt);}catch(e){}}else if(d._dataTs)age=Math.max(0,Math.round((Date.now()-d._dataTs)/1000));else if(typeof d.playbackAgeSec==='number'&&isFinite(d.playbackAgeSec)){age=Math.max(0,d.playbackAgeSec);try{d._dataTs=Date.now()-age*1000;}catch(e){}}else if(src==='live')age=0;if(isCache){__setUpdatedAt('cache',age);}else if(window.__manualRefreshPending){__setUpdatedAt('manual');window.__manualRefreshPending=false;}if(window.__scheduleEnrich)window.__scheduleEnrich();}window.__applyPlayback=applyPlayback;function applyMeta(d,isCache){if(!d)return;var n=document.getElementById('hero-name');if(n&&d.name)n.textContent=d.name;applyAvatar(d.avatar,d.avatarAlt);if(d.statsHtml)setHTML('#stats-box',d.statsHtml);if(!isCache)try{lsSet('mt:meta',d,1800);}catch(e){}}window.__applyMeta=applyMeta;var __homeDataLoading=false;
-function fetchPart(part,force,live){return fetch('/api/home-data?part='+encodeURIComponent(part)+(force?'&force=1':'')+(live?'&live=1':''),{credentials:'same-origin',cache:'no-store'}).then(function(r){if(r.status===401){return r.json().catch(function(){return{};}).then(function(d){var msg=(d&&d.error)||'登录已失效，请重新登录';try{sessionStorage.setItem('mt:relogin',msg);}catch(e){}if(window.__toast)window.__toast(msg,{type:'warn',duration:2200});setTimeout(function(){location.href='/login';},1000);return null;});}if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){if(!d)return null;if(d.login){location.href='/login';return null;}return d;});}window.__fetchPart=fetchPart;var __loadedParts={};function loadPartOnce(part){if(__loadedParts[part])return Promise.resolve(__loadedParts[part]);return fetchPart(part).then(function(d){__loadedParts[part]=d;return d;});}window.__loadPartOnce=loadPartOnce;window.__loadedParts=__loadedParts;function loadHomeData(opts){opts=opts||{};var silent=!!opts.silent;if(__homeDataLoading&&!silent)return;__homeDataLoading=true;__lastRefreshAt=Date.now();function onPlayback(d,isCache){if(!d)return;applyPlayback(d,isCache);if(!isCache){try{lsSet('mt:pb',d,900);}catch(e){}if(!silent&&window.__initialDetail){var s=window.__initialDetail,idx=s.indexOf('/');if(idx>0&&window.openDetail)openDetail(s.slice(0,idx),s.slice(idx+1),false);window.__initialDetail=null;}}if(!silent&&window.__hideSplash)window.__hideSplash(true);}if(!silent){var cachedPb=lsGet('mt:pb');if(cachedPb){try{onPlayback(cachedPb,true);}catch(e){}}else if(window.__earlyPbApplied&&window.__hideSplash){window.__hideSplash(true);}}var pPlayback;if(!silent&&window.__primaryBootP){pPlayback=window.__primaryBootP.then(function(d){window.__primaryBootP=null;if(d){onPlayback(d,false);return d;}return fetchPart('playback',false,true).then(function(x){onPlayback(x,false);return x;});}).catch(function(){return fetchPart('playback',false,true).then(function(x){onPlayback(x,false);return x;});});}else{pPlayback=fetchPart('playback',false,true).then(function(x){onPlayback(x,false);return x;});}pPlayback=pPlayback.catch(function(){if(!silent){setHTML('#playback-hscroll','<div class="empty"><p>暂时无法从 Trakt 拉取数据<br><span style="font-size:.82rem;opacity:.75">可能是官方限流或网络异常，请过几分钟再试</span></p><p style="margin-top:12px"><button class="btn-ghost" onclick="location.reload()">重试</button></p></div>');if(window.__hideSplash)window.__hideSplash(true);}});Promise.resolve(pPlayback).then(function(){__homeDataLoading=false;if(!silent){var cachedMeta=lsGet('mt:meta');if(cachedMeta)setTimeout(function(){try{applyMeta(cachedMeta,true);}catch(e){}},0);}var runMeta=function(){fetchPart('meta').then(function(d){applyMeta(d,false);}).catch(function(){});};if(window.requestIdleCallback)requestIdleCallback(runMeta,{timeout:1500});else setTimeout(runMeta,200);});}var __refreshTick=0,__lastUserAct=Date.now(),__lastBoardReload=Date.now();['scroll','click','touchstart','keydown'].forEach(function(t){window.addEventListener(t,function(){__lastUserAct=Date.now();},{passive:true});});function silentRefresh(){if(document.hidden)return;var __m=document.getElementById('modal');if(__m&&__m.classList.contains('open'))return;if(window.__forceRefreshing||window.__homeDataLoading)return;__refreshTick++;__lastRefreshAt=Date.now();fetchPart('playback',false,true).then(function(d){if(!d)return;if(d.activityUnchanged)return;var prevHtml=window.__lastPbHtml||null;var newHtml=(d&&d.playbackHScrollHtml)||null;if(newHtml&&prevHtml&&prevHtml===newHtml)return;applyPlayback(d);try{lsSet('mt:pb',d,900);}catch(e){}__setUpdatedAt('auto');if(newHtml&&prevHtml&&prevHtml!==newHtml&&window.__toast)window.__toast('已自动更新观看进度',{type:'success',duration:2000});}).catch(function(){});}window.__refreshStats=silentRefresh;
-window.forceRefresh=async function(){if(window.__forceRefreshing)return;window.__forceRefreshing=true;window.__manualRefreshPending=true;try{localStorage.removeItem('mt:pb');localStorage.removeItem('mt:meta');try{window.__cwMoreCache=null;}catch(e){}}catch(e){}var btn=document.getElementById('btn-refresh');var span=btn&&btn.querySelector('span');var oldText=span?span.textContent:'刷新';if(btn)btn.classList.add('loading');if(span)span.textContent='刷新中';var okCount=0,cacheCount=0,failCount=0,cooling=0,hitLimit=false;var GAP_OK=600,GAP_LIMIT=1400;try{var wanted=['playback','meta','calendar'];var loaded=window.__loadedParts||{};['history','watchlist'].forEach(function(p){if(loaded[p]&&wanted.indexOf(p)<0)wanted.push(p);});for(var i=0;i<wanted.length;i++){if(hitLimit)break;var part=wanted[i];if(i>0){var gap=cooling>0?GAP_LIMIT:GAP_OK;await new Promise(function(r){setTimeout(r,gap);});}var d=null;try{d=await __enqueueTrakt(function(){return fetchPart(part,true);});}catch(e){d=null;}if(!d){failCount++;continue;}var isCache=false;if(part==='playback'&&d.playbackSource==='cache')isCache=true;if(part==='meta'&&d.metaSource==='cache')isCache=true;if(part==='calendar'&&d.calendarSource==='cache')isCache=true;if(isCache)cacheCount++;else okCount++;if(part==='playback'){applyPlayback(d);try{lsSet('mt:pb',d,900);}catch(e){}}else if(part==='meta'){applyMeta(d,false);}else if(part==='watchlist'||part==='calendar'||part==='history'){__applyPart(part,d);__savePartSnap(part,d);}window.__loadedParts[part]=d;if(__partFailed(d)){try{delete window.__loadedParts[part];}catch(e){}}if(d.rateLimited||(d.cooling&&d.cooling>0)){hitLimit=true;cooling=Math.max(cooling,Number(d.cooling)||0);}else if(isCache&&(part==='playback'||part==='meta')){hitLimit=true;}}if(failCount&&!okCount&&!cacheCount){__errToast('刷新失败',new Error('无法连接，请检查网络后重试'));}else if(hitLimit){var msg=cooling>0?('刷新失败，Trakt 限流约 '+cooling+' 秒，已显示缓存'):'刷新失败，已显示缓存';__toast(msg,{type:'warn',duration:4200});}else if(failCount||cacheCount){__setUpdatedAt('manual');__toast('已刷新观看数据（部分仍为缓存）',{type:'warn',duration:2800});}else{__setUpdatedAt('manual');__toast('已刷新观看数据',{type:'success',duration:1800});}if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){__errToast('刷新失败',e);}finally{if(btn)btn.classList.remove('loading');if(span)span.textContent=oldText;window.__forceRefreshing=false;}};
+  if(kind==='本机')el.classList.add('src-cache');
+  else el.classList.add('src-live');
+}function applyPlayback(d,isCache){if(!d)return;if(d.playbackHScrollHtml){window.__lastPbHtml=d.playbackHScrollHtml;setHTML('#playback-hscroll',d.playbackHScrollHtml);}try{__rememberCwTimes(d);}catch(e){}var src=isCache?'cache':(d.playbackSource||'');var age=null;if(d.playbackDataTs){age=Math.max(0,Math.round((Date.now()-Number(d.playbackDataTs))/1000));try{d._dataTs=Number(d.playbackDataTs);}catch(e){}}else if(d.userUpdatedAt){age=Math.max(0,Math.round((Date.now()-Number(d.userUpdatedAt))/1000));src=src||'cache';try{d._dataTs=Number(d.userUpdatedAt);}catch(e){}}else if(d._dataTs)age=Math.max(0,Math.round((Date.now()-d._dataTs)/1000));else if(typeof d.playbackAgeSec==='number'&&isFinite(d.playbackAgeSec)){age=Math.max(0,d.playbackAgeSec);try{d._dataTs=Date.now()-age*1000;}catch(e){}}var dataTs=(d&&d.continueUpdatedAt)?Number(d.continueUpdatedAt):(d&&d.playbackDataTs)?Number(d.playbackDataTs):(d&&d._dataTs)?Number(d._dataTs):(d&&d.userUpdatedAt)?Number(d.userUpdatedAt):null;if(isCache){__setUpdatedAt('cache',age,dataTs);}else if(window.__manualRefreshPending){__setUpdatedAt('manual',age,dataTs);window.__manualRefreshPending=false;}else if(src==='live'){__setUpdatedAt('live',age,dataTs);}else{__setUpdatedAt(src||'cache',age,dataTs);}if(window.__scheduleEnrich)window.__scheduleEnrich();}
+window.__applyPlayback=applyPlayback;try{__setUpdatedAt('boot');}catch(e){}function applyMeta(d,isCache){if(!d)return;var n=document.getElementById('hero-name');if(n&&d.name)n.textContent=d.name;applyAvatar(d.avatar,d.avatarAlt);if(d.statsHtml)setHTML('#stats-box',d.statsHtml);if(!isCache)try{lsSet('mt:meta',d,604800);}catch(e){}}window.__applyMeta=applyMeta;var __homeDataLoading=false;
+function fetchPart(part,force,live){return fetch('/api/home-data?part='+encodeURIComponent(part)+(force?'&force=1':'')+(live?'&live=1':''),{credentials:'same-origin',cache:'no-store'}).then(function(r){if(r.status===401){return r.json().catch(function(){return{};}).then(function(d){var msg=(d&&d.error)||'登录已失效，请重新登录';try{sessionStorage.setItem('mt:relogin',msg);}catch(e){}if(window.__toast)window.__toast(msg,{type:'warn',duration:2200});setTimeout(function(){location.href='/login';},1000);return null;});}if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){if(!d)return null;if(d.login){location.href='/login';return null;}return d;});}window.__fetchPart=fetchPart;var __loadedParts={};function loadPartOnce(part){if(__loadedParts[part])return Promise.resolve(__loadedParts[part]);return fetchPart(part).then(function(d){__loadedParts[part]=d;return d;});}window.__loadPartOnce=loadPartOnce;window.__loadedParts=__loadedParts;function loadHomeData(opts){
+  opts=opts||{};
+  var silent=!!opts.silent;
+  if(__homeDataLoading&&!silent)return;
+  __homeDataLoading=true;
+  __lastRefreshAt=Date.now();
+  /** 首页继续观看加载状态：loading | cache | live | error */
+  var bootState=silent?'loading':'loading';
+  function setBootState(s){bootState=s;try{window.__homeBootState=s;}catch(e){}}
+  function finishSplash(){if(!silent&&window.__hideSplash)window.__hideSplash(true);}
+  function showPlaybackError(){
+    setBootState('error');
+    if(silent)return;
+    setHTML('#playback-hscroll','<div class="empty"><p>暂时无法从 Trakt 拉取数据<br><span style="font-size:.82rem;opacity:.75">可能是官方限流或网络异常，请过几分钟再试</span></p><p style="margin-top:12px"><button class="btn-ghost" onclick="location.reload()">重试</button></p></div>');
+    finishSplash();
+  }
+  function onPlayback(d,from){
+    if(!d)return;
+    var isCache=from==='cache';
+    setBootState(isCache?'cache':(from==='live'?'live':from||'live'));
+    applyPlayback(d,isCache);
+    if(!isCache){
+      try{lsSet('mt:pb',d,900);}catch(e){}
+      if(!silent&&window.__initialDetail){
+        var s=window.__initialDetail,idx=s.indexOf('/');
+        if(idx>0&&window.openDetail)openDetail(s.slice(0,idx),s.slice(idx+1),false);
+        window.__initialDetail=null;
+      }
+    }
+    finishSplash();
+  }
+  setBootState('loading');
+  if(!silent){
+    var cachedPb=lsGet('mt:pb');
+    if(cachedPb){try{onPlayback(cachedPb,'cache');}catch(e){}}
+    else if(window.__earlyPbApplied)finishSplash();
+  }
+  function fetchLive(){
+    return fetchPart('playback',false,true).then(function(x){onPlayback(x,'live');return x;});
+  }
+  var pPlayback;
+  if(!silent&&window.__primaryBootP){
+    pPlayback=window.__primaryBootP.then(function(d){
+      window.__primaryBootP=null;
+      if(d){onPlayback(d,'live');return d;}
+      return fetchLive();
+    }).catch(function(){return fetchLive();});
+  }else{
+    pPlayback=fetchLive();
+  }
+  pPlayback=pPlayback.catch(function(){showPlaybackError();});
+  Promise.resolve(pPlayback).then(function(){
+    __homeDataLoading=false;
+    if(!silent){
+      var cachedMeta=lsGet('mt:meta');
+      if(cachedMeta)setTimeout(function(){try{applyMeta(cachedMeta,true);}catch(e){}},0);
+    }
+    var runMeta=function(){fetchPart('meta').then(function(d){applyMeta(d,false);}).catch(function(){});};
+    if(window.requestIdleCallback)requestIdleCallback(runMeta,{timeout:1500});
+    else setTimeout(runMeta,200);
+  });
+}var __refreshTick=0,__lastUserAct=Date.now(),__lastBoardReload=Date.now();['scroll','click','touchstart','keydown'].forEach(function(t){window.addEventListener(t,function(){__lastUserAct=Date.now();},{passive:true});});function silentRefresh(){if(document.hidden)return;var __m=document.getElementById('modal');if(__m&&__m.classList.contains('open'))return;if(window.__forceRefreshing||window.__homeDataLoading)return;__refreshTick++;__lastRefreshAt=Date.now();fetchPart('playback',false,true).then(function(d){if(!d)return;if(d.activityUnchanged)return;var prevHtml=window.__lastPbHtml||null;var newHtml=(d&&d.playbackHScrollHtml)||null;if(newHtml&&prevHtml&&prevHtml===newHtml)return;applyPlayback(d);try{lsSet('mt:pb',d,900);}catch(e){}if(newHtml&&prevHtml&&prevHtml!==newHtml&&window.__toast)window.__toast('已自动更新观看进度',{type:'success',duration:2000});}).catch(function(){});}window.__refreshStats=silentRefresh;
+window.forceRefresh=async function(){if(window.__forceRefreshing)return;window.__forceRefreshing=true;window.__manualRefreshPending=true;try{localStorage.removeItem('mt:pb');localStorage.removeItem('mt:meta');try{window.__cwMoreCache=null;}catch(e){}}catch(e){}var btn=document.getElementById('btn-refresh');var span=btn&&btn.querySelector('span');var oldText=span?span.textContent:'刷新';if(btn)btn.classList.add('loading');if(span)span.textContent='刷新中';var okCount=0,cacheCount=0,failCount=0,cooling=0,hitLimit=false;var GAP_OK=600,GAP_LIMIT=1400;try{var wanted=['playback','meta','calendar'];var loaded=window.__loadedParts||{};['history','watchlist'].forEach(function(p){if(loaded[p]&&wanted.indexOf(p)<0)wanted.push(p);});for(var i=0;i<wanted.length;i++){if(hitLimit)break;var part=wanted[i];if(i>0){var gap=cooling>0?GAP_LIMIT:GAP_OK;await new Promise(function(r){setTimeout(r,gap);});}var d=null;try{d=await __enqueueTrakt(function(){return fetchPart(part,true);});}catch(e){d=null;}if(!d){failCount++;continue;}var isCache=false;if(part==='playback'&&d.playbackSource==='cache')isCache=true;if(part==='meta'&&d.metaSource==='cache')isCache=true;if(part==='calendar'&&d.calendarSource==='cache')isCache=true;if(isCache)cacheCount++;else okCount++;if(part==='playback'){applyPlayback(d);try{lsSet('mt:pb',d,900);}catch(e){}}else if(part==='meta'){applyMeta(d,false);}else if(part==='watchlist'||part==='calendar'||part==='history'){__applyPart(part,d);__savePartSnap(part,d);}window.__loadedParts[part]=d;if(__partFailed(d)){try{delete window.__loadedParts[part];}catch(e){}}if(d.rateLimited||(d.cooling&&d.cooling>0)){hitLimit=true;cooling=Math.max(cooling,Number(d.cooling)||0);}else if(isCache&&(part==='playback'||part==='meta')){hitLimit=true;}}if(failCount&&!okCount&&!cacheCount){__errToast('刷新失败',new Error('无法连接，请检查网络后重试'));}else if(hitLimit){var msg=cooling>0?('刷新失败，Trakt 限流约 '+cooling+' 秒，已显示缓存'):'刷新失败，已显示缓存';__toast(msg,{type:'warn',duration:4200});}else if(failCount||cacheCount){__toast('已刷新观看数据（部分仍为缓存）',{type:'warn',duration:2800});}else{__toast('已刷新观看数据',{type:'success',duration:1800});}if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){__errToast('刷新失败',e);}finally{if(btn)btn.classList.remove('loading');if(span)span.textContent=oldText;window.__forceRefreshing=false;}};
 function startHomeData(){loadHomeData({silent:false});}if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',startHomeData);}else{startHomeData();}var REFRESH_MS=${HOME_AUTO_REFRESH_MINUTES}*60*1000;var __lastRefreshAt=Date.now();if(REFRESH_MS>0){setInterval(function(){if(Date.now()-__lastUserAct<60000)return;silentRefresh();},REFRESH_MS);document.addEventListener('visibilitychange',function(){if(document.hidden)return;silentRefresh();});}})();`;
 }
 
@@ -10425,42 +11071,112 @@ async function __loadTrending(force){var box=document.getElementById('search-res
 window.__loadTrending=__loadTrending;
 (function(){var inp=document.getElementById('search-input');if(!inp)return;inp.addEventListener('input',function(){if(__searchTimer)clearTimeout(__searchTimer);var q=inp.value.trim();if(!q){__loadTrending();return;}__searchTimer=setTimeout(function(){__doSearch(q);},380);});inp.addEventListener('keydown',function(e){if(e.key==='Enter'){if(__searchTimer)clearTimeout(__searchTimer);var q=inp.value.trim();if(q)__doSearch(q);else __loadTrending(true);}});})();
 document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-wl-add-detail]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.wlAddDetailType,tmdbId=btn.dataset.wlAddDetail;if(!type||!tmdbId)return;const nameEl=document.querySelector('.detail-title');const name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'＋',title:'加入待看',message:'确定要把「'+(name||'该条目')+'」加入待看列表吗？',okText:'加入',tone:'success'})))return;const prevHtml=btn.innerHTML;btn.disabled=true;btn.classList.add('loading');try{await __enqueueWrite(async()=>{await __traktPost('/api/watchlist/add',{type:type,tmdbId:Number(tmdbId)||tmdbId});btn.classList.remove('loading');btn.classList.add('active');btn.disabled=true;btn.removeAttribute('data-wl-add-detail');btn.removeAttribute('data-wl-add-detail-type');btn.setAttribute('title','已在待看');btn.innerHTML='<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" stroke="none"><path d="M7 3h10a1 1 0 0 1 1 1v16l-6-3.5L6 20V4a1 1 0 0 1 1-1z"/></svg>';__toast('已加入待看列表',{type:'success'});try{if(window.__loadedParts)delete window.__loadedParts.watchlist;}catch(e){}try{if(typeof fetchPart==='function'){fetchPart('watchlist',true).then(function(d){if(!d)return;if(window.__applyPart)window.__applyPart('watchlist',d);if(window.__savePartSnap)window.__savePartSnap('watchlist',d);if(window.__loadedParts)window.__loadedParts.watchlist=d;}).catch(function(){});}}catch(e){}if(document.getElementById('watchlist-grid')&&typeof onWatchlistSortChange==='function'){try{onWatchlistSortChange('added');}catch(e){}}if(window.__refreshStats)window.__refreshStats();});}catch(err){btn.disabled=false;btn.classList.remove('loading');btn.innerHTML=prevHtml;__errToast('加入失败',err);}},true);
-var __listModalSections={playback:{title:'继续观看'},guduo:{title:'骨朵热榜',section:'guduo'},theater:{title:'平台剧场',section:'theater'},'douban-domestic':{title:'豆瓣热播国产剧',section:'domestic'},'douban-hktw':{title:'豆瓣热播港台剧',section:'hktw'},'douban-jpkr':{title:'豆瓣热播日韩剧',section:'jpkr'},'douban-western':{title:'豆瓣热播欧美剧',section:'western'}};
-window.openListModal=function(id){var cfg=__listModalSections[id];if(!cfg)return;var modal=document.getElementById('list-modal');var title=document.getElementById('list-modal-title');var body=document.getElementById('list-modal-body');if(!modal||!title||!body)return;title.textContent=cfg.title||'';body.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';modal.classList.add('open');document.body.style.overflow='hidden';if(id==='playback'){
-body.innerHTML='<div id="cw-modal-grid" class="grid cw-modal-grid"><div class="pane-loading"><div class="spinner"></div></div></div><div id="cw-modal-more-wrap" class="load-more-wrap" style="display:none"></div>';
-function __cwApplyPage1(res){
-  var grid=document.getElementById('cw-modal-grid');
-  var wrap=document.getElementById('cw-modal-more-wrap');
-  if(!grid)return;
-  if(res.html&&res.html.trim()){grid.innerHTML=res.html;}
-  else{grid.innerHTML='<div class="empty"><p>暂无内容</p></div>';}
-  if(res.hasMore&&wrap){
-    wrap.style.display='';
-    wrap.innerHTML='<button class="load-more" data-page="2" type="button" onclick="loadMoreContinue(this)">加载更多</button>';
-  }else if(wrap){
-    wrap.style.display=res.html&&res.html.trim()?'':'none';
-    wrap.innerHTML=res.html&&res.html.trim()?'<div class="load-more-end" style="text-align:center;padding:14px 0 8px;color:var(--text-mute,#71717a);font-size:0.82rem">已经到底啦</div>':'';
+var __listModalSections={
+  playback:{title:'继续观看',kind:'playback'},
+  guduo:{title:'骨朵热榜',kind:'tabsGrid',tabsApi:'/api/guduo-list?mode=categories',tabsKey:'categories',tabsParam:'category',listApi:function(cat){return '/api/guduo-list?mode=grid&category='+encodeURIComponent(cat||'all');},gridId:'guduo-grid',tabsId:'guduo-filter-tabs'},
+  theater:{title:'平台剧场',kind:'simpleGrid',listApi:function(){return '/api/theater-list?platform=all&mode=grid';},gridId:'theater-grid'},
+  'douban-domestic':{title:'豆瓣热播国产剧',kind:'simpleGrid',listApi:function(){return '/api/douban-list?section=domestic&mode=grid';},gridId:'douban-modal-grid'},
+  'douban-hktw':{title:'豆瓣热播港台剧',kind:'simpleGrid',listApi:function(){return '/api/douban-list?section=hktw&mode=grid';},gridId:'douban-modal-grid'},
+  'douban-jpkr':{title:'豆瓣热播日韩剧',kind:'simpleGrid',listApi:function(){return '/api/douban-list?section=jpkr&mode=grid';},gridId:'douban-modal-grid'},
+  'douban-western':{title:'豆瓣热播欧美剧',kind:'simpleGrid',listApi:function(){return '/api/douban-list?section=western&mode=grid';},gridId:'douban-modal-grid'}
+};
+function __openSimpleGridModal(body,cfg){
+  var gid=cfg.gridId||'list-modal-grid';
+  body.innerHTML='<div id="'+gid+'" class="grid"><div class="pane-loading"><div class="spinner"></div></div></div>';
+  var grid=document.getElementById(gid);
+  var url=typeof cfg.listApi==='function'?cfg.listApi():cfg.listApi;
+  fetch(url).then(function(r){return r.ok?r.text():'';}).then(function(html){
+    if(!grid)return;
+    grid.innerHTML=html||'<div class="empty"><p>暂无内容</p></div>';
+    if(window.__scheduleEnrich)window.__scheduleEnrich();
+  }).catch(function(){if(grid)grid.innerHTML='<div class="empty"><p>加载失败，请稍后重试</p></div>';});
+}
+function __openTabsGridModal(body,cfg){
+  var tabsId=cfg.tabsId||'list-filter-tabs';
+  var gid=cfg.gridId||'list-modal-grid';
+  body.innerHTML='<div id="'+tabsId+'" class="douban-filter-tabs" style="display:none"></div><div id="'+gid+'" class="grid"><div class="pane-loading"><div class="spinner"></div></div></div>';
+  var grid=document.getElementById(gid),tabsBox=document.getElementById(tabsId);
+  function loadList(val){
+    if(!grid)return;
+    grid.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';
+    var url=typeof cfg.listApi==='function'?cfg.listApi(val):cfg.listApi;
+    fetch(url).then(function(r){return r.ok?r.text():'';}).then(function(html){
+      grid.innerHTML=html||'<div class="empty"><p>暂无内容</p></div>';
+      if(window.__scheduleEnrich)window.__scheduleEnrich();
+    }).catch(function(){grid.innerHTML='<div class="empty"><p>加载失败，请稍后重试</p></div>';});
   }
-  if(window.__scheduleEnrich)window.__scheduleEnrich();
+  loadList('all');
+  if(!cfg.tabsApi||!tabsBox)return;
+  fetch(cfg.tabsApi).then(function(r){return r.ok?r.json():{};}).then(function(d){
+    var list=(d&&d[cfg.tabsKey||'categories'])||[];
+    if(!list.length)return;
+    var param=cfg.tabsParam||'category';
+    var html='<button class="douban-filter-tab active" data-val="all">全部</button>';
+    for(var i=0;i<list.length;i++){
+      html+='<button class="douban-filter-tab" data-val="'+__esc(list[i])+'">'+__esc(list[i])+'</button>';
+    }
+    tabsBox.innerHTML=html;tabsBox.style.display='';
+    tabsBox.addEventListener('click',function(e){
+      var btn=e.target.closest('.douban-filter-tab');if(!btn)return;
+      tabsBox.querySelectorAll('.douban-filter-tab').forEach(function(b){b.classList.remove('active');});
+      btn.classList.add('active');
+      loadList(btn.getAttribute('data-val')||'all');
+    });
+  }).catch(function(){});
 }
-var cache=window.__cwMoreCache;
-var now=Date.now();
-var TTL=5*60*1000;
-if(cache&&cache.ts&&(now-cache.ts)<TTL&&cache.pages&&cache.pages[1]){
-  __cwApplyPage1({html:cache.pages[1],hasMore:!!cache.hasMoreAfter[1]});
-  return;
-}
-fetch('/api/more?type=playback&page=1&limit=20&mode=grid').then(function(r){
-  if(!r.ok)throw new Error('HTTP '+r.status);
-  return r.text().then(function(html){return{html:html,hasMore:r.headers.get('X-Has-More')==='true'};});
-}).then(function(res){
-  window.__cwMoreCache={ts:Date.now(),pages:{1:res.html||''},hasMoreAfter:{1:!!res.hasMore}};
-  __cwApplyPage1(res);
-}).catch(function(){
-  var grid=document.getElementById('cw-modal-grid');
-  if(grid)grid.innerHTML='<div class="empty"><p>加载失败，请稍后重试</p></div>';
-});
-return;}if(id==='guduo'){body.innerHTML='<div id="guduo-filter-tabs" class="douban-filter-tabs" style="display:none"></div><div id="guduo-grid" class="grid"><div class="pane-loading"><div class="spinner"></div></div></div>';var ggrid=document.getElementById('guduo-grid'),gtabs=document.getElementById('guduo-filter-tabs');function loadGuduoGrid(cat){ggrid.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';fetch('/api/guduo-list?category='+encodeURIComponent(cat)+'&mode=grid').then(function(r){return r.ok?r.text():'';}).then(function(html){ggrid.innerHTML=html||'<div class="empty"><p>暂无内容</p></div>';if(window.__scheduleEnrich)window.__scheduleEnrich();}).catch(function(){ggrid.innerHTML='<div class="empty"><p>加载失败，请稍后重试</p></div>';});}loadGuduoGrid('all');fetch('/api/guduo-list?mode=categories').then(function(r){return r.ok?r.json():{categories:[]};}).then(function(d){var cats=(d&&d.categories)||[];if(!cats.length)return;var html='<button class="douban-filter-tab active" data-category="all">全部</button>';cats.forEach(function(p){html+='<button class="douban-filter-tab" data-category="'+__esc(p)+'">'+__esc(p)+'</button>';});gtabs.innerHTML=html;gtabs.style.display='';gtabs.querySelectorAll('.douban-filter-tab').forEach(function(btn){btn.addEventListener('click',function(){gtabs.querySelectorAll('.douban-filter-tab').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');loadGuduoGrid(btn.getAttribute('data-category')||'all');});});}).catch(function(){});return;}if(id==='theater'){body.innerHTML='<div id="theater-filter-tabs" class="douban-filter-tabs" style="display:none"></div><div id="theater-grid" class="grid"><div class="pane-loading"><div class="spinner"></div></div></div>';var tgrid=document.getElementById('theater-grid'),tabsBox=document.getElementById('theater-filter-tabs');function loadTheater(platform){tgrid.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';fetch('/api/theater-list?platform='+encodeURIComponent(platform)+'&mode=grid').then(function(r){return r.ok?r.text():'';}).then(function(html){tgrid.innerHTML=html||'<div class="empty"><p>暂无内容</p></div>';if(window.__scheduleEnrich)window.__scheduleEnrich();}).catch(function(){tgrid.innerHTML='<div class="empty"><p>加载失败，请稍后重试</p></div>';});}loadTheater('all');fetch('/api/theater-list?mode=platforms').then(function(r){return r.ok?r.json():{platforms:[]};}).then(function(d){var platforms=(d&&d.platforms)||[];if(!platforms.length)return;var html='<button class="douban-filter-tab active" data-platform="all">全部</button>';platforms.forEach(function(p){html+='<button class="douban-filter-tab" data-platform="'+__esc(p)+'">'+__esc(p)+'</button>';});tabsBox.innerHTML=html;tabsBox.style.display='';tabsBox.querySelectorAll('.douban-filter-tab').forEach(function(btn){btn.addEventListener('click',function(){tabsBox.querySelectorAll('.douban-filter-tab').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');loadTheater(btn.dataset.platform);});});}).catch(function(){});return;}var section=cfg.section;body.innerHTML='<div id="douban-modal-grid" class="grid"><div class="pane-loading"><div class="spinner"></div></div></div>';var grid=document.getElementById('douban-modal-grid');fetch('/api/douban-list?section='+encodeURIComponent(section)+'&mode=grid').then(function(r){return r.ok?r.text():'';}).then(function(html){if(html)grid.innerHTML=html;else grid.innerHTML='<div class="empty"><p>暂无内容</p></div>';if(window.__scheduleEnrich)window.__scheduleEnrich();}).catch(function(){grid.innerHTML='<div class="empty"><p>加载失败，请稍后重试</p></div>';});};
+
+window.openListModal=function(id){
+  var cfg=__listModalSections[id];
+  if(!cfg)return;
+  var modal=document.getElementById('list-modal');
+  var title=document.getElementById('list-modal-title');
+  var body=document.getElementById('list-modal-body');
+  if(!modal||!title||!body)return;
+  title.textContent=cfg.title||'';
+  body.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';
+  modal.classList.add('open');
+  document.body.style.overflow='hidden';
+  if(cfg.kind==='playback'||id==='playback'){
+    body.innerHTML='<div id="cw-modal-grid" class="grid cw-modal-grid"><div class="pane-loading"><div class="spinner"></div></div></div><div id="cw-modal-more-wrap" class="load-more-wrap" style="display:none"></div>';
+    function __cwApplyPage1(res){
+      var grid=document.getElementById('cw-modal-grid');
+      var wrap=document.getElementById('cw-modal-more-wrap');
+      if(!grid)return;
+      if(res.html&&res.html.trim()){grid.innerHTML=res.html;}
+      else{grid.innerHTML='<div class="empty"><p>暂无内容</p></div>';}
+      if(res.hasMore&&wrap){
+        wrap.style.display='';
+        wrap.innerHTML='<button class="load-more" data-page="2" type="button" onclick="loadMoreContinue(this)">加载更多</button>';
+      }else if(wrap){
+        wrap.style.display=res.html&&res.html.trim()?'':'none';
+        wrap.innerHTML=res.html&&res.html.trim()?'<div class="load-more-end" style="text-align:center;padding:14px 0 8px;color:var(--text-mute,#71717a);font-size:0.82rem">已经到底啦</div>':'';
+      }
+      if(window.__scheduleEnrich)window.__scheduleEnrich();
+    }
+    var cache=window.__cwMoreCache;
+    var now=Date.now();
+    var TTL=5*60*1000;
+    if(cache&&cache.ts&&(now-cache.ts)<TTL&&cache.pages&&cache.pages[1]){
+      __cwApplyPage1({html:cache.pages[1],hasMore:!!cache.hasMoreAfter[1]});
+      return;
+    }
+    fetch('/api/more?type=playback&page=1&limit=20&mode=grid').then(function(r){
+      if(!r.ok)throw new Error('HTTP '+r.status);
+      return r.text().then(function(html){return{html:html,hasMore:r.headers.get('X-Has-More')==='true'};});
+    }).then(function(res){
+      window.__cwMoreCache={ts:Date.now(),pages:{1:res.html||''},hasMoreAfter:{1:!!res.hasMore}};
+      __cwApplyPage1(res);
+    }).catch(function(){
+      var grid=document.getElementById('cw-modal-grid');
+      if(grid)grid.innerHTML='<div class="empty"><p>加载失败，请稍后重试</p></div>';
+    });
+    return;
+  }
+  if(cfg.kind==='tabsGrid'){__openTabsGridModal(body,cfg);return;}
+  if(cfg.kind==='simpleGrid'){__openSimpleGridModal(body,cfg);return;}
+  // fallback
+  if(cfg.listApi){__openSimpleGridModal(body,cfg);return;}
+};
 window.__platformNames={netflix:"Netflix",disney:"Disney+",appletv:"Apple TV+",hbomax:"HBO Max",prime:"Prime Video",iqiyi:"爱奇艺",youku:"优酷",tencent:"腾讯视频",mgtv:"芒果TV",bilibili:"哔哩哔哩"};
 window.__platformState={id:null,media:"all",page:1,loading:false,hasMore:false};
 window.openPlatformList=function(platformId){
@@ -10537,6 +11253,14 @@ window.openPlatformList=function(platformId){
   }
 };
 document.addEventListener("click",function(e){
+  var tBtn=e.target&&e.target.closest&&e.target.closest(".platform-card[data-theater-platform]");
+  if(tBtn){
+    e.preventDefault();
+    e.stopPropagation();
+    var tp=tBtn.getAttribute("data-theater-platform");
+    if(tp&&window.openTheaterPlatformList)window.openTheaterPlatformList(tp);
+    return;
+  }
   var btn=e.target&&e.target.closest&&e.target.closest(".platform-card[data-platform-id]");
   if(!btn)return;
   e.preventDefault();
@@ -10544,48 +11268,85 @@ document.addEventListener("click",function(e){
   var id=btn.getAttribute("data-platform-id");
   if(id)window.openPlatformList(id);
 });
-(function loadPlatformPreviews(){
-  var busy=false;
-  function paint(el,posters){
-    var html="";
-    for(var i=0;i<4;i++){
-      if(posters[i]){
-        html+='<img class="platform-card-poster p'+i+'" src="'+posters[i]+'" alt="" loading="lazy">';
+window.openTheaterPlatformList=function(platform){
+  var modal=document.getElementById("list-modal");
+  var title=document.getElementById("list-modal-title");
+  var body=document.getElementById("list-modal-body");
+  if(!modal||!title||!body)return;
+  platform=platform||"all";
+  title.textContent=platform==="all"?"平台剧场":platform;
+  body.innerHTML='<div id="theater-grid" class="grid"><div class="pane-loading"><div class="spinner"></div></div></div>';
+  modal.classList.add("open");
+  document.body.style.overflow="hidden";
+  var tgrid=document.getElementById("theater-grid");
+  if(!tgrid)return;
+  fetch("/api/theater-list?platform="+encodeURIComponent(platform)+"&mode=grid")
+    .then(function(r){return r.ok?r.text():"";})
+    .then(function(html){
+      tgrid.innerHTML=html||'<div class="empty"><p>暂无内容</p></div>';
+      if(window.__scheduleEnrich)window.__scheduleEnrich();
+    })
+    .catch(function(){tgrid.innerHTML='<div class="empty"><p>加载失败，请稍后重试</p></div>';});
+};
+(function(){
+  function paintPosters(el,posters){
+    var html="",i;
+    for(i=0;i<4;i++){
+      if(posters&&posters[i]){
+        html+='<img class="platform-card-poster p'+i+'" src="'+posters[i]+'" alt="" loading="lazy" referrerpolicy="no-referrer">';
       }else{
         html+='<span class="platform-card-poster p'+i+' platform-card-poster-ph"></span>';
       }
     }
     el.innerHTML=html;
   }
-  function run(force){
-    var nodes=document.querySelectorAll("[data-plat-posters]");
-    if(!nodes.length)return;
-    var need=0;
-    for(var i=0;i<nodes.length;i++){if(force||nodes[i].dataset.loaded!=="1")need++;}
-    if(!need&&!force)return;
-    if(busy)return;
-    busy=true;
-    fetch("/api/platform-list?mode=previews"+(force?"&force=1":""))
-      .then(function(r){return r.ok?r.json():null;})
-      .then(function(d){
-        var items=(d&&d.items)||{};
-        for(var i=0;i<nodes.length;i++){
-          var el=nodes[i],id=el.getAttribute("data-plat-posters");
-          var posters=(id&&items[id])||[];
-          el.dataset.loaded="1";
-          if(posters.length)paint(el,posters);
-        }
-      })
-      .catch(function(){
-        for(var i=0;i<nodes.length;i++)nodes[i].dataset.loaded="0";
-      })
-      .then(function(){busy=false;});
+  function loadCardPreviews(api,mapKey,filterFn){
+    var busy=false;
+    return function run(force){
+      var all=document.querySelectorAll('[data-plat-posters]');
+      var nodes=[];
+      for(var i=0;i<all.length;i++){
+        if(filterFn(all[i]))nodes.push(all[i]);
+      }
+      if(!nodes.length||busy)return;
+      busy=true;
+      var url=api+(force?(api.indexOf('?')>=0?'&':'?')+'force=1':'');
+      fetch(url,{credentials:'same-origin'})
+        .then(function(r){return r.ok?r.json():null;})
+        .then(function(d){
+          var map=(d&&d[mapKey])||{};
+          for(var i=0;i<nodes.length;i++){
+            var el=nodes[i],id=el.getAttribute('data-plat-posters');
+            var posters=(id&&map[id])||[];
+            el.dataset.loaded='1';
+            if(posters.length)paintPosters(el,posters);
+          }
+        })
+        .catch(function(){for(var i=0;i<nodes.length;i++)nodes[i].dataset.loaded='0';})
+        .then(function(){busy=false;});
+    };
   }
-  window.__reloadPlatformPreviews=function(force){run(!!force);};
-  if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",function(){run(false);});
-  else run(false);
-  setTimeout(function(){run(false);},1200);
-  setTimeout(function(){run(false);},3000);
+  var runPlatform=loadCardPreviews('/api/platform-list?mode=previews','items',function(el){return !el.closest('.theater-platform-rows');});
+  var runTheater=loadCardPreviews('/api/theater-list?mode=previews','previews',function(el){return !!el.closest('.theater-platform-rows');});
+  window.__reloadPlatformPreviews=function(force){runPlatform(!!force);};
+  window.__reloadTheaterPreviews=function(force){runTheater(!!force);};
+  function boot(){runPlatform(false);runTheater(false);}
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot);
+  else boot();
+})();
+(function(){
+  // 桌面端：鼠标悬停在平台/剧场横滑区域时，滚轮左右滑动
+  function onWheel(e){
+    var el=e.target&&e.target.closest&&e.target.closest(".platform-cards");
+    if(!el)return;
+    if(el.scrollWidth<=el.clientWidth+2)return;
+    // 触控板已有横向位移时不抢
+    if(Math.abs(e.deltaX)>Math.abs(e.deltaY))return;
+    if(!e.deltaY)return;
+    e.preventDefault();
+    el.scrollLeft+=e.deltaY;
+  }
+  document.addEventListener("wheel",onWheel,{passive:false,capture:true});
 })();
 window.closeListModal=function(){var modal=document.getElementById('list-modal');if(!modal)return;modal.classList.remove('open');document.body.style.overflow='';};
 document.addEventListener('keydown',function(e){if(e.key==='Escape'){var m=document.getElementById('list-modal');if(m&&m.classList.contains('open')){window.closeListModal();return;}}});
@@ -10607,9 +11368,8 @@ async function __loadHScroll(elId,url,keepId){
     if(window.__scheduleEnrich)window.__scheduleEnrich();
   }catch(e){el.innerHTML='<div class="h-scroll-empty"><p>加载失败，请稍后重试</p></div>';}
 }
-async function loadGuduoHScroll(category,force){category=category||'all';return __loadHScroll('guduo-hscroll','/api/guduo-list?mode=hscroll&category='+encodeURIComponent(category)+(force?'&force=1':''));}async function loadGuduoHomeTabs(){var tabsBox=document.getElementById('guduo-home-tabs');if(!tabsBox||tabsBox.dataset.loaded==='1')return;try{var r=await fetch('/api/guduo-list?mode=categories');var d=r.ok?await r.json():{categories:[]};var cats=(d&&d.categories)||[];if(!cats.length){}cats=cats.length?cats:['剧集','电影','动漫','综艺'];var html='<button class="theater-filter-tab active" data-category="all">全部</button>';for(var i=0;i<cats.length;i++){var p=cats[i];html+='<button class="theater-filter-tab" data-category="'+__esc(p)+'">'+__esc(p)+'</button>';}tabsBox.innerHTML=html;tabsBox.style.display='';tabsBox.dataset.loaded='1';tabsBox.addEventListener('click',function(e){var btn=e.target.closest('.theater-filter-tab');if(!btn)return;tabsBox.querySelectorAll('.theater-filter-tab').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');loadGuduoHScroll(btn.getAttribute('data-category')||'all');});}catch(e){}}async function loadTheaterHScroll(platform,force){platform=platform||'all';return __loadHScroll('theater-hscroll','/api/theater-list?mode=hscroll&platform='+encodeURIComponent(platform)+(force?'&force=1':''));}
-async function loadTheaterHomeTabs(){var tabsBox=document.getElementById('theater-home-tabs');if(!tabsBox||tabsBox.dataset.loaded==='1')return;try{var r=await fetch('/api/theater-list?mode=platforms');var d=r.ok?await r.json():{platforms:[]};var platforms=(d&&d.platforms)||[];if(!platforms.length)return;var html='<button class="theater-filter-tab active" data-platform="all">全部</button>';for(var i=0;i<platforms.length;i++){var p=platforms[i];html+='<button class="theater-filter-tab" data-platform="'+__esc(p)+'">'+__esc(p)+'</button>';}tabsBox.innerHTML=html;tabsBox.style.display='';tabsBox.dataset.loaded='1';tabsBox.addEventListener('click',function(e){var btn=e.target.closest('.theater-filter-tab');if(!btn)return;tabsBox.querySelectorAll('.theater-filter-tab').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');loadTheaterHScroll(btn.dataset.platform);});}catch(e){}}
-(function(){var sections=[['douban-domestic','domestic'],['douban-hktw','hktw'],['douban-jpkr','jpkr'],['douban-western','western']];function loadOne(id,section,force){return __loadHScroll(id+'-hscroll','/api/douban-list?section='+section+'&mode=hscroll'+(force?'&force=1':''),true);}function start(force){sections.forEach(function(pair){loadOne(pair[0],pair[1],force);});var guduoTab=document.querySelector('#guduo-home-tabs .theater-filter-tab.active');var guduoCat=guduoTab?guduoTab.getAttribute('data-category')||'all':'all';var theaterTab=document.querySelector('#theater-home-tabs .theater-filter-tab.active');var theaterPlat=theaterTab?theaterTab.getAttribute('data-platform')||'all':'all';loadGuduoHScroll(guduoCat,force);if(force){var gt=document.getElementById('guduo-home-tabs');if(gt)gt.dataset.loaded='0';var tt=document.getElementById('theater-home-tabs');if(tt)tt.dataset.loaded='0';}loadGuduoHomeTabs();loadTheaterHScroll(theaterPlat,force);loadTheaterHomeTabs();if(window.__reloadPlatformPreviews)window.__reloadPlatformPreviews(false);}if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',function(){start(false);});else start(false);window.__reloadDoubanSections=start;})();
+async function loadGuduoHScroll(category,force){category=category||'all';return __loadHScroll('guduo-hscroll','/api/guduo-list?mode=hscroll&category='+encodeURIComponent(category)+(force?'&force=1':''));}async function loadGuduoHomeTabs(){var tabsBox=document.getElementById('guduo-home-tabs');if(!tabsBox||tabsBox.dataset.loaded==='1')return;try{var r=await fetch('/api/guduo-list?mode=categories');var d=r.ok?await r.json():{categories:[]};var cats=(d&&d.categories)||[];if(!cats.length){}cats=cats.length?cats:['剧集','电影','动漫','综艺'];var html='<button class="theater-filter-tab active" data-category="all">全部</button>';for(var i=0;i<cats.length;i++){var p=cats[i];html+='<button class="theater-filter-tab" data-category="'+__esc(p)+'">'+__esc(p)+'</button>';}tabsBox.innerHTML=html;tabsBox.style.display='';tabsBox.dataset.loaded='1';tabsBox.addEventListener('click',function(e){var btn=e.target.closest('.theater-filter-tab');if(!btn)return;tabsBox.querySelectorAll('.theater-filter-tab').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');loadGuduoHScroll(btn.getAttribute('data-category')||'all');});}catch(e){}}
+(function(){var sections=[['douban-domestic','domestic'],['douban-hktw','hktw'],['douban-jpkr','jpkr'],['douban-western','western']];function loadOne(id,section,force){return __loadHScroll(id+'-hscroll','/api/douban-list?section='+section+'&mode=hscroll'+(force?'&force=1':''),true);}function start(force){sections.forEach(function(pair){loadOne(pair[0],pair[1],force);});var guduoTab=document.querySelector('#guduo-home-tabs .theater-filter-tab.active');var guduoCat=guduoTab?guduoTab.getAttribute('data-category')||'all':'all';loadGuduoHScroll(guduoCat,force);if(force){var gt=document.getElementById('guduo-home-tabs');if(gt)gt.dataset.loaded='0';}loadGuduoHomeTabs();if(window.__reloadPlatformPreviews)window.__reloadPlatformPreviews(false);if(window.__reloadTheaterPreviews)window.__reloadTheaterPreviews(!!force);}if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',function(){start(false);});else start(false);window.__reloadDoubanSections=start;})();
 let modalLoadingId=0;window.__lastDetailType=null;window.__lastDetailId=null;async function openDetail(type,id,push=true){const modal=document.getElementById('modal'),body=document.getElementById('modal-body');if(!modal||!body)return;if(window.__stopTrailers)window.__stopTrailers();window.__lastDetailType=type;window.__lastDetailId=id;modal.classList.add('open');document.body.style.overflow='hidden';if(push&&location.pathname!=='/detail/'+type+'/'+id)history.pushState({detail:true},'','/detail/'+type+'/'+id);const reqId=++modalLoadingId;body.innerHTML='<div class="modal-loading"><div class="spinner"></div></div>';body.scrollTop=0;try{const r=await fetch('/api/detail?type='+encodeURIComponent(type)+'&id='+encodeURIComponent(id));if(reqId!==modalLoadingId)return;if(!r.ok)throw new Error('HTTP '+r.status);body.innerHTML=await r.text();if(window.__detailDeferLoad)window.__detailDeferLoad(type);}catch(e){if(reqId!==modalLoadingId)return;body.innerHTML='<div class="modal-error"><p>加载失败，请稍后重试</p><button class="btn-ghost" type="button" style="margin-top:14px" onclick="window.__retryDetail&&window.__retryDetail()">重试</button></div>';}}window.openDetail=openDetail;
 window.__retryDetail=function(){if(window.__lastDetailType&&window.__lastDetailId)openDetail(window.__lastDetailType,window.__lastDetailId,false);};
 function __loadSeasonBody(body,head){if(!body||!head)return;if(body.dataset.loaded||body.dataset.loading)return;body.dataset.loading='1';body.innerHTML='<div class="modal-loading" style="padding:24px"><div class="spinner"></div></div>';fetch('/api/season?show='+encodeURIComponent(head.dataset.show||'')+'&season='+encodeURIComponent(head.dataset.season)+'&tmdb='+encodeURIComponent(head.dataset.tmdb)+'&slug='+encodeURIComponent(head.dataset.slug||'')).then(function(r){return r.ok?r.text():'';}).then(function(html){body.innerHTML=html;body.dataset.loaded='1';delete body.dataset.loading;}).catch(function(){body.innerHTML='<div class="modal-error" style="padding:20px">加载失败</div>';delete body.dataset.loading;});}
@@ -10652,7 +11412,33 @@ window.__summaryNav=function(dir){var st=window.__summaryState;if(!st._prevRef&&
 document.addEventListener('click',function(e){var row=e.target&&e.target.closest&&e.target.closest('.sum-row-click');if(!row)return;var type=row.getAttribute('data-sum-type'),id=row.getAttribute('data-sum-id');if(!type||!id)return;e.preventDefault();if(typeof openDetail==='function')openDetail(type,id,true);});
 window.__openSummary=function(){var modal=document.getElementById('summary-modal');if(!modal)return;modal.classList.add('open');modal.style.display='block';document.body.style.overflow='hidden';window.__loadSummary(true);};
 window.__closeSummary=function(){var modal=document.getElementById('summary-modal');if(!modal)return;modal.classList.remove('open');modal.style.display='none';document.body.style.overflow='';};
-window.__loadSummary=async function(force){var body=document.getElementById('summary-modal-body');if(!body)return;if(body.dataset.loaded==='1'&&!force)return;var st=window.__summaryState;if(!st.ref)st.ref=__sumDefaultRef(st.period);body.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';try{var r=await fetch('/api/summary?period='+encodeURIComponent(st.period)+'&ref='+encodeURIComponent(st.ref));if(!r.ok)throw new Error('HTTP '+r.status);var data=await r.json();st.ref=data.ref||st.ref;st.period=data.period||st.period;st._prevRef=data.prevRef||null;st._nextRef=data.nextRef||null;body.innerHTML=__sumRender(data);body.dataset.loaded='1';}catch(e){body.innerHTML='<div class="empty"><p>小结加载失败，请稍后重试</p></div>';body.dataset.loaded='0';}};
+window.__loadSummary=async function(force){var body=document.getElementById('summary-modal-body');if(!body)return;if(body.dataset.loaded==='1'&&!force)return;var st=window.__summaryState;if(!st.ref)st.ref=__sumDefaultRef(st.period);body.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';
+  var lsKey='mt:sum:'+st.period+':'+st.ref;
+  try{
+    var cached=null;
+    try{var raw=localStorage.getItem(lsKey);if(raw){var o=JSON.parse(raw);if(o&&o.data&&(!o._exp||o._exp>Date.now()))cached=o.data;}}catch(e){}
+    if(cached&&!cached.error&&!force){
+      st.ref=cached.ref||st.ref;st.period=cached.period||st.period;
+      st._prevRef=cached.prevRef||null;st._nextRef=cached.nextRef||null;
+      body.innerHTML=__sumRender(cached);body.dataset.loaded='1';
+    }
+    var r=await fetch('/api/summary?period='+encodeURIComponent(st.period)+'&ref='+encodeURIComponent(st.ref));
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    var data=await r.json();
+    if(data&&!data.error&&!data.__error){
+      st.ref=data.ref||st.ref;st.period=data.period||st.period;
+      st._prevRef=data.prevRef||null;st._nextRef=data.nextRef||null;
+      body.innerHTML=__sumRender(data);body.dataset.loaded='1';
+      try{localStorage.setItem(lsKey,JSON.stringify({data:data,_exp:Date.now()+7*86400e3}));}catch(e){}
+    }else if(!cached){
+      body.innerHTML='<div class="empty"><p>小结暂无数据</p></div>';body.dataset.loaded='0';
+    }
+  }catch(e){
+    if(body.dataset.loaded!=='1'){
+      body.innerHTML='<div class="empty"><p>小结加载失败，请稍后重试</p></div>';body.dataset.loaded='0';
+    }
+  }
+};
 document.addEventListener('click',function(e){var av=e.target&&e.target.closest&&e.target.closest('#hero-avatar');if(av){e.preventDefault();window.__openSummary&&window.__openSummary();}});
 document.addEventListener('keydown',function(e){if(e.key==='Escape'){var m=document.getElementById('summary-modal');if(m&&m.classList.contains('open'))window.__closeSummary();}});
 let __personLoadingId=0;
