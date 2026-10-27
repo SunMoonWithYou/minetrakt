@@ -1,6 +1,3 @@
-/* =============================================================================
- * 1. 常量与配置（API 地址、TTL、主题、资源）
- * ============================================================================= */
 const TRAKT_AUTH = "https://auth.trakt.tv",
   TRAKT_API = "https://api.trakt.tv",
   TMDB_API = "https://api.themoviedb.org/3",
@@ -75,8 +72,8 @@ const PAGE_SIZE = 20,
   TMDB_KV_TTL = 86400 * 7,
   OMDB_KV_TTL = 86400 * 7,
   WATCHLIST_PAGE_SIZE = 30,
-  WATCHLIST_KV_TTL = 3600,
-  CALENDAR_KV_TTL = 900,
+  WATCHLIST_KV_TTL = 28800,
+  CALENDAR_KV_TTL = 28800,
   TREND_KV_TTL = 86400,
   MISS_KV_TTL = 300,
   HISTORY_KV_TTL = 5400,
@@ -85,9 +82,9 @@ const PAGE_SIZE = 20,
   PROFILE_KV_TTL = 86400,
   ENTITY_KV_TTL = 86400,
   SEASON_KV_TTL = 86400,
-  DOUBAN_KV_TTL = 21600,
+  DOUBAN_KV_TTL = 86400,
   THEATER_KV_TTL = 86400,
-  GUDUO_KV_TTL = 21600,
+  GUDUO_KV_TTL = 86400,
   PLATFORM_KV_TTL = 86400;
 
 const KV_STALE_RETENTION = 86400 * 7,
@@ -95,7 +92,7 @@ const KV_STALE_RETENTION = 86400 * 7,
 
 const HOME_AUTO_REFRESH_MINUTES = 10;
 
-const APP_VERSION = "1.0.0"; // 版本号（每次发布需要修改）
+const APP_VERSION = "1.1.0";  //  版本号（更新代码需要跟随更新）
 const APP_JS_VERSION = APP_VERSION;
 const APP_CSS_VERSION = APP_VERSION;
 
@@ -118,15 +115,14 @@ const CACHE_USER_META = {
   jitter: 300,
 };
 
-/** 用户进度类缓存默认项（可再覆盖） */
 function cacheUser(extra) {
   return Object.assign({}, CACHE_USER_LONG, extra || {});
 }
-/** 用户元数据类缓存默认项 */
+
 function cacheUserMeta(extra) {
   return Object.assign({}, CACHE_USER_META, extra || {});
 }
-/** 公开只读资源缓存默认项 */
+
 function cachePublic(ttl, extra) {
   return Object.assign(
     {
@@ -140,7 +136,6 @@ function cachePublic(ttl, extra) {
   );
 }
 
-/** 返回 JSON Response，可附带自定义 headers / status */
 function jsonResp(data, headers, status) {
   return new Response(JSON.stringify(data), {
     status: status || 200,
@@ -151,7 +146,6 @@ function jsonResp(data, headers, status) {
   });
 }
 
-/** Cloudflare Cache API 边缘缓存包装（公开只读资源） */
 async function edgeCached(request, ctx, ttlSec, fn) {
   if (request.method !== "GET") return fn();
   let cache = null;
@@ -200,7 +194,7 @@ async function edgeCached(request, ctx, ttlSec, fn) {
 
 const __enrichHits = new Map();
 const __enrichBucketMem = new Map();
-/** 限制 enrich 接口频率，防止刷 TMDB */
+
 function allowEnrich(request) {
   const ip =
     request.headers.get("CF-Connecting-IP") ||
@@ -265,9 +259,6 @@ const CK = {
   },
 };
 
-/* =============================================================================
- * 2. Trakt 请求封装：超时、全局/用户级节流、429 冷却
- * ============================================================================= */
 async function fetchT(url, opts = {}, ms = 8000, userKey) {
   if (TRAKT_HOST_RE.test(url)) await traktGate(userKey);
   const ctrl = new AbortController();
@@ -293,7 +284,6 @@ let __traktTail = Promise.resolve(),
 const __traktUserTails = new Map();
 const __traktUserLast = new Map();
 
-/** 串行化 Trakt 请求，限制全局/每用户最小间隔，减轻 429 */
 function traktGate(userKey) {
   const uk = userKey || "__anon__";
   const prevGlobal = __traktTail;
@@ -342,21 +332,18 @@ const TRAKT_RATE_LIMIT_MAX_COOLDOWN = 300000;
 const __traktRateLimitByUser = new Map();
 const __traktStrikes = new Map();
 
-/** 当前用户是否处于 Trakt 429 冷却 */
 function isTraktRateLimited(userKey) {
   const k = userKey || "__anon__";
   const until = __traktRateLimitByUser.get(k) || 0;
   return Date.now() < until;
 }
 
-/** 冷却剩余秒数 */
 function traktRateLimitedRemaining(userKey) {
   const k = userKey || "__anon__";
   const until = __traktRateLimitByUser.get(k) || 0;
   return Math.max(0, Math.ceil((until - Date.now()) / 1000));
 }
 
-/** 根据 Retry-After 写入用户冷却截止时间 */
 function markTraktRateLimited(ms, userKey) {
   const k = userKey || "__anon__";
   const strikes = (__traktStrikes.get(k) || 0) + 1;
@@ -387,13 +374,11 @@ function markTraktRateLimited(ms, userKey) {
   return wait;
 }
 
-/** 清除连续 429 计数 */
 function clearTraktStrikes(userKey) {
   const k = userKey || "__anon__";
   if (__traktStrikes.size && __traktStrikes.has(k)) __traktStrikes.delete(k);
 }
 
-/** 从响应头解析 Retry-After 并 mark 冷却 */
 function consumeRetryAfter(r, userKey) {
   const ra = parseInt(r.headers.get("Retry-After") || "", 10);
   const waitMs =
@@ -403,7 +388,6 @@ function consumeRetryAfter(r, userKey) {
   return markTraktRateLimited(waitMs, userKey);
 }
 
-/** 带重试与 429 处理的 Trakt JSON 请求；wantPageCount 时附带分页头 */
 async function traktFetch(
   url,
   headers,
@@ -478,10 +462,6 @@ async function traktFetch(
 const traktGet = (url, headers, retries = 2, userKey) =>
   traktFetch(url, headers, { retries, timeout: 12000, userKey });
 
-/* =============================================================================
- * 3. KV + 内存缓存
- *    读：内存 → KV → 上游；写：热点 2 分钟 / 普通 1 小时间隔，unchanged 跳过
- * ============================================================================= */
 const KV_MEM_TTL = 1800000,
   KV_EDGE_TTL = 1800,
   KV_MISS = Symbol("kv-miss"),
@@ -494,7 +474,6 @@ const KV_HOT_PUT_INTERVAL_MS = 120000;
 const KV_FORCE_PUT_INTERVAL_MS = 3600000;
 const LAST_GOOD_MIN_PUT_INTERVAL_MS = 7 * 24 * 3600000;
 
-/** 用户进度类 key：写间隔更短（2 分钟），保证刷新相对及时 */
 function isHotKvKey(key) {
   if (!key) return false;
   const k = String(key);
@@ -518,37 +497,6 @@ function isHotKvKey(key) {
 }
 const ENRICH_BUCKETS = 4;
 const ENRICH_BUCKET_TTL = 86400 * 30;
-/* 跨设备同步的 key：读不读内存，直接读 KV；写入不做长间隔节流 */
-const CROSS_DEVICE_KV_PREFIXES = [
-  "pb:", // 继续观看（暂停/进度）
-  "hist:", // 观看历史
-  "more:hist:", // 历史分页
-  "more:pb:", // 继续观看分页
-  "spb:", // 单剧暂停
-  "tpr:", // 单剧进度
-  "tmh:", // 电影观看历史
-  "we:", // 已看剧集集合
-  "cwh:", // 继续观看隐藏表
-  "stats:", // 统计
-  "wlv:", // 待看版本号
-  "wl:", // 待看列表
-  "cal:", // 追剧日历
-  "prof:", // 用户资料
-  "sum2:", // 观看小结
-  "us:", // 用户状态聚合
-  "dropped:", // 弃看集合
-  "act:", // 活动签名
-];
-
-/** 判断 key 是否属于跨设备同步数据（用户进度类） */
-function isCrossDeviceKvKey(key) {
-  if (!key) return false;
-  const k = String(key);
-  for (let i = 0; i < CROSS_DEVICE_KV_PREFIXES.length; i++) {
-    if (k.startsWith(CROSS_DEVICE_KV_PREFIXES[i])) return true;
-  }
-  return false;
-}
 const ENRICH_BUCKET_MAX = 500;
 const ENRICH_BATCH_MAX = 20;
 const ENRICH_BUCKET_MEM_TTL = 120000;
@@ -556,8 +504,8 @@ const DEFAULT_JITTER_SEC = 600;
 const __KV_LASTPUT_MAX = 5000;
 
 const __kvLastPut = new Map();
-/** 用户继续观看/暂停记录的最近更新时间（Worker 内存） */
-const __cwTimeMem = new Map(); // userKey -> { pauseUpdatedAt, continueUpdatedAt }
+
+const __cwTimeMem = new Map();
 
 const __kvMem = new Map(),
   __kvMemExp = new Map(),
@@ -565,7 +513,6 @@ const __kvMem = new Map(),
 const __kvMemStale = new Map();
 const STALE_MAX_AGE = 3600000;
 
-/** 内存中保留一份过期数据供 SWR 展示 */
 function kvMemStaleSet(key, data, dataTs) {
   __kvMemStale.set(key, {
     data,
@@ -581,7 +528,6 @@ function kvMemStaleSet(key, data, dataTs) {
   }
 }
 
-/** 读取内存 stale 数据（未超 STALE_MAX_AGE） */
 function kvMemStaleGet(key) {
   const e = __kvMemStale.get(key);
   if (!e) return undefined;
@@ -594,20 +540,18 @@ function kvMemStaleGet(key) {
 
 let __kvDownUntil = 0;
 
-/** KV 是否被标记为暂时不可用 */
 function kvIsDown() {
   return Date.now() < __kvDownUntil;
 }
-/** 标记 KV 故障，短时跳过 put/get */
+
 function kvMarkDown() {
   __kvDownUntil = Date.now() + KV_DOWN_COOLDOWN_MS;
 }
-/** KV 恢复正常 */
+
 function kvMarkUp() {
   __kvDownUntil = 0;
 }
 
-/** 读内存缓存；返回 data 或带 miss 标记 */
 function kvMemGet(key) {
   const exp = __kvMemExp.get(key);
   if (exp === undefined) return undefined;
@@ -619,7 +563,6 @@ function kvMemGet(key) {
   return __kvMem.get(key);
 }
 
-/** 写内存缓存并设过期时间 */
 function kvMemSet(key, val, ttlMs) {
   __kvMem.set(key, val);
   __kvMemExp.set(key, Date.now() + (ttlMs || KV_MEM_TTL));
@@ -645,7 +588,6 @@ function kvMemSet(key, val, ttlMs) {
   }
 }
 
-/** 同一 key 并发只跑一次 fetcher，其余等待结果 */
 function singleFlight(key, fn) {
   const existing = __kvInflight.get(key);
   if (existing) return existing;
@@ -660,7 +602,6 @@ function singleFlight(key, fn) {
   return p;
 }
 
-/** 内存 → KV 读 JSON；支持 edgeTtl / missTtl */
 async function kvGetJSON(env, key, memOnly, edgeTtl, missTtl) {
   if (memOnly) return undefined;
   if (!env.TMDB_CACHE || kvIsDown()) return KV_ERR;
@@ -677,7 +618,6 @@ async function kvGetJSON(env, key, memOnly, edgeTtl, missTtl) {
   }
 }
 
-/** 写 KV（受最小写间隔与 hot key 规则约束；跨设备 key 不写内存、不节流） */
 function kvPutJSON(
   env,
   ctx,
@@ -691,7 +631,6 @@ function kvPutJSON(
 ) {
   if (unchanged) return;
 
-  const skipMem = isCrossDeviceKvKey(key);
   const memMs =
     payload && payload.miss
       ? 30000
@@ -707,25 +646,19 @@ function kvPutJSON(
   )
     payload._ts = Date.now();
 
-  if (!skipMem) {
-    kvMemSet(key, payload, memMs);
-  }
+  kvMemSet(key, payload, memMs);
   if (memOnly) return;
   if (!env.TMDB_CACHE || kvIsDown()) return;
   if (ttl != null && ttl < KV_MIN_PUT_TTL) return;
 
   const now = Date.now();
   const lastPut = __kvLastPut.get(key) || 0;
-
-  // 跨设备 key 不做 minGap 节流（数据变了就写；不变已在 writeFresh 过滤）
-  if (!skipMem) {
-    const minGap = force
-      ? KV_FORCE_PUT_INTERVAL_MS
-      : isHotKvKey(key)
-        ? KV_HOT_PUT_INTERVAL_MS
-        : KV_MIN_PUT_INTERVAL_MS;
-    if (lastPut && now - lastPut < minGap) return;
-  }
+  const minGap = force
+    ? KV_FORCE_PUT_INTERVAL_MS
+    : isHotKvKey(key)
+      ? KV_HOT_PUT_INTERVAL_MS
+      : KV_MIN_PUT_INTERVAL_MS;
+  if (lastPut && now - lastPut < minGap) return;
   __kvLastPut.set(key, now);
 
   if (__kvLastPut.size > __KV_LASTPUT_MAX) {
@@ -754,7 +687,6 @@ function kvPutJSON(
   if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
 }
 
-/** 判断是否为缓存的错误占位载荷 */
 function __isErrorPayload(d) {
   if (d === null || d === undefined || d === false) return true;
   if (typeof d === "object" && d) {
@@ -765,7 +697,6 @@ function __isErrorPayload(d) {
   return false;
 }
 
-/** 对 key 做稳定抖动，避免缓存雪崩 */
 function stableJitter(key, maxSec) {
   const m = Math.floor(Number(maxSec) || 0);
   if (m <= 0) return 0;
@@ -778,12 +709,6 @@ function stableJitter(key, maxSec) {
   return h % m;
 }
 
-/**
- * 通用缓存包装：SWR、miss 短 TTL、lastGood 兜底、bypass 强制刷新。
- * 跨设备用户数据（isCrossDeviceKvKey）跳过内存，直接读 KV。
- * @param {string} key KV/内存键
- * @param {Function} fetcher 未命中时拉取上游
- */
 async function cachedJSON(
   env,
   ctx,
@@ -806,12 +731,8 @@ async function cachedJSON(
     staleRetention = null,
     memOnlyOnBypass = false,
     minWriteGapMs = null,
-    noMem = false,
   } = {},
 ) {
-  // 跨设备 key 自动跳过内存；minWriteGap 归零，数据一变就写 KV
-  const skipMem = noMem === true || isCrossDeviceKvKey(key);
-
   const jitterSec = stableJitter(
     key,
     jitter != null ? jitter : DEFAULT_JITTER_SEC,
@@ -819,11 +740,8 @@ async function cachedJSON(
   const effectiveTtl = ttl + jitterSec;
   const softAge =
     swr === true ? Math.floor(ttl * 0.5) : typeof swr === "number" ? swr : 0;
-  const effectiveMinWriteGap = skipMem
-    ? 0
-    : minWriteGapMs != null
-      ? minWriteGapMs
-      : KV_FORCE_PUT_INTERVAL_MS;
+  const effectiveMinWriteGap =
+    minWriteGapMs != null ? minWriteGapMs : KV_FORCE_PUT_INTERVAL_MS;
 
   function unwrapVal(cached) {
     if (cached === KV_MISS || cached == null) return null;
@@ -841,7 +759,6 @@ async function cachedJSON(
       if (fromCache === null) {
         sourceTracker.fromCache = null;
         sourceTracker.age = 0;
-        sourceTracker._ts = null;
         return;
       }
       sourceTracker.fromCache = !!fromCache;
@@ -852,13 +769,6 @@ async function cachedJSON(
         : typeof liveAgeSec === "number" && isFinite(liveAgeSec)
           ? Math.max(0, liveAgeSec)
           : 0;
-      sourceTracker._ts = fromCache
-        ? cached && cached._ts
-          ? cached._ts
-          : null
-        : typeof liveAgeSec === "number" && isFinite(liveAgeSec)
-          ? Date.now() - liveAgeSec * 1000
-          : null;
     }
   }
 
@@ -947,36 +857,24 @@ async function cachedJSON(
     const memMs = effectiveTtl
       ? Math.min(KV_MEM_TTL, Math.max(5000, effectiveTtl * 1000))
       : KV_MEM_TTL;
-
     if (!unchanged && prevWts && nowMs - prevWts < effectiveMinWriteGap) {
-      if (!skipMem) {
-        kvMemSet(
-          key,
-          { data, _ts: (prev && prev._ts) || nowMs, _wts: prevWts },
-          memMs,
-        );
-      }
+      kvMemSet(
+        key,
+        { data, _ts: (prev && prev._ts) || nowMs, _wts: prevWts },
+        memMs,
+      );
       kvMemStaleSet(key, data, (prev && prev._ts) || undefined);
       return 0;
     }
 
     const nowWts = unchanged ? prevWts || wts : nowMs;
-
-    // skipMem 的 key 没有内存可写，memOnlyOverride（"只写内存"）的语义不成立
-    // 数据不变已被 __stableStr 去重；数据变了就是真的变了，必须落 KV 供跨设备读取
-    const effectiveMemOnly = skipMem
-      ? false
-      : memOnlyOverride != null
-        ? memOnlyOverride
-        : memOnly;
-
     kvPutJSON(
       env,
       ctx,
       key,
       { data, _ts: wts, _wts: nowWts },
       effectiveTtl,
-      effectiveMemOnly,
+      memOnlyOverride != null ? memOnlyOverride : memOnly,
       force,
       null,
       unchanged,
@@ -984,9 +882,7 @@ async function cachedJSON(
     kvMemStaleSet(key, data, wts);
 
     if (unchanged) {
-      if (!skipMem) {
-        kvMemSet(key, { data, _ts: wts, _wts: nowWts }, memMs);
-      }
+      kvMemSet(key, { data, _ts: wts, _wts: nowWts }, memMs);
     } else {
       writeLastGood(data);
     }
@@ -1160,30 +1056,27 @@ async function cachedJSON(
     );
   }
 
-  // 跨设备 key 跳过内存，直接走 KV 分支
-  if (!skipMem) {
-    const mem = kvMemGet(key);
-    if (mem !== undefined) {
-      if (mem === KV_MISS) {
-        const lg = await tryLastGood();
-        if (lg.found) {
-          kvMemSet(
-            key,
-            { data: lg.val, _ts: (lg.raw && lg.raw._ts) || Date.now() },
-            KV_MEM_TTL,
-          );
-          kvMemStaleSet(key, lg.val, (lg.raw && lg.raw._ts) || undefined);
-          markSource(true, lg.raw || null);
-          return unwrap ? lg.val : { data: lg.val };
-        }
-        markSource(null, null);
-        return null;
+  const mem = kvMemGet(key);
+  if (mem !== undefined) {
+    if (mem === KV_MISS) {
+      const lg = await tryLastGood();
+      if (lg.found) {
+        kvMemSet(
+          key,
+          { data: lg.val, _ts: (lg.raw && lg.raw._ts) || Date.now() },
+          KV_MEM_TTL,
+        );
+        kvMemStaleSet(key, lg.val, (lg.raw && lg.raw._ts) || undefined);
+        markSource(true, lg.raw || null);
+        return unwrap ? lg.val : { data: lg.val };
       }
-      if (revalidate && needRefresh(mem)) scheduleRefresh(mem);
-      markSource(true, mem);
-      if (unwrap) return unwrapVal(mem);
-      return mem;
+      markSource(null, null);
+      return null;
     }
+    if (revalidate && needRefresh(mem)) scheduleRefresh(mem);
+    markSource(true, mem);
+    if (unwrap) return unwrapVal(mem);
+    return mem;
   }
 
   return singleFlight(key, async () => {
@@ -1301,13 +1194,11 @@ self.addEventListener("fetch", function (event) {
 
 var __cachePs = {};
 
-/** 打开 Cache Storage 命名缓存（SW 用） */
 function getCache(name) {
   if (!__cachePs[name]) __cachePs[name] = caches.open(name);
   return __cachePs[name];
 }
 
-/** 启动页导航：SWR 策略 */
 async function navigateLaunchSwr(req) {
   var cache = await getCache(NAV_CACHE);
   var cached = await cache.match(req);
@@ -1324,7 +1215,6 @@ async function navigateLaunchSwr(req) {
   return r;
 }
 
-/** 导航请求网络优先 */
 async function navigateNetworkFirst(req) {
   var ctrl = new AbortController();
   var timer = setTimeout(function () {
@@ -1375,7 +1265,6 @@ async function navigateNetworkFirst(req) {
   }
 }
 
-/** 静态资源 SWR */
 async function staleWhileRevalidate(req) {
   var cacheP = getCache(RUNTIME_CACHE);
   var networkP = fetch(req).then(function (r) {
@@ -1399,9 +1288,6 @@ async function staleWhileRevalidate(req) {
   return cached || networkP;
 }`;
 
-/* =============================================================================
- * 4. Worker 入口：路由分发
- * ============================================================================= */
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url),
@@ -1441,19 +1327,19 @@ export default {
     if (path === "/api/search") return handleSearch(request, env, ctx);
     if (path === "/api/trending") return handleTrending(request, env, ctx);
     if (path === "/api/douban-list")
-      return edgeCached(request, ctx, 600, () =>
+      return edgeCached(request, ctx, 86400, () =>
         handleDoubanList(request, env, ctx),
       );
     if (path === "/api/theater-list")
-      return edgeCached(request, ctx, 600, () =>
+      return edgeCached(request, ctx, 86400, () =>
         handleTheaterList(request, env, ctx),
       );
     if (path === "/api/guduo-list")
-      return edgeCached(request, ctx, 600, () =>
+      return edgeCached(request, ctx, 86400, () =>
         handleGuduoList(request, env, ctx),
       );
     if (path === "/api/platform-list")
-      return edgeCached(request, ctx, 900, () =>
+      return edgeCached(request, ctx, 86400, () =>
         handlePlatformList(request, env, ctx),
       );
 
@@ -1488,7 +1374,6 @@ export default {
   },
 };
 
-/** 代理用户头像，避免跨域 */
 async function handleAvatar(request, ctx) {
   const raw = new URL(request.url).searchParams.get("u") || "";
   let target;
@@ -1539,7 +1424,6 @@ async function handleAvatar(request, ctx) {
   return resp;
 }
 
-/** 本地静态图标等资源 */
 async function handleAsset(path, ctx) {
   const entry = ASSET_ORIGINS[path];
   if (!entry) return new Response("Not Found", { status: 404 });
@@ -1566,7 +1450,6 @@ async function handleAsset(path, ctx) {
   }
 }
 
-/** 输出全站 CSS（pageStyles） */
 function handleAppCss() {
   return new Response(pageStyles(), {
     headers: {
@@ -1577,7 +1460,6 @@ function handleAppCss() {
   });
 }
 
-/** 输出前端 bootstrap 脚本 */
 function handleAppJs(request) {
   const etag = `"js-v${APP_JS_VERSION}"`;
   const cacheHeaders = {
@@ -1595,7 +1477,6 @@ function handleAppJs(request) {
   });
 }
 
-/** PWA manifest */
 function handleManifest() {
   return new Response(
     JSON.stringify({
@@ -1629,7 +1510,6 @@ function handleManifest() {
   );
 }
 
-/** 返回 js/css 版本号 JSON */
 function handleAppVersion() {
   return new Response(
     JSON.stringify({ js: APP_JS_VERSION, css: APP_CSS_VERSION }),
@@ -1642,7 +1522,6 @@ function handleAppVersion() {
   );
 }
 
-/** 返回 SW 脚本 */
 function handleServiceWorker() {
   return new Response(SW_JS_CONTENT, {
     headers: {
@@ -1653,10 +1532,6 @@ function handleServiceWorker() {
   });
 }
 
-/* =============================================================================
- * 5. 鉴权与 Cookie
- * ============================================================================= */
-/** 要求登录，失败返回 401/登录页 */
 async function requireAuth(request, env) {
   const cookieAuth = readAuth(request);
   if (!cookieAuth) return { ok: false };
@@ -1672,7 +1547,6 @@ async function requireAuth(request, env) {
   };
 }
 
-/** 解析 Cookie 鉴权；可要求 strict / 返回 HTML 错误 */
 async function authed(
   request,
   env,
@@ -1725,7 +1599,6 @@ async function authed(
   };
 }
 
-/** 将 API 错误码转为用户可读中文 */
 function humanizeApiError(codeOrMsg, extra) {
   const s = String(codeOrMsg || "").trim();
   const cooling = extra && extra.cooling != null ? Number(extra.cooling) : null;
@@ -1769,7 +1642,6 @@ function humanizeApiError(codeOrMsg, extra) {
   return s || "操作失败，请稍后重试";
 }
 
-/** 未登录 JSON 响应 */
 function unauthorizedJson() {
   return Response.json(
     { error: humanizeApiError("unauthorized") },
@@ -1780,7 +1652,6 @@ function unauthorizedJson() {
   );
 }
 
-/** 未登录 HTML 响应 */
 function unauthorizedHtml() {
   return new Response(humanizeApiError("unauthorized"), {
     status: 401,
@@ -1788,7 +1659,6 @@ function unauthorizedHtml() {
   });
 }
 
-/** 带鉴权 Cookie 刷新的 JSON 响应 */
 function authJson(auth, needsCookieUpdate, data, status = 200) {
   const headers = { "Content-Type": CT_JSON };
   if (needsCookieUpdate && auth)
@@ -1802,7 +1672,6 @@ function authJson(auth, needsCookieUpdate, data, status = 200) {
   return new Response(JSON.stringify(data), { status, headers });
 }
 
-/** 带鉴权 Cookie 刷新的通用 Response */
 function authResp(
   auth,
   needsCookieUpdate,
@@ -1815,7 +1684,6 @@ function authResp(
   return new Response(body, { status, headers: h });
 }
 
-/** 安全解析请求 JSON body */
 async function parseJsonBody(request) {
   try {
     return { ok: true, body: await request.json() };
@@ -1827,7 +1695,6 @@ async function parseJsonBody(request) {
   }
 }
 
-/** 通用 Trakt sync POST（标记已看/移除等） */
 async function traktSyncAction(
   request,
   env,
@@ -1925,10 +1792,6 @@ async function traktSyncAction(
   return authJson(auth, needsCookieUpdate, { ok: true, result });
 }
 
-/** 开始设备码登录，返回 user_code */
-/* =============================================================================
- * 设备码登录 / 轮询 / 登出
- * ============================================================================= */
 async function handleDevice(env) {
   const codeVerifier = randomString(64),
     codeChallenge = await pkceChallenge(codeVerifier);
@@ -2004,7 +1867,6 @@ async function handleDevice(env) {
   });
 }
 
-/** 轮询设备码是否已授权 */
 async function handlePoll(request, env, ctx) {
   let body;
   try {
@@ -2222,7 +2084,6 @@ async function handlePoll(request, env, ctx) {
   );
 }
 
-/** 清除登录 Cookie */
 async function handleLogout(request, env, ctx) {
   try {
     const cookieAuth = readAuth(request);
@@ -2259,7 +2120,6 @@ async function handleLogout(request, env, ctx) {
   });
 }
 
-/** 构造 trakt_auth Set-Cookie */
 function buildCookie(auth, traktId) {
   const payload = {
     access_token: auth.access_token,
@@ -2275,7 +2135,6 @@ function buildCookie(auth, traktId) {
   return `${COOKIE_NAME}=${b64urlEncode(JSON.stringify(payload))}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${COOKIE_MAX_AGE}`;
 }
 
-/** 从 Cookie 读取 auth 对象 */
 function readAuth(request) {
   const cookie = request.headers.get("Cookie") || "";
   const m = cookie.match(new RegExp(`(?:^|;\\s*)${COOKIE_NAME}=([^;]+)`));
@@ -2289,7 +2148,6 @@ function readAuth(request) {
   }
 }
 
-/** access_token 将过期时刷新 */
 async function refreshIfNeeded(auth, env) {
   if (auth.expires_at - Date.now() > 30 * 60_000) return auth;
 
@@ -2325,7 +2183,6 @@ async function refreshIfNeeded(auth, env) {
   };
 }
 
-/** 带 Authorization 的 Trakt 请求头 */
 function makeTraktHeaders(env, auth) {
   return {
     "Content-Type": "application/json",
@@ -2336,7 +2193,6 @@ function makeTraktHeaders(env, auth) {
   };
 }
 
-/** 稳定用户 key（用于 KV 命名空间） */
 async function getStableUserId(
   auth,
   headers,
@@ -2408,7 +2264,6 @@ async function getStableUserId(
   return userId;
 }
 
-/** 缓存 trakt id 与 token 的映射 */
 function rememberTraktUserId(auth, traktId) {
   if (!auth || !traktId) return;
   const id = String(traktId);
@@ -2418,12 +2273,10 @@ function rememberTraktUserId(auth, traktId) {
   if (at) kvMemSet(CK.uidAt(at.slice(0, 24)), id, KV_MEM_TTL);
 }
 
-/** 登出用的过期 Cookie 头 */
 function clearCookieHeader() {
   return `${COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`;
 }
 
-/** 从 profile Cookie 读展示名/头像提示 */
 function readProfileHint(request) {
   const cookie = request.headers.get("Cookie") || "";
   const m = cookie.match(new RegExp(`(?:^|;\\s*)${PROFILE_COOKIE}=([^;]+)`));
@@ -2435,7 +2288,6 @@ function readProfileHint(request) {
   }
 }
 
-/** 选择头像 URL */
 function pickAvatar(profile) {
   const out = { url: "", alts: [] };
   if (!profile || typeof profile !== "object") return out;
@@ -2466,13 +2318,11 @@ function pickAvatar(profile) {
   return out;
 }
 
-/** 写入轻量 profile Cookie */
 function buildProfileCookie(profile) {
   const data = { name: profile.name || "", avatar: profile.avatar || "" };
   return `${PROFILE_COOKIE}=${b64urlEncode(JSON.stringify(data))}; Secure; SameSite=Lax; Path=/; Max-Age=${COOKIE_MAX_AGE}`;
 }
 
-/** 待看列表版本号（变更时递增以失效缓存） */
 async function getWatchlistVersion(env, ctx, userKey) {
   if (!userKey) return "0";
   const key = CK.watchlistVersion(userKey);
@@ -2494,7 +2344,6 @@ async function getWatchlistVersion(env, ctx, userKey) {
   }
 }
 
-/** 加入/移除待看后 bump 版本并清内存 */
 function invalidateWatchlistCache(env, ctx, userKey) {
   if (userKey) {
     const verKey = CK.watchlistVersion(userKey);
@@ -2558,7 +2407,6 @@ function invalidateWatchlistCache(env, ctx, userKey) {
   }
 }
 
-/** 某用户相关的缓存 key 列表 */
 function userCacheKeys(userKey) {
   return {
     exact: [
@@ -2590,7 +2438,6 @@ function userCacheKeys(userKey) {
   };
 }
 
-/** 强制刷新时删除用户首页相关 KV */
 function bustHomeUserCaches(userKey, env, ctx) {
   if (!userKey) return;
 
@@ -2633,7 +2480,6 @@ function bustHomeUserCaches(userKey, env, ctx) {
   }
 }
 
-/** 限制并发执行 task 列表 */
 async function runLimited(taskFns, concurrency = 2, delayMs = 150) {
   let idx = 0;
   async function worker() {
@@ -2651,10 +2497,6 @@ async function runLimited(taskFns, concurrency = 2, delayMs = 150) {
   await Promise.all(workers);
 }
 
-/** 请求 TMDB API */
-/* =============================================================================
- * TMDB / 图片 / 第三方榜单
- * ============================================================================= */
 async function tmdbGet(url) {
   try {
     const r = await fetchT(url, {}, 8000);
@@ -2665,7 +2507,6 @@ async function tmdbGet(url) {
   }
 }
 
-/** 拼接 TMDB URL 与 api_key */
 function tmdbUrl(path, env, extra = {}) {
   const sep = path.includes("?") ? "&" : "?";
   const q = new URLSearchParams({
@@ -2676,7 +2517,6 @@ function tmdbUrl(path, env, extra = {}) {
   return `${TMDB_API}${path}${sep}${q}`;
 }
 
-/** 缓存的电影/剧详情 */
 async function tmdbDetailCached(path, env, ctx, ttl = 86400) {
   if (!env.TMDB_API_KEY) return null;
   return cachedJSON(
@@ -2687,20 +2527,18 @@ async function tmdbDetailCached(path, env, ctx, ttl = 86400) {
     {
       ttl,
       missTtl: MISS_KV_TTL,
-      swr: Math.min(86400, Math.floor(ttl * 0.25)), // 1 小时 → 24 小时
+      swr: Math.min(86400, Math.floor(ttl * 0.25)),
       edgeTtl: 900,
       jitter: 200,
-      minWriteGapMs: 7 * 24 * 3600 * 1000, // 6 小时 → 7 天
+      minWriteGapMs: 7 * 24 * 3600 * 1000,
     },
   );
 }
 
-/** 海报 URL */
 function tmdbPoster(path, size = "w185") {
   return path ? `${TMDB_IMG}/${size}${path}` : null;
 }
 
-/** 某季剧集 still 图映射 */
 async function tmdbSeasonStillMap(tmdbId, season, env, ctx) {
   if (!env || !env.TMDB_API_KEY) return null;
   const sid = Number(tmdbId),
@@ -2723,7 +2561,6 @@ async function tmdbSeasonStillMap(tmdbId, season, env, ctx) {
   return map;
 }
 
-/** 单集剧照 */
 async function tmdbEpisodeStill(tmdbId, season, episode, env, ctx) {
   if (!env || !env.TMDB_API_KEY) return null;
   const sid = Number(tmdbId),
@@ -2744,7 +2581,6 @@ async function tmdbEpisodeStill(tmdbId, season, episode, env, ctx) {
   return null;
 }
 
-/** 剧集 backdrop */
 async function tmdbShowBackdrop(tmdbId, env, ctx, kind) {
   if (!env || !env.TMDB_API_KEY) return null;
   const sid = Number(tmdbId);
@@ -2763,7 +2599,6 @@ async function tmdbShowBackdrop(tmdbId, env, ctx, kind) {
   return null;
 }
 
-/** 优先中文标题 */
 async function tmdbZhTitle(kind, tmdbId, env, ctx) {
   if (!env || !env.TMDB_API_KEY || !tmdbId) return null;
   const path = kind === "movie" ? `/movie/${tmdbId}` : `/tv/${tmdbId}`;
@@ -2776,10 +2611,6 @@ const IMG_MAP_KV_TTL = 86400 * 30;
 const IMG_MAP_MIN_PUT_INTERVAL_MS = 10 * 60 * 1000;
 const __IMG_MAP_LAST_PUT = new Map();
 
-/**
- * 读取图片映射表：内存 → KV。
- * 避免冷启动后继续观看/历史/日历/待看反复逐条读 TMDB detail。
- */
 async function loadImageMap(env, key) {
   if (!key) return {};
 
@@ -2818,10 +2649,6 @@ async function loadImageMap(env, key) {
   }
 }
 
-/**
- * 写入图片映射表：内存立即写，KV 最多 10 分钟写一次。
- * 原实现是空函数，导致每个新 isolate 都重新补图。
- */
 function saveImageMap(env, ctx, key, map) {
   if (!key || !map || typeof map !== "object") return;
 
@@ -2860,7 +2687,6 @@ function saveImageMap(env, ctx, key, map) {
   else p.catch(() => {});
 }
 
-/** 继续观看条目的图片缓存 key */
 function pbImageKey(entry) {
   if (!entry) return null;
   if (entry.movie && entry.movie.ids && entry.movie.ids.trakt != null)
@@ -2874,7 +2700,6 @@ function pbImageKey(entry) {
   return "s:" + show.ids.trakt + ":" + s + ":" + n;
 }
 
-/** 把缓存图应用到条目 */
 function applyPbImage(j, imgMap) {
   const rec = j.k ? imgMap[j.k] : null;
   if (!rec) return false;
@@ -2889,7 +2714,6 @@ function applyPbImage(j, imgMap) {
   return true;
 }
 
-/** 从追剧日历生成未来数小时内的「即将播出」卡片，供继续观看列表注入 */
 function calendarToLocalContinue(
   calendar,
   nowMs,
@@ -2899,7 +2723,7 @@ function calendarToLocalContinue(
 ) {
   if (!Array.isArray(calendar) || !calendar.length) return [];
   const now = nowMs != null ? nowMs : Date.now();
-  // 即将：未来 6h；正在播：开播后约 2h；已播出未看：开播后 2h～24h
+
   const upcomingWindowMs = 6 * 3600 * 1000;
   const airingWindowMs = 2 * 3600 * 1000;
   const airedWindowMs = 24 * 3600 * 1000;
@@ -2959,20 +2783,10 @@ function calendarToLocalContinue(
   return out;
 }
 
-/* =============================================================================
- * 6. 继续观看：合并暂停 / up_next / 即将播出，过滤过期暂停
- * ============================================================================= */
-/**
- * 继续观看列表辅助：过期暂停过滤、已看集过滤。
- * watchedSet 来自 getWatchedEpisodeIds（Set + 可选 __showLastAt）。
- */
-
-/** 是否为日历注入的「即将播出」卡片（不可按暂停规则丢掉） */
 function isLocalAirEntry(entry) {
   return !!(entry && (entry.__localUpcoming || entry.__localAired));
 }
 
-/** 取出条目的播放进度百分比（数字 progress 或 progress.percent） */
 function entryProgressPercent(entry) {
   if (!entry) return null;
   if (typeof entry.progress === "number") return entry.progress;
@@ -2983,46 +2797,20 @@ function entryProgressPercent(entry) {
 
 function isStalePause(entry, watchedSet) {
   if (!entry || !entry.paused_at || isLocalAirEntry(entry)) return false;
-
-  const pausedMs = Date.parse(entry.paused_at);
-  if (!Number.isFinite(pausedMs)) return false;
-
-  // 1. 优先比对单集的时间
-  const ep = entry.episode || (entry.progress && entry.progress.next_episode);
-  if (ep && ep.ids && ep.ids.trakt != null) {
-    const epId = Number(ep.ids.trakt);
-    const epLastMap = watchedSet && watchedSet.__epLastAt;
-    if (epLastMap && epLastMap[epId]) {
-      const lastMs = epLastMap[epId];
-      // 暂停时间早于或等于已看时间 -> 过期
-      if (lastMs > 0 && pausedMs <= lastMs) {
-        return true;
-      }
-    }
-  }
-
-  // 2. 兜底比对整部剧的时间
   const showLastMap = watchedSet && watchedSet.__showLastAt;
   if (
-    showLastMap &&
-    entry.show &&
-    entry.show.ids &&
-    entry.show.ids.trakt != null
-  ) {
-    const sid = Number(entry.show.ids.trakt);
-    const lastMs = Number(showLastMap[sid] || showLastMap[String(sid)] || 0);
-    if (lastMs > 0 && pausedMs <= lastMs) {
-      return true;
-    }
-  }
-
-  return false;
+    !showLastMap ||
+    !entry.show ||
+    !entry.show.ids ||
+    entry.show.ids.trakt == null
+  )
+    return false;
+  const sid = Number(entry.show.ids.trakt);
+  const lastMs = Number(showLastMap[sid] || showLastMap[String(sid)] || 0);
+  const pausedMs = Date.parse(entry.paused_at);
+  return lastMs > 0 && Number.isFinite(pausedMs) && pausedMs < lastMs;
 }
 
-/**
- * 合并后二次过滤：去掉无效/过期条目，保留即将播出。
- * 返回新数组，不改入参。
- */
 function filterContinueEntries(list, watchedSet) {
   if (!Array.isArray(list)) return [];
   if (!watchedSet) return list.filter(Boolean);
@@ -3033,7 +2821,7 @@ function filterContinueEntries(list, watchedSet) {
       const epId = Number(e.episode.ids.trakt);
       if (watchedSet.has(epId)) {
         const p = entryProgressPercent(e);
-        // 已看过且没有有效进度 → 不展示
+
         if (typeof p !== "number" || p <= 0) return false;
       }
     }
@@ -3042,14 +2830,12 @@ function filterContinueEntries(list, watchedSet) {
   });
 }
 
-/** 把 showId → last_watched_at(ms) 写入 map */
 function bumpShowLastAt(map, sid, atMs) {
   if (sid == null || !Number.isFinite(atMs)) return;
   const k = Number(sid);
   if (!map[k] || atMs > map[k]) map[k] = atMs;
 }
 
-/** 合并暂停进度 + up_next + 即将播出；按剧去重，limit 截断 */
 function mergeContinueLists(
   playbackList,
   upNextList,
@@ -3075,8 +2861,6 @@ function mergeContinueLists(
         : null;
   const autoUnhide = new Set();
 
-  // Dedupe by movie / show (one card per title). Episode-level keys used to
-  // produce duplicates when playback (paused ep) and up_next (next ep) differ.
   function keyOf(entry) {
     if (!entry) return null;
     if (entry.movie && entry.movie.ids && entry.movie.ids.trakt != null)
@@ -3145,7 +2929,6 @@ function mergeContinueLists(
       if (typeof completed === "number" && completed <= 0) return true;
     }
 
-    // 已看过的集且无进度、或过期暂停 → 跳过
     if (
       watched &&
       entry.episode &&
@@ -3156,17 +2939,8 @@ function mergeContinueLists(
       if (watched.has(epId)) {
         const p = entryProgressPercent(entry);
         if (typeof p !== "number" || p <= 0) return true;
-
-        // ★ 核心逻辑：谁新用谁
-        // 如果该集的观看时间 (watchedMs) >= 暂停时间 (pausedMs)，说明已经看完了，旧的暂停作废
-        const watchedMs = watched.__epLastAt && watched.__epLastAt[epId];
-        const pausedMs = entry.paused_at ? Date.parse(entry.paused_at) : 0;
-        if (Number.isFinite(watchedMs) && Number.isFinite(pausedMs)) {
-          if (watchedMs >= pausedMs) return true;
-        }
       }
     }
-
     if (isStalePause(entry, watched)) return true;
 
     return false;
@@ -3181,8 +2955,7 @@ function mergeContinueLists(
       if (k) {
         if (seen.has(k)) {
           const idx = seen.get(k);
-          // Keep the more recent activity when the same title appears twice
-          // (e.g. paused rewatch ep vs up_next next ep).
+
           if (entryTime(entry) > entryTime(out[idx])) {
             out[idx] = entry;
           }
@@ -3229,7 +3002,6 @@ function mergeContinueLists(
   return result;
 }
 
-/** 若当前集已在已看集合中，标记 __isRewatch（UI 显示重温） */
 function applyRewatchFlags(list, watchedEpIds) {
   if (!Array.isArray(list)) return list;
   const set =
@@ -3426,7 +3198,6 @@ async function attachContinueStillsForPlayback(
   return list;
 }
 
-/** 为历史/列表条目补海报 */
 async function attachEntityPosters(list, env, ctx, imgKey, maxFetch = 30) {
   if (!env || !Array.isArray(list) || !list.length) return list;
   if (!env.TMDB_API_KEY) return list;
@@ -3489,7 +3260,6 @@ async function attachEntityPosters(list, env, ctx, imgKey, maxFetch = 30) {
   return list;
 }
 
-/** 待看列表补图 */
 async function attachWatchlistStills(list, env, ctx, userKey, opts = {}) {
   if (!env || !Array.isArray(list) || !list.length) return list;
 
@@ -3616,7 +3386,6 @@ async function attachWatchlistStills(list, env, ctx, userKey, opts = {}) {
   return list;
 }
 
-/** TMDB 搜索结果映射为统一卡片结构 */
 function mapTmdbItem(r, typeHint) {
   if (!r || !r.id) return null;
   const mt = typeHint || r.media_type;
@@ -3637,7 +3406,6 @@ function mapTmdbItem(r, typeHint) {
   };
 }
 
-/** 豆瓣/骨朵榜单：空数据不写 KV */
 function isUsableBoardPayload(data) {
   if (data == null) return false;
   if (Array.isArray(data)) return data.length > 0;
@@ -3668,7 +3436,6 @@ function isUsableBoardPayload(data) {
   }
 }
 
-/** 拉取豆瓣热榜原始数据 */
 async function getDoubanRaw(env, ctx, force) {
   return cachedJSON(
     env,
@@ -3679,7 +3446,7 @@ async function getDoubanRaw(env, ctx, force) {
         const r = await fetchT(DOUBAN_API, {}, 10000);
         if (!r.ok) return null;
         const data = await r.json();
-        // 空数据不写 KV（返回 null → 走 error/fallback，不 writeFresh）
+
         if (!isUsableBoardPayload(data)) return null;
         return data;
       } catch {
@@ -3689,7 +3456,7 @@ async function getDoubanRaw(env, ctx, force) {
     {
       ttl: DOUBAN_KV_TTL,
       missTtl: 600,
-      // 约一半 TTL 起后台刷新，硬过期 6h
+
       swr: force ? false : true,
       jitter: 300,
       bypass: !!force,
@@ -3698,13 +3465,11 @@ async function getDoubanRaw(env, ctx, force) {
   );
 }
 
-/** 是否港台剧分区 */
 function isHkTw(region) {
   if (!region) return false;
   return region.indexOf("香港") >= 0 || region.indexOf("台湾") >= 0;
 }
 
-/** 豆瓣条目映射 */
 function mapDoubanItem(x) {
   if (!x || !x.tmdbId) return null;
   return {
@@ -3722,7 +3487,6 @@ function mapDoubanItem(x) {
   };
 }
 
-/** 整理豆瓣各分区列表 */
 function collectDoubanLists(data, keys) {
   const out = [];
   if (!data) return out;
@@ -3733,7 +3497,6 @@ function collectDoubanLists(data, keys) {
   return out;
 }
 
-/** 按 section 取列表 */
 function pickDoubanSection(data, section, filter) {
   if (!data) return [];
 
@@ -3792,7 +3555,6 @@ function pickDoubanSection(data, section, filter) {
   return out;
 }
 
-/** 渲染豆瓣卡片 HTML */
 function renderDoubanItems(items) {
   if (!Array.isArray(items) || !items.length) return "";
   return items
@@ -3832,7 +3594,6 @@ async function handleDoubanList(request, env, ctx) {
   return listResp(html, mode, outHeaders);
 }
 
-/** 平台剧场数据 */
 async function getTheaterRaw(env, ctx, force) {
   return cachedJSON(
     env,
@@ -3977,7 +3738,6 @@ function pickTheaterSection(data, platform) {
   return out;
 }
 
-/** 渲染剧场卡片 */
 function renderTheaterItems(items) {
   if (!Array.isArray(items) || !items.length) return "";
   return items
@@ -4088,7 +3848,6 @@ async function handleTheaterList(request, env, ctx) {
   return listResp(html, mode, outHeaders);
 }
 
-/** 骨朵热榜 */
 async function getGuduoRaw(env, ctx, force) {
   return cachedJSON(
     env,
@@ -4175,7 +3934,6 @@ function pickGuduoSection(data, category) {
   return out;
 }
 
-/** 渲染骨朵卡片 */
 function renderGuduoItems(items) {
   if (!Array.isArray(items) || !items.length) return "";
   return items
@@ -4623,7 +4381,6 @@ async function handlePlatformList(request, env, ctx) {
   );
 }
 
-/** 构造 /sync/* 请求体 */
 function traktSyncPayload(kind, id) {
   const entry = { ids: { trakt: id } };
   if (kind === "movie") return { movies: [entry] };
@@ -4633,7 +4390,6 @@ function traktSyncPayload(kind, id) {
   return null;
 }
 
-/** TMDB id → Trakt id */
 async function resolveTraktIdFromTmdb(tmdbId, type, headers, userKey) {
   if (!tmdbId) return null;
   const id = String(tmdbId).trim();
@@ -4814,7 +4570,6 @@ function renderExtRatings(r, opts = {}) {
   return out.join("");
 }
 
-/** 直接拉 Trakt 待看原始列表 */
 async function fetchWatchlistRaw(headers, sort, userKey, debug) {
   const qs = `extended=full&images=poster`;
   const [movies, shows, seasons, episodes] = await Promise.all([
@@ -4883,7 +4638,6 @@ async function fetchWatchlistRaw(headers, sort, userKey, debug) {
   return merged;
 }
 
-/** 带版本缓存的待看列表 */
 async function getWatchlist(
   headers,
   sort = "added",
@@ -4908,7 +4662,7 @@ async function getWatchlist(
       ttl: WATCHLIST_KV_TTL,
       missTtl: 180,
       swr: force ? true : false,
-      edgeTtl: 300,
+      edgeTtl: 3600,
       jitter: 300,
       bypass: !!force,
       revalidate: !!force,
@@ -4948,7 +4702,6 @@ async function getWatchlist(
   return null;
 }
 
-/** 待看中的 TMDB id 列表（判断详情是否已在待看） */
 async function getWatchlistTmdbIds(headers, env, ctx, userKey, type) {
   const merged = await getWatchlist(headers, "added", env, ctx, userKey);
   if (!Array.isArray(merged)) return [];
@@ -4963,10 +4716,6 @@ async function getWatchlistTmdbIds(headers, env, ctx, userKey, type) {
   return ids;
 }
 
-/** 搜索 API（TMDB） */
-/* =============================================================================
- * 搜索 / 趋势 / 榜单 API
- * ============================================================================= */
 async function handleSearch(request, env, ctx) {
   const url = new URL(request.url),
     q = (url.searchParams.get("q") || "").trim(),
@@ -5021,7 +4770,6 @@ async function handleSearch(request, env, ctx) {
   return jsonResp({ items: merged.slice(0, 30) }, outHeaders);
 }
 
-/** TMDB 趋势 */
 async function handleTrending(request, env, ctx) {
   const A = await authed(request, env, ctx);
   if (!A.ok) return A.response;
@@ -5062,7 +4810,6 @@ async function handleTrending(request, env, ctx) {
   });
 }
 
-/** 加入 Trakt 待看 */
 async function handleWatchlistAdd(request, env, ctx) {
   const A = await authed(request, env, ctx);
   if (!A.ok) return A.response;
@@ -5131,7 +4878,6 @@ async function handleWatchlistAdd(request, env, ctx) {
   return authJson(auth, needsCookieUpdate, { ok: true, traktId, result });
 }
 
-/** 移出待看 */
 async function handleWatchlistRemove(request, env, ctx) {
   return traktSyncAction(request, env, ctx, {
     allowedTypes: ["movie", "show", "season", "episode"],
@@ -5144,7 +4890,6 @@ async function handleWatchlistRemove(request, env, ctx) {
   });
 }
 
-/** 标记已看 */
 async function handleMarkWatched(request, env, ctx) {
   return traktSyncAction(request, env, ctx, {
     allowedTypes: ["movie", "episode"],
@@ -5197,7 +4942,6 @@ async function handleMarkWatched(request, env, ctx) {
   });
 }
 
-/** 取消已看 */
 async function handleUnmarkWatched(request, env, ctx) {
   return traktSyncAction(request, env, ctx, {
     allowedTypes: ["movie", "episode"],
@@ -5210,7 +4954,6 @@ async function handleUnmarkWatched(request, env, ctx) {
   });
 }
 
-/** 标记整季已看 */
 async function handleMarkSeasonWatched(request, env, ctx) {
   const A = await authed(request, env, ctx);
   if (!A.ok) return A.response;
@@ -5384,7 +5127,6 @@ async function handleMarkSeasonWatched(request, env, ctx) {
   });
 }
 
-/** 从继续观看隐藏 */
 async function handleHideContinue(request, env, ctx) {
   const A = await authed(request, env, ctx);
   if (!A.ok) return A.response;
@@ -5466,7 +5208,6 @@ async function handleHideContinue(request, env, ctx) {
   });
 }
 
-/** 弃看剧集 */
 async function handleDropShow(request, env, ctx) {
   const A = await authed(request, env, ctx);
   if (!A.ok) return A.response;
@@ -5655,7 +5396,6 @@ async function handleShowCalendar(request, env, ctx) {
   );
 }
 
-/** 观看小结数据 */
 async function handleSummary(request, env, ctx) {
   const A = await authed(request, env, ctx, { strict: true });
   if (!A.ok) return A.response;
@@ -5673,16 +5413,16 @@ async function handleSummary(request, env, ctx) {
   }
 
   const cacheKey = `sum2:${userKey}:${period}:${ref}`;
-  // 写入 KV（不要 memOnly），冷启动/限流时也能显示上次成功的小结
+
   const data = await cachedJSON(
     env,
     ctx,
     cacheKey,
     () => buildSummary(headers, period, ref, env, ctx, userKey),
     {
-      ttl: 604800, // 7 天
+      ttl: 604800,
       missTtl: 300,
-      swr: 86400, // 过期后 1 天内仍可 SWR 后台刷新
+      swr: 86400,
       unwrap: true,
       jitter: 600,
       lastGoodKey: "lg:" + cacheKey,
@@ -6068,7 +5808,6 @@ function streamHomeShell(initialDetail, profileHint) {
 const __actSigMemCache = new Map();
 const ACT_SIG_MEM_TTL = 180000;
 
-/** 用 last_activities 拼签名，判断观看/暂停是否有变化，从而决定是否绕过 playback 缓存 */
 async function getUserActivitySig(headers, env, ctx, userKey, force = false) {
   if (!userKey || userKey === "anon") return null;
 
@@ -6166,24 +5905,20 @@ const DROPPED_MEM_TTL = 120000;
 const __droppedShowIdsNegative = new Map();
 const DROPPED_NEGATIVE_TTL = 5 * 60 * 1000;
 
-/** 已弃看 show id 集合 */
 async function getDroppedShowIds(headers, env, ctx, userKey) {
   const key = `dropped:${userKey || "anon"}`;
   const now = Date.now();
 
-  // 1) mem 一级缓存
   const mem = __droppedShowIdsMem.get(key);
   if (mem && now - mem.ts < DROPPED_MEM_TTL)
     return new Set(mem.ids.map(Number));
 
-  // 2) negative cooldown：最近失败过，短时间内不再打 Trakt
   const negAt = __droppedShowIdsNegative.get(key);
   if (negAt && now - negAt < DROPPED_NEGATIVE_TTL) {
     if (mem) return new Set(mem.ids.map(Number));
     return new Set();
   }
 
-  // 3) KV 二级缓存 + 兜底 Trakt
   const data = await cachedJSON(
     env,
     ctx,
@@ -6234,7 +5969,6 @@ async function getDroppedShowIds(headers, env, ctx, userKey) {
     },
   );
 
-  // 4) 命中：更新 mem，清除 negative
   if (data && Array.isArray(data.ids)) {
     const ids = data.ids.map(Number);
     __droppedShowIdsMem.set(key, { ids, ts: now });
@@ -6250,7 +5984,6 @@ async function getDroppedShowIds(headers, env, ctx, userKey) {
     return new Set(ids);
   }
 
-  // 5) 失败：设置 negative cooldown，回退到旧 mem
   __droppedShowIdsNegative.set(key, now);
   if (__droppedShowIdsNegative.size > 500) {
     const it = __droppedShowIdsNegative.keys();
@@ -6289,10 +6022,6 @@ function watchedStateToSet(watched) {
   return set;
 }
 
-/**
- * 聚合用户状态：弃看 + 已看集 + 继续观看隐藏表。
- * 冷启动从 3 个 KV 读降为 1 个；写操作后调用 bustUserStateBundle。
- */
 async function getUserStateBundle(headers, env, ctx, userKey, force = false) {
   const key = userStateCacheKey(userKey);
 
@@ -6367,9 +6096,6 @@ function bustUserStateBundle(userKey, env, ctx) {
   safeDeleteKvKeys(env, ctx, [seasonKey, userStateCacheKey(userKey)]);
 }
 
-/**
- * 统一批量删除 KV，清理内存、去重、不阻塞主流程。
- */
 function safeDeleteKvKeys(env, ctx, keys) {
   const list = [...new Set((keys || []).filter(Boolean))];
   if (!list.length) return;
@@ -6421,18 +6147,9 @@ async function getWatchedEpisodeIds(headers, env, ctx, userKey) {
 
         const out = [];
         const showLastAt = {};
-        const epLastAt = {}; // 新增：单集最后观看时间
         for (const w of arr) {
           const id = w && w.episode && w.episode.ids && w.episode.ids.trakt;
-          if (id != null) {
-            const nid = Number(id);
-            out.push(nid);
-            const at =
-              w && w.last_watched_at ? Date.parse(w.last_watched_at) : NaN;
-            if (Number.isFinite(at)) {
-              epLastAt[nid] = Math.max(epLastAt[nid] || 0, at);
-            }
-          }
+          if (id != null) out.push(Number(id));
           const sid = w && w.show && w.show.ids && w.show.ids.trakt;
           const at =
             w && w.last_watched_at ? Date.parse(w.last_watched_at) : NaN;
@@ -6451,7 +6168,7 @@ async function getWatchedEpisodeIds(headers, env, ctx, userKey) {
             }
           } catch {}
         }
-        return { ids: out, showLastAt, epLastAt };
+        return { ids: out, showLastAt };
       } catch {
         return null;
       }
@@ -6459,17 +6176,14 @@ async function getWatchedEpisodeIds(headers, env, ctx, userKey) {
     { ttl: 3600, missTtl: 300, swr: true, edgeTtl: 600, jitter: 300 },
   );
   if (!raw) return null;
+
   if (Array.isArray(raw)) return new Set(raw.map(Number));
   const set = new Set((Array.isArray(raw.ids) ? raw.ids : []).map(Number));
   if (raw.showLastAt && typeof raw.showLastAt === "object")
     set.__showLastAt = raw.showLastAt;
-  // 新增：挂载单集时间
-  if (raw.epLastAt && typeof raw.epLastAt === "object")
-    set.__epLastAt = raw.epLastAt;
   return set;
 }
 
-/** 继续观看隐藏表 */
 async function getCwHideMap(env, ctx, userKey) {
   if (!userKey) return {};
   const raw = await cachedJSON(env, ctx, CK.cwHide(userKey), async () => ({}), {
@@ -6483,7 +6197,6 @@ async function getCwHideMap(env, ctx, userKey) {
   return raw;
 }
 
-/** 写入隐藏表 */
 function putCwHideMap(env, ctx, userKey, map) {
   if (!userKey) return;
   const data = map && typeof map === "object" ? map : {};
@@ -6533,7 +6246,6 @@ function isCwHiddenEntry(entry, hideMap) {
   return true;
 }
 
-/** 按用户隐藏表过滤继续观看 */
 function filterCwHiddenList(list, hideMap) {
   if (!Array.isArray(list) || !list.length) return list || [];
   if (!hideMap || typeof hideMap !== "object" || !Object.keys(hideMap).length)
@@ -6568,7 +6280,6 @@ function filterCwHiddenList(list, hideMap) {
   return out;
 }
 
-/** 缓存的播出日历 */
 async function getCalendarCached(
   today,
   headers,
@@ -6618,7 +6329,7 @@ async function getCalendarCached(
       missTtl: 120,
 
       swr: force ? true : Math.floor(CALENDAR_KV_TTL * 0.45),
-      edgeTtl: 180,
+      edgeTtl: 3600,
       jitter: 120,
       bypass: !!force,
       revalidate: true,
@@ -6663,10 +6374,6 @@ async function handleActivitySig(request, env, ctx) {
   });
 }
 
-/* =============================================================================
- * 7. 首页数据 API（playback / history / calendar / watchlist / meta）
- * ============================================================================= */
-/** 首页分 part 数据（playback/meta/…） */
 async function handleHomeData(request, env, ctx) {
   const A = await authed(request, env, ctx, { strict: true });
   if (!A.ok) {
@@ -6822,12 +6529,7 @@ async function handleHomeData(request, env, ctx) {
             };
           }
 
-          const userState = await getUserStateBundle(
-            headers,
-            env,
-            ctx,
-            userKey,
-          );
+          const userState = await getUserStateBundle(headers, env, ctx, userKey);
           const droppedSet = droppedStateToSet(userState);
           const watchedEpIds = watchedStateToSet(userState.watched);
           const hideMapRaw = userState.hideMap || {};
@@ -7103,9 +6805,7 @@ async function handleHomeData(request, env, ctx) {
         opts({
           ...CACHE_USER_META,
           ttl: STATS_KV_TTL,
-          lastGoodKey: CK.lastGood.stats
-            ? CK.lastGood.stats(userKey)
-            : "lg:stats:" + userKey,
+          lastGoodKey: CK.lastGood.stats ? CK.lastGood.stats(userKey) : "lg:stats:" + userKey,
         }),
       );
     });
@@ -7115,107 +6815,13 @@ async function handleHomeData(request, env, ctx) {
   const gapMs = force ? 1000 : 40;
   await runLimited(taskFns, concurrency, gapMs);
 
-  await runLimited(taskFns, concurrency, gapMs);
-
-  // ★ 用 history 交叉过滤 playback 中的过期暂停记录
-  // 如果历史记录里有这一集，且观看时间 >= 暂停时间，则剔除该播放记录
-  if (wantPlayback && Array.isArray(playback) && playback.length > 0) {
-    let historyItems = null;
-    if (history) {
-      historyItems = Array.isArray(history)
-        ? history
-        : history && Array.isArray(history.items)
-          ? history.items
-          : null;
-    }
-    if (historyItems && historyItems.length > 0) {
-      const histEpMap = new Map();
-      for (const h of historyItems) {
-        if (h.episode && h.episode.ids && h.episode.ids.trakt) {
-          const epId = Number(h.episode.ids.trakt);
-          const watchedAt = Date.parse(h.watched_at || "");
-          if (Number.isFinite(watchedAt)) {
-            histEpMap.set(epId, Math.max(histEpMap.get(epId) || 0, watchedAt));
-          }
-        }
-      }
-      if (histEpMap.size > 0) {
-        playback = playback.filter((entry) => {
-          const ep =
-            entry.episode || (entry.progress && entry.progress.next_episode);
-          if (!ep || !ep.ids || ep.ids.trakt == null) return true;
-          const epId = Number(ep.ids.trakt);
-          const histAt = histEpMap.get(epId);
-          const pausedAt = Date.parse(entry.paused_at || "");
-
-          // 如果历史记录的时间 >= 暂停时间，说明已经看完，剔除旧进度
-          if (histAt && Number.isFinite(pausedAt) && histAt >= pausedAt) {
-            return false;
-          }
-          return true;
-        });
-      }
-    }
-  }
-
   const actSig = await actSigP.catch(() => null);
 
-  // ★ 新增：利用 history 交叉过滤 playback 中的过期暂停记录
-  // 如果历史记录里有这一集的最近观看，且时间晚于 playback 的暂停时间，则剔除
-  if (wantPlayback && Array.isArray(playback) && playback.length > 0) {
-    let historyItems = null;
-    if (history) {
-      historyItems = Array.isArray(history)
-        ? history
-        : history && Array.isArray(history.items)
-          ? history.items
-          : null;
-    }
-    if (historyItems && historyItems.length > 0) {
-      const histEpMap = new Map();
-      for (const h of historyItems) {
-        if (h.episode && h.episode.ids && h.episode.ids.trakt) {
-          const epId = Number(h.episode.ids.trakt);
-          const watchedAt = Date.parse(h.watched_at || "");
-          if (Number.isFinite(watchedAt)) {
-            histEpMap.set(epId, Math.max(histEpMap.get(epId) || 0, watchedAt));
-          }
-        }
-      }
-      if (histEpMap.size > 0) {
-        playback = playback.filter((entry) => {
-          const ep =
-            entry.episode || (entry.progress && entry.progress.next_episode);
-          if (!ep || !ep.ids || ep.ids.trakt == null) return true;
-          const epId = Number(ep.ids.trakt);
-          const histAt = histEpMap.get(epId);
-          const pausedAt = Date.parse(entry.paused_at || "");
-          if (histAt && Number.isFinite(pausedAt) && histAt >= pausedAt) {
-            return false; // 历史记录中的时间更新或相等，说明是旧进度
-          }
-          return true;
-        });
-      }
-    }
-  }
-
   if (actSig && actSig.sig) {
-    let prevLast = kvMemGet(`act:${userKey}:last`);
-    if (typeof prevLast !== "string") prevLast = null;
     kvMemSet(`act:${userKey}:last`, actSig.sig, KV_MEM_TTL);
-    // sig 变化时同步写 KV，让其他 isolate 共享基线，避免 A 反复 bypass 而 B 永远 unchanged
-    if (prevLast !== actSig.sig && env && env.TMDB_CACHE && !kvIsDown()) {
-      const p = env.TMDB_CACHE.put(
-        `act:${userKey}:last`,
-        JSON.stringify({ data: actSig.sig, _ts: Date.now(), _ttl: 86400 }),
-        { expirationTtl: 86400 },
-      )
-        .then(() => kvMarkUp())
-        .catch(() => {
-          kvMarkDown();
-        });
-      if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
-    }
+    try {
+      kvMemSet(`act:${userKey}:last`, actSig.sig, KV_MEM_TTL);
+    } catch {}
   }
 
   if (isTraktRateLimited(userKey)) {
@@ -7240,9 +6846,7 @@ async function handleHomeData(request, env, ctx) {
   if (wantPlayback) {
     const pbList = Array.isArray(playback) ? playback : [];
     try {
-      await attachContinueStillsForPlayback(pbList, env, ctx, userKey, {
-        maxFetch: 20,
-      });
+      await attachContinueStillsForPlayback(pbList, env, ctx, userKey, { maxFetch: 20 });
       result.playbackHScrollHtml = renderContinueItems(pbList, "hscroll");
     } catch {
       result.playbackHScrollHtml =
@@ -7254,54 +6858,35 @@ async function handleHomeData(request, env, ctx) {
         : playbackSrc.fromCache === false
           ? "live"
           : "";
+
     let playbackAgeSec = 0;
     let playbackDataTs = 0;
     let playbackTsSource = null;
 
-    // 1) 内存中如果有（fallbackChain 兜底写过）就优先用
     try {
       const mem = kvMemGet(CK.playback(userKey));
       if (mem && mem._ts) {
         playbackDataTs = mem._ts;
-        playbackAgeSec = Math.max(
-          0,
-          Math.round((Date.now() - playbackDataTs) / 1000),
-        );
+        playbackAgeSec = Math.max(0, Math.round((Date.now() - playbackDataTs) / 1000));
         playbackTsSource = "mem-ts";
       }
     } catch {}
 
-    // 2) sourceTracker._ts 是数据真正的写入时间（KV 命中 = cached._ts，live = now-age）
-    if (!playbackDataTs && playbackSrc._ts) {
-      playbackDataTs = playbackSrc._ts;
-      playbackAgeSec = Math.max(
-        0,
-        Math.round((Date.now() - playbackDataTs) / 1000),
-      );
-      playbackTsSource = "tracker-ts";
-    }
-
-    // 3) 退化为 age
     if (!playbackDataTs && typeof playbackSrc.age === "number") {
       playbackAgeSec = playbackSrc.age || 0;
       playbackDataTs = Date.now() - playbackAgeSec * 1000;
       playbackTsSource = "age";
     }
 
-    // 4) live 写入
     if (playbackSrc.fromCache === false && playbackSrc.age === 0) {
       playbackDataTs = Date.now();
       playbackAgeSec = 0;
       playbackTsSource = "live-write";
     }
 
-    // 保底
     if (!playbackDataTs) {
       playbackDataTs = userUpdatedAt || Date.now();
-      playbackAgeSec = Math.max(
-        0,
-        Math.round((Date.now() - playbackDataTs) / 1000),
-      );
+      playbackAgeSec = Math.max(0, Math.round((Date.now() - playbackDataTs) / 1000));
       playbackTsSource = "fallback";
     }
 
@@ -7309,7 +6894,6 @@ async function handleHomeData(request, env, ctx) {
     result.playbackDataTs = playbackDataTs || null;
     result.playbackTsSource = playbackTsSource;
 
-    // 多端统一同步时间：直接复用 playback 数据本身的写入时间戳，不新增任何 KV 写入
     const lastSyncAt = playbackDataTs || userUpdatedAt || null;
 
     result.pauseUpdatedAt = lastSyncAt;
@@ -7408,7 +6992,7 @@ async function handleHomeData(request, env, ctx) {
         env,
         ctx,
         CK.histImages(userKey),
-        20,
+        20
       ).catch(() => {});
 
       let historyPageCount = 1;
@@ -7448,7 +7032,7 @@ async function handleHomeData(request, env, ctx) {
         env,
         ctx,
         CK.calImages(userKey),
-        20,
+        20
       ).catch(() => {});
       result.calendarHtml = renderCalendarPage(calFiltered, env, {});
     } catch {
@@ -7464,9 +7048,7 @@ async function handleHomeData(request, env, ctx) {
         result.watchlistHtml = emptyWatchlistHtml();
       } else {
         const list = watchlist;
-        await attachWatchlistStills(list, env, ctx, userKey, {
-          maxFetch: WATCHLIST_PAGE_SIZE,
-        });
+        await attachWatchlistStills(list, env, ctx, userKey, { maxFetch: WATCHLIST_PAGE_SIZE });
         const firstPage = list.slice(0, WATCHLIST_PAGE_SIZE),
           hasMore = list.length > WATCHLIST_PAGE_SIZE,
           cardsHtml = renderWatchlistItems(firstPage, env),
@@ -7547,7 +7129,6 @@ const HOME_PLATFORM_IDS = [
   "bilibili",
 ];
 
-/** 平台剧场入口（与流媒体同款卡片展示） */
 const THEATER_PLATFORMS = [
   {
     id: "X剧场",
@@ -7628,7 +7209,7 @@ function renderPlatformCard(p, extraAttr) {
 
 function renderPlatformRows() {
   const cards = HOME_PLATFORM_IDS.map((id) => PLATFORMS[id]).filter(Boolean);
-  // 单行横向滚动
+
   return `<div class="platform-rows"><div class="platform-row"><div class="platform-cards">${cards.map((p) => renderPlatformCard(p)).join("")}</div></div></div>`;
 }
 
@@ -7638,7 +7219,6 @@ function renderTheaterPlatformRows() {
   ).join("")}</div></div></div>`;
 }
 
-/** 首页骨架 HTML */
 function renderHomeSkeleton(initialDetail, profileHint) {
   const boot = initialDetail
     ? `<script>window.addEventListener('load',()=>{const s=${jsStr(initialDetail)},idx=s.indexOf('/');if(idx>0)openDetail(s.slice(0,idx),s.slice(idx+1),false);});<\/script>`
@@ -7804,7 +7384,6 @@ async function handleDetailExtras(request, env, ctx) {
   );
 }
 
-/** 演员详情 */
 async function handlePerson(request, env, ctx) {
   const url = new URL(request.url);
   const id = url.searchParams.get("id");
@@ -8250,7 +7829,7 @@ async function handleApiDetail(request, env, ctx) {
     }
 
     let inWatchlist = false;
-    // 优先 TMDB 详情 id（剧集 entity.ids.tmdb 有时缺失）
+
     const wlTmdbId =
       (tmdbBasic && tmdbBasic.id) ||
       (entity && entity.ids && entity.ids.tmdb) ||
@@ -8652,7 +8231,7 @@ async function enrichBatch(keys, env, ctx) {
       kvMemSet(CK.enrich(key), hit, KV_MEM_TTL);
       continue;
     }
-    // ★ 新兜底：先查 td:，命中直接组装
+
     const parsed = parseEnrichKey(key);
     if (parsed && parsed.source === "tmdb") {
       const td = await kvGetJSON(
@@ -8671,7 +8250,7 @@ async function enrichBatch(keys, env, ctx) {
             poster: d.poster_path ? tmdbPoster(d.poster_path) : null,
           };
           out[key] = v;
-          // 顺手写进 mem bucket，让同 isolate 后续命中
+
           const b = keyBucket.get(key);
           if (!bucketData.has(b)) bucketData.set(b, {});
           bucketData.get(b)[key] = {
@@ -8736,7 +8315,7 @@ async function enrichBatch(keys, env, ctx) {
       for (let i = 0; i < ks.length - ENRICH_BUCKET_MAX; i++)
         delete items[ks[i]];
     }
-    // 只更新 mem bucket，不再写 KV
+
     __enrichBucketMem.set(b, {
       items,
       exp: Date.now() + ENRICH_BUCKET_MEM_TTL,
@@ -8746,7 +8325,6 @@ async function enrichBatch(keys, env, ctx) {
   return out;
 }
 
-/** 前端批量 enrich 元数据 */
 async function handleEnrich(request, env, ctx) {
   let body;
   try {
@@ -8850,7 +8428,6 @@ function mediaItem(opts) {
   return `<div class="item${clickable}"${dataAttrs}${enrichAttrs}${lockPosterAttr}${opts.itemAttrs || ""}${style}>${removeHtml}${watchedHtml}${unwatchHtml}<div class="poster">${opts.poster ? `<img src="${opts.poster}" loading="lazy" alt="" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"><div class="poster-ph" style="display:none"><span>${opts.tagClass === "movie" ? "🎬" : "📺"}</span></div>` : `<div class="poster-ph"><span>${opts.tagClass === "movie" ? "🎬" : "📺"}</span></div>`}${playHtml}${dropHtml}</div><div class="info"><div class="name-row"><span class="name">${esc(opts.title)}</span>${rewatchBadge}${tagHtml}</div>${opts.line1 ? `<div class="meta">${esc(opts.line1)}</div>` : ""}${opts.overview ? `<div class="overview">${esc(opts.overview)}</div>` : ""}${opts.line2 ? `<div class="meta dim">${esc(opts.line2)}</div>` : ""}${bar}${cwActionsHtml}${calendarBtnHtml}</div></div>`;
 }
 
-/** 历史记录 HTML */
 function renderHistoryPage(items, env, isFragment) {
   if (isFragment === undefined) isFragment = false;
   if (!Array.isArray(items))
@@ -8962,7 +8539,6 @@ function emptyWatchlistHtml() {
   return `<div class="empty"><svg viewBox="0 0 24 24" width="56" height="56" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.25"><circle cx="12" cy="12" r="10"/><path d="M12 8v8M8 12h8"/></svg><p>待看列表是空的</p><p style="font-size:0.82rem;color:#5a6474;margin-top:10px;line-height:1.6;text-align:center">去 Trakt 上把想看的电影 / 剧集加入 watchlist，这里就会显示</p></div>`;
 }
 
-/** 待看卡片 HTML */
 function renderWatchlistItems(items, env) {
   if (!Array.isArray(items) || !items.length) return "";
   return items
@@ -9019,7 +8595,6 @@ function renderWatchlistItems(items, env) {
     .join("");
 }
 
-/** Infuse 深链 */
 function buildInfuseHrefForContinue(item) {
   if (!item) return null;
 
@@ -9070,10 +8645,6 @@ function buildInfuseHrefForContinue(item) {
   return `infuse://series/${tmdbId}-1`;
 }
 
-/* =============================================================================
- * 9. 服务端渲染 HTML 片段（继续观看卡片等）
- * ============================================================================= */
-/** 继续观看卡片（grid/hscroll/fragment） */
 function renderContinueItems(upNext, mode = "grid") {
   if (mode === true) mode = "fragment";
 
@@ -9685,7 +9256,7 @@ function renderDetailFragment(d) {
     '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" stroke="none"><path d="M7 3h10a1 1 0 0 1 1 1v16l-6-3.5L6 20V4a1 1 0 0 1 1-1z"/></svg>';
   const iconPlay =
     '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" stroke="none"><path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11.04-6.86a1 1 0 0 0 0-1.72L9.5 4.28A1 1 0 0 0 8 5.14z"/></svg>';
-  // 分享 / 复制链接
+
   const iconShare =
     '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.6 13.5l6.8 4M15.4 6.5l-6.8 4"/></svg>';
 
@@ -9754,7 +9325,6 @@ function renderDetailFragment(d) {
   if (infuseHref)
     barBtns += `<a class="d-act d-act-play" href="${esc(infuseHref)}" rel="noopener" title="在 Infuse 中查看">${iconPlay}</a>`;
 
-  // TMDB 页面链接，点击复制到剪贴板
   if (tmdb && tmdb.id) {
     const tmdbUrl = isMovie
       ? `https://www.themoviedb.org/movie/${tmdb.id}`
@@ -9982,7 +9552,6 @@ function renderSeasonEpisodes(
     .join("");
 }
 
-/** 空状态 HTML */
 function emptyView(opts) {
   if (typeof opts === "string") opts = { text: opts };
   const text = opts.text || "";
@@ -10034,7 +9603,6 @@ function b64urlDecode(str) {
   return new TextDecoder().decode(bytes);
 }
 
-/** HTML 转义 */
 function esc(s) {
   return String(s == null ? "" : s)
     .replace(/&/g, "&amp;")
@@ -10055,7 +9623,6 @@ function pad(n) {
   return String(n == null ? 0 : n).padStart(2, "0");
 }
 
-/** 相对时间文案（如 3 小时前） */
 function fmtRelative(iso) {
   if (!iso) return "";
   const d = new Date(iso),
@@ -10083,10 +9650,6 @@ function html(body) {
   });
 }
 
-/**
- * 首页「即将播出」是在 playback 缓存写完后注入的；
- * 查看更多等路径需调用本函数，才能与首页横滑一致。
- */
 async function injectLocalUpcomingIntoContinue(
   list,
   headers,
@@ -10154,10 +9717,6 @@ async function injectLocalUpcomingIntoContinue(
   return Array.isArray(list) ? list : [];
 }
 
-/* =============================================================================
- * 8. 分页「查看更多」（历史 / 继续观看 / 待看）
- * ============================================================================= */
-/** 查看更多分页（历史/继续观看/待看） */
 async function handleMore(request, env, ctx) {
   const url = new URL(request.url),
     type = url.searchParams.get("type"),
@@ -10224,7 +9783,7 @@ async function handleMore(request, env, ctx) {
   }
 
   if (type === "playback") {
-    // 查看更多：分页加载，默认每页 20，可一直「加载更多」
+
     const limit = limitParam > 0 ? Math.min(limitParam, 40) : 20;
 
     async function readHomePlaybackList() {
@@ -10315,7 +9874,7 @@ async function handleMore(request, env, ctx) {
             !Array.isArray(userState.hideMap)
               ? userState.hideMap
               : {};
-          // limit 用满，不再压成 20
+
           items = mergeContinueLists(
             pausedItems,
             upNextItems,
@@ -10372,7 +9931,6 @@ async function handleMore(request, env, ctx) {
     let pageCount = (data && data.pageCount) || 0;
     let fromFallback = false;
 
-    // 仅在拉取失败时回退首页缓存（可能只有约 20 条）
     if ((!list || (data && data.__error)) && page === 1) {
       const homeList = await readHomePlaybackList();
       if (homeList && homeList.length) {
@@ -10383,7 +9941,6 @@ async function handleMore(request, env, ctx) {
     }
     if (!list) list = [];
 
-    // 注入即将播出（与首页同一套日历逻辑，额度跟 limit）
     if (page === 1) {
       list = await injectLocalUpcomingIntoContinue(
         list,
@@ -10405,7 +9962,7 @@ async function handleMore(request, env, ctx) {
     const mode = (url.searchParams.get("mode") || "fragment").toLowerCase();
     const renderMode =
       mode === "grid" ? "grid" : mode === "hscroll" ? "hscroll" : "fragment";
-    // 无数据时返回空字符串，避免「加载更多」把「暂无内容」大空态追加到已有列表下面
+
     const html = list.length ? renderContinueItems(list, renderMode) : "";
     const reallyHasMore = !!(hasMore && list.length > 0);
     return authResp(auth, needsCookieUpdate, html || "", {
@@ -10448,17 +10005,12 @@ async function handleMore(request, env, ctx) {
   return new Response("", { status: 400 });
 }
 
-/** 登录页 */
 function renderLoginPage() {
   return pageShell(
     `<div class="login-wrap"><div class="login-card"><div class="login-logo"><img src="${ICON_192}" alt="MineTrakt" width="64" height="64" style="display:block;margin:0 auto"></div><h1 class="login-title">MineTrakt</h1><p class="login-sub">首页 · 待看列表 · 追剧日历 · 观看记录</p><div id="login-area" class="login-area"><button class="btn-primary" onclick="startLogin()">使用 Trakt 登录</button></div></div></div><script>async function startLogin(){const area=document.getElementById('login-area');window.__loginGen=(window.__loginGen||0)+1;const gen=window.__loginGen;area.innerHTML='<div class="spinner"></div>';let r;try{r=await fetch('/auth/device');}catch(e){if(gen!==window.__loginGen)return;area.innerHTML='<div class="err-box"><p class="err-title">网络错误</p><p class="err">'+String(e)+'</p></div><button class="btn-primary" onclick="startLogin()">重试</button>';return;}if(gen!==window.__loginGen)return;if(!r.ok){const err=await r.json().catch(()=>({}));if(gen!==window.__loginGen)return;if(r.status===429||err.rateLimited){var wait=Number(err.retryAfter)||30;area.innerHTML='<div class="err-box" style="background:rgba(255,184,77,.10);border-color:rgba(255,184,77,.28)"><p class="err-title" style="color:#ffb84d">请求过于频繁</p><p class="err" style="color:#ffd693">Trakt 限流了，请 <span id="rl-count">'+wait+'</span> 秒后再试</p></div><button class="btn-primary" id="rl-btn" disabled style="opacity:.5;cursor:not-allowed">请稍候…</button>';var cnt=document.getElementById('rl-count'),btn=document.getElementById('rl-btn'),left=wait;var t=setInterval(function(){if(gen!==window.__loginGen){clearInterval(t);return;}left--;if(cnt)cnt.textContent=String(left);if(left<=0){clearInterval(t);if(btn){btn.disabled=false;btn.style.opacity='';btn.style.cursor='';btn.textContent='立即重试';btn.onclick=function(){startLogin();};}}},1000);return;}area.innerHTML='<div class="err-box"><p class="err-title">获取设备码失败</p><p class="err">'+(err.error||('HTTP '+r.status))+'</p>'+(err.hint?'<p class="hint">'+err.hint+'</p>':'')+'</div><button class="btn-primary" onclick="startLogin()">重试</button>';return;}const d=await r.json();if(gen!==window.__loginGen)return;const activateUrl='https://trakt.tv/activate',qr='https://api.qrserver.com/v1/create-qr-code/?size=220x220&color=4a6db8&bgcolor=ffffff&data='+encodeURIComponent(activateUrl);area.innerHTML='<div class="device-flow"><div class="steps"><div class="step"><span class="n">1</span><span>打开 <a href="'+activateUrl+'" target="_blank" rel="noopener">trakt.tv/activate</a></span></div><div class="step"><span class="n">2</span><span>输入下方代码</span></div></div><div class="code-box">'+d.user_code+'</div><button type="button" class="btn-ghost" id="refresh-code-btn" onclick="startLogin()" style="margin:4px 0 10px">换一个验证码</button><div class="step"><span class="n">3</span><span>在 Trakt 页面点击授权</span></div><div class="qr-box"><img src="'+qr+'" alt="QR"></div><p id="status" class="status" style="display:none"></p></div><details class="log-details"><summary>调试日志</summary><div id="log" class="log-box"></div></details>';let interval=(d.interval||5)*1000,attempt=0;const logEl=document.getElementById('log'),log=(s)=>{if(logEl)logEl.innerHTML+='<div>['+new Date().toLocaleTimeString()+'] '+s+'</div>';};const tick=async()=>{if(gen!==window.__loginGen)return;attempt++;let r2;try{r2=await fetch('/auth/poll',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({state:d.state})});}catch(e){if(gen!==window.__loginGen)return;log('网络错误');setTimeout(tick,interval);return;}if(gen!==window.__loginGen)return;if(r2.status===200){try{const st=document.getElementById('status');if(st){st.innerHTML='✓ 授权成功，正在进入…';st.className='status success';st.style.display='';}}catch(e){}setTimeout(()=>location.href='/home',400);return;}let text='';try{text=await r2.text();}catch{}let data={};try{data=JSON.parse(text);}catch{}log('HTTP '+r2.status+' · '+(data.status||data.message||'未知'));if(r2.status===202){if(data.status==='slow_down')interval+=2000;setTimeout(tick,interval);return;}if(r2.status===429){setTimeout(tick,Math.max(interval,5000));return;}if(r2.status===502||r2.status===503||r2.status===504){setTimeout(tick,Math.max(interval,3000));return;}if(r2.status===403){try{const st=document.getElementById('status');if(st){st.textContent=data.message||'你拒绝了授权，请换一个验证码重试';st.className='status error';st.style.display='';}const rb=document.getElementById('refresh-code-btn');if(rb){rb.style.borderColor='rgba(224,85,96,.45)';rb.style.color='#ff8a8a';}}catch(e){}return;}if(r2.status===410){try{const st=document.getElementById('status');if(st){st.textContent=data.message||'验证码无效或已过期，请换一个重试';st.className='status error';st.style.display='';}const rb=document.getElementById('refresh-code-btn');if(rb){rb.style.borderColor='rgba(224,85,96,.45)';rb.style.color='#ff8a8a';rb.focus();}}catch(e){}return;}setTimeout(tick,interval);};setTimeout(tick,1000);}<\/script><script>(function(){try{var msg=sessionStorage.getItem('mt:relogin');if(!msg)return;sessionStorage.removeItem('mt:relogin');var area=document.getElementById('login-area');if(!area)return;var p=document.createElement('p');p.className='err';p.style.cssText='margin-bottom:14px;text-align:center';p.textContent=msg;area.parentNode.insertBefore(p,area);}catch(e){}})();<\/script>`,
   );
 }
 
-/** 启动全屏 splash HTML */
-/* =============================================================================
- * Splash / 启动页 / 页面壳
- * ============================================================================= */
 function renderSplash() {
   return `<div id="splash" class="splash" style="position:fixed;top:0;left:0;right:0;bottom:calc(-1 * env(safe-area-inset-bottom,0px));width:100%;min-height:100%;min-height:100dvh;min-height:-webkit-fill-available;min-height:calc(100dvh + env(safe-area-inset-bottom,0px));padding-bottom:env(safe-area-inset-bottom,0px);box-sizing:border-box;z-index:99999;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000"><div class="splash-glow"></div><div class="splash-inner"><div class="splash-logo"><img src="${SPLASH_LOGO}" alt="" width="96" height="96" loading="eager" decoding="async" style="display:block;filter:drop-shadow(0 0 22px var(--splash-glow-color,rgba(125,157,212,.55)))"></div><div class="splash-name">MineTrakt</div><div class="splash-bar"><div class="splash-bar-fill"></div></div></div></div>`;
 }
@@ -10479,10 +10031,9 @@ function launchLogoSvg() {
   );
 }
 
-/** 启动页关键 CSS（强制铺满视口） */
 function launchCriticalCss() {
   const B = "box-sizing:border-box";
-  // 启动页强制铺满视口（浅色主题 / 桌面窗口 / iPad Stage Manager）
+
   return (
     `html,body{background:#000!important;color:#eef1f7;margin:0;padding:0;width:100%;height:100%;min-width:100%;min-height:100%;min-height:100vh;min-height:100dvh;min-height:-webkit-fill-available;min-height:calc(100dvh + env(safe-area-inset-bottom,0px));overflow:hidden}` +
     `*{${B}}` +
@@ -10503,7 +10054,6 @@ function launchCriticalCss() {
   );
 }
 
-/** 根路径启动页（短暂展示后跳转 home/login） */
 function renderLaunchPage(request) {
   const loggedIn = !!readAuth(request);
   const target = loggedIn ? "/home" : "/login";
@@ -10559,7 +10109,6 @@ function renderLaunchPage(request) {
   );
 }
 
-/** 顶部统计四格 */
 function renderStatsHtml(s) {
   const movieCount = s ? s.movie : 0,
     showCount = s ? s.show : 0,
@@ -10601,7 +10150,6 @@ function renderStatsHtml(s) {
     .join("");
 }
 
-/** 公共 head meta / 预连接 */
 function commonHeadMeta() {
   return `<meta charset="utf-8">${THEME_BOOT_SCRIPT}<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1,user-scalable=no"><meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"><meta http-equiv="Pragma" content="no-cache"><meta name="color-scheme" content="dark light"><meta name="theme-color" content="${THEME_COLOR}"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="${APP_SHORT_NAME}"><meta name="mobile-web-app-capable" content="yes"><meta name="format-detection" content="telephone=no"><title>${APP_NAME}</title><link rel="icon" href="${FAVICON_URL}" type="image/png"><link rel="apple-touch-icon" href="${APPLE_ICON}"><link rel="manifest" href="/manifest.webmanifest"><link rel="preconnect" href="https://api.trakt.tv" crossorigin><link rel="preconnect" href="https://api.themoviedb.org" crossorigin><link rel="preconnect" href="https://image.tmdb.org" crossorigin>`;
 }
@@ -10638,12 +10186,10 @@ function pageTail() {
 })();<\/script></body></html>`;
 }
 
-/** HTML 文档外壳 */
 function pageShell(body) {
   return pageHeadEarly() + body + pageTail();
 }
 
-/** 首页 splash 关键 CSS */
 function splashCriticalCss() {
   return `html,body{background:var(--bg-solid,#000);color:var(--text,#eef1f7);margin:0;padding:0;min-height:100%;min-height:100dvh}
 *{box-sizing:border-box}
@@ -10678,31 +10224,8 @@ function splashCriticalCss() {
 `;
 }
 
-/* =============================================================================
- * 10. 前端 bootstrap（静默刷新、查看更多缓存、强制刷新）
- *     注意：以下为注入到页面的字符串脚本，修改时保持可在浏览器直接执行
- * ============================================================================= */
-/** 前端主脚本字符串（/app.js） */
 function getBootstrapScript() {
-  return `(function(){var __CFG=window.__HOME_CONFIG__||{};if(!__CFG.loggedIn)return;window.__HOME_CONFIG__=null;if(__CFG.initialDetail)window.__initialDetail=__CFG.initialDetail;if(!window.__splashT0)window.__splashT0=Date.now();window.__splashHidden=false;window.__hideSplash=function(force){try{if(window.__splashHidden)return;window.__splashHidden=true;var el=document.getElementById('splash');if(!el)return;var wait=force?0:Math.max(0,120-(Date.now()-(window.__splashT0||Date.now())));setTimeout(function(){try{el.classList.add('hide');setTimeout(function(){try{if(el&&el.parentNode)el.parentNode.removeChild(el);}catch(e){}},280);}catch(e){}},wait);}catch(e){}};setTimeout(function(){if(window.__hideSplash)window.__hideSplash();},80);function lsGet(k){try{var v=localStorage.getItem(k);if(!v)return null;var o=JSON.parse(v);if(o&&o._exp&&o._exp<Date.now()){try{localStorage.removeItem(k);}catch(e){}return null;}return o&&o.data?o.data:null;}catch(e){return null;}}function lsSet(k,d,ttlSec){try{localStorage.setItem(k,JSON.stringify({data:d,_exp:Date.now()+ttlSec*1000}));}catch(e){try{localStorage.removeItem(k);}catch(e2){}}}window.__lsGet=lsGet;window.__lsSet=lsSet;var __lastPbFetchAt=0;
-try{
-  var _pba=localStorage.getItem('mt:pbAt');
-  if(_pba){
-    var _o=JSON.parse(_pba);
-    if(_o&&_o.ts&&Number(_o.ts)>0&&(!_o._exp||_o._exp>Date.now()))
-      __lastPbFetchAt=Number(_o.ts)||0;
-  }
-}catch(e){}
-window.__lastPbFetchAt=__lastPbFetchAt;
-function __markPbFetch(){
-  var now=Date.now();
-  __lastPbFetchAt=now;
-  window.__lastPbFetchAt=now;
-  try{
-    localStorage.setItem('mt:pbAt',JSON.stringify({ts:now,_exp:now+7*86400e3}));
-  }catch(e){}
-}
-window.__markPbFetch=__markPbFetch;function setHTML(sel,html){var el=typeof sel==='string'?document.querySelector(sel):sel;if(el)el.innerHTML=html||'';}window.__setHTML=setHTML;function applyAvatar(url,alts){if(!url)return;var av=document.getElementById('hero-avatar');if(!av)return;var list=[url];if(alts&&alts.length){for(var a=0;a<alts.length;a++){if(alts[a]&&alts[a]!==url)list.push(alts[a]);}}list.push('/avatar?u='+encodeURIComponent(url));var i=0;function next(){if(i>=list.length){av.innerHTML='<span class="hero-avatar-ph">👤</span>';return;}var src=list[i++];var img=document.createElement('img');img.onerror=next;img.alt='';img.width=56;img.height=56;img.decoding='async';img.setAttribute('referrerpolicy','no-referrer');img.src=src;av.innerHTML='';av.appendChild(img);}next();}
+  return `(function(){var __CFG=window.__HOME_CONFIG__||{};if(!__CFG.loggedIn)return;window.__HOME_CONFIG__=null;if(__CFG.initialDetail)window.__initialDetail=__CFG.initialDetail;if(!window.__splashT0)window.__splashT0=Date.now();window.__splashHidden=false;window.__hideSplash=function(force){try{if(window.__splashHidden)return;window.__splashHidden=true;var el=document.getElementById('splash');if(!el)return;var wait=force?0:Math.max(0,120-(Date.now()-(window.__splashT0||Date.now())));setTimeout(function(){try{el.classList.add('hide');setTimeout(function(){try{if(el&&el.parentNode)el.parentNode.removeChild(el);}catch(e){}},280);}catch(e){}},wait);}catch(e){}};setTimeout(function(){if(window.__hideSplash)window.__hideSplash();},80);function lsGet(k){try{var v=localStorage.getItem(k);if(!v)return null;var o=JSON.parse(v);if(o&&o._exp&&o._exp<Date.now()){try{localStorage.removeItem(k);}catch(e){}return null;}return o&&o.data?o.data:null;}catch(e){return null;}}function lsSet(k,d,ttlSec){try{localStorage.setItem(k,JSON.stringify({data:d,_exp:Date.now()+ttlSec*1000}));}catch(e){try{localStorage.removeItem(k);}catch(e2){}}}window.__lsGet=lsGet;window.__lsSet=lsSet;function setHTML(sel,html){var el=typeof sel==='string'?document.querySelector(sel):sel;if(el)el.innerHTML=html||'';}window.__setHTML=setHTML;function applyAvatar(url,alts){if(!url)return;var av=document.getElementById('hero-avatar');if(!av)return;var list=[url];if(alts&&alts.length){for(var a=0;a<alts.length;a++){if(alts[a]&&alts[a]!==url)list.push(alts[a]);}}list.push('/avatar?u='+encodeURIComponent(url));var i=0;function next(){if(i>=list.length){av.innerHTML='<span class="hero-avatar-ph">👤</span>';return;}var src=list[i++];var img=document.createElement('img');img.onerror=next;img.alt='';img.width=56;img.height=56;img.decoding='async';img.setAttribute('referrerpolicy','no-referrer');img.src=src;av.innerHTML='';av.appendChild(img);}next();}
 function __fmtFull(ts){
   var d=new Date(ts);if(isNaN(d.getTime()))return'';
   var p=function(n){return(n<10?'0':'')+n;};
@@ -10811,22 +10334,21 @@ function fetchPart(part,force,live){return fetch('/api/home-data?part='+encodeUR
     setHTML('#playback-hscroll','<div class="empty"><p>暂时无法从 Trakt 拉取数据<br><span style="font-size:.82rem;opacity:.75">可能是官方限流或网络异常，请过几分钟再试</span></p><p style="margin-top:12px"><button class="btn-ghost" onclick="location.reload()">重试</button></p></div>');
     finishSplash();
   }
-function onPlayback(d,from){
-  if(!d)return;
-  var isCache=from==='cache';
-  setBootState(isCache?'cache':(from==='live'?'live':from||'live'));
-  applyPlayback(d,isCache);
-  if(!isCache){
-    __markPbFetch();
-    try{lsSet('mt:pb',d,900);}catch(e){}
-    if(!silent&&window.__initialDetail){
-      var s=window.__initialDetail,idx=s.indexOf('/');
-      if(idx>0&&window.openDetail)openDetail(s.slice(0,idx),s.slice(idx+1),false);
-      window.__initialDetail=null;
+  function onPlayback(d,from){
+    if(!d)return;
+    var isCache=from==='cache';
+    setBootState(isCache?'cache':(from==='live'?'live':from||'live'));
+    applyPlayback(d,isCache);
+    if(!isCache){
+      try{lsSet('mt:pb',d,900);}catch(e){}
+      if(!silent&&window.__initialDetail){
+        var s=window.__initialDetail,idx=s.indexOf('/');
+        if(idx>0&&window.openDetail)openDetail(s.slice(0,idx),s.slice(idx+1),false);
+        window.__initialDetail=null;
+      }
     }
+    finishSplash();
   }
-  finishSplash();
-}
   setBootState('loading');
   if(!silent){
     var cachedPb=lsGet('mt:pb');
@@ -10857,50 +10379,9 @@ function onPlayback(d,from){
     if(window.requestIdleCallback)requestIdleCallback(runMeta,{timeout:1500});
     else setTimeout(runMeta,200);
   });
-}var __refreshTick=0,__lastUserAct=Date.now(),__lastBoardReload=Date.now();
-['scroll','click','touchstart','keydown'].forEach(function(t){
-  window.addEventListener(t,function(){__lastUserAct=Date.now();},{passive:true});
-});
-function silentRefresh(opts){
-  opts=opts||{};
-  var force=!!opts.force;
-  if(document.hidden)return;
-  var __m=document.getElementById('modal');
-  if(__m&&__m.classList.contains('open'))return;
-  if(window.__forceRefreshing||window.__homeDataLoading)return;
-  // 距上次成功拉取不足 10 分钟，跳过（force 可绕过）
-  if(!force&&__lastPbFetchAt&&Date.now()-__lastPbFetchAt<10*60*1000)return;
-  __refreshTick++;
-  __lastRefreshAt=Date.now();
-  fetchPart('playback',false,true).then(function(d){
-    if(!d)return;
-    __markPbFetch();
-    if(d.activityUnchanged)return;
-    var prevHtml=window.__lastPbHtml||null;
-    var newHtml=(d&&d.playbackHScrollHtml)||null;
-    if(newHtml&&prevHtml&&prevHtml===newHtml)return;
-    applyPlayback(d);
-    try{lsSet('mt:pb',d,900);}catch(e){}
-    if(newHtml&&prevHtml&&prevHtml!==newHtml&&window.__toast)window.__toast('已自动更新观看进度',{type:'success',duration:2000});
-  }).catch(function(){});
-}
-window.__refreshStats=silentRefresh;
-window.forceRefresh=async function(){if(window.__forceRefreshing)return;window.__forceRefreshing=true;window.__manualRefreshPending=true;try{localStorage.removeItem('mt:pb');localStorage.removeItem('mt:meta');try{window.__cwMoreCache=null;}catch(e){}}catch(e){}var btn=document.getElementById('btn-refresh');var span=btn&&btn.querySelector('span');var oldText=span?span.textContent:'刷新';if(btn)btn.classList.add('loading');if(span)span.textContent='刷新中';var okCount=0,cacheCount=0,failCount=0,cooling=0,hitLimit=false;var GAP_OK=600,GAP_LIMIT=1400;try{var wanted=['playback','meta','calendar'];var loaded=window.__loadedParts||{};['history','watchlist'].forEach(function(p){if(loaded[p]&&wanted.indexOf(p)<0)wanted.push(p);});for(var i=0;i<wanted.length;i++){if(hitLimit)break;var part=wanted[i];if(i>0){var gap=cooling>0?GAP_LIMIT:GAP_OK;await new Promise(function(r){setTimeout(r,gap);});}var d=null;try{d=await __enqueueTrakt(function(){return fetchPart(part,true);});}catch(e){d=null;}if(!d){failCount++;continue;}var isCache=false;if(part==='playback'&&d.playbackSource==='cache')isCache=true;if(part==='meta'&&d.metaSource==='cache')isCache=true;if(part==='calendar'&&d.calendarSource==='cache')isCache=true;if(isCache)cacheCount++;else okCount++;if(part==='playback'){applyPlayback(d);__markPbFetch();try{lsSet('mt:pb',d,900);}catch(e){}}else if(part==='meta'){applyMeta(d,false);}else if(part==='watchlist'||part==='calendar'||part==='history'){__applyPart(part,d);__savePartSnap(part,d);}window.__loadedParts[part]=d;if(__partFailed(d)){try{delete window.__loadedParts[part];}catch(e){}}if(d.rateLimited||(d.cooling&&d.cooling>0)){hitLimit=true;cooling=Math.max(cooling,Number(d.cooling)||0);}else if(isCache&&(part==='playback'||part==='meta')){hitLimit=true;}}if(failCount&&!okCount&&!cacheCount){__errToast('刷新失败',new Error('无法连接，请检查网络后重试'));}else if(hitLimit){var msg=cooling>0?('刷新失败，Trakt 限流约 '+cooling+' 秒，已显示缓存'):'刷新失败，已显示缓存';__toast(msg,{type:'warn',duration:4200});}else if(failCount||cacheCount){__toast('已刷新观看数据（部分仍为缓存）',{type:'warn',duration:2800});}else{__toast('已刷新观看数据',{type:'success',duration:1800});}if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){__errToast('刷新失败',e);}finally{if(btn)btn.classList.remove('loading');if(span)span.textContent=oldText;window.__forceRefreshing=false;}};
-function startHomeData(){loadHomeData({silent:false});}if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',startHomeData);}else{startHomeData();}var REFRESH_MS=${HOME_AUTO_REFRESH_MINUTES}*60*1000;
-var __lastRefreshAt=Date.now();
-if(REFRESH_MS>0){
-  // 每分钟 tick 一次；silentRefresh 内部按 10 分钟阈值判断是否真拉，
-  // 避免用户在 10 分钟 tick 点恰好有操作而全部被跳过，导致 20 分钟以上才刷新
-  setInterval(function(){
-    if(Date.now()-__lastUserAct<60000)return;
-    silentRefresh();
-  },60*1000);
-  document.addEventListener('visibilitychange',function(){
-    if(document.hidden)return;
-    // 回到前台也走 silentRefresh 的 10 分钟阈值判断
-    silentRefresh();
-  });
-}})();`;
+}var __refreshTick=0,__lastUserAct=Date.now(),__lastBoardReload=Date.now();['scroll','click','touchstart','keydown'].forEach(function(t){window.addEventListener(t,function(){__lastUserAct=Date.now();},{passive:true});});function silentRefresh(){if(document.hidden)return;var __m=document.getElementById('modal');if(__m&&__m.classList.contains('open'))return;if(window.__forceRefreshing||window.__homeDataLoading)return;__refreshTick++;__lastRefreshAt=Date.now();fetchPart('playback',false,true).then(function(d){if(!d)return;if(d.activityUnchanged)return;var prevHtml=window.__lastPbHtml||null;var newHtml=(d&&d.playbackHScrollHtml)||null;if(newHtml&&prevHtml&&prevHtml===newHtml)return;applyPlayback(d);try{lsSet('mt:pb',d,900);}catch(e){}if(newHtml&&prevHtml&&prevHtml!==newHtml&&window.__toast)window.__toast('已自动更新观看进度',{type:'success',duration:2000});}).catch(function(){});}window.__refreshStats=silentRefresh;
+window.forceRefresh=async function(){if(window.__forceRefreshing)return;window.__forceRefreshing=true;window.__manualRefreshPending=true;try{localStorage.removeItem('mt:pb');localStorage.removeItem('mt:meta');try{window.__cwMoreCache=null;}catch(e){}}catch(e){}var btn=document.getElementById('btn-refresh');var span=btn&&btn.querySelector('span');var oldText=span?span.textContent:'刷新';if(btn)btn.classList.add('loading');if(span)span.textContent='刷新中';var okCount=0,cacheCount=0,failCount=0,cooling=0,hitLimit=false;var GAP_OK=600,GAP_LIMIT=1400;try{var wanted=['playback','meta','calendar'];var loaded=window.__loadedParts||{};['history','watchlist'].forEach(function(p){if(loaded[p]&&wanted.indexOf(p)<0)wanted.push(p);});for(var i=0;i<wanted.length;i++){if(hitLimit)break;var part=wanted[i];if(i>0){var gap=cooling>0?GAP_LIMIT:GAP_OK;await new Promise(function(r){setTimeout(r,gap);});}var d=null;try{d=await __enqueueTrakt(function(){return fetchPart(part,true);});}catch(e){d=null;}if(!d){failCount++;continue;}var isCache=false;if(part==='playback'&&d.playbackSource==='cache')isCache=true;if(part==='meta'&&d.metaSource==='cache')isCache=true;if(part==='calendar'&&d.calendarSource==='cache')isCache=true;if(isCache)cacheCount++;else okCount++;if(part==='playback'){applyPlayback(d);try{lsSet('mt:pb',d,900);}catch(e){}}else if(part==='meta'){applyMeta(d,false);}else if(part==='watchlist'||part==='calendar'||part==='history'){__applyPart(part,d);__savePartSnap(part,d);}window.__loadedParts[part]=d;if(__partFailed(d)){try{delete window.__loadedParts[part];}catch(e){}}if(d.rateLimited||(d.cooling&&d.cooling>0)){hitLimit=true;cooling=Math.max(cooling,Number(d.cooling)||0);}else if(isCache&&(part==='playback'||part==='meta')){hitLimit=true;}}if(failCount&&!okCount&&!cacheCount){__errToast('刷新失败',new Error('无法连接，请检查网络后重试'));}else if(hitLimit){var msg=cooling>0?('刷新失败，Trakt 限流约 '+cooling+' 秒，已显示缓存'):'刷新失败，已显示缓存';__toast(msg,{type:'warn',duration:4200});}else if(failCount||cacheCount){__toast('已刷新观看数据（部分仍为缓存）',{type:'warn',duration:2800});}else{__toast('已刷新观看数据',{type:'success',duration:1800});}if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){__errToast('刷新失败',e);}finally{if(btn)btn.classList.remove('loading');if(span)span.textContent=oldText;window.__forceRefreshing=false;}};
+function startHomeData(){loadHomeData({silent:false});}if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',startHomeData);}else{startHomeData();}var REFRESH_MS=${HOME_AUTO_REFRESH_MINUTES}*60*1000;var __lastRefreshAt=Date.now();if(REFRESH_MS>0){setInterval(function(){if(Date.now()-__lastUserAct<60000)return;silentRefresh();},REFRESH_MS);document.addEventListener('visibilitychange',function(){if(document.hidden)return;silentRefresh();});}})();`;
 }
 
 function getClientSideScripts() {
@@ -11002,7 +10483,6 @@ async function loadMoreContinue(btn){
       cache.ts=Date.now();
     }
     var grid=document.getElementById('cw-modal-grid');
-    // 空页：不追加任何空态 HTML
     if(grid&&html&&html.trim()&&html.indexOf('暂时没有继续观看')<0&&html.indexOf('class="empty"')<0){
       var tmp=document.createElement('div');tmp.innerHTML=html;
       var existing=new Set();
@@ -11154,7 +10634,6 @@ document.addEventListener('click',function(e){
 document.addEventListener('keydown',function(e){
   if(e.key==='Escape')__closeCwSheet();
 });
-
 
 async function __hideContinueById(id, name, season, episode, mediaType, mediaId){
   id=String(id||'').trim();
@@ -11323,36 +10802,24 @@ function __openTabsGridModal(body,cfg){
       if(window.__scheduleEnrich)window.__scheduleEnrich();
     }).catch(function(){grid.innerHTML='<div class="empty"><p>加载失败，请稍后重试</p></div>';});
   }
-  
-  if(!cfg.tabsApi||!tabsBox){
-    loadList('all');
-    return;
-  }
-  
+  loadList('all');
+  if(!cfg.tabsApi||!tabsBox)return;
   fetch(cfg.tabsApi).then(function(r){return r.ok?r.json():{};}).then(function(d){
     var list=(d&&d[cfg.tabsKey||'categories'])||[];
-    if(!list.length){
-      loadList('all');
-      return;
-    }
-    
-    var html='';
+    if(!list.length)return;
+    var param=cfg.tabsParam||'category';
+    var html='<button class="douban-filter-tab active" data-val="all">全部</button>';
     for(var i=0;i<list.length;i++){
-      html+='<button class="douban-filter-tab'+(i===0?' active':'')+'" data-val="'+__esc(list[i])+'">'+__esc(list[i])+'</button>';
+      html+='<button class="douban-filter-tab" data-val="'+__esc(list[i])+'">'+__esc(list[i])+'</button>';
     }
     tabsBox.innerHTML=html;tabsBox.style.display='';
-    
-    loadList(list[0]);
-    
     tabsBox.addEventListener('click',function(e){
       var btn=e.target.closest('.douban-filter-tab');if(!btn)return;
       tabsBox.querySelectorAll('.douban-filter-tab').forEach(function(b){b.classList.remove('active');});
       btn.classList.add('active');
-      loadList(btn.getAttribute('data-val')||'剧集');
+      loadList(btn.getAttribute('data-val')||'all');
     });
-  }).catch(function(){
-    loadList('all');
-  });
+  }).catch(function(){});
 }
 
 window.openListModal=function(id){
@@ -11404,7 +10871,6 @@ window.openListModal=function(id){
   }
   if(cfg.kind==='tabsGrid'){__openTabsGridModal(body,cfg);return;}
   if(cfg.kind==='simpleGrid'){__openSimpleGridModal(body,cfg);return;}
-  // fallback
   if(cfg.listApi){__openSimpleGridModal(body,cfg);return;}
 };
 window.__platformNames={netflix:"Netflix",disney:"Disney+",appletv:"Apple TV+",hbomax:"HBO Max",prime:"Prime Video",iqiyi:"爱奇艺",youku:"优酷",tencent:"腾讯视频",mgtv:"芒果TV",bilibili:"哔哩哔哩"};
@@ -11565,12 +11031,10 @@ window.openTheaterPlatformList=function(platform){
   else boot();
 })();
 (function(){
-  // 桌面端：鼠标悬停在平台/剧场横滑区域时，滚轮左右滑动
   function onWheel(e){
     var el=e.target&&e.target.closest&&e.target.closest(".platform-cards");
     if(!el)return;
     if(el.scrollWidth<=el.clientWidth+2)return;
-    // 触控板已有横向位移时不抢
     if(Math.abs(e.deltaX)>Math.abs(e.deltaY))return;
     if(!e.deltaY)return;
     e.preventDefault();
@@ -11598,8 +11062,8 @@ async function __loadHScroll(elId,url,keepId){
     if(window.__scheduleEnrich)window.__scheduleEnrich();
   }catch(e){el.innerHTML='<div class="h-scroll-empty"><p>加载失败，请稍后重试</p></div>';}
 }
-async function loadGuduoHScroll(category,force){category=category||'all';return __loadHScroll('guduo-hscroll','/api/guduo-list?mode=hscroll&category='+encodeURIComponent(category)+(force?'&force=1':''));}async function loadGuduoHomeTabs(){var tabsBox=document.getElementById('guduo-home-tabs');if(!tabsBox||tabsBox.dataset.loaded==='1')return;try{var r=await fetch('/api/guduo-list?mode=categories');var d=r.ok?await r.json():{categories:[]};var cats=(d&&d.categories)||[];cats=cats.length?cats:['剧集','电影','动漫','综艺'];var html='';for(var i=0;i<cats.length;i++){var p=cats[i];html+='<button class="theater-filter-tab'+(i===0?' active':'')+'" data-category="'+__esc(p)+'">'+__esc(p)+'</button>';}tabsBox.innerHTML=html;tabsBox.style.display='';tabsBox.dataset.loaded='1';tabsBox.addEventListener('click',function(e){var btn=e.target.closest('.theater-filter-tab');if(!btn)return;tabsBox.querySelectorAll('.theater-filter-tab').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');loadGuduoHScroll(btn.getAttribute('data-category')||'剧集');});}catch(e){}}
-(function(){var sections=[['douban-domestic','domestic'],['douban-hktw','hktw'],['douban-jpkr','jpkr'],['douban-western','western']];function loadOne(id,section,force){return __loadHScroll(id+'-hscroll','/api/douban-list?section='+section+'&mode=hscroll'+(force?'&force=1':''),true);}function start(force){sections.forEach(function(pair){loadOne(pair[0],pair[1],force);});var guduoTab=document.querySelector('#guduo-home-tabs .theater-filter-tab.active');var guduoCat=guduoTab?guduoTab.getAttribute('data-category')||'剧集':'剧集';loadGuduoHScroll(guduoCat,force);if(force){var gt=document.getElementById('guduo-home-tabs');if(gt)gt.dataset.loaded='0';}loadGuduoHomeTabs();if(window.__reloadPlatformPreviews)window.__reloadPlatformPreviews(false);if(window.__reloadTheaterPreviews)window.__reloadTheaterPreviews(!!force);}if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',function(){start(false);});else start(false);window.__reloadDoubanSections=start;})();
+async function loadGuduoHScroll(category,force){category=category||'all';return __loadHScroll('guduo-hscroll','/api/guduo-list?mode=hscroll&category='+encodeURIComponent(category)+(force?'&force=1':''));}async function loadGuduoHomeTabs(){var tabsBox=document.getElementById('guduo-home-tabs');if(!tabsBox||tabsBox.dataset.loaded==='1')return;try{var r=await fetch('/api/guduo-list?mode=categories');var d=r.ok?await r.json():{categories:[]};var cats=(d&&d.categories)||[];if(!cats.length){}cats=cats.length?cats:['剧集','电影','动漫','综艺'];var html='<button class="theater-filter-tab active" data-category="all">全部</button>';for(var i=0;i<cats.length;i++){var p=cats[i];html+='<button class="theater-filter-tab" data-category="'+__esc(p)+'">'+__esc(p)+'</button>';}tabsBox.innerHTML=html;tabsBox.style.display='';tabsBox.dataset.loaded='1';tabsBox.addEventListener('click',function(e){var btn=e.target.closest('.theater-filter-tab');if(!btn)return;tabsBox.querySelectorAll('.theater-filter-tab').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');loadGuduoHScroll(btn.getAttribute('data-category')||'all');});}catch(e){}}
+(function(){var sections=[['douban-domestic','domestic'],['douban-hktw','hktw'],['douban-jpkr','jpkr'],['douban-western','western']];function loadOne(id,section,force){return __loadHScroll(id+'-hscroll','/api/douban-list?section='+section+'&mode=hscroll'+(force?'&force=1':''),true);}function start(force){sections.forEach(function(pair){loadOne(pair[0],pair[1],force);});var guduoTab=document.querySelector('#guduo-home-tabs .theater-filter-tab.active');var guduoCat=guduoTab?guduoTab.getAttribute('data-category')||'all':'all';loadGuduoHScroll(guduoCat,force);if(force){var gt=document.getElementById('guduo-home-tabs');if(gt)gt.dataset.loaded='0';}loadGuduoHomeTabs();if(window.__reloadPlatformPreviews)window.__reloadPlatformPreviews(false);if(window.__reloadTheaterPreviews)window.__reloadTheaterPreviews(!!force);}if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',function(){start(false);});else start(false);window.__reloadDoubanSections=start;})();
 let modalLoadingId=0;window.__lastDetailType=null;window.__lastDetailId=null;async function openDetail(type,id,push=true){const modal=document.getElementById('modal'),body=document.getElementById('modal-body');if(!modal||!body)return;if(window.__stopTrailers)window.__stopTrailers();window.__lastDetailType=type;window.__lastDetailId=id;modal.classList.add('open');document.body.style.overflow='hidden';if(push&&location.pathname!=='/detail/'+type+'/'+id)history.pushState({detail:true},'','/detail/'+type+'/'+id);const reqId=++modalLoadingId;body.innerHTML='<div class="modal-loading"><div class="spinner"></div></div>';body.scrollTop=0;try{const r=await fetch('/api/detail?type='+encodeURIComponent(type)+'&id='+encodeURIComponent(id));if(reqId!==modalLoadingId)return;if(!r.ok)throw new Error('HTTP '+r.status);body.innerHTML=await r.text();if(window.__detailDeferLoad)window.__detailDeferLoad(type);}catch(e){if(reqId!==modalLoadingId)return;body.innerHTML='<div class="modal-error"><p>加载失败，请稍后重试</p><button class="btn-ghost" type="button" style="margin-top:14px" onclick="window.__retryDetail&&window.__retryDetail()">重试</button></div>';}}window.openDetail=openDetail;
 window.__retryDetail=function(){if(window.__lastDetailType&&window.__lastDetailId)openDetail(window.__lastDetailType,window.__lastDetailId,false);};
 function __loadSeasonBody(body,head){if(!body||!head)return;if(body.dataset.loaded||body.dataset.loading)return;body.dataset.loading='1';body.innerHTML='<div class="modal-loading" style="padding:24px"><div class="spinner"></div></div>';fetch('/api/season?show='+encodeURIComponent(head.dataset.show||'')+'&season='+encodeURIComponent(head.dataset.season)+'&tmdb='+encodeURIComponent(head.dataset.tmdb)+'&slug='+encodeURIComponent(head.dataset.slug||'')).then(function(r){return r.ok?r.text():'';}).then(function(html){body.innerHTML=html;body.dataset.loaded='1';delete body.dataset.loading;}).catch(function(){body.innerHTML='<div class="modal-error" style="padding:20px">加载失败</div>';delete body.dataset.loading;});}
@@ -11706,7 +11170,6 @@ window.addEventListener('load',()=>{setTimeout(__runEnrich,200);});`
 
 let __pageStylesCache = null;
 
-/** 全站 CSS 字符串（/app.css） */
 function pageStyles() {
   if (__pageStylesCache) return __pageStylesCache;
   __pageStylesCache = `html{color-scheme:dark}html[data-theme="light"]{color-scheme:light}@media (prefers-color-scheme:light){html[data-theme="system"]{color-scheme:light}}html,body{background:var(--bg-solid);color:var(--text);margin:0;padding:0;min-height:100%;min-height:100dvh;transition:background-color 0.2s ease,color 0.2s ease}*{box-sizing:border-box;margin:0;padding:0}.splash{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;overflow:hidden;background:var(--splash-bg);transition:opacity 0.22s ease;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;-webkit-tap-highlight-color:transparent;animation:splashAutoHide 0.22s ease 0.45s forwards}.splash.hide{opacity:0;pointer-events:none;animation:none}@keyframes splashAutoHide{to{opacity:0;visibility:hidden;pointer-events:none}}.splash-glow{position:absolute;width:340px;height:340px;border-radius:50%;background:radial-gradient(circle,var(--splash-glow-color) 0%,rgba(125,157,212,0) 70%);animation:splashPulse 2.4s ease-in-out infinite}.splash-inner{position:relative;z-index:1;display:flex;flex-direction:column;align-items:center;gap:20px}.splash-logo{color:var(--splash-name-b);animation:splashPop 0.75s cubic-bezier(0.22,1.1,0.36,1) both}.splash-logo img{display:block}.splash-name{font-size:1.35rem;font-weight:800;letter-spacing:0.4px;background:var(--name-grad);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;animation:splashFadeUp 0.6s ease 0.28s both}.splash-bar{width:128px;height:3px;border-radius:99px;background:var(--bar-track);overflow:hidden;animation:splashFadeUp 0.6s ease 0.45s both}.splash-bar-fill{height:100%;width:42%;border-radius:99px;background:var(--splash-bar-fill);animation:splashSlide 1.15s cubic-bezier(0.65,0,0.35,1) infinite}@keyframes splashPulse{0%,100%{transform:scale(0.85);opacity:0.7}50%{transform:scale(1.12);opacity:1}}@keyframes splashPop{0%{opacity:0;transform:scale(0.55) rotate(-8deg)}60%{opacity:1;transform:scale(1.08) rotate(2deg)}100%{opacity:1;transform:scale(1) rotate(0)}}@keyframes splashFadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}@keyframes splashSlide{0%{transform:translateX(-130%)}100%{transform:translateX(330%)}}.spinner{width:30px;height:30px;border:3px solid var(--spinner-track);border-top-color:var(--spinner-active);border-radius:50%;animation:spin 0.8s linear infinite;margin:4px auto}@keyframes spin{to{transform:rotate(360deg)}}:root{--bg:#050505;--surface:#0e0e10;--surface-2:#16161a;--surface-3:#1c1c22;--border:rgba(255,255,255,0.08);--border-strong:rgba(255,255,255,0.14);--text:#f4f4f5;--text-dim:#a1a1aa;--text-mute:#71717a;--accent:#a78bfa;--accent-2:#c4b5fd;--accent-soft:rgba(167,139,250,0.12);--accent-glow:rgba(167,139,250,0.28);--success:#34d399;--blue:#c4b5fd;--radius-sm:10px;--radius-md:14px;--radius-lg:18px;--radius-xl:22px;--shadow-card:0 8px 32px rgba(0,0,0,0.55);--bg-solid:#000000;--panel-grad:linear-gradient(165deg,#16161a 0%,#0e0e10 100%);--hover-bg:rgba(255,255,255,0.04);--hover-bg-strong:rgba(255,255,255,0.09);--sticky-bg:rgba(5,5,5,0.88);--sticky-border:rgba(255,255,255,0.06);--sticky-shadow:0 10px 28px rgba(0,0,0,0.35);--overlay:rgba(2,4,8,0.78);--overlay-strong:rgba(0,0,0,0.78);--modal-bg:#000000;--toast-bg:rgba(20,22,28,0.96);--toast-text:#ffffff;--bar-track:rgba(255,255,255,0.1);--spinner-track:#212735;--spinner-active:#7d9dd4;--splash-bg:radial-gradient(circle at 50% 45%,#0a0a0a 0%,#000 62%);--launch-splash-bg:radial-gradient(120% 90% at 50% 108%,rgba(124,58,237,0.3) 0%,rgba(124,58,237,0) 55%),radial-gradient(110% 85% at 50% -12%,rgba(56,97,190,0.25) 0%,rgba(0,0,0,0) 55%),#000;--launch-glow:rgba(124,58,237,0.18);--splash-glow-color:rgba(125,157,212,0.55);--splash-name-b:#a8b2c4;--splash-bar-fill:linear-gradient(90deg,#7d9dd4,#a78bfa);--name-grad:linear-gradient(135deg,#fff 20%,#c4b5fd 90%);--num-grad:linear-gradient(180deg,#fff 0%,#c4b5fd 100%);--brand-grad:linear-gradient(135deg,#7c3aed 0%,#a78bfa 100%);--brand-grad-hover:linear-gradient(145deg,#8b5cf6,#a78bfa);--avatar-ring:rgba(167,139,250,0.45);--avatar-grad:linear-gradient(135deg,#1a2233,#2a3a55);--soft-card-grad:var(--soft-card-grad);--btn-hover-bg:rgba(167,139,250,0.1);--btn-hover-border:rgba(167,139,250,0.35);--btn-hover-shadow:0 4px 16px rgba(167,139,250,0.18);--danger-bg:rgba(224,85,96,0.1);--danger-border:rgba(224,85,96,0.35);--danger-shadow:0 4px 16px rgba(224,85,96,0.15);--poster-ph-bg:rgba(0,0,0,0.65);--shadow-avatar:rgba(0,0,0,0.5);--shadow-login:rgba(0,0,0,0.7);--detail-hero-grad:linear-gradient(180deg,rgba(10,14,24,0.6),rgba(10,14,24,0.95));--detail-bg-filter:brightness(0.5);--chip-bg:rgba(255,255,255,0.05);--chip-bg-hover:rgba(255,255,255,0.09);--chip-fg:#a1a1aa;--chip-fg-hover:#f4f4f5;--chip-border:rgba(255,255,255,0.08);--chip-accent:#a78bfa;--pill-bg:linear-gradient(165deg,rgba(255,255,255,0.09) 0%,rgba(255,255,255,0.04) 100%);--pill-border:rgba(255,255,255,0.12);--pill-shadow:0 8px 28px rgba(0,0,0,0.45),inset 0 1px 0 rgba(255,255,255,0.06);--pill-fg:rgba(255,255,255,0.55);--pill-act-hover:rgba(255,255,255,0.1);--platform-card-grad:linear-gradient(145deg,#1a1a1a 0%,#0a0a0a 100%);--platform-card-text:#ffffff;--platform-shadow-hover:rgba(0,0,0,0.65);--scrollbar:#2a3345;--link:#c4b5fd;--link-hover:#ddd6fe;--success-fg:#4ade80;--warn-fg:#ffb84d;--danger-fg:#ff8a8a;--cal-accent:#4a6db8;--cal-accent-2:#9db0d0;--cal-accent-3:#7d9dd4;--cal-cell-border:#3a4a68;--cal-soft:rgba(90,120,180,0.22);--cal-soft-border:rgba(140,170,220,0.35)}html[data-theme="light"]{--danger-fg:#ff7b85;--chip-bg:#f4f4f5;--chip-bg-hover:#e4e4e7;--chip-fg:#3f3f46;--chip-fg-hover:#18181b;--chip-border:rgba(0,0,0,0.1);--chip-accent:#7c3aed;--pill-bg:rgba(255,255,255,0.92);--pill-border:rgba(0,0,0,0.1);--pill-shadow:0 8px 28px rgba(0,0,0,0.08);--pill-fg:rgba(0,0,0,0.6);--pill-act-hover:rgba(0,0,0,0.06);--bg:#ffffff;--surface:#ffffff;--surface-2:#f7f7f8;--surface-3:#f1f1f3;--border:rgba(0,0,0,0.08);--border-strong:rgba(0,0,0,0.14);--text:#18181b;--text-dim:#52525b;--text-mute:#71717a;--accent:#7c3aed;--accent-2:#6d28d9;--accent-soft:rgba(124,58,237,0.09);--accent-glow:rgba(124,58,237,0.2);--success:#059669;--blue:#6d28d9;--shadow-card:0 8px 28px rgba(0,0,0,0.08);--bg-solid:#ffffff;--panel-grad:linear-gradient(165deg,#ffffff 0%,#f7f7f8 100%);--hover-bg:rgba(0,0,0,0.035);--hover-bg-strong:rgba(0,0,0,0.06);--sticky-bg:rgba(243,243,245,0.92);--sticky-border:rgba(0,0,0,0.07);--sticky-shadow:0 6px 20px rgba(0,0,0,0.1);--overlay:rgba(15,18,26,0.42);--overlay-strong:rgba(15,18,26,0.45);--modal-bg:#ffffff;--toast-bg:rgba(24,24,27,0.94);--toast-text:#ffffff;--bar-track:rgba(0,0,0,0.08);--spinner-track:#e4e4e7;--spinner-active:#7c3aed;--splash-bg:radial-gradient(circle at 50% 45%,#ffffff 0%,#f4f4f6 62%);--launch-splash-bg:radial-gradient(120% 90% at 50% 108%,rgba(124,58,237,0.12) 0%,rgba(124,58,237,0) 55%),radial-gradient(110% 85% at 50% -12%,rgba(56,97,190,0.1) 0%,rgba(255,255,255,0) 55%),#ffffff;--launch-glow:rgba(124,58,237,0.1);--splash-glow-color:rgba(124,58,237,0.22);--splash-name-b:#52525b;--splash-bar-fill:linear-gradient(90deg,#6d28d9,#7c3aed);--name-grad:linear-gradient(135deg,#18181b 20%,#7c3aed 90%);--num-grad:linear-gradient(180deg,#18181b 0%,#7c3aed 100%);--brand-grad:linear-gradient(135deg,#6d28d9 0%,#7c3aed 100%);--brand-grad-hover:linear-gradient(145deg,#7c3aed,#8b5cf6);--avatar-ring:rgba(124,58,237,0.4);--avatar-grad:linear-gradient(135deg,#ede9fe,#ddd6fe);--soft-card-grad:linear-gradient(135deg,#ffffff,#f1f1f3);--btn-hover-bg:rgba(124,58,237,0.1);--btn-hover-border:rgba(124,58,237,0.35);--btn-hover-shadow:0 4px 16px rgba(124,58,237,0.18);--danger-bg:rgba(248,113,113,0.16);--danger-border:rgba(248,113,113,0.5);--danger-shadow:0 4px 16px rgba(0,0,0,0.25);--poster-ph-bg:rgba(0,0,0,0.06);--platform-card-grad:linear-gradient(145deg,#f4f4f5 0%,#e9e9ec 100%);--platform-card-text:#3f3f46;--platform-shadow-hover:rgba(0,0,0,0.16);--scrollbar:#d4d4d8;--link:#6d28d9;--link-hover:#5b21b6;--success-fg:#059669;--warn-fg:#b45309;--cal-accent:#4a6db8;--cal-accent-2:#5b6b88;--cal-accent-3:#4a6db8;--cal-cell-border:#d4d9e6;--cal-soft:rgba(74,109,184,0.12);--cal-soft-border:rgba(74,109,184,0.3);--shadow-avatar:rgba(0,0,0,0.12);--shadow-login:rgba(0,0,0,0.1);--detail-hero-grad:linear-gradient(180deg,rgba(255,255,255,0.72),rgba(247,247,248,0.96));--detail-bg-filter:brightness(1.05) saturate(0.9)}@media (prefers-color-scheme:light){html[data-theme="system"]{--shadow-avatar:rgba(0,0,0,0.12);--shadow-login:rgba(0,0,0,0.1);--detail-hero-grad:linear-gradient(180deg,rgba(255,255,255,0.72),rgba(247,247,248,0.96));--detail-bg-filter:brightness(1.05) saturate(0.9);--danger-fg:#ff7b85;--chip-bg:#f4f4f5;--chip-bg-hover:#e4e4e7;--chip-fg:#3f3f46;--chip-fg-hover:#18181b;--chip-border:rgba(0,0,0,0.1);--chip-accent:#7c3aed;--pill-bg:rgba(255,255,255,0.92);--pill-border:rgba(0,0,0,0.1);--pill-shadow:0 8px 28px rgba(0,0,0,0.08);--pill-fg:rgba(0,0,0,0.6);--pill-act-hover:rgba(0,0,0,0.06);--bg:#ffffff;--surface:#ffffff;--surface-2:#f7f7f8;--surface-3:#f1f1f3;--border:rgba(0,0,0,0.08);--border-strong:rgba(0,0,0,0.14);--text:#18181b;--text-dim:#52525b;--text-mute:#71717a;--accent:#7c3aed;--accent-2:#6d28d9;--accent-soft:rgba(124,58,237,0.09);--accent-glow:rgba(124,58,237,0.2);--success:#059669;--blue:#6d28d9;--shadow-card:0 8px 28px rgba(0,0,0,0.08);--bg-solid:#ffffff;--panel-grad:linear-gradient(165deg,#ffffff 0%,#f7f7f8 100%);--hover-bg:rgba(0,0,0,0.035);--hover-bg-strong:rgba(0,0,0,0.06);--sticky-bg:rgba(243,243,245,0.92);--sticky-border:rgba(0,0,0,0.07);--sticky-shadow:0 6px 20px rgba(0,0,0,0.1);--overlay:rgba(15,18,26,0.42);--overlay-strong:rgba(15,18,26,0.45);--modal-bg:#ffffff;--toast-bg:rgba(24,24,27,0.94);--toast-text:#ffffff;--bar-track:rgba(0,0,0,0.08);--spinner-track:#e4e4e7;--spinner-active:#7c3aed;--splash-bg:radial-gradient(circle at 50% 45%,#ffffff 0%,#f4f4f6 62%);--launch-splash-bg:radial-gradient(120% 90% at 50% 108%,rgba(124,58,237,0.12) 0%,rgba(124,58,237,0) 55%),radial-gradient(110% 85% at 50% -12%,rgba(56,97,190,0.1) 0%,rgba(255,255,255,0) 55%),#ffffff;--launch-glow:rgba(124,58,237,0.1);--splash-glow-color:rgba(124,58,237,0.22);--splash-name-b:#52525b;--splash-bar-fill:linear-gradient(90deg,#6d28d9,#7c3aed);--name-grad:linear-gradient(135deg,#18181b 20%,#7c3aed 90%);--num-grad:linear-gradient(180deg,#18181b 0%,#7c3aed 100%);--brand-grad:linear-gradient(135deg,#6d28d9 0%,#7c3aed 100%);--brand-grad-hover:linear-gradient(145deg,#7c3aed,#8b5cf6);--avatar-ring:rgba(124,58,237,0.4);--avatar-grad:linear-gradient(135deg,#ede9fe,#ddd6fe);--soft-card-grad:linear-gradient(135deg,#ffffff,#f1f1f3);--btn-hover-bg:rgba(124,58,237,0.1);--btn-hover-border:rgba(124,58,237,0.35);--btn-hover-shadow:0 4px 16px rgba(124,58,237,0.18);--danger-bg:rgba(248,113,113,0.16);--danger-border:rgba(248,113,113,0.5);--danger-shadow:0 4px 16px rgba(0,0,0,0.25);--poster-ph-bg:rgba(0,0,0,0.06);--platform-card-grad:linear-gradient(145deg,#f4f4f5 0%,#e9e9ec 100%);--platform-card-text:#3f3f46;--platform-shadow-hover:rgba(0,0,0,0.16);--scrollbar:#d4d4d8;--link:#6d28d9;--link-hover:#5b21b6;--success-fg:#059669;--warn-fg:#b45309;--cal-accent:#4a6db8;--cal-accent-2:#5b6b88;--cal-accent-3:#4a6db8;--cal-cell-border:#d4d9e6;--cal-soft:rgba(74,109,184,0.12);--cal-soft-border:rgba(74,109,184,0.3)}}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;background:var(--bg-solid);background-attachment:fixed;color:var(--text);-webkit-font-smoothing:antialiased;line-height:1.5;overflow-x:hidden;overscroll-behavior-y:none}a{color:var(--accent-2);text-decoration:none;transition:color 0.15s}a:hover{color:var(--link-hover)}img{display:block;max-width:100%}.container{max-width:880px;width:100%;margin:0 auto;padding:0 16px calc(80px + env(safe-area-inset-bottom))}.app-version{text-align:center;font-size:0.7rem;color:var(--text-mute);opacity:0.7;padding:8px 0 4px;letter-spacing:0.4px;user-select:none}.pane-loading{padding:60px 20px;text-align:center}.load-more-wrap{text-align:center;margin-top:24px}.load-more{background:var(--surface-2);border:1px solid var(--border);color:var(--text);padding:11px 32px;border-radius:var(--radius-md);font-size:0.9rem;font-weight:600;cursor:pointer;transition:all 0.2s;font-family:inherit}.load-more:hover:not(:disabled){border-color:rgba(91,124,250,0.45);color:var(--accent-2);box-shadow:0 4px 20px var(--accent-glow);background:var(--surface-3)}.load-more:disabled{cursor:not-allowed}.login-wrap{min-height:100vh;min-height:100dvh;display:flex;align-items:center;justify-content:center;padding:20px}.login-card{width:100%;max-width:440px;background:var(--panel-grad);border:1px solid var(--border-strong);border-radius:24px;padding:44px 32px;text-align:center;box-shadow:0 24px 64px var(--shadow-login),inset 0 1px 0 var(--hover-bg-strong)}.login-logo{color:var(--splash-name-b);margin-bottom:16px}.login-title{font-size:1.75rem;font-weight:800;letter-spacing:-0.5px;background:var(--name-grad);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:6px}.login-sub{color:var(--text-dim);font-size:0.9rem;margin-bottom:28px}.btn-primary{background:var(--brand-grad);color:#fff;border:none;padding:13px 30px;border-radius:12px;font-size:0.95rem;font-weight:700;cursor:pointer;box-shadow:0 6px 24px var(--accent-glow)}.btn-primary:hover{filter:brightness(1.08);transform:translateY(-1px)}.btn-ghost{background:var(--chip-bg);color:var(--chip-fg);border:1px solid var(--chip-border);padding:8px 16px;border-radius:10px;font-size:0.85rem;cursor:pointer;transition:all 0.15s;font-family:inherit}.btn-ghost:hover{color:var(--chip-fg-hover);border-color:var(--chip-border);background:var(--chip-bg-hover)}.steps{display:flex;flex-direction:column;gap:6px}.step{display:flex;align-items:center;gap:10px;text-align:left;padding:4px 0;font-size:0.9rem}.step .n{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;background:var(--accent);color:#fff;border-radius:50%;font-size:0.72rem;font-weight:700;flex-shrink:0}.code-box{font-family:ui-monospace,Menlo,monospace;font-size:1.75rem;font-weight:800;letter-spacing:6px;color:#a8c0e8;background:rgba(90,120,180,0.12);border:1px solid rgba(140,170,220,0.35);border-radius:14px;padding:14px;margin:14px 0;user-select:all;text-align:center}.qr-box{background:#fff;border-radius:14px;padding:10px;display:inline-block;margin:6px 0 14px}.qr-box img{border-radius:8px}.status{display:inline-flex;align-items:center;gap:8px;font-size:0.88rem;padding:8px 16px;border-radius:20px;color:var(--text-dim);background:var(--surface-2)}.status.success{color:#4ade80;background:rgba(74,222,128,0.1)}.status.error{color:#e05560;background:rgba(224,85,96,0.12)}.err-box{background:rgba(224,85,96,0.1);border:1px solid rgba(224,85,96,0.28);border-radius:12px;padding:14px;text-align:left;margin-bottom:14px}.err-title{font-weight:600;color:#e05560;margin-bottom:4px;font-size:0.92rem}.err{color:#e8a3ab;font-size:0.85rem}.hint{color:var(--text-dim);font-size:0.82rem;margin-top:6px}.log-details{margin-top:18px;text-align:left}.log-details summary{cursor:pointer;font-size:0.76rem;color:var(--text-dim);padding:4px 0;user-select:none}.log-box{font-family:ui-monospace,Menlo,monospace;font-size:0.7rem;color:var(--text-dim);background:var(--surface-3);border:1px solid var(--border);border-radius:8px;padding:10px;max-height:160px;overflow:auto;margin-top:6px;line-height:1.6}.hero{display:flex;justify-content:space-between;align-items:center;padding:calc(8px + env(safe-area-inset-top)) 0 6px;gap:10px}.hero-left{display:flex;align-items:center;gap:12px;min-width:0}.hero-avatar{width:50px;height:50px;border-radius:50%;overflow:hidden;flex-shrink:0;background:var(--surface-2);border:2px solid var(--avatar-ring);box-shadow:0 0 0 3px var(--accent-soft),0 4px 20px var(--shadow-avatar)}.hero-avatar img{width:100%;height:100%;object-fit:cover;display:block}.hero-avatar-ph{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:1.25rem;background:var(--avatar-grad)}.hero-text{min-width:0;flex:1;display:flex;flex-direction:column;align-items:flex-start;gap:1px}.hero-name{font-size:1.45rem;font-weight:800;letter-spacing:-0.4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:var(--name-grad);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}.updated-times{display:flex;flex-direction:column;gap:1px}.updated-at{font-size:0.72rem;color:var(--text-mute);font-weight:400;letter-spacing:0.2px;transition:color 0.4s ease;line-height:1.35}.updated-at:empty{display:none}.updated-times:empty{display:none}.updated-at.flash{animation:updatedFlash 1.1s ease-out}.updated-at.src-live{color:#4ade80}.updated-at.src-cache{color:var(--text-mute)}@keyframes updatedFlash{0%{color:var(--accent-2)}100%{color:var(--text-mute)}}.hero-actions{display:flex;gap:8px;flex-shrink:0}.btn-action{display:inline-flex;align-items:center;gap:6px;background:var(--chip-bg);color:var(--chip-fg);border:1px solid var(--chip-border);padding:8px 14px;border-radius:10px;font-size:0.82rem;font-weight:600;cursor:pointer;font-family:inherit;transition:all 0.18s ease;-webkit-tap-highlight-color:transparent}.btn-action svg{flex-shrink:0;transition:transform 0.25s ease}.btn-action:hover{color:var(--chip-fg-hover);border-color:var(--btn-hover-border);background:var(--btn-hover-bg);box-shadow:var(--btn-hover-shadow)}.btn-action:hover svg{transform:rotate(180deg)}.btn-action:active{transform:scale(0.97)}#btn-logout:hover{color:var(--danger-fg);background:var(--danger-bg);border-color:var(--danger-border);box-shadow:var(--danger-shadow)}#btn-logout:hover svg{transform:translateX(2px)}#btn-theme:hover{color:var(--chip-accent)}#btn-theme:hover svg{transform:none}#btn-theme svg{transition:opacity 0.2s ease,transform 0.2s ease}#btn-theme .theme-icon{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}@media (max-width:768px){.btn-action span{display:none}.btn-action{padding:9px}.hero-actions{gap:6px}}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;background:var(--panel-grad);border:1px solid var(--border);border-radius:var(--radius-lg);padding:8px 6px;margin-bottom:8px;box-shadow:var(--shadow-card),inset 0 1px 0 rgba(255,255,255,0.04);position:relative;overflow:hidden}.stats::before{content:"";position:absolute;top:0;left:10%;right:10%;height:1px;background:linear-gradient(90deg,transparent,rgba(167,139,250,0.35),transparent)}.stat{position:relative;text-align:center;display:flex;flex-direction:column;align-items:center;gap:2px;padding:6px 2px;border-radius:12px;transition:background 0.2s ease}.stat:hover{background:rgba(255,255,255,0.025)}.stat + .stat::before{content:"";position:absolute;left:-4px;top:18%;bottom:18%;width:1px;background:linear-gradient(180deg,transparent,rgba(255,255,255,0.08),transparent)}.stat-icon{width:26px;height:26px;border-radius:8px;display:flex;align-items:center;justify-content:center;margin-bottom:2px;transition:transform 0.25s ease,box-shadow 0.25s ease}.stat:hover .stat-icon{transform:translateY(-1px) scale(1.06)}.stat-movie .stat-icon{background:linear-gradient(135deg,rgba(167,139,250,0.18),rgba(167,139,250,0.06));color:#c4b5fd;box-shadow:0 4px 14px rgba(167,139,250,0.18),inset 0 0 0 1px rgba(167,139,250,0.18)}.stat-show .stat-icon{background:linear-gradient(135deg,rgba(96,165,250,0.18),rgba(96,165,250,0.06));color:#93c5fd;box-shadow:0 4px 14px rgba(96,165,250,0.18),inset 0 0 0 1px rgba(96,165,250,0.18)}.stat-episode .stat-icon{background:linear-gradient(135deg,rgba(52,211,153,0.18),rgba(52,211,153,0.06));color:#6ee7b7;box-shadow:0 4px 14px rgba(52,211,153,0.18),inset 0 0 0 1px rgba(52,211,153,0.18)}.stat-hours .stat-icon{background:linear-gradient(135deg,rgba(251,191,36,0.18),rgba(251,191,36,0.06));color:#fcd34d;box-shadow:0 4px 14px rgba(251,191,36,0.18),inset 0 0 0 1px rgba(251,191,36,0.18)}.stat-num{font-size:1.2rem;font-weight:800;letter-spacing:-0.6px;line-height:1.1;background:var(--num-grad);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}.stat-label{font-size:0.7rem;color:var(--text-mute);font-weight:500}.tabs{display:flex;gap:4px;margin-bottom:0}.top-sticky{position:sticky;top:0;z-index:40;margin:0 -16px;padding:0 16px;background:var(--sticky-bg);backdrop-filter:blur(18px) saturate(1.2);-webkit-backdrop-filter:blur(18px) saturate(1.2);border-bottom:1px solid var(--sticky-border);box-shadow:var(--sticky-shadow)}.top-sticky .hero{padding-top:calc(20px + env(safe-area-inset-top));padding-bottom:4px}.top-sticky .stats{margin-bottom:4px}@media (min-width:768px){.top-sticky{margin:0 -28px;padding:0 28px 8px}}@media (min-width:1024px){.top-sticky{margin:0 -36px;padding:0 36px 8px}}@media (min-width:1280px){.top-sticky{margin:0 -40px;padding:0 40px 8px}}.tab{flex:1 1 0;min-width:0;background:transparent;border:none;color:var(--text-dim);padding:7px 2px;border-radius:999px;font-size:0.75rem;font-weight:600;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:center;display:flex;align-items:center;justify-content:center;gap:5px;transition:color 0.2s ease,background 0.2s ease;font-family:inherit;outline:none !important}.tab svg{flex-shrink:0;opacity:0.9}.tab span{overflow:hidden;text-overflow:ellipsis}.tab:hover{color:var(--text);background:rgba(255,255,255,0.06)}.tab.active{background:var(--brand-grad);color:#fff;font-weight:700}.pane{display:none}.pane.active{display:block;animation:fadeIn 0.3s ease;padding-top:12px}@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}.grid{display:flex;flex-direction:column;gap:10px}.item{position:relative;display:flex;gap:14px;background:var(--panel-grad);border:1px solid var(--border);border-radius:var(--radius-lg);padding:12px;transition:transform 0.2s ease,border-color 0.2s,box-shadow 0.2s;animation:fadeInUp 0.4s ease backwards;overflow:hidden;box-shadow:0 4px 20px var(--shadow-card),inset 0 1px 0 var(--hover-bg);text-decoration:none;color:inherit}.item.clickable{cursor:pointer}.item.clickable:active{transform:scale(0.985);background:var(--surface-2)}@keyframes fadeInUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}.item:hover{border-color:rgba(167,139,250,0.25);box-shadow:0 8px 28px rgba(0,0,0,0.45),0 0 0 1px rgba(167,139,250,0.08);transform:translateY(-1px)}.wl-remove,.wl-drop,.wl-watched,.wl-unwatch{position:absolute;top:6px;right:6px;width:26px;height:26px;border-radius:50%;background:rgba(0,0,0,0.65);line-height:1;cursor:pointer;z-index:3;display:flex;align-items:center;justify-content:center;padding:0;font-family:inherit;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);transition:background 0.15s,transform 0.15s,opacity 0.15s,color 0.15s}.wl-remove{color:#fff;border:1px solid rgba(255,255,255,0.22);font-size:1rem;font-weight:400;opacity:0.88}.wl-remove:hover{background:rgba(200,70,80,0.92);opacity:1;transform:scale(1.06)}.wl-drop{position:absolute;top:6px;right:6px;width:30px;height:30px;border-radius:50%;background:rgba(0,0,0,0.72);color:#ff8a8a;border:1px solid rgba(255,120,120,0.55);font-size:0.85rem;opacity:1;z-index:5;display:flex;align-items:center;justify-content:center;padding:0;cursor:pointer;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}.wl-drop:hover{background:rgba(200,70,80,0.95);color:#fff;transform:scale(1.08)}.wl-drop svg{display:block;pointer-events:none}.wl-drop:disabled{opacity:0.5;cursor:wait}.cal-action-row{display:flex;gap:8px;margin-top:8px;align-self:flex-start;flex-wrap:wrap}.cal-open-btn,.cal-drop-btn{align-self:auto;margin-top:0;margin-left:0;display:inline-flex;align-items:center;justify-content:center;padding:5px 12px;border-radius:8px;font-size:0.74rem;font-weight:600;cursor:pointer;font-family:inherit;transition:all 0.15s;white-space:nowrap}.cal-open-btn{background:rgba(90,120,180,0.14);border:1px solid rgba(140,170,220,0.35);color:#9db5e0}.cal-open-btn:hover{background:rgba(120,150,210,0.28);color:#c2d4f0;border-color:rgba(140,170,220,0.65)}.cal-open-btn svg{flex-shrink:0;pointer-events:none}.cal-drop-btn{background:rgba(224,85,96,0.14);border:1px solid rgba(224,85,96,0.4);color:#ff8a8a}.cal-drop-btn:hover{background:rgba(224,85,96,0.3);color:#ffb3b3;border-color:rgba(224,85,96,0.65)}.cal-drop-btn svg{flex-shrink:0;pointer-events:none}.cal-drop-btn:disabled{opacity:0.5;cursor:wait}.wl-watched{color:#4ade80;border:1px solid rgba(74,222,128,0.45);font-size:0.85rem;font-weight:700;opacity:0.9}.wl-watched:hover{background:rgba(74,222,128,0.95);color:#000;opacity:1;transform:scale(1.06)}.wl-unwatch{color:#ffb84d;border:1px solid rgba(255,184,77,0.45);font-size:0.9rem;font-weight:700;opacity:0.9}.wl-unwatch:hover{background:rgba(255,184,77,0.95);color:#000;opacity:1;transform:scale(1.06)}.wl-remove:disabled,.wl-watched:disabled,.wl-unwatch:disabled{opacity:0.5;cursor:wait}.poster{width:76px;height:114px;border-radius:10px;overflow:hidden;flex-shrink:0;background:var(--surface-2);position:relative}.poster img{width:100%;height:100%;object-fit:cover}.poster-ph{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:1.8rem;background:var(--soft-card-grad);color:var(--text-dim)}.poster-play{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:46px;height:46px;border-radius:50%;background:rgba(8,10,18,0.72);color:#fff;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);opacity:1;transition:opacity 0.2s ease,transform 0.2s ease,background 0.15s ease,box-shadow 0.2s ease;text-decoration:none;border:1px solid rgba(255,255,255,0.24);z-index:4;box-shadow:0 4px 18px rgba(0,0,0,0.55);-webkit-tap-highlight-color:transparent}.poster-play svg{display:block;margin-left:2px;pointer-events:none;width:24px;height:24px}.item:hover .poster-play{opacity:1}.poster-play:hover{background:linear-gradient(145deg,#8b5cf6,#a78bfa);transform:translate(-50%,-50%) scale(1.1);color:#fff;border-color:rgba(255,255,255,0.4);box-shadow:0 8px 28px rgba(139,92,246,0.6)}.poster-play:active{transform:translate(-50%,-50%) scale(0.94)}.info{flex:1;min-width:0;display:flex;flex-direction:column;justify-content:center;gap:4px}.name-row{display:flex;align-items:baseline;gap:0;overflow:hidden;white-space:nowrap;line-height:1.3;letter-spacing:-0.2px}.name{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:1rem;font-weight:700;color:var(--text)}.tag{flex:0 0 auto;font-size:inherit;font-weight:inherit;letter-spacing:0;white-space:nowrap}.tag.upcoming{color:#ffb84d}.tag.aired{color:#4ade80}.tag.soon{color:#fbbf24}.overview{font-size:0.8rem;color:var(--text-dim);overflow:hidden;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;line-height:1.45;margin-top:4px}.meta{font-size:0.8rem;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.meta.dim{color:#7a8394;font-size:0.78rem;margin-top:2px}.bar{height:3px;background:rgba(255,255,255,0.06);border-radius:99px;overflow:hidden;margin-top:8px}.bar-fill{height:100%;background:linear-gradient(90deg,#7c3aed,#c4b5fd);border-radius:99px;box-shadow:0 0 10px rgba(167,139,250,0.5)}.search-bar{margin-bottom:16px}.search-input{width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:12px 16px;border-radius:12px;font-size:0.95rem;font-family:inherit;outline:none;transition:border-color 0.15s,background 0.15s;-webkit-appearance:none;appearance:none}.search-input:focus{border-color:var(--accent);background:var(--surface-2);box-shadow:0 0 0 3px var(--accent-soft)}.search-input::placeholder{color:var(--text-mute)}.trending-head{display:flex;align-items:center;gap:8px;font-size:0.88rem;font-weight:700;color:var(--text);margin:4px 0 14px;padding-left:2px;letter-spacing:0.2px}.trending-head::before{content:"";width:3px;height:14px;border-radius:2px;background:linear-gradient(180deg,#f97316,#ef4444)}.home-section{margin-bottom:12px}.home-section-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}.home-section-title{font-size:1rem;font-weight:700;letter-spacing:0.2px;display:flex;align-items:center;gap:8px}.home-section-title::before{content:"";width:3px;height:16px;border-radius:2px;background:linear-gradient(180deg,#a78bfa,#7c3aed)}.home-more-btn{background:transparent;border:none;color:var(--text-dim);font-size:0.82rem;font-weight:600;cursor:pointer;font-family:inherit;padding:6px 10px;border-radius:8px;transition:all 0.15s;display:inline-flex;align-items:center;gap:4px}.home-more-btn:hover{color:var(--accent-2);background:rgba(167,139,250,0.1)}.home-more-btn svg{transition:transform 0.2s ease}.platform-section{margin-bottom:14px}.platform-rows{display:flex;flex-direction:column;gap:8px}.platform-row{display:flex;align-items:center;gap:8px;min-width:0}.platform-cards{display:flex;gap:10px;overflow-x:auto;padding:2px 2px 6px;-webkit-overflow-scrolling:touch;scrollbar-width:none;flex:1;min-width:0;scroll-snap-type:x proximity}.platform-cards::-webkit-scrollbar{display:none}.platform-card{flex:0 0 auto;width:min(42vw,168px);height:74px;border:none;border-radius:14px;background:var(--platform-card-grad);box-shadow:0 8px 20px var(--shadow-card),inset 0 1px 0 var(--hover-bg-strong);display:flex;align-items:stretch;padding:0;cursor:pointer;overflow:hidden;position:relative;scroll-snap-align:start;transition:transform 0.18s ease,box-shadow 0.18s ease;-webkit-tap-highlight-color:transparent;font:inherit;color:var(--platform-card-text)}.platform-card:hover{transform:translateY(-3px);box-shadow:0 16px 36px var(--platform-shadow-hover),inset 0 1px 0 var(--hover-bg-strong)}html[data-theme="light"] .platform-card:hover{box-shadow:0 4px 12px rgba(0,0,0,0.03),inset 0 1px 0 #ffffff}@media (prefers-color-scheme:light){html[data-theme="system"] .platform-card:hover{box-shadow:0 4px 12px rgba(0,0,0,0.03),inset 0 1px 0 #ffffff}}.platform-card:active{transform:scale(0.985)}.platform-card-left{flex:0 0 40%;max-width:40%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0;padding:6px 2px 6px 6px;z-index:2;position:relative}.platform-card-logo{width:60px;height:60px;border-radius:0;object-fit:contain;object-position:center;flex-shrink:0;box-shadow:none;background:transparent;padding:0;box-sizing:border-box;display:block}.platform-card-name{display:none}.platform-card-right{flex:1;position:relative;min-width:0;overflow:hidden}.platform-card-posters{position:absolute;right:-4px;top:50%;transform:translateY(-50%);width:96px;height:66px}.platform-card-poster{position:absolute;width:32px;height:48px;border-radius:6px;object-fit:cover;box-shadow:0 4px 10px rgba(0,0,0,0.28);border:1.5px solid rgba(255,255,255,0.95);background:#c5c9d0;top:50%;margin-top:-24px}.platform-card-poster-ph{background:linear-gradient(145deg,#d0d4db 0%,#b8bec8 100%)}.platform-card-poster.p0{right:4px;z-index:5;transform:rotate(8deg)}.platform-card-poster.p1{right:20px;z-index:4;transform:rotate(3deg)}.platform-card-poster.p2{right:36px;z-index:3;transform:rotate(-4deg)}.platform-card-poster.p3{right:52px;z-index:2;transform:rotate(-10deg)}@media (min-width:768px){.platform-card{flex:1 1 260px;min-width:260px;width:auto;height:96px;border-radius:16px}.platform-card-logo{width:76px;height:76px;border-radius:0;padding:0}.platform-card-posters{width:140px;height:88px}.platform-card-poster{width:48px;height:72px;margin-top:-36px;border-radius:8px}.platform-card-poster.p0{right:8px}.platform-card-poster.p1{right:30px}.platform-card-poster.p2{right:52px}.platform-card-poster.p3{right:74px}.platform-cards{gap:12px}}.h-scroll-wrap{margin:0 -16px;padding:0 16px}.h-scroll{display:flex;gap:12px;overflow-x:auto;padding:2px 0 8px;-webkit-overflow-scrolling:touch;scrollbar-width:none;scroll-snap-type:x proximity}.h-scroll::-webkit-scrollbar{display:none}.h-scroll-empty{padding:30px 0;text-align:center}.h-scroll .item{flex:0 0 auto;width:132px;display:flex;flex-direction:column;gap:0;padding:0;border-radius:12px;background:transparent;border:none;overflow:visible;animation:none;box-shadow:none;scroll-snap-align:start;transform:none}.h-scroll .item:hover{background:transparent;border:none;box-shadow:none;transform:none}.h-scroll .item.clickable:active{transform:scale(0.96);background:transparent}.h-scroll .item .poster{width:100%;height:auto;aspect-ratio:2/3;border-radius:12px;box-shadow:0 4px 16px rgba(0,0,0,0.5);transition:transform 0.25s ease,box-shadow 0.25s ease}.h-scroll .item:hover .poster{transform:translateY(-3px);box-shadow:0 12px 28px rgba(91,124,250,0.3),0 4px 16px rgba(0,0,0,0.6)}.h-scroll .item .info{display:block;padding:8px 2px 0;flex:none;justify-content:flex-start}.h-scroll .item .name{font-size:0.82rem;line-height:1.3}.h-scroll .item .overview{display:none}.h-scroll .item .meta{font-size:0.72rem;margin-top:2px;color:var(--text-dim)}.h-scroll .item .meta.dim{font-size:0.7rem}.h-scroll .hist-days{display:flex;flex-direction:column;gap:24px;width:100%;padding-top:4px}.hist-day-head{display:flex;align-items:center;gap:12px;margin:0 0 12px;padding:0 2px}.hist-day-num{flex-shrink:0;width:42px;height:42px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:1.05rem;font-weight:800;color:var(--text);background:var(--surface-2,#1c1f2a);border:1px solid var(--border,rgba(255,255,255,.08))}.hist-day-num.is-today{background:linear-gradient(135deg,#7c3aed,#a78bfa);color:#fff;border-color:transparent}.hist-day-text{flex:1;min-width:0}.hist-day-main{font-size:0.95rem;font-weight:700;line-height:1.2}.hist-day-sub{font-size:0.72rem;color:var(--text-dim);margin-top:2px}.hist-day-count{font-size:0.72rem;color:var(--text-mute,var(--text-dim));flex-shrink:0}.hist-day-grid{margin:0}#history.pane{padding-top:8px}#history>.grid{display:block;padding:20px 0 12px}#history>.grid>.hist-days{width:100%}.cw-card{flex:0 0 auto;width:min(78vw,280px);max-width:280px;display:flex;flex-direction:column;gap:0;padding:0;border-radius:12px;background:transparent;border:none;overflow:visible;scroll-snap-align:start;position:relative}.h-scroll .cw-card:hover{background:transparent;border:none;box-shadow:none;transform:none}.h-scroll .cw-card.clickable:active{transform:scale(0.97)}.cw-poster{position:relative;width:100%;aspect-ratio:16/9;border-radius:12px;overflow:hidden;background:var(--surface-2);box-shadow:0 4px 16px rgba(0,0,0,0.5)}html[data-theme="light"] .cw-poster{box-shadow:0 4px 12px rgba(0,0,0,0.06)}@media (prefers-color-scheme:light){html[data-theme="system"] .cw-poster{box-shadow:0 4px 12px rgba(0,0,0,0.06)}}.cw-poster img{width:100%;height:100%;object-fit:cover;display:block}.cw-poster .poster-ph{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:2rem;color:var(--text-dim);background:var(--soft-card-grad,var(--surface-2))}.cw-overlay{position:absolute;left:8px;bottom:12px;z-index:2;font-size:0.72rem;font-weight:700;color:#fff;text-shadow:0 1px 4px rgba(0,0,0,0.85);background:rgba(0,0,0,0.45);padding:3px 8px;border-radius:6px;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);max-width:calc(100% - 16px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.cw-bar{position:absolute;left:0;right:0;bottom:0;height:3px;background:rgba(255,255,255,0.18);z-index:3}.cw-bar-fill{height:100%;background:linear-gradient(90deg,#a78bfa,#7c3aed);border-radius:0 2px 2px 0}.cw-info{padding:6px 2px 0;min-width:0;display:flex;flex-direction:column;gap:1px}.cw-title-row{display:flex;align-items:center;gap:4px;min-width:0;position:relative;line-height:1.25;padding-right:28px}.cw-title{flex:1;min-width:0;font-size:0.82rem;font-weight:600;line-height:1.25;color:var(--text);display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}.cw-badge-rewatch{display:inline-flex;align-items:center;justify-content:center;padding:0 5px;height:16px;font-size:0.62rem;font-weight:700;color:#fff;background:linear-gradient(135deg,#8b5cf6,#a78bfa);border-radius:4px;margin-left:4px;flex-shrink:0;transform:translateY(-1px)}.cw-watching{font-size:0.72rem;font-weight:500;line-height:1.25;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.cw-meta{margin-top:0;font-size:0.68rem;line-height:1.25;color:var(--text-mute,var(--text-dim))}.cw-more{position:absolute;right:-8px;top:50%;transform:translateY(-50%);width:36px;height:36px;margin:0;border:none;background:transparent;color:var(--text-dim);border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;font-family:inherit;transition:color 0.15s,background 0.15s;-webkit-tap-highlight-color:transparent;z-index:6;touch-action:manipulation}.cw-more::before{content:"";position:absolute;inset:-6px;border-radius:50%}.cw-more:hover,.cw-more:active{color:var(--text);background:rgba(255,255,255,0.1)}.cw-sheet{position:fixed;inset:0;z-index:500;display:none}.cw-sheet.open{display:block}.cw-sheet-backdrop{position:absolute;inset:0;background:rgba(0,0,0,0.55);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px)}.cw-sheet-panel{position:absolute;left:12px;right:12px;bottom:calc(12px + env(safe-area-inset-bottom,0px));background:var(--panel-grad,#1a1d27);border:1px solid var(--border-strong,rgba(255,255,255,0.12));border-radius:16px;box-shadow:0 16px 48px rgba(0,0,0,0.65);padding:8px;animation:cwSheetIn 0.2s cubic-bezier(0.2,0.9,0.3,1)}@keyframes cwSheetIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}.cw-sheet-title{font-size:0.78rem;color:var(--text-dim);padding:8px 14px 6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.cw-sheet-item{display:block;width:100%;text-align:left;border:none;background:transparent;color:var(--text);font-size:1rem;font-weight:600;font-family:inherit;padding:16px 14px;border-radius:12px;cursor:pointer;min-height:48px;-webkit-tap-highlight-color:transparent;touch-action:manipulation}.cw-sheet-item:active{background:rgba(255,255,255,0.08)}.cw-sheet-item.danger{color:#ff8a8a}.cw-sheet-cancel{margin-top:4px;border-top:1px solid var(--border,rgba(255,255,255,0.08));color:var(--text-dim);font-weight:500}@media (min-width:700px){.cw-sheet-panel{left:50%;right:auto;bottom:auto;top:50%;transform:translate(-50%,-50%);width:min(340px,92vw);animation:cwSheetInCenter 0.2s cubic-bezier(0.2,0.9,0.3,1)}@keyframes cwSheetInCenter{from{opacity:0;transform:translate(-50%,-48%) scale(0.96)}to{opacity:1;transform:translate(-50%,-50%) scale(1)}}}.cw-modal-grid{padding:2px 0 4px}.cw-card .wl-watched{top:6px;right:6px}@media (min-width:768px){.h-scroll .cw-card{width:260px}.cw-title{font-size:0.86rem}}.h-scroll .item .bar{margin-top:6px}.h-scroll .item .wl-watched,.h-scroll .item .wl-remove,.h-scroll .item .wl-drop,.h-scroll .item .wl-unwatch{top:6px;right:6px;width:24px;height:24px;font-size:0.75rem}.h-scroll .item .cal-action-row,.h-scroll .item .cal-open-btn{display:none}.h-scroll .item .poster-play{width:46px;height:46px;opacity:1}.h-scroll .item .poster-play svg{width:24px;height:24px}@media (min-width:768px){.h-scroll-wrap{margin:0;padding:0}.h-scroll .item{width:168px}}@media (min-width:1024px){.h-scroll .item{width:188px}}@media (min-width:1280px){.h-scroll .item{width:200px}}@media (min-width:1600px){.h-scroll .item{width:214px}}@media (min-width:1920px){.container{width:100%;padding-left:48px;padding-right:48px}.h-scroll .item{width:228px}}@media (min-width:2200px){.h-scroll .item{width:240px}}.grid .item .cw-more{margin-left:auto;flex-shrink:0;width:28px;height:28px;border:none;background:transparent;color:var(--text-dim);border-radius:8px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;padding:0}.grid .item .cw-more:hover{color:var(--text);background:var(--chip-bg)}.grid .item .name-row{display:flex;align-items:center;gap:6px}.cw-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.cw-act-btn{flex:1 1 auto;min-width:0;padding:8px 12px;border-radius:10px;font-size:0.78rem;font-weight:600;font-family:inherit;cursor:pointer;border:1px solid var(--chip-border);background:var(--chip-bg);color:var(--chip-fg);transition:background 0.15s,border-color 0.15s,color 0.15s;-webkit-tap-highlight-color:transparent}.cw-act-btn:hover{background:var(--chip-bg-hover);color:var(--chip-fg-hover)}.cw-act-btn.danger{border-color:rgba(224,85,96,0.35);background:rgba(224,85,96,0.1);color:#ff8a8a}.cw-act-btn.danger:hover{background:rgba(224,85,96,0.18);color:#ffb0b0}.h-scroll .cw-actions{flex-direction:column;gap:6px}.h-scroll .cw-act-btn{width:100%;padding:7px 10px;font-size:0.72rem}.list-modal{position:fixed;inset:0;z-index:150;display:none}.list-modal.open{display:block}.list-modal-backdrop{position:absolute;inset:0;background:rgba(2,4,8,0.8);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);animation:fadeIn 0.2s ease}.list-modal-panel{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:min(94vw,1000px);max-height:88vh;display:flex;flex-direction:column;background:var(--panel-grad);border:1px solid var(--border-strong);border-radius:18px;box-shadow:0 30px 80px rgba(0,0,0,0.85);overflow:hidden;animation:modalIn 0.25s cubic-bezier(0.2,0.9,0.3,1)}.list-modal-head{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);flex-shrink:0}.list-modal-title{font-size:1.05rem;font-weight:700}.list-modal-close{width:40px;height:40px;border-radius:50%;border:1px solid var(--chip-border);background:var(--chip-bg);color:var(--chip-fg);font-size:1.2rem;cursor:pointer;font-family:inherit;line-height:1;display:flex;align-items:center;justify-content:center;transition:all 0.15s}.list-modal-close:hover{color:#fff;border-color:var(--border-strong);background:rgba(255,255,255,0.08)}.list-modal-body{overflow-y:auto;padding:16px 20px 24px;-webkit-overflow-scrolling:touch}.douban-filter-tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}.douban-filter-tab{background:var(--chip-bg);border:1px solid var(--chip-border);color:var(--chip-fg);padding:7px 16px;border-radius:999px;font-size:0.82rem;font-weight:600;cursor:pointer;font-family:inherit;transition:all 0.15s;-webkit-tap-highlight-color:transparent}.douban-filter-tab:hover{color:var(--chip-fg-hover);border-color:var(--chip-border);background:var(--chip-bg-hover)}.douban-filter-tab.active{background:var(--brand-grad);color:#fff;border-color:transparent;box-shadow:0 4px 14px rgba(167,139,250,0.3)}.theater-home-tabs{display:flex;gap:8px;overflow-x:auto;padding:0 16px 12px;margin:0 -16px;scrollbar-width:none;-webkit-overflow-scrolling:touch;scroll-snap-type:x proximity}.theater-home-tabs::-webkit-scrollbar{display:none}.theater-filter-tab{flex-shrink:0;background:var(--chip-bg);border:1px solid var(--chip-border);color:var(--chip-fg);padding:6px 14px;border-radius:999px;font-size:0.78rem;font-weight:600;cursor:pointer;font-family:inherit;transition:all 0.15s;-webkit-tap-highlight-color:transparent;scroll-snap-align:start}.theater-filter-tab:hover{color:var(--chip-fg-hover);border-color:var(--chip-border);background:var(--chip-bg-hover)}.theater-filter-tab.active{background:var(--brand-grad);color:#fff;border-color:transparent;box-shadow:0 4px 14px rgba(167,139,250,0.3)}@media (min-width:768px){.theater-home-tabs{margin:0;padding-left:0;padding-right:0}}@media (max-width:599px){.list-modal-panel{top:auto;bottom:0;left:0;right:0;transform:none;width:100%;max-height:92vh;border-radius:18px 18px 0 0}}.show-cal-modal{position:fixed;inset:0;z-index:240;display:none}.show-cal-modal.open{display:block}.show-cal-backdrop{position:absolute;inset:0;background:var(--overlay);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);animation:fadeIn 0.2s ease}.show-cal-panel{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:min(92vw,440px);max-height:90vh;overflow-y:auto;background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:20px;box-shadow:0 30px 80px rgba(0,0,0,0.8);animation:modalIn 0.25s cubic-bezier(0.2,0.9,0.3,1)}.show-cal-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}.show-cal-name{font-size:0.95rem;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}.show-cal-close{width:40px;height:40px;flex-shrink:0;background:var(--chip-bg);border:1px solid var(--chip-border);color:var(--chip-fg);border-radius:50%;cursor:pointer;font-size:1.2rem;line-height:1;display:flex;align-items:center;justify-content:center;transition:all 0.15s;font-family:inherit}.show-cal-close:hover{color:var(--chip-fg-hover);border-color:var(--chip-border);background:var(--chip-bg-hover)}.show-cal-info{font-size:0.72rem;color:var(--text-dim);margin-bottom:12px;line-height:1.4}.show-cal-nav{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;font-size:0.88rem;color:var(--text);font-weight:600}.show-cal-nav button{width:30px;height:30px;background:var(--chip-bg);border:1px solid var(--chip-border);color:var(--chip-fg);border-radius:8px;cursor:pointer;font-size:1rem;line-height:1;display:flex;align-items:center;justify-content:center;transition:all 0.15s;font-family:inherit}.show-cal-nav button:hover{color:var(--chip-fg-hover);border-color:var(--chip-border);background:var(--chip-bg-hover)}.show-cal-weekdays{display:grid;grid-template-columns:repeat(7,1fr);text-align:center;font-size:0.7rem;color:var(--text-dim);margin-bottom:6px}.show-cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:4px}.sc-day{position:relative;aspect-ratio:1;display:flex;align-items:center;justify-content:center;border-radius:8px;font-size:0.8rem;color:var(--text-dim);cursor:default;border:1px solid transparent;transition:background 0.15s,border-color 0.15s}.sc-day.sc-has{cursor:pointer;font-weight:700}.sc-day.sc-past{background:var(--cal-soft);color:var(--cal-accent-2);border-color:rgba(120,150,210,0.5)}.sc-day.sc-past:hover{background:var(--cal-soft-border);color:#d0dcf0}.sc-day.sc-today-day{background:var(--cal-accent);color:#fff;border-color:#7d9dd4;box-shadow:0 0 14px rgba(125,157,212,0.7)}.sc-day.sc-today-day:hover{background:#5b7fc4}.sc-day.sc-future{background:rgba(255,184,77,0.18);color:#ffd693;border-color:rgba(255,184,77,0.55)}.sc-day.sc-future:hover{background:rgba(255,184,77,0.4);color:#fff0d0}.sc-day.sc-active{outline:2px solid #fff;outline-offset:-2px}.sc-day.sc-empty{visibility:hidden}.sc-badge{position:absolute;top:2px;right:2px;min-width:14px;height:14px;padding:0 3px;border-radius:7px;background:var(--cal-accent);color:#fff;font-size:0.6rem;font-weight:700;line-height:14px;text-align:center}.sc-day.sc-future .sc-badge{background:#d99a3a}.show-cal-legend{display:flex;flex-wrap:wrap;gap:12px;justify-content:center;margin-top:14px;font-size:0.7rem;color:var(--text-dim)}.legend-item{display:inline-flex;align-items:center;gap:5px}.legend-dot{display:inline-block;width:10px;height:10px;border-radius:3px}.legend-past{background:var(--cal-soft-border);border:1px solid rgba(140,170,220,0.8)}.legend-today{background:var(--cal-accent);border:1px solid #7d9dd4}.legend-future{background:rgba(255,184,77,0.4);border:1px solid rgba(255,184,77,0.8)}.show-cal-detail{margin-top:14px;border-top:1px solid var(--border);padding-top:12px;min-height:20px}.sc-ep{display:flex;gap:10px;align-items:baseline;padding:6px 0;font-size:0.82rem}.sc-ep-tag{font-family:ui-monospace,Menlo,monospace;font-size:0.72rem;font-weight:700;color:#7d9dd4;flex-shrink:0}.sc-ep-title{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ext-rating{display:inline-flex;align-items:center;gap:6px;padding:4px 10px 4px 8px;border-radius:8px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);line-height:1;font-size:0.82rem;color:var(--text);white-space:nowrap;text-decoration:none;transition:background 0.15s,border-color 0.15s,transform 0.12s}.ext-rating:hover{background:rgba(255,255,255,0.1);border-color:rgba(255,255,255,0.16)}.ext-logo{display:block;flex-shrink:0;border-radius:2px}.ext-score{font-weight:800;letter-spacing:0.2px;font-variant-numeric:tabular-nums}.ext-rating.ext-imdb{background:rgba(245,197,24,0.14);border-color:rgba(245,197,24,0.35);color:#f5c518}.ext-rating.ext-imdb .ext-score{color:#f5c518}.ext-rating.ext-rt{background:rgba(250,50,10,0.12);border-color:rgba(250,50,10,0.32);color:#ff7666}.ext-rating.ext-rt .ext-score{color:#ff7666}.ext-rating.ext-mc{background:rgba(255,255,255,0.05);border-color:rgba(255,255,255,0.12);color:var(--text)}.ext-rating.ext-trakt{background:rgba(237,28,36,0.12);border-color:rgba(237,28,36,0.32);color:#ff6b70}.ext-rating.ext-trakt .ext-score{color:#ff6b70}.ext-rating.ext-tmdb{background:rgba(1,180,228,0.12);border-color:rgba(1,180,228,0.32);color:#4dd0e1}.ext-rating.ext-tmdb .ext-score{color:#4dd0e1}.ext-rating.ext-douban{background:rgba(46,150,61,0.12);border-color:rgba(46,150,61,0.38);color:#4ecb71}.ext-rating.ext-douban:hover{background:rgba(46,150,61,0.22);border-color:rgba(46,150,61,0.6);color:#6fe089}.detail-ext-ratings{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:8px;align-items:center}@media (min-width:600px){.container{padding-left:20px;padding-right:20px}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}.item{border-radius:14px}.poster{width:72px;height:108px}}@media (min-width:768px){.container{width:100%;padding:0 28px calc(76px + env(safe-area-inset-bottom))}.hero{padding:12px 0 8px;gap:8px}.hero-avatar{width:56px;height:56px}.hero-name{font-size:1.55rem}.stats{gap:6px;padding:10px 8px;margin-bottom:8px}.stat-num{font-size:1.5rem}.stat-label{font-size:0.76rem}.stat-icon{width:34px;height:34px;border-radius:10px}.tabs{position:relative;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch;padding-bottom:2px}.tabs::-webkit-scrollbar{display:none}.tab{flex:0 0 auto;padding:9px 14px;font-size:0.87rem}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:16px}.item{display:flex;flex-direction:column;gap:0;padding:0;border-radius:12px;background:transparent;border:none;overflow:visible}.item:hover{background:transparent;border:none}.item.clickable:active{transform:none;background:transparent}.poster{width:100%;height:auto;aspect-ratio:2/3;border-radius:12px;transition:transform 0.25s ease,box-shadow 0.25s ease;box-shadow:0 4px 16px rgba(0,0,0,0.5)}.item:hover .poster{transform:translateY(-4px);box-shadow:0 12px 32px rgba(91,124,250,0.3),0 4px 16px rgba(0,0,0,0.6)}.info{display:block;padding:10px 2px 0;flex:none;justify-content:flex-start}.name{font-size:0.88rem}.overview{-webkit-line-clamp:2;font-size:0.74rem;margin-top:4px}.meta{font-size:0.76rem;margin-top:3px}.meta.dim{font-size:0.72rem}.bar{margin-top:8px}.wl-remove,.wl-watched,.wl-unwatch{top:8px;right:8px;width:28px;height:28px}.day-num{font-size:1.6rem}}@media (min-width:1024px){.container{width:100%;padding:0 36px 100px}.hero{padding:14px 0 8px}.hero-name{font-size:1.7rem}.stats{gap:8px;padding:12px 10px;margin-bottom:10px}.stat-num{font-size:1.7rem}.stat-label{font-size:0.78rem}.stat-icon{width:36px;height:36px}.grid{grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:20px}.name{font-size:0.9rem}.overview{-webkit-line-clamp:3;font-size:0.76rem}.wl-remove,.wl-watched,.wl-unwatch{top:10px;right:10px;width:30px;height:30px}.wl-watched,.wl-unwatch{font-size:0.95rem}}@media (min-width:1280px){.container{width:100%;padding:0 40px 110px}.grid{grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:22px}.hero-name{font-size:1.85rem}}@media (min-width:1600px){.container{width:100%}.grid{grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:24px}}.day{margin-bottom:18px}.day-head{display:flex;align-items:center;gap:12px;margin-bottom:12px;padding-left:2px}.day-num{font-size:1.8rem;font-weight:800;color:#7d9dd4;line-height:1;letter-spacing:-1px}.day-mon{font-size:0.75rem;color:var(--text-dim)}.day-wd{font-size:0.85rem;font-weight:600;color:var(--text)}.today{background:var(--accent);color:#fff;font-size:0.68rem;padding:3px 9px;border-radius:999px;font-weight:700;margin-left:auto}.empty{text-align:center;padding:80px 20px;color:var(--text-dim)}.empty p{margin-top:14px;font-size:0.92rem}@media (min-width:700px){.empty{padding:120px 20px}}.modal{position:fixed;inset:0;z-index:220;display:none}.modal.open{display:block}.modal-backdrop{position:absolute;inset:0;background:var(--overlay-strong);backdrop-filter:blur(12px) saturate(1.1);-webkit-backdrop-filter:blur(12px) saturate(1.1);animation:fadeIn 0.2s ease}.modal-panel{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:12px;padding-top:calc(12px + env(safe-area-inset-top));padding-bottom:calc(12px + env(safe-area-inset-bottom));pointer-events:none}.modal-shell{pointer-events:auto;position:relative;display:flex;flex-direction:column;width:100%;max-width:min(1120px,100%);max-height:100%;background:var(--modal-bg);border:1px solid var(--border);border-radius:18px;box-shadow:0 40px 100px rgba(0,0,0,0.85);animation:modalIn 0.28s cubic-bezier(0.2,0.9,0.3,1);overflow:hidden}.modal-body{position:relative;width:100%;flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;background:var(--modal-bg);-webkit-overflow-scrolling:touch;overscroll-behavior:contain}.modal-close{position:absolute;top:12px;right:12px;z-index:5;width:40px;height:40px;border-radius:50%;background:rgba(13,16,23,0.86);border:1px solid rgba(255,255,255,0.18);color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);transition:background 0.15s,transform 0.15s,border-color 0.15s;padding:0;box-shadow:0 4px 16px rgba(0,0,0,0.55);touch-action:manipulation;-webkit-tap-highlight-color:transparent}.modal-close::before{content:"";position:absolute;inset:-8px;border-radius:50%}.modal-close:hover{background:rgba(30,38,58,0.95);transform:scale(1.05);border-color:rgba(255,255,255,0.28)}.modal-close:active{transform:scale(0.94);background:rgba(50,60,88,0.95)}@media (max-width:599px){.modal-panel{padding:0;align-items:stretch;justify-content:flex-start}.modal-shell{position:absolute;left:0;right:0;top:calc(10px + env(safe-area-inset-top));bottom:0;max-width:100%;max-height:none;width:100%;border-radius:16px 16px 0 0;border:none;border-top:1px solid var(--border)}.modal-body{padding-bottom:env(safe-area-inset-bottom)}.detail-inner{padding-top:24px}.detail-body{padding-bottom:calc(28px + env(safe-area-inset-bottom))}.modal-close{top:12px;right:12px;width:40px;height:40px;background:rgba(13,16,23,0.94);border-color:rgba(255,255,255,0.24);box-shadow:0 6px 22px rgba(0,0,0,0.65),inset 0 1px 0 rgba(255,255,255,0.08)}.modal-close::before{inset:-12px}.modal-close:active{transform:scale(0.9);background:rgba(50,60,88,0.96)}}@media (min-width:768px) and (max-width:1023px){.modal-shell{max-width:min(880px,92vw)}}@media (min-width:700px){.modal-panel{padding:40px 24px}}@keyframes modalIn{from{opacity:0;transform:translateY(14px) scale(0.98)}to{opacity:1;transform:translateY(0) scale(1)}}.modal-loading{padding:100px 20px;text-align:center}.modal-error{padding:80px 20px;text-align:center;color:#9db5e0;font-size:0.9rem}.detail-hero{position:relative;overflow:hidden;background:var(--surface);border-radius:18px 18px 0 0}.detail-bg{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:blur(30px) saturate(1.2) var(--detail-bg-filter,brightness(0.5));transform:scale(1.15);z-index:0}.detail-hero::after{content:"";position:absolute;inset:0;z-index:1;background:var(--detail-hero-grad)}.detail-inner{position:relative;z-index:2;display:flex;flex-direction:column;align-items:center;text-align:center;gap:16px;padding:24px 20px 24px}.detail-poster{width:min(48vw,200px);height:auto;aspect-ratio:2/3;border-radius:14px;object-fit:cover;flex-shrink:0;box-shadow:0 16px 40px var(--shadow-login);margin:0 auto}.detail-poster-ph{display:flex;align-items:center;justify-content:center;background:var(--surface-2);font-size:2.8rem;color:var(--text-dim);width:min(48vw,200px);aspect-ratio:2/3}.detail-info{flex:1;min-width:0;display:flex;flex-direction:column;gap:8px;align-items:center;width:100%}.detail-title{font-size:1.45rem;font-weight:800;letter-spacing:-0.4px;line-height:1.25;color:var(--text)}.detail-tagline{font-size:0.85rem;color:var(--text-dim);font-style:italic}.detail-meta{display:flex;flex-wrap:wrap;gap:10px;font-size:0.85rem;color:var(--text-dim);justify-content:center}.detail-genres{font-size:0.82rem;color:var(--text-dim)}.detail-overview{font-size:0.88rem;color:var(--text-dim);line-height:1.55;margin-top:4px;display:-webkit-box;-webkit-line-clamp:5;-webkit-box-orient:vertical;overflow:hidden;text-align:center;cursor:pointer;-webkit-tap-highlight-color:transparent;transition:color 0.15s}.detail-overview:active{color:var(--text)}.detail-overview.expanded{display:block;-webkit-line-clamp:unset;overflow:visible;cursor:pointer}.d-status{display:flex;gap:12px;align-items:center;background:var(--panel-grad);border:1px solid var(--border);border-radius:14px;padding:12px 14px;margin-top:8px;width:100%;justify-content:flex-start}.d-status.done{border-color:rgba(74,222,128,0.3);background:rgba(74,222,128,0.06)}.d-status-progress{flex-direction:column;align-items:stretch;gap:10px}.d-status-row{display:flex;gap:12px;align-items:center;width:100%}.d-status-icon{width:32px;height:32px;border-radius:50%;background:var(--surface-2);color:var(--text-dim);display:flex;align-items:center;justify-content:center;font-weight:700;flex-shrink:0;font-size:0.95rem}.d-status.done .d-status-icon{background:rgba(74,222,128,0.15);color:#4ade80}.d-status-body{flex:1;min-width:0;text-align:left}.d-status-title{font-size:0.88rem;font-weight:600}.d-status-sub{font-size:0.76rem;color:var(--text-dim);margin-top:2px}.d-action-bar{display:inline-flex;align-items:center;gap:2px;margin-top:16px;padding:4px;background:var(--pill-bg);border:1px solid var(--pill-border);border-radius:999px;box-shadow:var(--pill-shadow);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}.d-act{display:inline-flex;align-items:center;justify-content:center;width:44px;height:44px;border-radius:50%;border:none;background:transparent;color:var(--pill-fg);cursor:pointer;padding:0;font-family:inherit;transition:background 0.18s ease,color 0.18s ease,transform 0.12s ease,box-shadow 0.18s ease;-webkit-tap-highlight-color:transparent;text-decoration:none;flex-shrink:0;position:relative}.d-act svg{display:block;pointer-events:none}.d-act:hover{background:var(--pill-act-hover);color:#fff}.d-act:active{transform:scale(0.9)}.d-act:disabled{opacity:0.5;cursor:default;pointer-events:none}.d-act-watched.active{background:linear-gradient(145deg,#8b5cf6 0%,#a78bfa 55%,#c4b5fd 100%);color:#fff;box-shadow:0 4px 16px rgba(139,92,246,0.5),inset 0 1px 0 rgba(255,255,255,0.25)}.d-act-watched.active:hover{filter:brightness(1.1);color:#fff}.d-act-wl.active{color:#c4b5fd;background:rgba(167,139,250,0.12)}.d-act-wl.active:hover{background:rgba(167,139,250,0.2);color:var(--accent)}.d-act-play{color:var(--pill-fg)}.d-act-play:hover{background:rgba(167,139,250,0.15);color:var(--accent)}.detail-body{padding:20px 22px 24px}.d-section{margin-top:8px;margin-bottom:26px}.d-section:last-child{margin-bottom:0}.d-section-title{font-size:1rem;font-weight:700;letter-spacing:0.2px;margin-bottom:14px;color:var(--text);display:flex;align-items:center;gap:8px}.d-section-title::before{content:"";width:3px;height:16px;border-radius:2px;background:#7d9dd4}.cast-scroll{display:flex;gap:14px;overflow-x:auto;padding-bottom:8px;scrollbar-width:none}.cast-scroll::-webkit-scrollbar{display:none}.cast{flex-shrink:0;width:84px;text-align:center}.cast-img{width:84px;height:84px;border-radius:50%;object-fit:cover;background:var(--surface-2)}.cast-ph{display:flex;align-items:center;justify-content:center;color:var(--text-dim);font-size:1.6rem;font-weight:600;background:var(--soft-card-grad)}.cast-name{font-size:0.75rem;font-weight:600;margin-top:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.cast-role{font-size:0.68rem;color:var(--text-dim);margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.seasons{display:flex;flex-direction:column;gap:8px}.season-item{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;transition:border-color 0.15s}.season-item.open{border-color:var(--scrollbar)}.season-head{width:100%;background:none;border:none;color:inherit;display:flex;align-items:center;gap:10px;padding:14px 16px;cursor:pointer;font-family:inherit;text-align:left;transition:background 0.15s}.season-head:hover{background:var(--surface-2)}.season-title{font-weight:600;font-size:0.9rem;flex:1}.season-meta{font-size:0.76rem;color:var(--text-dim)}.chev{width:16px;height:16px;color:var(--text-dim);transition:transform 0.2s ease;flex-shrink:0}.season-item.open .chev{transform:rotate(180deg)}.season-body{display:none;border-top:1px solid var(--border);background:rgba(0,0,0,0.12)}.season-item.open .season-body{display:block}.season-body .episode:first-child{border-top:none}.ep-empty{padding:20px;text-align:center;color:var(--text-dim);font-size:0.85rem}.episode{display:flex;gap:14px;padding:14px;border-bottom:1px solid var(--border);align-items:stretch;transition:background 0.15s}.episode:last-child{border-bottom:none}.episode.clickable{cursor:pointer}.episode.clickable:hover{background:var(--surface-2)}.episode.clickable:active{background:var(--surface-3)}.episode.clickable:hover .ep-title{color:#7d9dd4}.episode.watched .ep-title{color:var(--text-dim)}.episode.watched.clickable:hover .ep-title{color:#7d9dd4}.ep-still-wrap{position:relative;flex-shrink:0;width:140px;border-radius:10px;overflow:hidden;background:var(--surface-2);aspect-ratio:16/9;align-self:flex-start}.ep-still{width:100%;height:100%;object-fit:cover;display:block}.ep-still-ph{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:1.6rem;color:var(--text-dim);background:var(--soft-card-grad,var(--surface-2))}.ep-still-badge{position:absolute;top:6px;left:6px;font-size:0.65rem;font-weight:700;padding:2px 6px;border-radius:6px;background:rgba(52,211,153,0.9);color:#052e1c}.ep-body{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}.ep-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}.ep-title-line{display:flex;align-items:baseline;gap:8px;min-width:0;flex:1}.ep-num{font-family:ui-monospace,Menlo,monospace;font-size:0.95rem;color:var(--text-dim);font-weight:800;flex-shrink:0;letter-spacing:0.3px}.ep-title{font-size:0.95rem;font-weight:700;line-height:1.35;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ep-meta{display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:0.75rem;color:var(--text-dim);margin-top:2px}.ep-vote{display:inline-flex;align-items:center;gap:3px;padding:1px 7px;border-radius:999px;background:rgba(167,139,250,0.14);color:#c4b5fd;font-weight:700;font-size:0.72rem}.ep-dot{opacity:0.45}.ep-overview{font-size:0.8rem;color:var(--text-dim);margin-top:4px;line-height:1.55;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.ep-actions{flex-shrink:0;display:flex;align-items:center;gap:8px}.ep-play-btn{width:30px;height:30px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;background:rgba(167,139,250,0.16);border:1px solid rgba(167,139,250,0.28);color:#c4b5fd;text-decoration:none;transition:background 0.15s,transform 0.12s;-webkit-tap-highlight-color:transparent}.ep-play-btn:hover{background:rgba(167,139,250,0.28);color:#ddd6fe}.ep-play-btn:active{transform:scale(0.94)}.ep-status{font-size:0.78rem;font-weight:600;white-space:nowrap;line-height:1;padding:0;border:none;background:none;font-family:inherit}.ep-status.watched{color:#4ade80;cursor:default}.ep-status.unwatched{color:var(--text-dim)}button.ep-status.unwatched{cursor:pointer;-webkit-tap-highlight-color:transparent}button.ep-status.unwatched:hover{color:#6ee7b7}@media (max-width:520px){.episode{gap:10px;padding:12px}.ep-still-wrap{width:112px}.ep-title{font-size:0.88rem;white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}.ep-overview{-webkit-line-clamp:2;font-size:0.76rem}}.ep-watch-btn:disabled{opacity:0.6;cursor:wait}.ep-status.done,.ep-watch-btn.done{color:#4ade80 !important;cursor:default}.modal-body .grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:16px}@media (min-width:700px){.detail-inner{flex-direction:row;align-items:flex-start;text-align:left;padding:34px;gap:30px}.detail-poster{width:220px;height:auto;aspect-ratio:2/3;margin:0}.detail-info{align-items:flex-start}.detail-meta{justify-content:flex-start}.detail-overview{text-align:left}.detail-title{font-size:1.85rem}.detail-overview{font-size:0.92rem;-webkit-line-clamp:6}.detail-body{padding:30px 34px 34px}.cast{width:96px}.cast-img{width:96px;height:96px}.modal-body .grid{grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:20px}.detail-ext-ratings{justify-content:flex-start}.d-action-bar{align-self:flex-start}}.confirm-modal{position:fixed;inset:0;z-index:620;display:none}.confirm-modal.open{display:block}.confirm-backdrop{position:absolute;inset:0;background:var(--overlay);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);animation:fadeIn 0.18s ease}.confirm-panel{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:min(88vw,340px);background:var(--panel-grad);border:1px solid var(--border-strong);border-radius:18px;padding:24px 22px 18px;box-shadow:0 30px 80px rgba(0,0,0,0.8);text-align:center;animation:confirmIn 0.22s cubic-bezier(0.2,0.9,0.3,1)}@keyframes confirmIn{from{opacity:0;transform:translate(-50%,-48%) scale(0.95)}to{opacity:1;transform:translate(-50%,-50%) scale(1)}}.confirm-icon{width:48px;height:48px;margin:0 auto 12px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:1.4rem;background:var(--accent-soft);color:var(--accent-2)}.confirm-icon.danger{background:rgba(224,85,96,0.14);color:#ff7b85}.confirm-icon.warn{background:rgba(255,184,77,0.14);color:#ffb84d}.confirm-icon.success{background:rgba(52,211,153,0.14);color:#34d399}.confirm-title{font-size:1.02rem;font-weight:700;margin-bottom:6px;color:var(--text)}.confirm-msg{font-size:0.84rem;color:var(--text-dim);line-height:1.55;word-break:break-word}.confirm-actions{display:flex;gap:10px;margin-top:20px}.confirm-btn{flex:1;padding:11px 14px;border-radius:12px;font-size:0.88rem;font-weight:700;font-family:inherit;cursor:pointer;border:1px solid transparent;transition:all 0.15s;-webkit-tap-highlight-color:transparent}.confirm-cancel{background:var(--chip-bg);border-color:var(--chip-border);color:var(--chip-fg)}.confirm-cancel:hover{background:var(--chip-bg-hover);color:var(--chip-fg-hover)}.confirm-ok{background:var(--brand-grad);color:#fff;box-shadow:0 6px 20px rgba(167,139,250,0.3)}.confirm-ok:hover{filter:brightness(1.08)}.confirm-ok.danger{background:linear-gradient(135deg,#dc2626 0%,#f87171 100%);box-shadow:0 6px 20px rgba(248,113,113,0.28)}.confirm-ok:disabled,.confirm-cancel:disabled{opacity:0.6;cursor:wait}.hero-avatar{border:2px solid rgba(167,139,250,0.5);padding:0;cursor:pointer;font:inherit;color:inherit}.hero-avatar:hover{box-shadow:0 0 0 3px rgba(167,139,250,0.28),0 4px 20px rgba(0,0,0,0.5);transform:scale(1.03)}.hero-avatar:active{transform:scale(0.97)}.summary-modal{position:fixed;inset:0;z-index:160;display:none}.summary-modal.open{display:block}.summary-backdrop{position:absolute;inset:0;background:var(--overlay);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}.summary-panel{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:min(94vw,480px);max-height:88vh;display:flex;flex-direction:column;background:var(--panel-grad);border:1px solid var(--border-strong);border-radius:18px;box-shadow:0 30px 80px rgba(0,0,0,0.85);overflow:hidden}.summary-head{display:flex;align-items:center;justify-content:space-between;padding:16px 18px 10px;border-bottom:1px solid var(--border);flex-shrink:0}.summary-title{font-size:1.05rem;font-weight:700}.summary-close{width:40px;height:40px;border-radius:50%;border:1px solid var(--chip-border);background:var(--chip-bg);color:var(--chip-fg);font-size:1.2rem;cursor:pointer;font-family:inherit;line-height:1}.summary-close:hover{color:#fff;border-color:var(--border-strong)}.summary-body{overflow-y:auto;padding:12px 16px 20px;-webkit-overflow-scrolling:touch}@media (max-width:599px){.summary-panel{top:auto;bottom:0;left:0;right:0;transform:none;width:100%;max-height:92vh;border-radius:18px 18px 0 0}}.sum-wrap{padding:4px 0 24px}.sum-nav{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:18px}.sum-nav-btn{width:36px;height:36px;border-radius:10px;border:1px solid var(--chip-border);background:var(--chip-bg);color:var(--text-dim);font-size:1.2rem;cursor:pointer;font-family:inherit;transition:all 0.15s}.sum-nav-btn:hover{color:#fff;border-color:var(--border-strong);background:rgba(167,139,250,0.12)}.sum-nav-center{flex:1;text-align:center;min-width:0}.sum-period-tabs{display:inline-flex;gap:4px;background:var(--chip-bg);border:1px solid var(--border);border-radius:999px;padding:3px;margin-bottom:8px}.sum-period-btn{border:none;background:transparent;color:var(--text-dim);padding:6px 14px;border-radius:999px;font-size:0.8rem;font-weight:600;cursor:pointer;font-family:inherit}.sum-period-btn.active{background:var(--brand-grad);color:#fff}.sum-label{font-size:1.05rem;font-weight:700;letter-spacing:0.2px}.sum-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px}.sum-stat{text-align:center;background:var(--panel-grad);border:1px solid var(--border);border-radius:14px;padding:14px 6px}.sum-stat-num{font-size:1.35rem;font-weight:800;letter-spacing:-0.5px;background:var(--num-grad);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}.sum-stat-label{font-size:0.7rem;color:var(--text-mute);margin-top:2px}.sum-chip{display:inline-flex;align-items:center;gap:6px;padding:8px 12px;border-radius:10px;background:rgba(167,139,250,0.1);border:1px solid rgba(167,139,250,0.25);color:var(--text-dim);font-size:0.82rem;margin-bottom:12px}.sum-chip strong{color:var(--accent)}.sum-muted{font-size:0.8rem;color:var(--text-mute);margin:6px 0 12px}.sum-block{margin-top:18px}.sum-h3{font-size:0.92rem;font-weight:700;margin-bottom:10px;display:flex;align-items:center;gap:8px}.sum-h3::before{content:"";width:3px;height:14px;border-radius:2px;background:linear-gradient(180deg,#a78bfa,#7c3aed)}.sum-heat{display:flex;flex-wrap:wrap;gap:4px}.sum-heat-cell{width:12px;height:12px;border-radius:3px;background:rgba(255,255,255,0.06)}.sum-heat-cell.lv1{background:rgba(167,139,250,0.25)}.sum-heat-cell.lv2{background:rgba(167,139,250,0.45)}.sum-heat-cell.lv3{background:rgba(167,139,250,0.7)}.sum-heat-cell.lv4{background:#a78bfa}.sum-list{display:flex;flex-direction:column;gap:8px}.sum-row{display:flex;align-items:center;gap:12px;padding:10px 12px;background:var(--panel-grad);border:1px solid var(--border);border-radius:12px}.sum-rank{width:22px;height:22px;border-radius:6px;background:rgba(167,139,250,0.15);color:#c4b5fd;font-size:0.72rem;font-weight:800;display:flex;align-items:center;justify-content:center;flex-shrink:0}.sum-row-body{min-width:0;flex:1}.sum-row-title{font-size:0.9rem;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sum-year{font-weight:500;color:var(--text-mute);font-size:0.8rem}.sum-row-meta{font-size:0.75rem;color:var(--text-dim);margin-top:2px}@media (max-width:420px){.sum-stats{gap:6px}.sum-stat{padding:12px 4px}.sum-stat-num{font-size:1.15rem}}#toast-container{position:fixed;left:50%;bottom:calc(28px + env(safe-area-inset-bottom));transform:translateX(-50%);z-index:99999;display:flex;flex-direction:column;gap:8px;pointer-events:none;max-width:min(92vw,440px);width:max-content}.toast{pointer-events:auto;display:flex;align-items:center;gap:10px;padding:11px 16px;border-radius:12px;font-size:0.86rem;font-weight:500;color:var(--toast-text);background:var(--toast-bg);border:1px solid rgba(255,255,255,0.1);box-shadow:0 12px 32px rgba(0,0,0,0.55);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);opacity:0;transform:translateY(12px) scale(0.96);transition:opacity 0.22s ease,transform 0.22s ease;cursor:pointer;line-height:1.45;word-break:break-word;max-width:min(92vw,440px)}.toast.toast-in{opacity:1;transform:translateY(0) scale(1)}.toast.toast-out{opacity:0;transform:translateY(8px) scale(0.96)}.toast-icon{flex-shrink:0;width:20px;height:20px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:0.72rem;font-weight:800;line-height:1}.toast-info .toast-icon{background:rgba(125,157,212,0.22);color:#a8c0e8}.toast-success .toast-icon{background:rgba(52,211,153,0.22);color:#6ee7b7}.toast-error .toast-icon{background:rgba(224,85,96,0.24);color:#ff8a8a}.toast-warn .toast-icon{background:rgba(255,184,77,0.22);color:#ffd693}.toast-success{border-color:rgba(52,211,153,0.35)}.toast-error{border-color:rgba(224,85,96,0.35)}.toast-warn{border-color:rgba(255,184,77,0.35)}@media (max-width:420px){.toast{font-size:0.82rem;padding:10px 14px}}.cast.clickable{cursor:pointer}.cast.clickable:hover .cast-img{transform:translateY(-2px) scale(1.03);box-shadow:0 8px 20px rgba(167,139,250,0.28)}.cast.clickable:hover .cast-name{color:#c4b5fd}.cast-img{transition:transform 0.2s ease,box-shadow 0.2s ease}.cast-name{transition:color 0.15s ease}.trailer-grid{display:grid;grid-template-columns:1fr;gap:14px}@media (min-width:600px){.trailer-grid{grid-template-columns:repeat(2,1fr)}}.trailer-card{position:relative;aspect-ratio:16/9;border-radius:12px;overflow:hidden;background:linear-gradient(135deg,#1a1528 0%,#0e0e10 100%);cursor:pointer;border:1px solid var(--border);transition:border-color 0.15s,transform 0.15s}.trailer-card:hover{border-color:rgba(167,139,250,0.4);transform:translateY(-1px)}.trailer-thumb{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block;z-index:1}.trailer-card.no-thumb .trailer-thumb{display:none}.trailer-play{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:52px;height:52px;border-radius:50%;background:rgba(8,10,18,0.72);border:1px solid rgba(255,255,255,0.28);color:#fff;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);transition:background 0.15s,transform 0.15s;pointer-events:none;z-index:3}.trailer-card:hover .trailer-play{background:linear-gradient(145deg,#8b5cf6,#a78bfa);transform:translate(-50%,-50%) scale(1.08)}.trailer-play svg{display:block;margin-left:2px}.trailer-name{position:absolute;left:0;right:0;bottom:0;padding:22px 12px 9px;font-size:0.8rem;font-weight:600;color:#fff;background:linear-gradient(180deg,transparent,rgba(0,0,0,0.85));overflow:hidden;text-overflow:ellipsis;white-space:nowrap;z-index:3}.trailer-card.playing .trailer-thumb,.trailer-card.playing .trailer-play,.trailer-card.playing .trailer-name{display:none}.trailer-frame{position:absolute;inset:0;width:100%;height:100%;background:var(--surface-2);z-index:2}.trailer-frame:empty{display:none}.trailer-frame iframe{position:absolute;inset:0;width:100%;height:100%;border:0;display:block}.trailer-card.playing .trailer-thumb,.trailer-card.playing .trailer-play{opacity:0;pointer-events:none}.trailer-yt-open{position:absolute;left:50%;bottom:10px;transform:translateX(-50%);z-index:3;padding:6px 12px;border-radius:999px;background:rgba(0,0,0,.72);color:#fff;font-size:.75rem;text-decoration:none;border:1px solid rgba(255,255,255,.18)}.person-modal{position:fixed;inset:0;z-index:230;display:none}.person-modal.open{display:block}.person-backdrop{position:absolute;inset:0;background:var(--overlay);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);animation:fadeIn 0.2s ease}.person-panel{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:min(94vw,760px);max-height:88vh;display:flex;flex-direction:column;background:var(--panel-grad);border:1px solid var(--border-strong);border-radius:18px;box-shadow:0 30px 80px rgba(0,0,0,0.85);overflow:hidden;animation:modalIn 0.25s cubic-bezier(0.2,0.9,0.3,1)}.person-panel-head{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid var(--border);flex-shrink:0}.person-panel-name{font-size:1rem;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}.person-close{width:40px;height:40px;flex-shrink:0;border-radius:50%;border:1px solid var(--chip-border);background:var(--chip-bg);color:var(--chip-fg);font-size:1.2rem;cursor:pointer;font-family:inherit;line-height:1;display:flex;align-items:center;justify-content:center;transition:all 0.15s}.person-close:hover{color:#fff;border-color:var(--border-strong)}.person-panel-body{overflow-y:auto;padding:18px 20px 24px;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}@media (max-width:599px){.person-panel{top:auto;bottom:0;left:0;right:0;transform:none;width:100%;max-height:92vh;border-radius:18px 18px 0 0}}.person-head{display:flex;gap:18px;margin-bottom:18px}.person-photo{width:110px;height:165px;border-radius:12px;object-fit:cover;flex-shrink:0;background:var(--surface-2);box-shadow:0 8px 24px rgba(0,0,0,0.5)}.person-photo-ph{display:flex;align-items:center;justify-content:center;font-size:2rem;color:var(--text-dim);background:var(--soft-card-grad)}.person-info{flex:1;min-width:0;display:flex;flex-direction:column;gap:6px}.person-name{font-size:1.3rem;font-weight:800;letter-spacing:-0.4px;line-height:1.25}.person-sub{font-size:0.82rem;color:var(--text-dim)}.person-rows{display:flex;flex-direction:column;gap:4px;margin-top:4px}.person-row{font-size:0.78rem;color:var(--text-dim);line-height:1.5}.person-row b{color:var(--text);font-weight:600;margin-right:6px}.person-bio{font-size:0.86rem;color:#c0c8d6;line-height:1.65;white-space:pre-line;margin-bottom:22px;padding-top:4px;border-top:1px solid var(--border)}.person-credits-title{font-size:0.95rem;font-weight:700;margin-bottom:14px;display:flex;align-items:center;gap:8px}.person-credits-title::before{content:"";width:3px;height:14px;border-radius:2px;background:linear-gradient(180deg,#a78bfa,#7c3aed)}@media (max-width:480px){.person-head{flex-direction:column;align-items:center;text-align:center;gap:12px}.person-info{align-items:center}.person-photo{width:130px;height:195px}.person-rows{align-items:center}}.btn-action.loading{color:var(--accent-2);border-color:rgba(167,139,250,0.45);background:rgba(167,139,250,0.12);pointer-events:none}.btn-action.loading svg{transform-origin:50% 50%;animation:btnSpin 0.7s linear infinite}@keyframes btnSpin{to{transform:rotate(360deg)}}.btn-action.loading span::after{content:"";display:inline-block;width:0;overflow:hidden;animation:btnDots 1.2s steps(4,end) infinite}@keyframes btnDots{0%{content:""}25%{content:"."}50%{content:".."}75%{content:"..."}}@media (max-width:767px){.h-scroll .item.cw-card{width:210px!important;max-width:210px!important}.h-scroll .item.cw-card .cw-title{font-size:0.86rem}.h-scroll .item.cw-card .cw-watching{font-size:0.74rem}.h-scroll .item.cw-card .cw-meta{font-size:0.7rem}.h-scroll .item.cw-card .cw-overlay{font-size:0.72rem}}@media (min-width:768px){.h-scroll .item.cw-card{width:300px!important;max-width:300px!important}.h-scroll .item.cw-card .cw-title{font-size:0.92rem}.h-scroll .item.cw-card .cw-watching{font-size:0.8rem}}.hist-day{margin-top:28px}.hist-day:first-child{margin-top:4px}.hist-day-head{margin-top:0;margin-bottom:14px}`;
