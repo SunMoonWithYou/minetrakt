@@ -1,9 +1,37 @@
 /* ==================================================================
  * MineTrakt —— 单文件 Cloudflare Worker
- * Trakt 客户端（服务端渲染 + PWA），数据全部走 KV（env.TMDB_CACHE）。
- * 目录：配置 → 通用工具 → Trakt 请求 → KV 缓存层 → cachedJSON
- *      → PWA/静态 → 认证 → 缓存失效 → TMDB → 业务聚合 → 路由 → 渲染
- *      → 内嵌前端脚本
+ * ----------------------------------------------------------------------
+ * Trakt 客户端（服务端渲染 + PWA）。浏览器只拿 HTML/JSON，
+ * 用户态与公共数据统一落在 KV 绑定 env.TMDB_CACHE，保证多设备一致。
+ *
+ * 依赖绑定（wrangler）：
+ *   - TMDB_CACHE          KV 命名空间
+ *   - TRAKT_CLIENT_ID     Trakt OAuth 应用 ID
+ *   - TMDB_API_KEY        （若代码内读 env）TMDB Key
+ *
+ * 模块目录（按阅读顺序）：
+ *   1. 配置与常量          UA、TTL、Cookie、主题、资源 URL
+ *   2. 通用响应工具        jsonResp、IP、enrich 限流
+ *   3. Trakt 请求与闸门    令牌桶、串行/并发、429 冷却、traktFetch
+ *   4. KV 缓存层           三态读、写、singleFlight、内存兜底
+ *   5. cachedJSON          读→回源→写回→SWR/lastGood 唯一入口
+ *   6. Service Worker      导航与静态资源缓存策略
+ *   7. 路由入口            export default fetch
+ *   8. 静态资源            图标、CSS/JS、manifest、头像代理
+ *   9. 认证与会话          设备码、Cookie、token 刷新、stable user id
+ *  10. 缓存失效            watchlist 版本、首页 bust
+ *  11. TMDB / 图片         详情、剧照、图片 map
+ *  12. 继续观看聚合        暂停列表 + upNext 合并过滤
+ *  13. 榜单（豆瓣/院线/骨朵/平台）
+ *  14. 写操作 API          已看/待看/弃剧/隐藏
+ *  15. 读操作 API          首页、详情、搜索、日历、小结
+ *  16. 页面渲染            login/home/launch HTML
+ *  17. 内嵌前端            getClientSideScripts + pageStyles
+ *
+ * 设计要点：
+ *   - 不做边缘/isolate 用户态缓存，避免多 colo 数据分叉
+ *   - auth.trakt.tv 与 api.trakt.tv 分闸门，防止登录打黑 IP 拖死业务
+ *   - 所有用户态 JSON 响应 Cache-Control: no-store
  * ================================================================== */
 
 /* ==================================================================
@@ -11,33 +39,58 @@
  * 站点地址、TTL、Cookie、主题色等所有可调参数集中在这里
  * ================================================================== */
 
-const TRAKT_AUTH = "https://auth.trakt.tv",
-  TRAKT_API = "https://api.trakt.tv",
-  TMDB_API = "https://api.themoviedb.org/3",
-  TMDB_IMG = "https://image.tmdb.org/t/p",
-  ACTIVATE_URL = "https://trakt.tv/activate",
-  OMDB_API = "https://www.omdbapi.com",
-  DOUBAN_SEARCH = "https://search.douban.com/movie/subject_search",
-  DOUBAN_API = "https://widget.v2too.top/data/douban.json",
-  THEATER_API = "https://widget.v2too.top/data/theater.json",
-  GUDUO_API = "https://widget.v2too.top/data/guduo.json";
+/** Trakt OAuth 授权主机（设备码 / 换 token） */
+const TRAKT_AUTH = "https://auth.trakt.tv";
+/** Trakt 业务 API 主机 */
+const TRAKT_API = "https://api.trakt.tv";
+/** The Movie Database API v3 */
+const TMDB_API = "https://api.themoviedb.org/3";
+/** TMDB 图片 CDN 前缀（后接 /w185/path） */
+const TMDB_IMG = "https://image.tmdb.org/t/p";
+/** 用户在浏览器打开的设备码激活页 */
+const ACTIVATE_URL = "https://trakt.tv/activate";
+/** OMDb（IMDb 评分等，可选 enrichment） */
+const OMDB_API = "https://www.omdbapi.com";
+/** 豆瓣站内搜索页（外链用） */
+const DOUBAN_SEARCH = "https://search.douban.com/movie/subject_search";
+/** 豆瓣热播 widget 数据源 */
+const DOUBAN_API = "https://widget.v2too.top/data/douban.json";
+/** 平台剧场 widget 数据源 */
+const THEATER_API = "https://widget.v2too.top/data/theater.json";
+/** 骨朵热榜 widget 数据源 */
+const GUDUO_API = "https://widget.v2too.top/data/guduo.json";
 
-const APP_NAME = "MineTrakt",
-  APP_SHORT_NAME = "MineTrakt",
-  THEME_COLOR = "#050505";
+/** PWA / 页面显示名 */
+const APP_NAME = "MineTrakt";
+/** 主屏短名 */
+const APP_SHORT_NAME = "MineTrakt";
+/** 默认主题色（深色） */
+const THEME_COLOR = "#050505";
 
-const THEME_STORAGE_KEY = "mt:theme",
-  THEME_COLOR_DARK = "#050505",
-  THEME_COLOR_LIGHT = "#ffffff";
+/** localStorage 中主题偏好的 key */
+const THEME_STORAGE_KEY = "mt:theme";
+/** 深色模式 theme-color / 背景 */
+const THEME_COLOR_DARK = "#050505";
+/** 浅色模式 theme-color / 背景 */
+const THEME_COLOR_LIGHT = "#ffffff";
 
 const THEME_BOOT_SCRIPT = `<script>(function(){try{var K=${JSON.stringify(THEME_STORAGE_KEY)};var t=localStorage.getItem(K);if(t!=='light'&&t!=='dark'&&t!=='system')t='dark';var d=document.documentElement;d.setAttribute('data-theme',t);var dark=(t==='dark')||(t==='system'&&(!window.matchMedia||matchMedia('(prefers-color-scheme: dark)').matches));var c=dark?${JSON.stringify(THEME_COLOR_DARK)}:${JSON.stringify(THEME_COLOR_LIGHT)};var tc=document.querySelector('meta[name="theme-color"]');if(tc)tc.setAttribute('content',c);var cs=document.querySelector('meta[name="color-scheme"]');if(cs)cs.setAttribute('content',dark?'dark':'light');var sb=document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]');if(sb)sb.setAttribute('content',dark?'black-translucent':'default');d.style.backgroundColor=c;}catch(e){}})();<\/script>`;
 
-const FAVICON_URL = "/assets/favicon.ico",
-  ICON_192 = "/assets/icon-192.png",
-  ICON_512 = "/assets/icon-512.png",
-  APPLE_ICON = "/assets/icon-512.png",
-  SPLASH_LOGO = "/assets/logo.png";
+/** favicon 路径 */
+const FAVICON_URL = "/assets/favicon.ico";
+/** PWA 192 图标 */
+const ICON_192 = "/assets/icon-192.png";
+/** PWA 512 图标 */
+const ICON_512 = "/assets/icon-512.png";
+/** iOS 主屏图标 */
+const APPLE_ICON = "/assets/icon-512.png";
+/** 启动闪屏 Logo */
+const SPLASH_LOGO = "/assets/logo.png";
 
+/**
+ * 本地 /assets/* 到图床源的映射：[url, mime]。
+ * handleAsset 会边缘缓存，源站挂了仍可能出图。
+ */
 const ASSET_ORIGINS = {
   "/assets/favicon.ico": [
     "https://i.ibb.co/s9tgxVhb/Mine-Trakt-icon-32x32.png",
@@ -57,6 +110,7 @@ const ASSET_ORIGINS = {
   ],
 };
 
+/** 缓存已算出的 Chrome 主版本，避免每次请求重算 */
 let __chromeMajorCached = 0;
 /**
  * 推算一个"当下看起来合理"的 Chrome 主版本号。
@@ -74,59 +128,152 @@ function chromeMajorForUA() {
   return __chromeMajorCached;
 }
 
+/* 两套 UA，按目标域分开用 —— 这是"同 IP 请求多了被限"的第一个成因。
+ *
+ * 1) TRAKT_UA：给 auth.trakt.tv 用。它前面是 Cloudflare 的 WAF，
+ *    只带 Content-Type + 浏览器 UA、别的头一个没有，是最典型的脚本特征；
+ *    头指纹不自洽（有 Chrome UA 却没有 Accept-Language / sec-ch-ua），
+ *    反而比老实报出自己是谁更容易被打分。
+ * 2) appUserAgent()：给 api.trakt.tv 用。官方 API 网关不吃浏览器伪装，
+ *    Trakt 明确要求第三方客户端带上自己的名字与版本；拿 Chrome 的 UA
+ *    去打 API 才是爬虫的典型特征。
+ */
+/**
+ * 给 auth.trakt.tv 用的浏览器态 UA（配 BROWSER_FETCH_HEADERS）。
+ */
 const TRAKT_UA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeMajorForUA()}.0.0.0 Safari/537.36`;
 
+/**
+ * api.trakt.tv 使用的客户端 UA。官方要求第三方带上应用名与版本，勿伪装成浏览器。
+ */
+function appUserAgent() {
+  return `MineTrakt/${APP_VERSION} (+https://trakt.real-mrtang.workers.dev; Cloudflare-Worker)`;
+}
+
+/* 浏览器一致性头组：只给 auth.trakt.tv 用。
+ * 目的是让请求看着像 trakt.tv 自己页面发的 XHR，而不是一个空壳 POST。
+ * 故意不设 Accept-Encoding —— Workers 的 fetch 会自己加，手写反而被忽略。
+ * 也不设 Origin：OAuth token 端点若校验 Origin 与 client 注册信息不一致，
+ * 会直接 403，得不偿失。 */
+/**
+ * auth 域浏览器一致性头组，避免空壳 POST 被 WAF 打低分。
+ */
+const BROWSER_FETCH_HEADERS = {
+  Accept: "application/json, text/plain, */*",
+  "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+  "Cache-Control": "no-cache",
+  Pragma: "no-cache",
+  Referer: "https://trakt.tv/",
+  "sec-ch-ua": `"Chromium";v="${chromeMajorForUA()}", "Not=A?Brand";v="24"`,
+  "sec-ch-ua-mobile": "?0",
+  "sec-ch-ua-platform": '"Windows"',
+  "Sec-Fetch-Dest": "empty",
+  "Sec-Fetch-Mode": "cors",
+  "Sec-Fetch-Site": "same-site",
+};
+
+/**
+ * 设备码/token 等 JSON POST 头。
+ */
 const JSON_HEADERS = {
   "Content-Type": "application/json",
   "User-Agent": TRAKT_UA,
+  ...BROWSER_FETCH_HEADERS,
 };
 
-const COOKIE_NAME = "trakt_auth",
-  COOKIE_MAX_AGE = 60 * 60 * 24 * 90,
-  PROFILE_COOKIE = "trakt_profile";
+/* 外站数据源（douban / theater / guduo 的 widget 接口）也不要在裸奔。
+ * 这几个站同样在 CDN 后面，无 UA 无 Accept 的请求会被当扫描器。 */
+/**
+ * 外站 widget（豆瓣/院线/骨朵）请求头，避免无 UA 被当扫描器。
+ */
+const SITE_HEADERS = {
+  "User-Agent": TRAKT_UA,
+  Accept: "application/json, text/plain, */*",
+  "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+};
 
-const PAGE_SIZE = 20,
-  TMDB_KV_TTL = 86400 * 7,
-  OMDB_KV_TTL = 86400 * 7,
-  WATCHLIST_PAGE_SIZE = 30,
-  WATCHLIST_KV_TTL = 28800,
-  CALENDAR_KV_TTL = 28800,
-  TREND_KV_TTL = 86400,
-  MISS_KV_TTL = 300,
-  HISTORY_KV_TTL = 5400,
-  PLAYBACK_KV_TTL = 5400,
-  STATS_KV_TTL = 604800,
-  PROFILE_KV_TTL = 86400,
-  ENTITY_KV_TTL = 86400 * 7,
-  SEASON_KV_TTL = 86400 * 7, // 已完结的季
-  SEASON_KV_TTL_LIVE = 86400, // 还在播的季：新集要当天就能看到
-  DOUBAN_KV_TTL = 86400,
-  THEATER_KV_TTL = 86400,
-  GUDUO_KV_TTL = 86400,
-  PLATFORM_KV_TTL = 86400;
+/** 登录态 Cookie 名（HttpOnly） */
+const COOKIE_NAME = "trakt_auth";
+/** 登录 Cookie 最长存活：90 天（秒） */
+const COOKIE_MAX_AGE = 60 * 60 * 24 * 90;
+/** 非敏感 profile 提示 Cookie（昵称/头像，供首屏骨架） */
+const PROFILE_COOKIE = "trakt_profile";
 
-const KV_STALE_RETENTION = 86400 * 7,
-  LAST_GOOD_KV_TTL = 86400 * 7;
+/** 列表默认分页大小 */
+const PAGE_SIZE = 20;
+/** TMDB 详情/实体在 KV 中的 TTL：7 天 */
+const TMDB_KV_TTL = 86400 * 7;
+/** OMDb 评分缓存 TTL：7 天 */
+const OMDB_KV_TTL = 86400 * 7;
+/** 待看列表每页条数 */
+const WATCHLIST_PAGE_SIZE = 30;
+/** 待看列表 KV TTL：8 小时 */
+const WATCHLIST_KV_TTL = 28800;
+/** 追剧日历 KV TTL：8 小时 */
+const CALENDAR_KV_TTL = 28800;
+/** Trakt 趋势榜 TTL：1 天 */
+const TREND_KV_TTL = 86400;
+/** 回源失败时的短 miss 占位 TTL：5 分钟（防打爆上游） */
+const MISS_KV_TTL = 300;
+/** 观看历史缓存 TTL：1.5 小时 */
+const HISTORY_KV_TTL = 5400;
+/** 播放进度 / 继续观看 TTL：1.5 小时 */
+const PLAYBACK_KV_TTL = 5400;
+/** 用户统计 TTL：7 天 */
+const STATS_KV_TTL = 604800;
+/** 用户资料 TTL：1 天 */
+const PROFILE_KV_TTL = 86400;
+/** Trakt 实体（电影/剧）缓存：7 天 */
+const ENTITY_KV_TTL = 86400 * 7;
+/** 已完结季的集列表 TTL：7 天 */
+const SEASON_KV_TTL = 86400 * 7;
+/** 还在播的季 TTL：1 天（新集当天可见） */
+const SEASON_KV_TTL_LIVE = 86400;
+/** 豆瓣热播 TTL：1 天 */
+const DOUBAN_KV_TTL = 86400;
+/** 平台剧场 TTL：1 天 */
+const THEATER_KV_TTL = 86400;
+/** 骨朵热榜 TTL：1 天 */
+const GUDUO_KV_TTL = 86400;
+/** 流媒体平台片单 TTL：1 天 */
+const PLATFORM_KV_TTL = 86400;
 
+/** KV 逻辑过期后仍保留的 stale 窗口，供故障降级读取 */
+const KV_STALE_RETENTION = 86400 * 7;
+/** lastGood 兜底副本 TTL：7 天 */
+const LAST_GOOD_KV_TTL = 86400 * 7;
+
+/** 首页自动刷新间隔（分钟） */
 const HOME_AUTO_REFRESH_MINUTES = 10;
+/** 播放数据视为「新鲜」的秒数（= 自动刷新间隔） */
 const PLAYBACK_FRESH_SEC = HOME_AUTO_REFRESH_MINUTES * 60;
 
-const APP_VERSION = "1.3.0";  //  版本号（更新代码需要跟随更新）
+/** 应用版本；发版时务必同步修改（影响 SW / 静态资源 ETag） */
+const APP_VERSION = "2.0.0";
+/** 前端 JS 资源版本（可与 APP_VERSION 解耦发版） */
 const APP_JS_VERSION = APP_VERSION;
+/** 前端 CSS 资源版本 */
 const APP_CSS_VERSION = APP_VERSION;
 
-// 所有响应一律不缓存：数据源就是 KV 里那一份，
-// 让浏览器再存一层只会带来"刷新了还是旧数据"。
+/** 禁止浏览器/中间层缓存响应体（用户态数据唯一真相在 KV） */
 const CC_NO_STORE = "no-store";
+/** JSON Content-Type */
 const CT_JSON = "application/json; charset=utf-8";
+/** HTML Content-Type */
 const CT_HTML = "text/html; charset=utf-8";
 
+/**
+ * 用户态长列表默认缓存策略。
+ */
 const CACHE_USER_LONG = {
   missTtl: 60,
   swr: true,
   unwrap: true,
   jitter: 300,
 };
+/**
+ * 用户元数据（profile/stats）缓存策略。
+ */
 const CACHE_USER_META = {
   missTtl: 180,
   swr: true,
@@ -146,6 +293,9 @@ function cacheUser(extra) {
  * 统一的 JSON 响应、边缘缓存开关、enrich 限流
  * ================================================================== */
 
+/**
+ * 统一 JSON 响应：默认 Content-Type + no-store。
+ */
 function jsonResp(data, headers, status) {
   return new Response(JSON.stringify(data), {
     status: status || 200,
@@ -156,24 +306,71 @@ function jsonResp(data, headers, status) {
   });
 }
 
-// 无边缘缓存：以前这里会把响应塞进 caches.default 存 1 天，
-// 于是豆瓣/影院/骨朵/平台这几个接口在不同 colo 上各存各的，
-// 设备之间看到的列表就不一样。现在直接放行到后端（后端本身走 KV）。
-async function edgeCached(request, ctx, ttlSec, fn) {
-  return fn();
-}
-
+/** enrich 限流：ip → 最近一分钟内请求时间戳数组 */
 const __enrichHits = new Map();
 
 /**
  * enrich 接口的简易限流：同一 IP 每分钟最多 60 次。
  * 详情页会批量触发 enrich，这层是防止被刷爆 TMDB 配额。
  */
+/* ------------------------------------------------------------------
+ * 客户端 IP 与"按 IP 的短期冷却"
+ *
+ * 为什么用 Cache API 而不是内存 Map：
+ *   内存 Map 只活在一个 isolate 里。同一个 IP 的请求会被随机分到
+ *   多个 isolate，每个 isolate 各记各的，等于没限。
+ *   Cache API 是按 colo 共享的，写一次三十秒内所有 isolate 都看得见，
+ *   而且不消耗 KV 读写额度 —— 拿来存"这个 IP 到几点之前别放行"最合适。
+ * ------------------------------------------------------------------ */
+function clientIp(request) {
+  // 只认 Cloudflare 注入的这个头。X-Forwarded-For 是客户端可伪造的，
+  // 拿它当限流依据，等于把限流开关交给攻击者。
+  return request.headers.get("CF-Connecting-IP") || "unknown";
+}
+
+/** Cache API 中授权冷却条目的伪 URL 前缀（仅作 key，不可访问） */
+const __AUTH_CD_PREFIX = "https://mt-internal.invalid/__authcd/";
+
+/**
+ * 查询该 IP 在授权域冷却中还剩多少秒（Cache API，跨 isolate 可见）。
+ */
+async function authCooldownRemaining(ip) {
+  try {
+    const hit = await caches.default.match(
+      __AUTH_CD_PREFIX + encodeURIComponent(ip),
+    );
+    if (!hit) return 0;
+    const until = Number(await hit.text()) || 0;
+    return Math.max(0, Math.ceil((until - Date.now()) / 1000));
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * 标记 IP 进入授权冷却；写入 Cache API，默认最长 900 秒。
+ */
+async function markAuthCooldown(ip, sec, ctx) {
+  if (!ip || ip === "unknown") return;
+  const s = Math.max(1, Math.min(Number(sec) || 30, 900));
+  try {
+    const p = caches.default.put(
+      new Request(__AUTH_CD_PREFIX + encodeURIComponent(ip)),
+      new Response(String(Date.now() + s * 1000), {
+        headers: { "Cache-Control": `public, max-age=${s}` },
+      }),
+    );
+    if (ctx && typeof ctx.waitUntil === "function")
+      ctx.waitUntil(p.catch(() => {}));
+    else await p;
+  } catch {}
+}
+
+/**
+ * enrich 接口简易限流：同一 IP 每分钟最多 60 次，防刷 TMDB 配额。
+ */
 function allowEnrich(request) {
-  const ip =
-    request.headers.get("CF-Connecting-IP") ||
-    request.headers.get("X-Forwarded-For") ||
-    "unknown";
+  const ip = clientIp(request);
   const now = Date.now();
   const arr = (__enrichHits.get(ip) || []).filter((t) => now - t < 60000);
   if (arr.length >= 60) {
@@ -191,6 +388,10 @@ function allowEnrich(request) {
   return true;
 }
 
+/**
+ * KV / 缓存键工厂。用户态 key 一律带 userId，避免串号。
+ * 版本后缀（如 pb:v2）用于不兼容的结构变更时主动失效旧数据。
+ */
 const CK = {
   // v2：缓存内容改为原始 { paused, upNext }，合并/过滤每次现算
   playback: (u) => `pb:v2:${u}`,
@@ -256,6 +457,9 @@ function seasonIsDone(data) {
   return true;
 }
 
+/**
+ * 已完结季用长 TTL，还在播的季用短 TTL，保证新集尽快可见。
+ */
 const seasonTtl = (data) =>
   seasonIsDone(data) ? SEASON_KV_TTL : SEASON_KV_TTL_LIVE;
 
@@ -269,8 +473,10 @@ const seasonTtl = (data) =>
  * 返回 Response 本身（不解析），失败时返回 { __error } 对象而不是抛异常。
  */
 async function fetchT(url, opts = {}, ms = 8000, userKey) {
+  const isAuthHost = TRAKT_AUTH_HOST_RE.test(url);
   const release =
-    TRAKT_HOST_RE.test(url) && (await traktGate(userKey, opts.method));
+    TRAKT_HOST_RE.test(url) &&
+    (await traktGate(userKey, opts.method, isAuthHost));
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), ms);
   try {
@@ -281,35 +487,59 @@ async function fetchT(url, opts = {}, ms = 8000, userKey) {
   }
 }
 
+/**
+ * Promise 版 sleep，用于退避与串行间隔。
+ */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/**
+ * 指数退避 + 抖动，i 从 0 起。
+ */
 const backoff = (i, base = 500, jitter = 500) =>
   sleep(base * (i + 1) + Math.random() * jitter);
-const TRAKT_HOST_RE = /^https?:\/\/api\.trakt\.tv\//i;
+/** 仅匹配 auth.trakt.tv */
+const TRAKT_AUTH_HOST_RE = /^https?:\/\/auth\.trakt\.tv\//i;
+/* 原来这里只写了 api.trakt.tv，结果是 auth.trakt.tv 上的
+ * 设备码 / 换 token 请求完全绕过闸门，无限流、无冷却、无节流。
+ * 而 auth 域恰恰是 Cloudflare WAF 判得最狠的地方：
+ * 同一个 Worker 出口 IP 上短时间打几十次设备码，直接 1015 / 429，
+ * 而且这个封锁是按 IP 算的 —— 一个人把 IP 打黑，所有用户一起挂。
+ * 两个域都必须过闸门，只是走不同的通道。 */
+/** 匹配 api/auth.trakt.tv，请求必须过 traktGate */
+const TRAKT_HOST_RE = /^https?:\/\/(?:api|auth)\.trakt\.tv\//i;
 
-// 高压通道（写请求 / 额度吃紧时）的串行间隔
+/** 高压/读串行时，全局两次 Trakt 请求最小间隔（毫秒） */
 const TRAKT_MIN_GAP_MS = 800;
+/** 同一用户两次请求最小间隔（毫秒） */
 const TRAKT_USER_GAP_MS = 1000;
+/** 串行排队最多等待这么久，避免把请求拖死 */
 const TRAKT_GAP_MAX_WAIT_MS = 20000;
-// 普通写请求（标记已看、加待看等）不需要 800ms 那么保守，
-// 太大会让一次"标记已看 + 清暂停记录"白等 1.6s
+/** 普通写请求（已看/待看）全局最小间隔，可比读更短 */
 const TRAKT_WRITE_GAP_MS = 300;
+/** 普通写请求的同用户最小间隔 */
 const TRAKT_WRITE_USER_GAP_MS = 400;
 
-// 令牌桶：Trakt 官方额度 1000 次 / 5 分钟 / 用户
+/** Trakt 官方额度窗口长度：5 分钟 */
 const TRAKT_WINDOW_MS = 300000;
+/** 窗口内允许的请求上限（官方约 1000/5min/用户） */
 const TRAKT_WINDOW_LIMIT = 1000;
-// 用量超过该比例就退化成串行限速，避免真的撞 429
+/** 用量超过该比例则退化为串行，避免撞 429 */
 const TRAKT_SOFT_RATIO = 0.8;
-// 低压时允许的读请求并发（原来恒为 1，把 1000/5min 的额度只用掉 ~20%）
+/** 低压时允许的读并发数 */
 const TRAKT_READ_CONCURRENCY = 3;
-// 同一用户并发请求之间的最小抖动，避免同一瞬间齐发
+/** 同用户并发读之间的最小抖动，避免同一瞬间齐发 */
 const TRAKT_USER_JITTER_MS = 120;
 
-let __traktTail = Promise.resolve(),
-  __traktLast = 0;
+/** api 域串行链尾 Promise */
+let __traktTail = Promise.resolve();
+/** 全局最近一次 Trakt api 请求时间戳 */
+let __traktLast = 0;
+/** 每用户最近一次请求时间 userKey → ts */
 const __traktUserLast = new Map();
+/** 滑动窗口内的请求时间戳列表 */
 const __traktWin = [];
+/** 当前占用的读并发数 */
 let __traktReadActive = 0;
+/** 等待读并发名额的 resolve 队列 */
 const __traktReadQueue = [];
 
 /**
@@ -373,6 +603,9 @@ function __traktMarkUsed(uk) {
 }
 
 // 串行通道：写请求、或额度进入警戒区时使用
+/**
+ * 串行通道：写请求或额度进入警戒区时，全局 + 同用户最小间隔排队。
+ */
 function __traktSerial(uk, minGap, userGap) {
   const gap = minGap != null ? minGap : TRAKT_MIN_GAP_MS;
   const uGap = userGap != null ? userGap : TRAKT_USER_GAP_MS;
@@ -395,7 +628,54 @@ function __traktSerial(uk, minGap, userGap) {
   });
 }
 
+/* ------------------------------------------------------------------
+ * auth.trakt.tv 专用通道
+ *
+ * 和 api 通道完全分开，理由有三：
+ *   1. 不互相阻塞。换 token 卡住时不能把首页的 api 请求一起堵死；
+ *   2. 间隔更长。设备码 / 授权轮询是低频动作，慢 1 秒无所谓，
+ *      但短时间连打十几次就会触发 WAF 按 IP 封；
+ *   3. 会主动泄压。队列积压超过 MAX_WAIT 就不再等，直接放行 ——
+ *      多人同时登录时宁可乱序，也不能让 poll 卡到超时、用户干等。
+ * ------------------------------------------------------------------ */
+/** auth 域两次请求最小间隔（毫秒），比 api 更保守 */
+const TRAKT_AUTH_GAP_MS = 1200;
+/** auth 排队超过该等待则不再死等，优先放行避免 poll 超时 */
+const TRAKT_AUTH_MAX_WAIT_MS = 3000;
+
+/** auth 域串行链尾 */
+let __traktAuthTail = Promise.resolve();
+/** auth 域最近一次请求时间戳 */
+let __traktAuthLast = 0;
+
+/**
+ * auth.trakt.tv 独立串行通道，与 api 互不阻塞。
+ */
+/**
+ * auth.trakt.tv 专用串行：间隔更长，积压超过 MAX_WAIT 则不再死等。
+ */
+function __traktAuthSerial() {
+  const prev = __traktAuthTail;
+  let release;
+  __traktAuthTail = new Promise((r) => (release = r));
+  return prev.then(async () => {
+    try {
+      const wait = Math.max(
+        0,
+        __traktAuthLast + TRAKT_AUTH_GAP_MS - Date.now(),
+      );
+      if (wait > 0 && wait <= TRAKT_AUTH_MAX_WAIT_MS) await sleep(wait);
+    } finally {
+      __traktAuthLast = Date.now();
+      release();
+    }
+  });
+}
+
 // 并发通道：低压读请求，只做同用户抖动
+/**
+ * 低压读通道：只做同用户短抖动，不抢写通道锁。
+ */
 async function __traktParallel(uk) {
   const wait =
     (__traktUserLast.get(uk) || 0) + TRAKT_USER_JITTER_MS - Date.now();
@@ -412,8 +692,15 @@ async function __traktParallel(uk) {
  * 全局层面用 5 分钟滑动窗口控制总量，同一用户层面强制串行 + 抖动，
  * 避免多设备同时刷新把 Trakt 的 1000 次/5 分钟额度打满。
  */
-async function traktGate(userKey, method) {
+async function traktGate(userKey, method, isAuthHost) {
   const uk = userKey || "__anon__";
+
+  // auth.trakt.tv 走独立通道，不参与读并发池、不占用 api 的额度窗口
+  if (isAuthHost) {
+    await __traktAuthSerial();
+    return null;
+  }
+
   const isWrite = !!method && String(method).toUpperCase() !== "GET";
   const pressure = traktWindowPressure();
 
@@ -453,10 +740,14 @@ async function traktGate(userKey, method) {
   return null;
 }
 
+/** 单次 429 基础冷却：60 秒（随后按命中次数指数上升） */
 const TRAKT_RATE_LIMIT_COOLDOWN = 60000;
+/** 429 冷却上限：5 分钟（WAF 封禁也按此满额） */
 const TRAKT_RATE_LIMIT_MAX_COOLDOWN = 300000;
 
+/** 用户 429 冷却截止时间 userKey → untilMs */
 const __traktRateLimitByUser = new Map();
+/** 用户连续 429 次数，用于加长冷却 */
 const __traktStrikes = new Map();
 
 /**
@@ -533,6 +824,45 @@ function consumeRetryAfter(r, userKey) {
 }
 
 /**
+ * 从 Response 判定限流来源与建议等待时间。
+ * Cloudflare WAF（cf-mitigated / 1015）按出口 IP 封，冷却拉满；
+ * Trakt 业务额度则尊重 Retry-After（有上限）。
+ */
+function classifyRateLimit(res, bodyText = "") {
+  const ra = parseInt(res.headers.get("Retry-After") || "", 10);
+  const cfMit = res.headers.get("cf-mitigated") || "";
+  const xrl =
+    res.headers.get("X-Ratelimit") || res.headers.get("x-ratelimit") || "";
+  const text = String(bodyText || "");
+  let source = "trakt";
+  if (xrl) source = "trakt";
+  else if (cfMit) source = "cloudflare";
+  else if (/error code:\s*1015/i.test(text) || /cf-ray/i.test(text))
+    source = "cloudflare";
+  let waitMs =
+    Number.isFinite(ra) && ra > 0
+      ? Math.min(ra * 1000, TRAKT_RATE_LIMIT_MAX_COOLDOWN)
+      : 0;
+  if (source === "cloudflare" || cfMit)
+    waitMs = Math.max(waitMs, TRAKT_RATE_LIMIT_MAX_COOLDOWN);
+  return { source, waitMs, cfMitigated: cfMit || null, ratelimit: xrl || null };
+}
+
+/**
+ * 授权域（auth.trakt.tv）按 IP 的冷却秒数。
+ */
+function authRateLimitWaitSec(
+  res,
+  { wafSec = 300, defaultSec = 30, maxSec = 180 } = {},
+) {
+  const wafBlocked = !!res.headers.get("cf-mitigated");
+  if (wafBlocked) return wafSec;
+  const ra = parseInt(res.headers.get("Retry-After") || "", 10);
+  if (Number.isFinite(ra) && ra > 0) return Math.min(ra, maxSec);
+  return defaultSec;
+}
+
+/**
  * 调 Trakt API 并按状态码决策：
  *   401 → 交给上层刷新 token 后重试
  *   429 → 记冷却时间，期间直接短路
@@ -566,7 +896,13 @@ async function traktFetch(
       const r = await fetchT(url, { headers }, timeout, userKey);
 
       if (r.status === 429) {
-        consumeRetryAfter(r, userKey);
+        // cf-mitigated = Cloudflare 的 WAF 按 IP 拦截（页面上那句 error 1015），
+        // 和"用户额度用完"不是一回事：它按出口 IP 计，会牵连所有
+        // 走同一个 Worker 的用户，而且持续几分钟不会自己松开。
+        // 这种情况必须给满冷却，否则重试只是把封禁时间往后续。
+        if (r.headers.get("cf-mitigated"))
+          markTraktRateLimited(TRAKT_RATE_LIMIT_MAX_COOLDOWN, userKey);
+        else consumeRetryAfter(r, userKey);
         return {
           __error: "HTTP 429",
           __cooling: traktRateLimitedRemaining(userKey),
@@ -610,16 +946,24 @@ async function traktFetch(
   return { __error: lastErr || "retries exhausted", ...errShape };
 }
 
+/**
+ * traktFetch 的 GET 简写。
+ */
 const traktGet = (url, headers, retries = 2, userKey) =>
   traktFetch(url, headers, { retries, timeout: 12000, userKey });
 
-const KV_MISS = Symbol("kv-miss"),
-  KV_ERR = Symbol("kv-err"),
-  KV_MIN_PUT_TTL = 30,
-  KV_DOWN_COOLDOWN_MS = 30000;
+/** KV 读结果：key 不存在，需要回源 */
+const KV_MISS = Symbol("kv-miss");
+/** KV 读结果：服务不可用，应走降级勿打爆上游 */
+const KV_ERR = Symbol("kv-err");
+/** 写入 KV 时 TTL 下限（秒），过短则跳过写入 */
+const KV_MIN_PUT_TTL = 30;
+/** KV 故障后暂停重试的冷却时间（毫秒） */
+const KV_DOWN_COOLDOWN_MS = 30000;
 
+/** lastGood 副本最短重写间隔：7 天（省 KV 写额度） */
 const LAST_GOOD_MIN_PUT_INTERVAL_MS = 7 * 24 * 3600000;
-// KV 写入最小间隔的应急阀。0 = 不节流（默认，多设备立即一致）。
+/** KV 写入最小间隔应急阀；0 = 不节流（多设备立即一致） */
 const KV_WRITE_MIN_GAP_MS = 0;
 
 /* ------------------------------------------------------------------
@@ -653,29 +997,45 @@ const KV_WRITE_MIN_GAP_MS = 0;
  * 这类数据的写入需要保证落盘（另一台设备会立刻读），
  * 公共数据则允许后台慢写，避免拖慢首屏。
  */
+/** 匹配用户态 KV key 前缀；命中则写路径 await 落盘 */
 const USER_STATE_KEY_RE =
   /^(?:pb|hist|more:hist|more:pb|lg|we|us|cwh|sync|act|dropped|cal|pbl|wl|wlids|wlv|tpr|tmh|spb|prof|stats|sum2|pbc|uid|lg:put|cwmeta):/;
 
+/**
+ * 是否用户态 KV key（写入需尽快落盘，保证多设备一致）。
+ */
 function isUserStateKey(key) {
   return !!key && USER_STATE_KEY_RE.test(String(key));
 }
 
+/**
+ * KV get 统一选项：按 JSON 解析。
+ */
 function kvReadOpts() {
   return { type: "json" };
 }
 
+/** enrich 结果分桶数量（打散热点 key） */
 const ENRICH_BUCKETS = 4;
+/** enrich 桶 TTL：30 天 */
 const ENRICH_BUCKET_TTL = 86400 * 30;
+/** 单桶最多缓存条目数 */
 const ENRICH_BUCKET_MAX = 500;
+/** 单次 enrich 请求最多处理条数 */
 const ENRICH_BATCH_MAX = 20;
-// 0 = 不跨请求复用：enrich 走 KV，各设备读同一份
+/** cachedJSON 默认 TTL 抖动上限（秒） */
 const DEFAULT_JITTER_SEC = 600;
+/** __kvLastPut 字典最大条目，超出则淘汰一批 */
 const __KV_LASTPUT_MAX = 5000;
 
+/** key → 上次写入时间，配合 KV_WRITE_MIN_GAP_MS 应急节流 */
 const __kvLastPut = new Map();
 
+/** singleFlight：进行中的读 Promise */
 const __kvInflight = new Map();
+/** KV 故障时的内存兜底副本（非正常缓存路径） */
 const __kvMemStale = new Map();
+/** 内存兜底最大存活：1 小时 */
 const STALE_MAX_AGE = 3600000;
 
 /**
@@ -711,6 +1071,7 @@ function kvMemStaleGet(key) {
   return e;
 }
 
+/** KV 故障冷却截止时间戳；在此之前不再打 KV */
 let __kvDownUntil = 0;
 
 /**
@@ -745,7 +1106,8 @@ function kvMarkUp() {
  * ------------------------------------------------------------------ */
 function kvRemember(key, val) {
   if (val === undefined || val === null || val === KV_MISS) return;
-  const data = typeof val === "object" && val.data !== undefined ? val.data : val;
+  const data =
+    typeof val === "object" && val.data !== undefined ? val.data : val;
   if (!__isErrorPayload(data)) kvMemStaleSet(key, data, val && val._ts);
 }
 
@@ -948,6 +1310,9 @@ function reqKvStat(ctx) {
   return ctx.__kvStat;
 }
 
+/**
+ * 缓存唯一入口：读 KV → 回源 → 写回 → lastGood/SWR 降级。
+ */
 async function cachedJSON(
   env,
   ctx,
@@ -1207,48 +1572,57 @@ async function cachedJSON(
   }
 
   if (bypass) {
-    // 加秒级时间桶：同一瞬间的并发强制刷新仍会合并成一次请求，
-    // 但不会因为 singleFlight 的 200ms 清理窗口而复用"上一次"的结果
-    // （复用会让调用方的 playbackSource 等 sourceTracker 停留在旧值，误报 stale）。
-    return singleFlight(
+    // 加秒级时间桶：同一瞬间的并发强制刷新合并成一次上游请求
+    const pack = await singleFlight(
       "force:" + key + ":" + Math.floor(Date.now() / 1000),
       async () => {
-      let data = null;
-      try {
-        data = await fetcher();
-      } catch {
-        data = null;
-      }
-      if (data && (data.__error || data.__cooling != null)) data = null;
+        let data = null;
+        try {
+          data = await fetcher();
+        } catch {
+          data = null;
+        }
+        if (data && (data.__error || data.__cooling != null)) data = null;
 
-      if (!__isErrorPayload(data)) {
-        let prevHint = null;
-        if (!memOnly && env && env.TMDB_CACHE && !kvIsDown()) {
-          try {
-            const raw = await env.TMDB_CACHE.get(key, kvReadOpts());
-            kvMarkUp();
-            if (raw && typeof raw === "object" && !raw.miss) {
-              prevHint = raw;
+        if (!__isErrorPayload(data)) {
+          let prevHint = null;
+          if (!memOnly && env && env.TMDB_CACHE && !kvIsDown()) {
+            try {
+              const raw = await env.TMDB_CACHE.get(key, kvReadOpts());
+              kvMarkUp();
+              if (raw && typeof raw === "object" && !raw.miss) {
+                prevHint = raw;
+              }
+            } catch {
+              kvMarkDown();
             }
-          } catch {
-            kvMarkDown();
           }
+
+          const liveAge = await writeFresh(data, {
+            force: true,
+            memOnlyOverride: memOnly ? true : null,
+            prevHint,
+          });
+          return { live: true, val: data, liveAge };
         }
 
-        const liveAge = await writeFresh(data, {
-          force: true,
-          memOnlyOverride: memOnly ? true : null,
-          prevHint,
-        });
-        markSource(false, null, liveAge);
-        return unwrap ? data : { data };
-      }
+        const fb = await fallbackChain();
+        if (fb.found) return { live: false, fromCache: true, val: fb.val };
+        return { live: false, val: null };
+      },
+    );
 
-      const fb = await fallbackChain();
-      if (fb.found) return unwrap ? fb.val : { data: fb.val };
-      markSource(null, null);
-      return null;
-    });
+    /* sourceTracker 必须由「本次调用」来标，不能只在 singleFlight 内部标。
+     * 同一秒内的两次强制刷新会复用到同一个 promise，内部只标了第一次，
+     * 第二次的 fromCache 还停在初始值 true —— 调用方就会把刚拉到的 live
+     * 数据当成"命中缓存"，连带 liveOk 为假、at 不更新，
+     * 前端于是永远显示"没更新"。（连点两次刷新、自动刷新撞上手动刷新都会踩到） */
+    if (pack && pack.live) markSource(false, null, pack.liveAge);
+    else if (pack && pack.fromCache) markSource(true, { _ts: Date.now() });
+    else markSource(null, null);
+
+    const val = pack ? pack.val : null;
+    return unwrap ? val : { data: val };
   }
 
   function needRefresh(cached) {
@@ -1291,7 +1665,10 @@ async function cachedJSON(
     if (mem === KV_MISS) {
       const lg = await tryLastGood();
       if (lg.found) {
-        kvRemember(key, { data: lg.val, _ts: (lg.raw && lg.raw._ts) || Date.now() });
+        kvRemember(key, {
+          data: lg.val,
+          _ts: (lg.raw && lg.raw._ts) || Date.now(),
+        });
         kvMemStaleSet(key, lg.val, (lg.raw && lg.raw._ts) || undefined);
         markSource(true, lg.raw || null);
         return unwrap ? lg.val : { data: lg.val };
@@ -1541,6 +1918,10 @@ async function staleWhileRevalidate(req) {
   return cached || networkP;
 }`;
 
+/**
+ * Worker 入口：静态资源 → 认证 → API → 页面路由。
+ * 未匹配路径回落到首页 handler（内部再鉴权）。
+ */
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url),
@@ -1554,7 +1935,7 @@ export default {
     if (path === "/manifest.webmanifest") return handleManifest();
     if (path === "/sw.js") return handleServiceWorker();
 
-    if (path === "/auth/device") return handleDevice(env);
+    if (path === "/auth/device") return handleDevice(request, env, ctx);
     if (path === "/auth/poll" && request.method === "POST")
       return handlePoll(request, env, ctx);
     if (path === "/auth/logout" && request.method === "POST")
@@ -1579,22 +1960,12 @@ export default {
     }
     if (path === "/api/search") return handleSearch(request, env, ctx);
     if (path === "/api/trending") return handleTrending(request, env, ctx);
-    if (path === "/api/douban-list")
-      return edgeCached(request, ctx, 86400, () =>
-        handleDoubanList(request, env, ctx),
-      );
+    if (path === "/api/douban-list") return handleDoubanList(request, env, ctx);
     if (path === "/api/theater-list")
-      return edgeCached(request, ctx, 86400, () =>
-        handleTheaterList(request, env, ctx),
-      );
-    if (path === "/api/guduo-list")
-      return edgeCached(request, ctx, 86400, () =>
-        handleGuduoList(request, env, ctx),
-      );
+      return handleTheaterList(request, env, ctx);
+    if (path === "/api/guduo-list") return handleGuduoList(request, env, ctx);
     if (path === "/api/platform-list")
-      return edgeCached(request, ctx, 86400, () =>
-        handlePlatformList(request, env, ctx),
-      );
+      return handlePlatformList(request, env, ctx);
 
     if (path === "/api/watchlist/add" && request.method === "POST")
       return handleWatchlistAdd(request, env, ctx);
@@ -2028,6 +2399,7 @@ async function traktSyncAction(
     endpoint,
     timeout = 10000,
     afterOk,
+    okMessage,
   },
 ) {
   const A = await authed(request, env, ctx);
@@ -2072,38 +2444,25 @@ async function traktSyncAction(
     const text = await r.text().catch(() => "");
     const payload = { error: "HTTP " + r.status, detail: text };
     if (r.status === 429) {
-      const ra = parseInt(r.headers.get("Retry-After") || "", 10);
-      const waitMs = Number.isFinite(ra) && ra > 0 ? ra * 1000 : 0;
-      const xrl =
-        r.headers.get("X-Ratelimit") || r.headers.get("x-ratelimit") || "";
-      const cfMit = r.headers.get("cf-mitigated") || "";
-      let source = "unknown";
-      if (xrl) source = "trakt";
-      else if (cfMit) source = "cloudflare";
-      else if (/error code:\s*1015/i.test(text) || /cf-ray/i.test(text))
-        source = "cloudflare";
-      else source = "trakt";
-
+      const info = classifyRateLimit(r, text);
       let uk = null;
       try {
         uk = await getStableUserId(auth, headers, env, ctx).catch(() => null);
       } catch {}
       const cooling = Math.ceil(
         markTraktRateLimited(
-          waitMs,
+          info.waitMs,
           uk || auth.refresh_token || auth.access_token,
         ) / 1000,
       );
       payload.cooling = cooling;
-      payload.source = source;
-      payload.ratelimit = xrl || null;
-      payload.cfMitigated = cfMit || null;
-      if (source === "cloudflare") {
-        payload.error = "被 Cloudflare 拦截（429），不是操作太勤，请稍后再试";
-      } else {
-        payload.error =
-          "Trakt 官方限流（429），请等待冷却后再试，期间会显示缓存";
-      }
+      payload.source = info.source;
+      payload.ratelimit = info.ratelimit;
+      payload.cfMitigated = info.cfMitigated;
+      payload.error =
+        info.source === "cloudflare"
+          ? "被 Cloudflare 拦截（429），不是操作太勤，请稍后再试"
+          : "Trakt 官方限流（429），请等待冷却后再试，期间会显示缓存";
     }
     return authJson(auth, needsCookieUpdate, payload, r.status);
   }
@@ -2111,7 +2470,16 @@ async function traktSyncAction(
   if (typeof afterOk === "function")
     await afterOk(auth, headers, env, ctx, body);
   const result = await r.json().catch(() => null);
-  return authJson(auth, needsCookieUpdate, { ok: true, result });
+
+  /* 成功文案由服务端给，前端拿到就能直接显示。
+   * 这样"成功提示"只有一处定义，不会出现接口改了、提示还停在旧文案。 */
+  const okBody = { ok: true, result };
+  if (okMessage)
+    okBody.message =
+      typeof okMessage === "function"
+        ? okMessage(type, body, result)
+        : okMessage;
+  return authJson(auth, needsCookieUpdate, okBody);
 }
 
 /* ==================================================================
@@ -2119,7 +2487,24 @@ async function traktSyncAction(
  * TV/手机端 OAuth 设备码轮询
  * ================================================================== */
 
-async function handleDevice(env) {
+async function handleDevice(request, env, ctx) {
+  /* 设备码是"一个 IP 打十几次就被 WAF 拉黑"的典型入口：
+   * 前端刷新一下、或者同时开几个标签页，就会连发好几次。
+   * 这里做一层按 IP 的冷却，命中过 429 的 IP 直接短路，
+   * 不再往上游打 —— 上游按 IP 封禁，多打一次就多封一会儿。 */
+  const ip = clientIp(request);
+  const cd = await authCooldownRemaining(ip);
+  if (cd > 0) {
+    return Response.json(
+      {
+        error: `授权接口冷却中，请 ${cd} 秒后再试`,
+        rateLimited: true,
+        retryAfter: cd,
+      },
+      { status: 429, headers: { "Retry-After": String(cd) } },
+    );
+  }
+
   const codeVerifier = randomString(64),
     codeChallenge = await pkceChallenge(codeVerifier);
 
@@ -2149,8 +2534,12 @@ async function handleDevice(env) {
     const errText = await res.text();
 
     if (res.status === 429) {
-      const ra = parseInt(res.headers.get("Retry-After") || "", 10);
-      const waitSec = Number.isFinite(ra) && ra > 0 ? Math.min(ra, 180) : 30;
+      const waitSec = authRateLimitWaitSec(res, {
+        wafSec: 300,
+        defaultSec: 30,
+        maxSec: 180,
+      });
+      await markAuthCooldown(ip, waitSec, ctx);
       return Response.json(
         {
           error: `Trakt 授权接口限流，请 ${waitSec} 秒后再获取设备码`,
@@ -2199,6 +2588,18 @@ async function handleDevice(env) {
  * 前端每隔几秒问一次"用户授权了没"，授权成功后写 Cookie 并返回跳转地址。
  */
 async function handlePoll(request, env, ctx) {
+  /* 轮询是 auth 域上调用最密的一环（默认 5 秒一次）。
+   * 一旦这个 IP 已经被 WAF 标记，继续每 5 秒打一次只会把封禁续下去，
+   * 所以冷却期内直接告诉前端"别问了"，让它退避到冷却结束。 */
+  const ip = clientIp(request);
+  const cd = await authCooldownRemaining(ip);
+  if (cd > 0) {
+    return Response.json(
+      { error: "cooling", status: "rate_limited", retryAfter: cd },
+      { status: 429, headers: { "Retry-After": String(cd) } },
+    );
+  }
+
   let body;
   try {
     body = await request.json();
@@ -2388,9 +2789,19 @@ async function handlePoll(request, env, ctx) {
     );
   }
   if (res.status === 429) {
+    const waitSec = authRateLimitWaitSec(res, {
+      wafSec: 300,
+      defaultSec: 60,
+      maxSec: 180,
+    });
+    await markAuthCooldown(ip, waitSec, ctx);
     return Response.json(
-      { status: "rate_limited", message: "Trakt 授权轮询被限流，请稍后再试" },
-      { status: 429 },
+      {
+        status: "rate_limited",
+        message: "Trakt 授权轮询被限流，请稍后再试",
+        retryAfter: waitSec,
+      },
+      { status: 429, headers: { "Retry-After": String(waitSec) } },
     );
   }
 
@@ -2525,10 +2936,12 @@ async function refreshIfNeeded(auth, env) {
 function makeTraktHeaders(env, auth) {
   return {
     "Content-Type": "application/json",
+    Accept: "application/json",
     "trakt-api-version": "2",
     "trakt-api-key": env.TRAKT_CLIENT_ID,
     Authorization: `Bearer ${auth.access_token}`,
-    "User-Agent": TRAKT_UA,
+    // API 域用可识别的客户端标识，不用浏览器 UA —— 见 appUserAgent 的注释
+    "User-Agent": appUserAgent(),
   };
 }
 
@@ -3024,8 +3437,11 @@ async function tmdbZhTitle(kind, tmdbId, env, ctx) {
   return (data.name || data.title || "").trim() || null;
 }
 
+/** 海报/剧照 map 在 KV 中的 TTL：30 天 */
 const IMG_MAP_KV_TTL = 86400 * 30;
+/** 同一图片 map 最短重写间隔：10 分钟（省写额度） */
 const IMG_MAP_MIN_PUT_INTERVAL_MS = 10 * 60 * 1000;
+/** 图片 map key → 上次写入时间 */
 const __IMG_MAP_LAST_PUT = new Map();
 
 /* ==================================================================
@@ -3227,6 +3643,7 @@ function entryProgressPercent(entry) {
 // 原来只要该剧有任何一条观看记录晚于暂停时间就隐藏卡片，
 // 这让"刚暂停 → 看了下一集"和"暂停记录比 watched 缓存新"两种情况难以区分，
 // 两台设备命中不同版本的 watched 缓存时，同一份播放列表会被过滤出不同结果。
+/** 暂停进度超过该时长且已看完则视为过期，移出继续观看 */
 const STALE_PAUSE_GRACE_MS = 30 * 60 * 1000;
 
 /* ==================================================================
@@ -3972,11 +4389,17 @@ function isUsableBoardPayload(data) {
  * 可以接受；真正的用户态数据（已看 / 进度 / 追剧）仍然一律读 KV。
  * 带 force=1 会绕过并刷新；标记已看之类的写操作会顺带清掉相关条目。
  * ------------------------------------------------------------------ */
+/** 进程内热榜内存缓存默认存活：12 小时 */
 const MEM_CACHE_TTL = 12 * 3600 * 1000;
 
+/** 豆瓣/院线/骨朵等热榜的 isolate 内存热表 */
 const __hotListMem = new Map();
+/** 观看小结的 isolate 内存热表 */
 const __summaryMem = new Map();
 
+/**
+ * 进程内热榜内存缓存读取。
+ */
 function memCacheGet(map, key) {
   const e = map.get(key);
   if (!e) return undefined;
@@ -4009,43 +4432,65 @@ function memCacheSet(map, key, data, cap) {
  * 豆瓣热播原始数据（12 小时内存缓存 → KV → 上游）。
  * 只缓存"能用的数据"，一次拉取失败不会把空白锁 12 小时。
  */
-async function getDoubanRaw(env, ctx, force) {
-  const memKey = CK.douban;
+/**
+ * 榜单原始 JSON 的统一入口：内存热表 → KV（cachedJSON）→ 上游。
+ * validateOnFetch：豆瓣/骨朵在回源时过滤坏载荷；院线结构松散，只在写内存时校验。
+ */
+async function getBoardRaw(
+  env,
+  ctx,
+  { key, url, ttl, force = false, validateOnFetch = true, swr = true },
+) {
   if (!force) {
-    const hit = memCacheGet(__hotListMem, memKey);
+    const hit = memCacheGet(__hotListMem, key);
     if (hit !== undefined) return hit;
   }
   const data = await cachedJSON(
     env,
     ctx,
-    memKey,
+    key,
     async () => {
       try {
-        const r = await fetchT(DOUBAN_API, {}, 10000);
+        const r = await fetchT(url, { headers: SITE_HEADERS }, 10000);
         if (!r.ok) return null;
         const data = await r.json();
-
-        if (!isUsableBoardPayload(data)) return null;
+        if (validateOnFetch && !isUsableBoardPayload(data)) return null;
         return data;
       } catch {
         return null;
       }
     },
     {
-      ttl: DOUBAN_KV_TTL,
+      ttl,
       missTtl: 600,
-
-      swr: force ? false : true,
+      swr: force ? false : swr,
       jitter: 300,
       bypass: !!force,
       revalidate: !!force,
     },
   );
   // 只缓存能用的数据，别把一次失败锁死 12 小时
-  if (isUsableBoardPayload(data)) memCacheSet(__hotListMem, memKey, data, 8);
+  if (isUsableBoardPayload(data)) memCacheSet(__hotListMem, key, data, 8);
   return data;
 }
 
+/**
+ * 豆瓣热播原始数据。
+ */
+async function getDoubanRaw(env, ctx, force) {
+  return getBoardRaw(env, ctx, {
+    key: CK.douban,
+    url: DOUBAN_API,
+    ttl: DOUBAN_KV_TTL,
+    force,
+    validateOnFetch: true,
+    swr: true,
+  });
+}
+
+/**
+ * 地区是否香港/台湾。
+ */
 function isHkTw(region) {
   if (!region) return false;
   return region.indexOf("香港") >= 0 || region.indexOf("台湾") >= 0;
@@ -4150,25 +4595,66 @@ function pickDoubanSection(data, section, filter) {
 /**
  * 把豆瓣条目渲染成网格卡片。
  */
-function renderDoubanItems(items) {
+/**
+ * 榜单卡片统一渲染。mapItem 返回要覆盖的 mediaItem 字段。
+ */
+function renderBoardMediaItems(items, mapItem) {
   if (!Array.isArray(items) || !items.length) return "";
   return items
     .map((x, i) => {
       const isMovie = x.kind === "movie";
-      return mediaItem({
+      const base = {
         poster: x.poster,
         tag: isMovie ? "电影" : "剧集",
         tagClass: isMovie ? "movie" : "episode",
         title: x.title,
         overview: x.overview,
         line1: x.year || "",
-        line2: [x.region, x.genre].filter(Boolean).join(" · "),
+        line2: "",
         delay: Math.min(i, 24) * 20,
         detailType: isMovie ? "movie" : "show",
         detailId: "tmdb-" + x.tmdbId,
-      });
+      };
+      return mediaItem(
+        mapItem ? Object.assign(base, mapItem(x, i, isMovie)) : base,
+      );
     })
     .join("");
+}
+
+/**
+ * 渲染豆瓣卡片。
+ */
+function renderDoubanItems(items) {
+  return renderBoardMediaItems(items, (x) => ({
+    line2: [x.region, x.genre].filter(Boolean).join(" · "),
+  }));
+}
+
+/**
+ * 渲染院线/平台剧场卡片。
+ */
+function renderTheaterItems(items) {
+  return renderBoardMediaItems(items, (x) => ({
+    line2: x.platform || "",
+  }));
+}
+
+/**
+ * 渲染骨朵热榜卡片。
+ */
+function renderGuduoItems(items) {
+  return renderBoardMediaItems(items, (x, i, isMovie) => {
+    const tag = x.category || (isMovie ? "电影" : "剧集");
+    const heatLine = x.heat
+      ? `热度 ${x.heat}`
+      : [x.region, x.genre].filter(Boolean).join(" · ");
+    return {
+      tag: x.rank != null ? `#${x.rank}` : tag,
+      line1: [x.year, tag].filter(Boolean).join(" · "),
+      line2: heatLine,
+    };
+  });
 }
 
 /* ==================================================================
@@ -4198,38 +4684,19 @@ async function handleDoubanList(request, env, ctx) {
  * 平台剧场原始数据（各平台正在播的内容），12 小时内存缓存 → KV。
  */
 async function getTheaterRaw(env, ctx, force) {
-  const memKey = CK.theater;
-  if (!force) {
-    const hit = memCacheGet(__hotListMem, memKey);
-    if (hit !== undefined) return hit;
-  }
-  const data = await cachedJSON(
-    env,
-    ctx,
-    memKey,
-    async () => {
-      try {
-        const r = await fetchT(THEATER_API, {}, 10000);
-        if (!r.ok) return null;
-        return await r.json();
-      } catch {
-        return null;
-      }
-    },
-    {
-      ttl: THEATER_KV_TTL,
-      missTtl: 600,
-      swr: force ? false : 57600,
-      jitter: 300,
-      bypass: !!force,
-      revalidate: !!force,
-    },
-  );
-  // 只缓存能用的数据，别把一次失败锁死 12 小时
-  if (isUsableBoardPayload(data)) memCacheSet(__hotListMem, memKey, data, 8);
-  return data;
+  return getBoardRaw(env, ctx, {
+    key: CK.theater,
+    url: THEATER_API,
+    ttl: THEATER_KV_TTL,
+    force,
+    validateOnFetch: false,
+    swr: 57600,
+  });
 }
 
+/**
+ * 递归收集剧场 JSON 中的条目。
+ */
 function collectTheaterItems(data) {
   const out = [];
   if (!data || typeof data !== "object") return out;
@@ -4368,26 +4835,6 @@ function pickTheaterSection(data, platform) {
 /**
  * 渲染平台剧场的卡片网格。
  */
-function renderTheaterItems(items) {
-  if (!Array.isArray(items) || !items.length) return "";
-  return items
-    .map((x, i) => {
-      const isMovie = x.kind === "movie";
-      return mediaItem({
-        poster: x.poster,
-        tag: isMovie ? "电影" : "剧集",
-        tagClass: isMovie ? "movie" : "episode",
-        title: x.title,
-        overview: x.overview,
-        line1: x.year || "",
-        line2: x.platform || "",
-        delay: Math.min(i, 24) * 20,
-        detailType: isMovie ? "movie" : "show",
-        detailId: "tmdb-" + x.tmdbId,
-      });
-    })
-    .join("");
-}
 
 /**
  * 榜单列表的统一响应：grid（网格）和 hscroll（横向滑动）两种形态，
@@ -4491,40 +4938,17 @@ async function handleTheaterList(request, env, ctx) {
  * 骨朵热度榜原始数据（剧集/电影/动漫/综艺），12 小时内存缓存 → KV。
  */
 async function getGuduoRaw(env, ctx, force) {
-  const memKey = CK.guduo;
-  if (!force) {
-    const hit = memCacheGet(__hotListMem, memKey);
-    if (hit !== undefined) return hit;
-  }
-  const data = await cachedJSON(
-    env,
-    ctx,
-    memKey,
-    async () => {
-      try {
-        const r = await fetchT(GUDUO_API, {}, 10000);
-        if (!r.ok) return null;
-        const data = await r.json();
-        if (!isUsableBoardPayload(data)) return null;
-        return data;
-      } catch {
-        return null;
-      }
-    },
-    {
-      ttl: GUDUO_KV_TTL,
-      missTtl: 600,
-      swr: force ? false : true,
-      jitter: 300,
-      bypass: !!force,
-      revalidate: !!force,
-    },
-  );
-  // 只缓存能用的数据，别把一次失败锁死 12 小时
-  if (isUsableBoardPayload(data)) memCacheSet(__hotListMem, memKey, data, 8);
-  return data;
+  return getBoardRaw(env, ctx, {
+    key: CK.guduo,
+    url: GUDUO_API,
+    ttl: GUDUO_KV_TTL,
+    force,
+    validateOnFetch: true,
+    swr: true,
+  });
 }
 
+/** 骨朵热榜固定分类顺序。 */
 const GUDUO_CATEGORIES = ["剧集", "电影", "动漫", "综艺"];
 
 /**
@@ -4593,30 +5017,6 @@ function pickGuduoSection(data, category) {
 /**
  * 渲染骨朵榜单卡片，带排名角标。
  */
-function renderGuduoItems(items) {
-  if (!Array.isArray(items) || !items.length) return "";
-  return items
-    .map((x, i) => {
-      const isMovie = x.kind === "movie";
-      const tag = x.category || (isMovie ? "电影" : "剧集");
-      const heatLine = x.heat
-        ? `热度 ${x.heat}`
-        : [x.region, x.genre].filter(Boolean).join(" · ");
-      return mediaItem({
-        poster: x.poster,
-        tag: x.rank != null ? `#${x.rank}` : tag,
-        tagClass: isMovie ? "movie" : "episode",
-        title: x.title,
-        overview: x.overview,
-        line1: [x.year, tag].filter(Boolean).join(" · "),
-        line2: heatLine,
-        delay: Math.min(i, 24) * 20,
-        detailType: isMovie ? "movie" : "show",
-        detailId: "tmdb-" + x.tmdbId,
-      });
-    })
-    .join("");
-}
 
 /* ==================================================================
  * 榜单：骨朵热榜
@@ -4673,6 +5073,10 @@ async function handleGuduoList(request, env, ctx) {
   return listResp(html, mode, outHeaders);
 }
 
+/**
+ * 流媒体平台配置：TMDB watch provider id、展示名、Logo。
+ * handlePlatformList 按 id 拉「正在该平台可看」列表。
+ */
 const PLATFORMS = {
   hbomax: {
     id: "hbomax",
@@ -4761,6 +5165,9 @@ const PLATFORMS = {
   },
 };
 
+/**
+ * 渲染平台片单卡片。
+ */
 function renderPlatformItems(items) {
   if (!Array.isArray(items) || !items.length) return "";
   return items
@@ -5520,6 +5927,11 @@ async function handleTrending(request, env, ctx) {
  * POST /api/watchlist/add —— 加入待看。
  * 成功后把待看版本号 +1，让所有 wl: 缓存一次性失效。
  */
+/* ==================================================================
+ * 写操作 API
+ * 待看 / 已看 / 弃剧 / 隐藏继续观看 —— 一律走 traktSyncAction 外壳
+ * ================================================================== */
+
 async function handleWatchlistAdd(request, env, ctx) {
   const A = await authed(request, env, ctx);
   if (!A.ok) return A.response;
@@ -5585,7 +5997,12 @@ async function handleWatchlistAdd(request, env, ctx) {
 
   await invalidateWatchlistCache(env, ctx, userKey);
   const result = await r.json().catch(() => null);
-  return authJson(auth, needsCookieUpdate, { ok: true, traktId, result });
+  return authJson(auth, needsCookieUpdate, {
+    ok: true,
+    traktId,
+    message: "已加入待看列表",
+    result,
+  });
 }
 
 /**
@@ -5596,6 +6013,7 @@ async function handleWatchlistRemove(request, env, ctx) {
     allowedTypes: ["movie", "show", "season", "episode"],
     endpoint: "/sync/watchlist/remove",
     buildPayload: (type, id) => traktSyncPayload(type, id),
+    okMessage: "已移出待看列表",
     afterOk: async (auth, headers, env, ctx) => {
       const userKey = await getStableUserId(auth, headers, env, ctx);
       await invalidateWatchlistCache(env, ctx, userKey);
@@ -5613,6 +6031,12 @@ async function handleMarkWatched(request, env, ctx) {
     allowedTypes: ["movie", "episode"],
     endpoint: "/sync/history",
     buildPayload: (type, id) => traktSyncPayload(type, id),
+    okMessage: (type) =>
+      type === "episode"
+        ? "已标记本集已看"
+        : type === "movie"
+          ? "已标记电影已看"
+          : "已标记为已看",
     afterOk: async (auth, headers, env, ctx, body) => {
       const userKey = await getStableUserId(auth, headers, env, ctx);
       // DELETE 必须早于缓存失效，否则"标记已看 → 立刻刷新"会读到还没删掉的暂停记录。
@@ -5642,11 +6066,15 @@ async function handleMarkWatched(request, env, ctx) {
   });
 }
 
+/**
+ * 取消已看。
+ */
 async function handleUnmarkWatched(request, env, ctx) {
   return traktSyncAction(request, env, ctx, {
     allowedTypes: ["movie", "episode"],
     endpoint: "/sync/history/remove",
     buildPayload: (type, id) => traktSyncPayload(type, id),
+    okMessage: "已取消观看记录",
     afterOk: async (auth, headers, env, ctx) => {
       const userKey = await getStableUserId(auth, headers, env, ctx);
       await bustHomeUserCaches(userKey, env, ctx);
@@ -5826,6 +6254,7 @@ async function handleMarkSeasonWatched(request, env, ctx) {
   return authJson(auth, needsCookieUpdate, {
     ok: true,
     marked: episodes.length,
+    message: `已标记本季 ${episodes.length} 集为已看`,
     result,
   });
 }
@@ -5902,6 +6331,9 @@ async function handleHideContinue(request, env, ctx) {
     s,
     e,
     playbackRemoved,
+    message: playbackRemoved
+      ? "已移除进度，该剧已从继续观看消失"
+      : "已从继续观看移除",
   });
 }
 
@@ -6006,7 +6438,16 @@ async function handleDropShow(request, env, ctx) {
 
   const added =
     result && result.added && result.added.shows ? result.added.shows : 0;
-  return authJson(auth, needsCookieUpdate, { ok: true, added, result, showId });
+  return authJson(auth, needsCookieUpdate, {
+    ok: true,
+    added,
+    showId,
+    message:
+      added === false
+        ? "这部剧已经在弃看列表里了"
+        : "已弃看，已从日历和继续观看移除",
+    result,
+  });
 }
 
 /* ==================================================================
@@ -6430,6 +6871,11 @@ async function buildSummary(headers, period, ref, env, ctx, userKey) {
  * GET / —— 首页。返回骨架 HTML（先渲染出人名/头像），
  * 具体数据由前端再请求 /api/home 填充。
  */
+/* ==================================================================
+ * 页面 HTML 路由
+ * home / launch / login —— SSR 壳；数据区由前端再拉 API
+ * ================================================================== */
+
 async function handleHome(request, env, ctx) {
   const url = new URL(request.url);
   let initialDetail = url.searchParams.get("d");
@@ -6768,6 +7214,9 @@ async function readSyncState(env, userKey) {
 
 // 内存副本不再参与读取，prev 必须从 KV 取，否则 patch 会把另一个字段覆盖掉
 // （比如只更新 sig 时把 at 抹掉，判定就退化成"从没校验过"）。
+/**
+ * 更新播放同步状态（上次 live 校验时间与活动签名），供首页判断是否需要强刷。
+ */
 async function writeSyncState(env, ctx, userKey, patch, persist = true) {
   // persist=false 表示这一轮没拿到 live 数据、要保持旧基线。
   // 那就什么都不用做：原来照样读一次 KV 再合并，纯属白读
@@ -7306,7 +7755,7 @@ async function handleHomeData(request, env, ctx) {
 
   const part = url.searchParams.get("part") || "all";
   const force = url.searchParams.get("force") === "1";
-  const liveSig = !force && url.searchParams.get("live") === "1";
+  const liveSig = url.searchParams.get("live") === "1";
 
   const fetchJson = (u, retries = 1, timeout = 7000) =>
     traktFetch(u, headers, {
@@ -7332,7 +7781,7 @@ async function handleHomeData(request, env, ctx) {
 
   // ================= 阶段 1：先看活动签名，决定要不要 bypass 打 Trakt =================
   const actSigP = wantPlayback
-    ? getUserActivitySig(headers, env, ctx, userKey, liveSig)
+    ? getUserActivitySig(headers, env, ctx, userKey, force || liveSig)
     : Promise.resolve(null);
   let pbBypass = force;
   let sigBaselineNeeded = false;
@@ -7343,7 +7792,7 @@ async function handleHomeData(request, env, ctx) {
   // pbc + 活动基线一次读出（原来分两个 key 各读一次）
   const syncState = wantPlayback ? await readSyncState(env, userKey) : null;
 
-  if (wantPlayback && !force) {
+  if (wantPlayback) {
     if (syncState && Number.isFinite(Number(syncState.at))) {
       pbLastCheckAt = Number(syncState.at);
     }
@@ -7353,6 +7802,7 @@ async function handleHomeData(request, env, ctx) {
         : Infinity;
 
     let sigChanged = false;
+    let hasBaseline = false;
     try {
       const sigEarly = await actSigP;
       if (sigEarly && sigEarly.sig) {
@@ -7360,14 +7810,22 @@ async function handleHomeData(request, env, ctx) {
           syncState && typeof syncState.sig === "string" ? syncState.sig : null;
         if (last === null) {
           sigBaselineNeeded = true;
-        } else if (last !== sigEarly.sig) {
-          sigChanged = true;
+        } else {
+          hasBaseline = true;
+          if (last !== sigEarly.sig) sigChanged = true;
         }
       }
     } catch {}
 
-    // 活动变化 → 立刻重拉；10 分钟内用 KV；超时再校验
-    if (sigChanged) {
+    if (force) {
+      /* 手动刷新：不管变没变都回源，但要把"有没有变"如实告诉前端。
+       * 原来是直接跳过整段判定，activityUnchanged 恒为 false，
+       * 前端就没法区分"拉到新数据"和"拉回来还是老样子"。 */
+      pbBypass = true;
+      pbWantLive = true;
+      activityUnchanged = hasBaseline && !sigChanged;
+    } else if (sigChanged) {
+      // 活动变化 → 立刻重拉
       pbBypass = true;
       pbWantLive = true;
       activityUnchanged = false;
@@ -7782,7 +8240,8 @@ async function handleHomeData(request, env, ctx) {
           false,
         ),
       );
-      if (stats && !stats.__error) memCacheSet(__summaryMem, statsKey, stats, 240);
+      if (stats && !stats.__error)
+        memCacheSet(__summaryMem, statsKey, stats, 240);
     });
   }
 
@@ -7848,17 +8307,19 @@ async function handleHomeData(request, env, ctx) {
     // 之前这里列表为空时直接返回空串，前端 applyPlayback 里 if(html) 不成立，
     // 骨架里的 spinner 就永远留在"继续观看"下面——这就是一直转圈的直接原因。
     const pbEmptyHint = isTraktRateLimited(userKey)
-      ? 'Trakt 限流中，稍后会自动同步'
-      : '';
+      ? "Trakt 限流中，稍后会自动同步"
+      : "";
     result.playbackHScrollHtml =
       pbHtml ||
       '<div class="empty" style="padding:50px 20px"><p style="margin:0;font-size:.92rem">' +
-      (playback == null ? '继续观看加载失败，稍后重试' : '暂无继续观看') +
-      '</p>' +
-      (pbEmptyHint
-        ? '<p style="margin:6px 0 0;font-size:.8rem;opacity:.6">' + pbEmptyHint + '</p>'
-        : '<p style="margin:6px 0 0;font-size:.8rem;opacity:.6">在 Trakt 上标记看过之后会出现在这里</p>') +
-      '</div>';
+        (playback == null ? "继续观看加载失败，稍后重试" : "暂无继续观看") +
+        "</p>" +
+        (pbEmptyHint
+          ? '<p style="margin:6px 0 0;font-size:.8rem;opacity:.6">' +
+            pbEmptyHint +
+            "</p>"
+          : '<p style="margin:6px 0 0;font-size:.8rem;opacity:.6">在 Trakt 上标记看过之后会出现在这里</p>') +
+        "</div>";
     result.playbackSource =
       playbackSrc.fromCache === true
         ? "cache"
@@ -7884,7 +8345,10 @@ async function handleHomeData(request, env, ctx) {
 
     if (!playbackDataTs) {
       playbackDataTs = userUpdatedAt || Date.now();
-      playbackAgeSec = Math.max(0, Math.round((Date.now() - playbackDataTs) / 1000));
+      playbackAgeSec = Math.max(
+        0,
+        Math.round((Date.now() - playbackDataTs) / 1000),
+      );
       playbackTsSource = "fallback";
     }
 
@@ -7901,8 +8365,7 @@ async function handleHomeData(request, env, ctx) {
       pbLastCheckAt = Date.now();
     }
 
-    const lastSyncAt =
-      pbLastCheckAt || playbackDataTs || userUpdatedAt || null;
+    const lastSyncAt = pbLastCheckAt || playbackDataTs || userUpdatedAt || null;
 
     result.pauseUpdatedAt = lastSyncAt;
     result.continueUpdatedAt = lastSyncAt;
@@ -8016,7 +8479,7 @@ async function handleHomeData(request, env, ctx) {
         env,
         ctx,
         CK.histImages(userKey),
-        20
+        20,
       ).catch(() => {});
 
       let historyPageCount = 1;
@@ -8056,7 +8519,7 @@ async function handleHomeData(request, env, ctx) {
         env,
         ctx,
         CK.calImages(userKey),
-        20
+        20,
       ).catch(() => {});
       result.calendarHtml = renderCalendarPage(calFiltered, env, {});
     } catch {
@@ -8072,7 +8535,9 @@ async function handleHomeData(request, env, ctx) {
         result.watchlistHtml = emptyWatchlistHtml();
       } else {
         const list = watchlist;
-        await attachWatchlistStills(list, env, ctx, userKey, { maxFetch: WATCHLIST_PAGE_SIZE });
+        await attachWatchlistStills(list, env, ctx, userKey, {
+          maxFetch: WATCHLIST_PAGE_SIZE,
+        });
         const firstPage = list.slice(0, WATCHLIST_PAGE_SIZE),
           hasMore = list.length > WATCHLIST_PAGE_SIZE,
           cardsHtml = renderWatchlistItems(firstPage, env),
@@ -8545,6 +9010,9 @@ async function handlePerson(request, env, ctx) {
   });
 }
 
+/**
+ * 季/集列表 API。
+ */
 async function handleSeason(request, env, ctx) {
   const url = new URL(request.url),
     showId = url.searchParams.get("show") || "",
@@ -9415,7 +9883,15 @@ async function enrichBatch(keys, env, ctx) {
       for (let i = 0; i < ks.length - ENRICH_BUCKET_MAX; i++)
         delete items[ks[i]];
     }
-    kvPutJSON(env, ctx, CK.enrichBucket(b), { items }, ENRICH_BUCKET_TTL, false, false);
+    kvPutJSON(
+      env,
+      ctx,
+      CK.enrichBucket(b),
+      { items },
+      ENRICH_BUCKET_TTL,
+      false,
+      false,
+    );
   }
 
   return out;
@@ -9460,6 +9936,9 @@ async function handleEnrich(request, env, ctx) {
   });
 }
 
+/**
+ * 服务端渲染单条媒体卡片 HTML。
+ */
 function mediaItem(opts) {
   const style =
       opts.delay != null ? ` style="animation-delay:${opts.delay}ms"` : "",
@@ -9761,6 +10240,9 @@ function buildInfuseHrefForContinue(item) {
   return `infuse://series/${tmdbId}-1`;
 }
 
+/**
+ * 继续观看列表 HTML。
+ */
 function renderContinueItems(upNext, mode = "grid") {
   if (mode === true) mode = "fragment";
 
@@ -10957,7 +11439,6 @@ async function handleMore(request, env, ctx) {
   }
 
   if (type === "playback") {
-
     const limit = limitParam > 0 ? Math.min(limitParam, 40) : 20;
 
     // 缓存里可能是旧的合并结果（数组），也可能是 v2 的原始 { paused, upNext }
@@ -11200,6 +11681,9 @@ function renderLoginPage() {
   );
 }
 
+/**
+ * 启动闪屏 HTML。
+ */
 function renderSplash() {
   return `<div id="splash" class="splash" style="position:fixed;top:0;left:0;right:0;bottom:calc(-1 * env(safe-area-inset-bottom,0px));width:100%;min-height:100%;min-height:100dvh;min-height:-webkit-fill-available;min-height:calc(100dvh + env(safe-area-inset-bottom,0px));padding-bottom:env(safe-area-inset-bottom,0px);box-sizing:border-box;z-index:99999;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000"><div class="splash-glow"></div><div class="splash-inner"><div class="splash-logo"><img src="${SPLASH_LOGO}" alt="" width="96" height="96" loading="eager" decoding="async" style="display:block;filter:drop-shadow(0 0 22px var(--splash-glow-color,rgba(125,157,212,.55)))"></div><div class="splash-name">MineTrakt</div><div class="splash-bar"><div class="splash-bar-fill"></div></div></div></div>`;
 }
@@ -11207,6 +11691,9 @@ function renderSplash() {
 const SPLASH_LOGO_IMG_RE =
   /<img src="[^"]*" alt="" width="96" height="96" loading="eager" decoding="async" style="[^"]*">/;
 
+/**
+ * 启动页 Logo SVG。
+ */
 function launchLogoSvg() {
   return (
     `<svg viewBox="0 0 96 96" width="96" height="96" role="img" aria-label="MineTrakt" xmlns="http://www.w3.org/2000/svg">` +
@@ -11220,6 +11707,9 @@ function launchLogoSvg() {
   );
 }
 
+/**
+ * 启动页关键 CSS（首屏内联）。
+ */
 function launchCriticalCss() {
   const B = "box-sizing:border-box";
 
@@ -11243,6 +11733,9 @@ function launchCriticalCss() {
   );
 }
 
+/**
+ * 启动页完整 HTML。
+ */
 function renderLaunchPage(request) {
   const loggedIn = !!readAuth(request);
   const target = loggedIn ? "/home" : "/login";
@@ -11298,6 +11791,9 @@ function renderLaunchPage(request) {
   );
 }
 
+/**
+ * 用户统计四格 HTML。
+ */
 function renderStatsHtml(s) {
   const movieCount = s ? s.movie : 0,
     showCount = s ? s.show : 0,
@@ -11339,14 +11835,23 @@ function renderStatsHtml(s) {
     .join("");
 }
 
+/**
+ * 公共 head meta / link。
+ */
 function commonHeadMeta() {
   return `<meta charset="utf-8">${THEME_BOOT_SCRIPT}<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1,user-scalable=no"><meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"><meta http-equiv="Pragma" content="no-cache"><meta name="color-scheme" content="dark light"><meta name="theme-color" content="${THEME_COLOR}"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="${APP_SHORT_NAME}"><meta name="mobile-web-app-capable" content="yes"><meta name="format-detection" content="telephone=no"><title>${APP_NAME}</title><link rel="icon" href="${FAVICON_URL}" type="image/png"><link rel="apple-touch-icon" href="${APPLE_ICON}"><link rel="manifest" href="/manifest.webmanifest"><link rel="preconnect" href="https://api.trakt.tv" crossorigin><link rel="preconnect" href="https://api.themoviedb.org" crossorigin><link rel="preconnect" href="https://image.tmdb.org" crossorigin>`;
 }
 
+/**
+ * 页面 head 前半（主题脚本等）。
+ */
 function pageHeadEarly() {
   return `<!DOCTYPE html><html lang="zh-CN" data-theme="dark"><head>${commonHeadMeta()}<link rel="preload" as="script" href="/app.js?v=${APP_JS_VERSION}"><link rel="preload" href="/app.css?v=${APP_CSS_VERSION}" as="style"><link rel="stylesheet" href="/app.css?v=${APP_CSS_VERSION}"><style>${splashCriticalCss()}</style></head><body style="background:var(--bg-solid,#000000);margin:0;min-height:100vh;min-height:100dvh">${renderSplash()}`;
 }
 
+/**
+ * 页面尾部脚本与弹层骨架。
+ */
 function pageTail() {
   const ver = `${APP_JS_VERSION}`;
   return `<script>(function(){try{if(window.__hideSplash)window.__hideSplash(true);}catch(e){}try{var s=document.getElementById('splash');if(s){s.classList.add('hide');setTimeout(function(){try{if(s&&s.parentNode)s.parentNode.removeChild(s);}catch(e){}},380);}}catch(e){}})();<\/script><script>(function(){
@@ -11375,10 +11880,16 @@ function pageTail() {
 })();<\/script></body></html>`;
 }
 
+/**
+ * 页面外壳：head + body 包装。
+ */
 function pageShell(body) {
   return pageHeadEarly() + body + pageTail();
 }
 
+/**
+ * 闪屏关键 CSS。
+ */
 function splashCriticalCss() {
   return `html,body{background:var(--bg-solid,#000);color:var(--text,#eef1f7);margin:0;padding:0;min-height:100%;min-height:100dvh}
 *{box-sizing:border-box}
@@ -11413,6 +11924,9 @@ function splashCriticalCss() {
 `;
 }
 
+/**
+ * 首页引导脚本（更新时间、局部刷新等）。
+ */
 function getBootstrapScript() {
   return `(function(){var __CFG=window.__HOME_CONFIG__||{};if(!__CFG.loggedIn)return;window.__HOME_CONFIG__=null;if(__CFG.initialDetail)window.__initialDetail=__CFG.initialDetail;if(!window.__splashT0)window.__splashT0=Date.now();window.__splashHidden=false;window.__hideSplash=function(force){try{if(window.__splashHidden)return;window.__splashHidden=true;var el=document.getElementById('splash');if(!el)return;var wait=force?0:Math.max(0,120-(Date.now()-(window.__splashT0||Date.now())));setTimeout(function(){try{el.classList.add('hide');setTimeout(function(){try{if(el&&el.parentNode)el.parentNode.removeChild(el);}catch(e){}},280);}catch(e){}},wait);}catch(e){}};setTimeout(function(){if(window.__hideSplash)window.__hideSplash();},80);function lsGet(k){try{var v=localStorage.getItem(k);if(!v)return null;var o=JSON.parse(v);if(o&&o._exp&&o._exp<Date.now()){try{localStorage.removeItem(k);}catch(e){}return null;}return o&&o.data?o.data:null;}catch(e){return null;}}function lsSet(k,d,ttlSec){try{localStorage.setItem(k,JSON.stringify({data:d,_exp:Date.now()+ttlSec*1000}));}catch(e){try{localStorage.removeItem(k);}catch(e2){}}}window.__lsGet=lsGet;window.__lsSet=lsSet;function setHTML(sel,html){var el=typeof sel==='string'?document.querySelector(sel):sel;if(el)el.innerHTML=html||'';}window.__setHTML=setHTML;function applyAvatar(url,alts){if(!url)return;var av=document.getElementById('hero-avatar');if(!av)return;var list=[url];if(alts&&alts.length){for(var a=0;a<alts.length;a++){if(alts[a]&&alts[a]!==url)list.push(alts[a]);}}list.push('/avatar?u='+encodeURIComponent(url));var i=0;function next(){if(i>=list.length){av.innerHTML='<span class="hero-avatar-ph">👤</span>';return;}var src=list[i++];var img=document.createElement('img');img.onerror=next;img.alt='';img.width=56;img.height=56;img.decoding='async';img.setAttribute('referrerpolicy','no-referrer');img.src=src;av.innerHTML='';av.appendChild(img);}next();}
 function __fmtFull(ts){
@@ -11467,14 +11981,21 @@ function __setUpdatedAt(source,ageSec,dataTs){
     best=Date.now();
   }
   window.__lastDataUpdateAt=best;
-  el.textContent='进度已同步 · '+__fmtShort(best);
-  el.title='最后同步时间：'+__fmtFull(best);
+  /* source='nochange' 表示这一轮确实回到上游问过了，但 Trakt 那边没有新动作。
+   * 它和 'cache'（根本没去问）在语义上不一样，所以要单独给文案，
+   * 否则用户看到"进度已同步"会以为又拉了一遍，看不出去问过且没变。 */
+  var same=source==='nochange';
+  el.textContent=(same?'已是最新 · ':'进度已同步 · ')+__fmtShort(best);
+  el.title=(same?'已是最新，无需更新。最后同步：':'最后同步时间：')+__fmtFull(best);
   el.classList.remove('flash','src-live','src-cache');
   void el.offsetWidth;
   el.classList.add('flash');
-  if(source==='cache') el.classList.add('src-cache');
+  if(source==='cache'||same) el.classList.add('src-cache');
   else el.classList.add('src-live');
 }
+/**
+ * applyPlayback
+ */
 function applyPlayback(d,isCache){
   if(!d)return;
   if(d.playbackHScrollHtml){window.__lastPbHtml=d.playbackHScrollHtml;setHTML('#playback-hscroll',d.playbackHScrollHtml);}
@@ -11498,6 +12019,10 @@ function applyPlayback(d,isCache){
   } else if(window.__manualRefreshPending){
     __setUpdatedAt('manual',age,dataTs);
     window.__manualRefreshPending=false;
+  } else if(d.activityUnchanged===true){
+    /* 回源问过了，但 Trakt 侧活动签名没变 —— 数据本来就是最新的。
+     * 角标照实写"已是最新"，不要写成"进度已同步"，那会让人以为又拿到了新东西。 */
+    __setUpdatedAt('nochange',age,dataTs);
   } else {
     __setUpdatedAt(src||'live',age,dataTs);
   }
@@ -11508,6 +12033,9 @@ try{
   if(window.__mtSyncAt) __setUpdatedAt('boot',null,window.__mtSyncAt);
   else __setUpdatedAt('boot');
 }catch(e){}
+/**
+ * applyMeta
+ */
 function applyMeta(d,isCache){if(!d)return;var n=document.getElementById('hero-name');if(n&&d.name)n.textContent=d.name;applyAvatar(d.avatar,d.avatarAlt);if(d.statsHtml)setHTML('#stats-box',d.statsHtml);if(!isCache)try{lsSet('mt:meta',d,604800);}catch(e){}}window.__applyMeta=applyMeta;var __homeDataLoading=false;
 /* 带超时的 fetch：后端如果卡在 Trakt 限流排队上，不能让前端无限转圈 */
 function __fetchWithTimeout(url,opts,ms){
@@ -11517,6 +12045,9 @@ function __fetchWithTimeout(url,opts,ms){
   return fetch(url,opts).then(function(r){if(timer)clearTimeout(timer);return r;},function(e){if(timer)clearTimeout(timer);throw e;});
 }
 
+/**
+ * fetchPart
+ */
 function fetchPart(part,force,live){return __fetchWithTimeout('/api/home-data?part='+encodeURIComponent(part)+(force?'&force=1':'')+(live?'&live=1':''),{credentials:'same-origin',cache:'no-store'},30000).then(function(r){if(r.status===401){return r.json().catch(function(){return{};}).then(function(d){var msg=(d&&d.error)||'登录已失效，请重新登录';try{sessionStorage.setItem('mt:relogin',msg);}catch(e){}if(window.__toast)window.__toast(msg,{type:'warn',duration:2200});setTimeout(function(){location.href='/login';},1000);return null;});}if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){if(!d)return null;if(d.login){location.href='/login';return null;}return d;});}window.__fetchPart=fetchPart;var __loadedParts={};function loadPartOnce(part){if(__loadedParts[part])return Promise.resolve(__loadedParts[part]);return fetchPart(part).then(function(d){__loadedParts[part]=d;return d;});}window.__loadPartOnce=loadPartOnce;window.__loadedParts=__loadedParts;function loadHomeData(opts){
   opts=opts||{};
   var silent=!!opts.silent;
@@ -11577,9 +12108,27 @@ function fetchPart(part,force,live){return __fetchWithTimeout('/api/home-data?pa
     if(window.requestIdleCallback)requestIdleCallback(runMeta,{timeout:1500});
     else setTimeout(runMeta,200);
   });
-}var __refreshTick=0,__lastUserAct=Date.now(),__lastBoardReload=Date.now();['scroll','click','touchstart','keydown'].forEach(function(t){window.addEventListener(t,function(){__lastUserAct=Date.now();},{passive:true});});function silentRefresh(){if(document.hidden)return;var __m=document.getElementById('modal');if(__m&&__m.classList.contains('open'))return;if(window.__forceRefreshing||window.__homeDataLoading)return;if(window.__silentRefreshing)return;window.__silentRefreshing=true;__refreshTick++;__lastRefreshAt=Date.now();function __applySilent(d,fromRetry){if(!d)return false;var dataTs=d.lastSyncAt||d.continueUpdatedAt||d.pauseUpdatedAt||d.playbackDataTs||null;if(dataTs){try{var n=Number(dataTs);if(isFinite(n)&&n>0)__setUpdatedAt(d.stale||d.refreshFailed?'cache':(d.playbackSource||'live'),null,n);}catch(e){}}if(d.stale||d.refreshFailed){if(window.__toast&&(!window.__staleToastAt||Date.now()-(window.__staleToastAt||0)>120000)){window.__staleToastAt=Date.now();window.__toast(d.cooling?'同步失败（限流），仍显示缓存':'同步失败，仍显示缓存',{type:'warn',duration:2800});}try{lsSet('mt:pb',d,600);}catch(e){}return true;}var prevHtml=window.__lastPbHtml||null;var newHtml=(d&&d.playbackHScrollHtml)||null;if(d.activityUnchanged&&newHtml&&prevHtml&&prevHtml===newHtml){try{lsSet('mt:pb',d,600);}catch(e){}return true;}if(newHtml){applyPlayback(d);try{lsSet('mt:pb',d,600);}catch(e){}if(prevHtml&&newHtml!==prevHtml&&window.__toast)window.__toast('已自动更新观看进度',{type:'success',duration:2000});return true;}return !!dataTs;}fetchPart('playback',false,true).then(function(d){if(__applySilent(d))return;return fetchPart('playback',false,true).then(function(d2){__applySilent(d2,true);});}).catch(function(){return new Promise(function(r){setTimeout(r,2000);}).then(function(){return fetchPart('playback',false,true).then(function(d){if(!__applySilent(d)&&window.__toast)window.__toast('自动同步失败，请稍后手动刷新',{type:'warn',duration:2800});}).catch(function(){if(window.__toast)window.__toast('自动同步失败，请稍后手动刷新',{type:'warn',duration:2800});});});}).finally(function(){window.__silentRefreshing=false;});}window.__refreshStats=silentRefresh;
-window.forceRefresh=async function(){if(window.__forceRefreshing)return;window.__forceRefreshing=true;window.__manualRefreshPending=true;try{localStorage.removeItem('mt:pb');localStorage.removeItem('mt:meta');try{window.__cwMoreCache=null;}catch(e){}}catch(e){}var btn=document.getElementById('btn-refresh');var span=btn&&btn.querySelector('span');var oldText=span?span.textContent:'刷新';if(btn)btn.classList.add('loading');if(span)span.textContent='刷新中';var okCount=0,cacheCount=0,failCount=0,cooling=0,hitLimit=false;var GAP_OK=0,GAP_LIMIT=600;try{var wanted=['playback','meta','calendar'];var loaded=window.__loadedParts||{};['history','watchlist'].forEach(function(p){if(loaded[p]&&wanted.indexOf(p)<0)wanted.push(p);});for(var i=0;i<wanted.length;i++){if(hitLimit)break;var part=wanted[i];if(i>0){var gap=cooling>0?GAP_LIMIT:GAP_OK;await new Promise(function(r){setTimeout(r,gap);});}var d=null;try{d=await __enqueueTrakt(function(){return fetchPart(part,true);});}catch(e){d=null;}if(!d){failCount++;continue;}var isCache=false;if(part==='playback'&&d.playbackSource==='cache')isCache=true;if(part==='meta'&&d.metaSource==='cache')isCache=true;if(part==='calendar'&&d.calendarSource==='cache')isCache=true;if(isCache)cacheCount++;else okCount++;if(part==='playback'){applyPlayback(d);try{lsSet('mt:pb',d,900);}catch(e){}}else if(part==='meta'){applyMeta(d,false);}else if(part==='watchlist'||part==='calendar'||part==='history'){__applyPart(part,d);__savePartSnap(part,d);}window.__loadedParts[part]=d;if(__partFailed(d)){try{delete window.__loadedParts[part];}catch(e){}}if(d.rateLimited||(d.cooling&&d.cooling>0)){hitLimit=true;cooling=Math.max(cooling,Number(d.cooling)||0);}else if(isCache&&(part==='playback'||part==='meta')){hitLimit=true;}}if(failCount&&!okCount&&!cacheCount){__errToast('刷新失败',new Error('无法连接，请检查网络后重试'));}else if(hitLimit){var msg=cooling>0?('刷新失败，Trakt 限流约 '+cooling+' 秒，已显示缓存'):'刷新失败，已显示缓存';__toast(msg,{type:'warn',duration:4200});}else if(failCount||cacheCount){__toast('已刷新观看数据（部分仍为缓存）',{type:'warn',duration:2800});}else{__toast('已刷新观看数据',{type:'success',duration:1800});}if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){__errToast('刷新失败',e);}finally{if(btn)btn.classList.remove('loading');if(span)span.textContent=oldText;window.__forceRefreshing=false;}};
-function startHomeData(){loadHomeData({silent:false});}if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',startHomeData);}else{startHomeData();}var REFRESH_MS=${HOME_AUTO_REFRESH_MINUTES}*60*1000;var __lastRefreshAt=Date.now();if(REFRESH_MS>0){setInterval(function(){if(Date.now()-__lastUserAct<60000)return;silentRefresh();},REFRESH_MS);document.addEventListener('visibilitychange',function(){if(document.hidden)return;if(Date.now()-__lastRefreshAt<60000)return;silentRefresh();});}})();`;
+}var __refreshTick=0,__lastUserAct=Date.now(),__lastBoardReload=Date.now();['scroll','click','touchstart','keydown'].forEach(function(t){window.addEventListener(t,function(){__lastUserAct=Date.now();},{passive:true});});var __noChangeToastAt=0;
+/* 数据没变时的反馈策略：
+ *   - 手动点刷新   → 每次都提示（用户主动问的，必须回答）
+ *   - 从后台切回来 → 提示，但 5 分钟最多一次（切来切去太频繁会烦）
+ *   - 10 分钟定时  → 不弹 toast，只把角标改成"已是最新"（后台行为不该打断） */
+function __onNoChange(reason){
+  try{__setUpdatedAt('nochange');}catch(e){}
+  if(reason!=='visible')return;
+  if(Date.now()-__noChangeToastAt<300000)return;
+  __noChangeToastAt=Date.now();
+  __toastOnce('nochange','已是最新，暂无更新',{type:'info',duration:2000});
+}
+/**
+ * silentRefresh
+ */
+function silentRefresh(reason){if(document.hidden)return;var __m=document.getElementById('modal');if(__m&&__m.classList.contains('open'))return;if(window.__forceRefreshing||window.__homeDataLoading)return;if(window.__silentRefreshing)return;window.__silentRefreshing=true;__refreshTick++;__lastRefreshAt=Date.now();function __applySilent(d,fromRetry){if(!d)return false;var dataTs=d.lastSyncAt||d.continueUpdatedAt||d.pauseUpdatedAt||d.playbackDataTs||null;if(dataTs){try{var n=Number(dataTs);if(isFinite(n)&&n>0)__setUpdatedAt(d.stale||d.refreshFailed?'cache':(d.playbackSource||'live'),null,n);}catch(e){}}if(d.stale||d.refreshFailed){if(window.__toast&&(!window.__staleToastAt||Date.now()-(window.__staleToastAt||0)>120000)){window.__staleToastAt=Date.now();window.__toast(d.cooling?'同步失败（限流），仍显示缓存':'同步失败，仍显示缓存',{type:'warn',duration:2800});}try{lsSet('mt:pb',d,600);}catch(e){}return true;}var prevHtml=window.__lastPbHtml||null;var newHtml=(d&&d.playbackHScrollHtml)||null;if(d.activityUnchanged&&newHtml&&prevHtml&&prevHtml===newHtml){try{lsSet('mt:pb',d,600);}catch(e){}__onNoChange(reason);return true;}if(newHtml){applyPlayback(d);try{lsSet('mt:pb',d,600);}catch(e){}if(prevHtml&&newHtml!==prevHtml&&window.__toast)window.__toast('已自动更新观看进度',{type:'success',duration:2000});return true;}return !!dataTs;}fetchPart('playback',false,true).then(function(d){if(__applySilent(d))return;return fetchPart('playback',false,true).then(function(d2){__applySilent(d2,true);});}).catch(function(){return new Promise(function(r){setTimeout(r,2000);}).then(function(){return fetchPart('playback',false,true).then(function(d){if(!__applySilent(d)&&window.__toast)window.__toast('自动同步失败，请稍后手动刷新',{type:'warn',duration:2800});}).catch(function(){if(window.__toast)window.__toast('自动同步失败，请稍后手动刷新',{type:'warn',duration:2800});});});}).finally(function(){window.__silentRefreshing=false;});}window.__refreshStats=silentRefresh;
+window.forceRefresh=async function(){if(window.__forceRefreshing)return;window.__forceRefreshing=true;window.__manualRefreshPending=true;try{localStorage.removeItem('mt:pb');localStorage.removeItem('mt:meta');try{window.__cwMoreCache=null;}catch(e){}}catch(e){}var btn=document.getElementById('btn-refresh');var span=btn&&btn.querySelector('span');var oldText=span?span.textContent:'刷新';if(btn)btn.classList.add('loading');if(span)span.textContent='刷新中';var okCount=0,cacheCount=0,failCount=0,cooling=0,hitLimit=false,pbUnchanged=false,pbSeen=false;var GAP_OK=0,GAP_LIMIT=600;try{var wanted=['playback','meta','calendar'];var loaded=window.__loadedParts||{};['history','watchlist'].forEach(function(p){if(loaded[p]&&wanted.indexOf(p)<0)wanted.push(p);});for(var i=0;i<wanted.length;i++){if(hitLimit)break;var part=wanted[i];if(i>0){var gap=cooling>0?GAP_LIMIT:GAP_OK;await new Promise(function(r){setTimeout(r,gap);});}var d=null;try{d=await __enqueueTrakt(function(){return fetchPart(part,true);});}catch(e){d=null;}if(!d){failCount++;continue;}var isCache=false;if(part==='playback'&&d.playbackSource==='cache')isCache=true;if(part==='meta'&&d.metaSource==='cache')isCache=true;if(part==='calendar'&&d.calendarSource==='cache')isCache=true;if(isCache)cacheCount++;else okCount++;if(part==='playback'){pbSeen=true;if(d&&d.activityUnchanged===true)pbUnchanged=true;applyPlayback(d);try{lsSet('mt:pb',d,900);}catch(e){}}else if(part==='meta'){applyMeta(d,false);}else if(part==='watchlist'||part==='calendar'||part==='history'){__applyPart(part,d);__savePartSnap(part,d);}window.__loadedParts[part]=d;if(__partFailed(d)){try{delete window.__loadedParts[part];}catch(e){}}if(d.rateLimited||(d.cooling&&d.cooling>0)){hitLimit=true;cooling=Math.max(cooling,Number(d.cooling)||0);}else if(isCache&&(part==='playback'||part==='meta')){hitLimit=true;}}if(failCount&&!okCount&&!cacheCount){__errToast('刷新失败',new Error('无法连接，请检查网络后重试'));}else if(hitLimit){var msg=cooling>0?('刷新失败，Trakt 限流约 '+cooling+' 秒，已显示缓存'):'刷新失败，已显示缓存';__toast(msg,{type:'warn',duration:4200});}else if(failCount||cacheCount){__toast('已刷新观看数据（部分仍为缓存）',{type:'warn',duration:2800});}else if(pbSeen&&pbUnchanged){__toast('已是最新，暂无更新',{type:'info',duration:2000});try{__setUpdatedAt('nochange');}catch(e){}}else{__toast('已刷新观看数据',{type:'success',duration:1800});}if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){__errToast('刷新失败',e);}finally{if(btn)btn.classList.remove('loading');if(span)span.textContent=oldText;window.__forceRefreshing=false;}};
+/**
+ * startHomeData
+ */
+function startHomeData(){loadHomeData({silent:false});}if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',startHomeData);}else{startHomeData();}var REFRESH_MS=${HOME_AUTO_REFRESH_MINUTES}*60*1000;var __lastRefreshAt=Date.now();if(REFRESH_MS>0){setInterval(function(){if(Date.now()-__lastUserAct<60000)return;silentRefresh();},REFRESH_MS);document.addEventListener('visibilitychange',function(){if(document.hidden)return;if(Date.now()-__lastRefreshAt<60000)return;silentRefresh('visible');});}})();`;
 }
 
 /* ==================================================================
@@ -11587,50 +12136,175 @@ function startHomeData(){loadHomeData({silent:false});}if(document.readyState===
  * 以下全部是浏览器端代码，通过 /app.js 下发
  * ================================================================== */
 
+/**
+ * 浏览器端完整脚本（由 /app.js 下发）。
+ * 职责概览：
+ *   - 首页分区刷新（playback / meta / 列表）
+ *   - 详情弹层、搜索、榜单横向滑动
+ *   - 标记已看 / 待看 / 弃剧等写操作 + toast
+ *   - 主题切换、小结、人物弹层、播出日历
+ *   - enrich 批量补海报
+ * 与服务端约定：写接口返回 { ok, message, error, cooling }；
+ * 错误文案优先使用服务端 humanize 后的 error。
+ */
 function getClientSideScripts() {
   return (
     getBootstrapScript() +
     `
+/** HTML 转义，防 XSS */
 function __esc(s){s=String(s==null?'':s);return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
-async function __traktPost(url,payload){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload||{})});if(!r.ok){let errMsg='HTTP '+r.status,cooling=0,source='';try{const j=await r.json();errMsg=(j&&(j.error||j.message))||('HTTP '+r.status);if(j&&j.cooling)cooling=Number(j.cooling)||0;if(j&&j.source)source=j.source;}catch(e){try{const t=await r.text();if(t)errMsg+=' '+t;}catch(e2){}}if(cooling)errMsg+='（冷却 '+cooling+' 秒）';var err=new Error(errMsg);err.cooling=cooling;err.source=source;throw err;}try{return await r.json();}catch(e){return null;}}
+/* ------------------------------------------------------------------
+ * 统一写请求出口
+ *
+ * 以前成功提示散落在每个按钮的 handler 里（有的写 __toast，有的没写），
+ * 失败提示只有一半的 handler 接住了，于是出现"点了没反应"。
+ * 现在所有改数据的请求都走 __apiWrite：
+ *   - 成功：优先用服务端返回的 message，没有则用调用方传的 okMsg；
+ *   - 失败：401 跳登录、429 显示冷却、网关 HTML 错误页不再整段吐给用户；
+ *   - 相同提示 2.5 秒内只弹一次，避免连点或轮询刷屏。
+ * ------------------------------------------------------------------ */
+var __toastSeen={};
+/** 同 key 去重的 toast，避免限流提示刷屏 */
+function __toastOnce(key,message,opts){
+  if(!message)return;
+  var now=Date.now(),last=__toastSeen[key]||0;
+  if(now-last<2500)return;
+  __toastSeen[key]=now;
+  if(Object.keys(__toastSeen).length>200)__toastSeen={};
+  __toast(message,opts);
+}
+window.__toastOnce=__toastOnce;
+
+/** 写接口统一封装：排队、错误 humanize、成功 toast */
+async function __apiWrite(url,payload,opts){
+  opts=opts||{};
+  var prefix=opts.failPrefix!=null?opts.failPrefix:'操作失败';
+  var r;
+  try{
+    r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',cache:'no-store',body:JSON.stringify(payload||{})});
+  }catch(e){
+    var ne=new Error('网络连接失败，请检查网络后重试');
+    ne.network=1;
+    if(!opts.silent)__errToast(prefix,ne);
+    throw ne;
+  }
+
+  var raw='';
+  try{raw=await r.text();}catch(e){}
+  var data=null;
+  try{data=raw?JSON.parse(raw):null;}catch(e){data=null;}
+
+  if(!r.ok){
+    if(r.status===401){
+      var msg401=(data&&(data.error||data.message))||'登录已失效，请重新登录';
+      try{sessionStorage.setItem('mt:relogin',msg401);}catch(e){}
+      __toast(msg401,{type:'warn',duration:2200});
+      setTimeout(function(){location.href='/login';},900);
+      var e401=new Error(msg401);e401.relogin=1;throw e401;
+    }
+    var rawMsg=(data&&(data.error||data.message))||('HTTP '+r.status);
+    /* 上游 5xx 时网关可能回一整页 HTML，直接塞进 toast 会看到一堆标签 */
+    if(!data&&raw&&!/^\s*[\[{]/.test(raw))rawMsg='服务暂时不可用（HTTP '+r.status+'）';
+    var cooling=Number((data&&data.cooling)||0);
+    var source=(data&&data.source)||'';
+    var err=new Error(__humanizeClientError(rawMsg,cooling));
+    err.status=r.status;err.cooling=cooling;err.source=source;
+    if(!opts.silent)__errToast(prefix,err);
+    throw err;
+  }
+
+  var okMsg=(data&&data.message)||opts.okMsg||'';
+  if(okMsg&&!opts.silent)
+    __toastOnce('ok:'+url+':'+okMsg,okMsg,{type:'success',duration:opts.okDuration||2200});
+  return data;
+}
+window.__apiWrite=__apiWrite;
+
+/* 兼容旧签名：静默版，只负责把错误结构化后抛出去，提示交给调用方 */
+async function __traktPost(url,payload){
+  return __apiWrite(url,payload,{silent:true});
+}
+/** 底部 toast 提示 */
 function __toast(message,opts){opts=opts||{};if(!message)return;var type=opts.type||'info';var duration=opts.duration||2600;var container=document.getElementById('toast-container');if(!container){container=document.createElement('div');container.id='toast-container';document.body.appendChild(container);}var toast=document.createElement('div');toast.className='toast toast-'+type;var icons={success:'✓',error:'✕',warn:'!',info:'i'};toast.innerHTML='<span class="toast-icon">'+(icons[type]||icons.info)+'</span><span class="toast-msg">'+__esc(message)+'</span>';container.appendChild(toast);requestAnimationFrame(function(){toast.classList.add('toast-in');});var remove=function(){if(!toast.parentNode)return;toast.classList.remove('toast-in');toast.classList.add('toast-out');setTimeout(function(){if(toast.parentNode)toast.parentNode.removeChild(toast);},260);};var timer=setTimeout(remove,duration);toast.addEventListener('click',function(){clearTimeout(timer);remove();});}window.__toast=__toast;
-var __THEME_KEY='mt:theme',__THEME_CYCLE=['dark','light','system'];
+/** localStorage 主题 key */
+var __THEME_KEY='mt:theme';
+/** 主题切换顺序 */
+var __THEME_CYCLE=['dark','light','system'];
+/** 主题选项展示文案 */
 var __THEME_LABEL={dark:'深色',light:'浅色',system:'跟随系统'};
 var __THEME_ICONS={
 dark:'<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>',
 light:'<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4"/></svg>',
 system:'<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none"/></svg>'};
+/** 读取主题偏好：light | dark | system */
 function __getTheme(){try{var t=localStorage.getItem(__THEME_KEY);return __THEME_CYCLE.indexOf(t)>=0?t:'dark';}catch(e){return 'dark';}}
+/** 将主题偏好解析为是否深色 */
 function __resolveDark(t){if(t==='system'){try{return !window.matchMedia||matchMedia('(prefers-color-scheme: dark)').matches;}catch(e){return true;}}return t!=='light';}
+/** 应用主题到 documentElement 与 meta theme-color */
 function __applyTheme(t){var dark=__resolveDark(t);var d=document.documentElement;d.setAttribute('data-theme',t);d.style.backgroundColor=dark?'#050505':'#ffffff';var tc=document.querySelector('meta[name="theme-color"]');if(tc)tc.setAttribute('content',dark?'#050505':'#ffffff');var cs=document.querySelector('meta[name="color-scheme"]');if(cs)cs.setAttribute('content',dark?'dark':'light');var sb=document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]');if(sb)sb.setAttribute('content',dark?'black-translucent':'default');var icon=document.getElementById('theme-icon');if(icon)icon.innerHTML=__THEME_ICONS[t]||__THEME_ICONS.dark;var btn=document.getElementById('btn-theme');if(btn){btn.setAttribute('aria-label','切换主题：'+__THEME_LABEL[t]);btn.setAttribute('title','主题：'+__THEME_LABEL[t]);}}
 window.__applyTheme=__applyTheme;window.__getTheme=__getTheme;
 window.cycleTheme=function(){var cur=__getTheme();var next=__THEME_CYCLE[(__THEME_CYCLE.indexOf(cur)+1)%__THEME_CYCLE.length];try{localStorage.setItem(__THEME_KEY,next);}catch(e){}__applyTheme(next);if(window.__toast)__toast('已切换主题：'+__THEME_LABEL[next],{type:'info',duration:1500});};
 (function(){__applyTheme(__getTheme());try{var mq=matchMedia('(prefers-color-scheme: dark)');var onChange=function(){if(__getTheme()==='system')__applyTheme('system');};if(mq.addEventListener)mq.addEventListener('change',onChange);else if(mq.addListener)mq.addListener(onChange);}catch(e){}})();
-function __humanizeClientError(msg,cooling){msg=String(msg||'').trim();if(!msg)return'操作失败，请稍后重试';if(msg.indexOf('登录已过期')>=0||msg.indexOf('unauthorized')>=0)return'登录已过期，请重新登录';if(/Cloudflare|cf-mitigated|error code:\\s*1015/i.test(msg)){if(cooling&&cooling>0)return'被 Cloudflare 拦截，本地冷却中，约 '+cooling+' 秒后再试（期间显示缓存）';return'被 Cloudflare 拦截，请稍后再试（当前已用缓存）';}if(/Trakt 官方限流|Trakt 限流|限流|过于频繁|429/.test(msg)){if(cooling&&cooling>0)return'Trakt 官方限流，本地冷却中，约 '+cooling+' 秒后再试（期间显示缓存，无需反复刷新）';return'Trakt 官方限流，请稍后再试（当前已用缓存）';}if(/网络|timeout|abort|Failed to fetch/i.test(msg))return'网络连接失败，请检查网络后重试';if(/^HTTP\\s*5\\d{2}/i.test(msg))return'Trakt 服务暂时不可用（5xx），请稍后重试';if(/^HTTP\\s*404/i.test(msg))return'未找到对应内容';if(/^HTTP\\s*403/i.test(msg))return'没有权限执行此操作';if(/^HTTP\\s*401/i.test(msg))return'登录已过期，请重新登录';if(/^HTTP\\s*\\d+/i.test(msg))return'请求失败，请稍后重试';if(/[\\u4e00-\\u9fff]/.test(msg))return msg;return msg;}function __errToast(prefix,err){var msg=(err&&err.message)?err.message:String(err||'未知错误');var cooling=err&&err.cooling;msg=__humanizeClientError(msg,cooling);var t='error';if(msg.indexOf('429')>=0||msg.indexOf('限流')>=0||msg.indexOf('频繁')>=0||msg.indexOf('冷却')>=0)t='warn';if(msg.indexOf('网络')>=0||msg.indexOf('暂时不可用')>=0)t='warn';__toast((prefix?prefix+'：':'')+msg,{type:t,duration:t==='warn'?3600:2800});}window.__errToast=__errToast;
+/** 客户端错误文案兜底（优先信任服务端已翻译的 error） */
+function __humanizeClientError(msg,cooling){msg=String(msg||'').trim();if(!msg)return'操作失败，请稍后重试';if(msg.indexOf('登录已过期')>=0||msg.indexOf('unauthorized')>=0)return'登录已过期，请重新登录';if(/Cloudflare|cf-mitigated|error code:\\s*1015/i.test(msg)){if(cooling&&cooling>0)return'被 Cloudflare 拦截，本地冷却中，约 '+cooling+' 秒后再试（期间显示缓存）';return'被 Cloudflare 拦截，请稍后再试（当前已用缓存）';}if(/Trakt 官方限流|Trakt 限流|限流|过于频繁|429/.test(msg)){if(cooling&&cooling>0)return'Trakt 官方限流，本地冷却中，约 '+cooling+' 秒后再试（期间显示缓存，无需反复刷新）';return'Trakt 官方限流，请稍后再试（当前已用缓存）';}if(/网络|timeout|abort|Failed to fetch/i.test(msg))return'网络连接失败，请检查网络后重试';if(/^HTTP\\s*5\\d{2}/i.test(msg))return'Trakt 服务暂时不可用（5xx），请稍后重试';if(/^HTTP\\s*404/i.test(msg))return'未找到对应内容';if(/^HTTP\\s*403/i.test(msg))return'没有权限执行此操作';if(/^HTTP\\s*401/i.test(msg))return'登录已过期，请重新登录';if(/^HTTP\\s*\\d+/i.test(msg))return'请求失败，请稍后重试';if(/[\\u4e00-\\u9fff]/.test(msg))return msg;return msg;}function __errToast(prefix,err){
+  /* 同一个错误只提示一次。
+   * __apiWrite 内部已经弹过，调用方的 catch 又会弹一遍 —— 不去重就是两条一样的 toast。 */
+  if(err&&err.__toasted)return;
+  if(err&&typeof err==='object'){try{err.__toasted=1;}catch(e){}}
+  var msg=(err&&err.message)?err.message:String(err||'未知错误');var cooling=err&&err.cooling;msg=__humanizeClientError(msg,cooling);
+  /* 同一个文案 2.5 秒内只弹一次：连点五次失败不该出现五条一样的提示 */
+  var __k='err:'+prefix+'：'+msg;
+  if(__toastSeen[__k]&&Date.now()-__toastSeen[__k]<2500){return;}
+  __toastSeen[__k]=Date.now();
+  var t='error';if(msg.indexOf('429')>=0||msg.indexOf('限流')>=0||msg.indexOf('频繁')>=0||msg.indexOf('冷却')>=0)t='warn';if(msg.indexOf('网络')>=0||msg.indexOf('暂时不可用')>=0)t='warn';__toast((prefix?prefix+'：':'')+msg,{type:t,duration:t==='warn'?3600:2800});}window.__errToast=__errToast;
+/** 解析 API JSON；非 ok 时带上 humanize 后的 error */
 async function __apiJson(r){var data=null;try{data=await r.json();}catch(e){data=null;}if(!r.ok){if(r.status===401&&data&&data.relogin){var msg=data.error||'登录已失效，请重新登录';try{sessionStorage.setItem('mt:relogin',msg);}catch(e){}__toast(msg,{type:'warn',duration:2200});setTimeout(function(){location.href='/login';},1000);var err=new Error(msg);err.relogin=true;throw err;}var msg2=(data&&data.error)||('HTTP '+r.status);var err2=new Error(__humanizeClientError(msg2,data&&data.cooling));if(data&&data.cooling!=null)err2.cooling=data.cooling;throw err2;}return data;}window.__apiJson=__apiJson;
+/** 通用确认弹窗，返回 Promise<boolean> */
 function __confirm(opts){opts=opts||{};return new Promise(function(resolve){var modal=document.getElementById('confirm-modal');if(!modal){resolve(window.confirm(opts.message||opts.title||'确认操作'));return;}var iconEl=document.getElementById('confirm-icon'),titleEl=document.getElementById('confirm-title'),msgEl=document.getElementById('confirm-msg'),okBtn=document.getElementById('confirm-ok'),cancelBtn=document.getElementById('confirm-cancel'),backdrop=modal.querySelector('.confirm-backdrop');iconEl.className='confirm-icon'+(opts.tone?' '+opts.tone:'');iconEl.textContent=opts.icon||'?';titleEl.textContent=opts.title||'确认操作';msgEl.textContent=opts.message||'';msgEl.style.display=opts.message?'':'none';okBtn.textContent=opts.okText||'确定';cancelBtn.textContent=opts.cancelText||'取消';okBtn.className='confirm-btn confirm-ok'+(opts.tone==='danger'?' danger':'');var settled=false;function cleanup(){okBtn.removeEventListener('click',onOk);cancelBtn.removeEventListener('click',onCancel);backdrop.removeEventListener('click',onCancel);document.removeEventListener('keydown',onKey,true);modal.classList.remove('open');modal.style.display='none';}function finish(v){if(settled)return;settled=true;cleanup();resolve(v);}function onOk(){finish(true);}function onCancel(){finish(false);}function onKey(e){if(e.key==='Escape'){e.preventDefault();e.stopPropagation();finish(false);}}okBtn.addEventListener('click',onOk);cancelBtn.addEventListener('click',onCancel);backdrop.addEventListener('click',onCancel);document.addEventListener('keydown',onKey,true);modal.style.display='block';modal.classList.add('open');setTimeout(function(){try{okBtn.focus();}catch(err){}},40);});}window.__confirm=__confirm;
-var __traktChain=Promise.resolve();
+var __traktChain=Promise.resolve(),__traktPending=0;
+/** 前端写操作串行队列，避免连点打爆 Trakt */
 function __enqueueTrakt(fn){
   var run=function(){return new Promise(function(r){setTimeout(r,1100);}).then(fn);};
-  __traktChain=__traktChain.then(run,run);
-  return __traktChain;
+  __traktPending++;
+  /* 连点几个按钮时，第二个开始要排在 1.1 秒的间隔后面。
+   * 以前这段等待完全没有反馈，用户以为点击丢了就继续点，越点排得越长。 */
+  if(__traktPending>1)
+    __toastOnce('queue','已收到，正在按顺序处理前面的操作…',{type:'info',duration:1800});
+  var p=__traktChain.then(run,run);
+  var done=function(){__traktPending=Math.max(0,__traktPending-1);};
+  p.then(done,done);
+  __traktChain=p.catch(function(){});
+  return p;
 }
 window.__enqueueTrakt=__enqueueTrakt;
 window.__enqueueWrite=__enqueueTrakt;
+/** 卡片淡出后移除 DOM */
 function __fadeRemoveCard(card){if(!card)return;card.style.transition='opacity 0.25s ease, transform 0.25s ease';card.style.opacity='0';card.style.transform='scale(0.96)';setTimeout(function(){var day=card.closest('.day'),pane=card.closest('.pane');card.remove();if(day&&!day.querySelector('.item')){day.style.transition='opacity 0.2s ease';day.style.opacity='0';setTimeout(function(){if(day.parentNode)day.remove();__maybeShowEmpty(pane);if(window.__refreshStats)window.__refreshStats();},200);return;}__maybeShowEmpty(pane);if(window.__refreshStats)window.__refreshStats();},260);}
+/** 列表空时显示 empty 占位 */
 function __maybeShowEmpty(pane){if(!pane)return;setTimeout(function(){if(pane.querySelector('.item'))return;if(pane.querySelector('.empty'))return;var grid=pane.querySelector('.grid');if(!grid)return;var pid=pane.id,txt='这里暂时没有内容';if(pid==='playback')txt='暂时没有继续观看的内容';else if(pid==='watchlist')txt='待看列表是空的';else if(pid==='calendar')txt='未来 30 天没有待播剧集';else if(pid==='history')txt='还没有观看记录';grid.innerHTML='<div class="empty"><p>'+txt+'</p></div>';},120);}
+/** 从分区响应拼出应有 HTML */
 function __partHtml(d){return d?String((d.watchlistHtml||'')+(d.calendarHtml||'')+(d.historyHtml||'')):'';}
+/** 分区数据是否拉取失败/空失败 */
 function __partFailed(d){if(!d)return true;var h=__partHtml(d);if(!h&&d.historyMoreHtml==null)return true;return /暂时无法加载/.test(h);}
+/** 把某一分区 HTML 写入对应 pane */
 function __applyPart(part,d){if(!d)return false;if(part==='watchlist'){if(d.watchlistHtml)__setHTML('#watchlist',d.watchlistHtml);}else if(part==='calendar'){try{d.__fetchedAt=Date.now();}catch(e){}if(d.calendarHtml){__setHTML('#calendar',d.calendarHtml);try{var dropped=JSON.parse(localStorage.getItem('mt:dropped')||'[]');if(Array.isArray(dropped)&&dropped.length){var cal=document.getElementById('calendar');if(cal)dropped.forEach(function(did){cal.querySelectorAll('[data-drop-show-id="'+did+'"]').forEach(function(b){var card=b.closest('.item');if(card){var day=card.closest('.day');card.remove();if(day&&!day.querySelector('.item'))day.remove();}});});}}catch(e){}try{if(window.__scheduleCalAirTick)window.__scheduleCalAirTick();}catch(e){}}}else if(part==='history'){if(d.historyHtml)__setHTML('#history .grid',d.historyHtml);if(d.historyMoreHtml!=null)__setHTML('#history-more',d.historyMoreHtml);}else{return false;}if(window.__scheduleEnrich)window.__scheduleEnrich();return true;}
 window.__applyPart=__applyPart;window.__partFailed=__partFailed;
-var __PART_LS={watchlist:'mt:wl',calendar:'mt:cal',history:'mt:hist'},__PART_SNAP_TTL=259200;
+/** 首页分区 localStorage 快照 key */
+var __PART_LS={watchlist:'mt:wl',calendar:'mt:cal',history:'mt:hist'};
+/** 分区快照 TTL（秒）约 3 天 */
+var __PART_SNAP_TTL=259200;
+/** 安全读 localStorage 快照 */
 function __lsGetSafe(k){try{if(typeof window.__lsGet==='function')return window.__lsGet(k);}catch(e){}try{var v=localStorage.getItem(k);if(!v)return null;var o=JSON.parse(v);if(o&&o._exp&&o._exp<Date.now()){try{localStorage.removeItem(k);}catch(e2){}return null;}return o&&o.data?o.data:null;}catch(e){return null;}}
+/** 安全写 localStorage 快照（带 TTL） */
 function __lsSetSafe(k,d,ttlSec){try{if(typeof window.__lsSet==='function'){window.__lsSet(k,d,ttlSec);return;}localStorage.setItem(k,JSON.stringify({data:d,_exp:Date.now()+ttlSec*1000}));}catch(e){}}
+/** 缓存首页分区快照，弱网可先展示 */
 function __savePartSnap(part,d){var k=__PART_LS[part];if(!k||!d||__partFailed(d))return;__lsSetSafe(k,d,__PART_SNAP_TTL);}
+/** 读取未过期的分区快照 */
 function __loadPartSnap(part){var k=__PART_LS[part];if(!k)return null;var s=__lsGetSafe(k);return s&&!__partFailed(s)?s:null;}
 window.__savePartSnap=__savePartSnap;window.__loadPartSnap=__loadPartSnap;
 var __partQueue = Promise.resolve();
 
+/** 切换 Tab 时拉取对应分区，失败可重试 */
 function __fetchPartForTab(part, retry) {
   try { delete window.__loadedParts[part]; } catch (e) {}
 
@@ -11661,10 +12335,36 @@ function __fetchPartForTab(part, retry) {
 window.__fetchPartForTab = __fetchPartForTab;
 document.querySelectorAll('.tab').forEach(t=>{t.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.pane').forEach(x=>x.classList.remove('active'));t.classList.add('active');var tabName=t.dataset.tab,pane=document.getElementById(tabName);if(pane)pane.classList.add('active');if(tabName==='search'){setTimeout(function(){var inp=document.getElementById('search-input');if(inp)inp.focus();if(inp&&!inp.value.trim()&&window.__loadTrending)window.__loadTrending();},60);return;}if(tabName==='playback')return;var partMap={watchlist:'watchlist',calendar:'calendar',history:'history'};var part=partMap[tabName];if(!part)return;var loaded=window.__loadedParts||{};if(loaded[part]&&!__partFailed(loaded[part])){__applyPart(part,loaded[part]);if(part==='calendar'){try{if(window.__scheduleCalAirTick)window.__scheduleCalAirTick();}catch(e){}var ts=Number(loaded[part].__fetchedAt||0);if(!ts||Date.now()-ts>12*60*1000){window.__fetchPartForTab(part).then(function(d){if(!d)return;d.__fetchedAt=Date.now();__applyPart(part,d);__savePartSnap(part,d);window.__loadedParts[part]=d;}).catch(function(){});}}return;}var snap=__loadPartSnap(part);if(snap)__applyPart(part,snap);window.__fetchPartForTab(part).then(function(d){if(d){__applyPart(part,d);return;}var lv=snap||__loadPartSnap(part);if(lv){__applyPart(part,lv);if(window.__toast)window.__toast('上游暂不可用，已显示上次数据',{type:'warn',duration:1800});return;}var p=document.getElementById(tabName);if(p)p.innerHTML='<div class="empty"><p>加载失败，请稍后重试</p></div>';});});});
 (function(){var order=['watchlist','calendar','history'],GAP=4000;function warm(i){if(i>=order.length||document.hidden)return;var p=order[i];function next(){setTimeout(function(){warm(i+1);},GAP);}var loaded=window.__loadedParts||{};if(loaded[p]&&!__partFailed(loaded[p])){next();return;}__fetchPartForTab(p).then(function(d){if(d)__applyPart(p,d);next();});}function start(){setTimeout(function(){warm(0);},1500);}if(window.requestIdleCallback)window.requestIdleCallback(start,{timeout:3000});else start();})();
-async function logout(){if(!(await __confirm({icon:'➜]',title:'退出登录',message:'确定要退出当前 Trakt 账号吗？',okText:'退出',cancelText:'取消',tone:'warn'})))return;try{localStorage.removeItem('mt:pb');localStorage.removeItem('mt:meta');}catch(e){}await fetch('/auth/logout',{method:'POST'});location.href='/login';}
+/**
+ * logout
+ */
+async function logout(){
+  if(!(await __confirm({icon:'➜]',title:'退出登录',message:'确定要退出当前 Trakt 账号吗？',okText:'退出',cancelText:'取消',tone:'warn'})))return;
+  try{localStorage.removeItem('mt:pb');localStorage.removeItem('mt:meta');}catch(e){}
+  var r;
+  try{
+    r=await fetch('/auth/logout',{method:'POST',credentials:'same-origin'});
+  }catch(e){
+    // 网络断了还跳转，用户会莫名其妙被弹回登录页，且服务端 Cookie 没清
+    __errToast('退出失败',new Error('网络连接失败'));
+    return;
+  }
+  if(!r.ok){
+    __errToast('退出失败',new Error('HTTP '+r.status));
+    return;
+  }
+  __toast('已退出登录',{type:'success',duration:1200});
+  setTimeout(function(){location.href='/login';},350);
+}
 window.logout=logout;
+/**
+ * loadMoreHistory
+ */
 async function loadMoreHistory(btn){return __loadMore(btn,'#history .hist-days','/api/more?type=history&page='+parseInt(btn.dataset.page||'2'));}
 window.loadMoreHistory=loadMoreHistory;
+/**
+ * loadMoreContinue
+ */
 async function loadMoreContinue(btn){
   if(!btn)return;
   btn.disabled=true;btn.textContent='加载中…';
@@ -11712,14 +12412,25 @@ async function loadMoreContinue(btn){
   }
 }
 window.loadMoreContinue=loadMoreContinue;
+/**
+ * onWatchlistSortChange
+ */
 async function onWatchlistSortChange(sort){const grid=document.getElementById('watchlist-grid'),pane=document.getElementById('watchlist');if(grid)grid.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';const oldMore=pane?pane.querySelector('.load-more-wrap'):null;if(oldMore)oldMore.remove();try{const r=await fetch('/api/more?type=watchlist&page=1&sort='+encodeURIComponent(sort));if(!r.ok)throw new Error('HTTP '+r.status);const htmlText=await r.text();if(grid)grid.innerHTML=htmlText||emptyWatchlistInner();const hasMore=r.headers.get('X-Has-More')==='true';if(hasMore&&pane&&grid){const wrap=document.createElement('div');wrap.className='load-more-wrap';wrap.innerHTML='<button class="load-more" data-page="2" data-sort="'+sort+'" onclick="loadMoreWatchlist(this)">加载更多</button>';pane.appendChild(wrap);}if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){if(grid)grid.innerHTML='<div class="empty"><p>加载失败，请稍后重试</p></div>';}}
 window.onWatchlistSortChange=onWatchlistSortChange;
+/**
+ * emptyWatchlistInner
+ */
 function emptyWatchlistInner(){return '<div class="empty"><p>待看列表是空的</p></div>';}
+/**
+ * loadMoreWatchlist
+ */
 async function loadMoreWatchlist(btn){return __loadMore(btn,'#watchlist-grid','/api/more?type=watchlist&page='+parseInt(btn.dataset.page||'2')+'&sort='+encodeURIComponent(btn.dataset.sort||'added'));}
 window.loadMoreWatchlist=loadMoreWatchlist;
-async function __loadMore(btn,gridSel,url){btn.disabled=true;btn.textContent='加载中…';try{const r=await fetch(url);if(!r.ok)throw new Error('HTTP '+r.status);const html=await r.text();const grid=document.querySelector(gridSel);if(grid)grid.insertAdjacentHTML('beforeend',html);if(window.__scheduleEnrich)window.__scheduleEnrich();if(r.headers.get('X-Has-More')==='true'){btn.dataset.page=parseInt(btn.dataset.page||'2')+1;btn.disabled=false;btn.textContent='加载更多';}else{btn.textContent='已经到底啦';btn.disabled=true;btn.style.opacity='0.5';btn.style.cursor='default';}}catch(e){btn.textContent='加载失败，点击重试';btn.disabled=false;}}
-document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-wl-remove-id]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.wlRemoveType,id=btn.dataset.wlRemoveId;if(!type||!id)return;const item=btn.closest('.item'),nameEl=item?item.querySelector('.name'):null,name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'🗑',title:'移除待看',message:'确定要把「'+(name||'该条目')+'」从待看列表移除吗？',okText:'移除',tone:'danger'})))return;const prevText=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueWrite(async()=>{await __traktPost('/api/watchlist/remove',{type,id});__fadeRemoveCard(btn.closest('.item'));__toast('已移出待看列表',{type:'success'});});}catch(err){btn.disabled=false;btn.textContent=prevText;__errToast('移除失败',err);}},true);
+/** 「加载更多」：历史/播放分页 */
+async function __loadMore(btn,gridSel,url){btn.disabled=true;btn.textContent='加载中…';try{const r=await fetch(url);if(!r.ok)throw new Error('HTTP '+r.status);const html=await r.text();const grid=document.querySelector(gridSel);if(grid)grid.insertAdjacentHTML('beforeend',html);if(window.__scheduleEnrich)window.__scheduleEnrich();if(r.headers.get('X-Has-More')==='true'){btn.dataset.page=parseInt(btn.dataset.page||'2')+1;btn.disabled=false;btn.textContent='加载更多';}else{btn.textContent='已经到底啦';btn.disabled=true;btn.style.opacity='0.5';btn.style.cursor='default';}}catch(e){btn.textContent='加载失败，点击重试';btn.disabled=false;if(window.__toastOnce)__toastOnce('more','加载失败，请稍后重试',{type:'warn',duration:2400});}}
+document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-wl-remove-id]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.wlRemoveType,id=btn.dataset.wlRemoveId;if(!type||!id)return;const item=btn.closest('.item'),nameEl=item?item.querySelector('.name'):null,name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'🗑',title:'移除待看',message:'确定要把「'+(name||'该条目')+'」从待看列表移除吗？',okText:'移除',tone:'danger'})))return;const prevText=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueWrite(async()=>{await __apiWrite('/api/watchlist/remove',{type,id},{okMsg:'已移出待看列表',failPrefix:'移除失败'});__fadeRemoveCard(btn.closest('.item'));});}catch(err){btn.disabled=false;btn.textContent=prevText;__errToast('移除失败',err);}},true);
 
+/** 确保继续观看操作底栏 DOM 存在 */
 function __ensureCwSheet(){
   var el=document.getElementById('cw-sheet');
   if(el)return el;
@@ -11765,6 +12476,7 @@ function __ensureCwSheet(){
   }
   return el;
 }
+/** 打开继续观看条目操作菜单（标记已看/隐藏/弃剧） */
 function __openCwSheet(id,name,season,episode,mediaType,mediaId){
   var el=__ensureCwSheet();
   el.dataset.dropShowId=id||'';
@@ -11779,6 +12491,7 @@ function __openCwSheet(id,name,season,episode,mediaType,mediaId){
   el.classList.add('open');
   document.body.style.overflow='hidden';
 }
+/** 关闭继续观看操作底栏 */
 function __closeCwSheet(){
   var el=document.getElementById('cw-sheet');
   if(!el)return;
@@ -11838,6 +12551,7 @@ document.addEventListener('keydown',function(e){
   if(e.key==='Escape')__closeCwSheet();
 });
 
+/** 隐藏继续观看条目并同步服务端 */
 async function __hideContinueById(id, name, season, episode, mediaType, mediaId){
   id=String(id||'').trim();
   if(!id)return;
@@ -11851,12 +12565,11 @@ async function __hideContinueById(id, name, season, episode, mediaType, mediaId)
     await __enqueueTrakt(async()=>{
       const payload={id:Number(id),season:s,episode:e};
       if(mid>0&&(mt==='episode'||mt==='movie')){payload.type=mt;payload.mediaId=mid;}
-      await __traktPost('/api/hide-continue',payload);
+      await __apiWrite('/api/hide-continue',payload,{okMsg:'已移除进度',failPrefix:'移除失败'});
       document.querySelectorAll('[data-cw-drop-id="'+id+'"]').forEach(function(b){
         const card=b.closest('.item')||b.closest('.cw-card');
         if(card)__fadeRemoveCard(card);
       });
-      __toast('已移除进度',{type:'success'});
       if(window.__loadedParts){
         delete window.__loadedParts.playback;
         delete window.__loadedParts.all;
@@ -11880,6 +12593,7 @@ async function __hideContinueById(id, name, season, episode, mediaType, mediaId)
   }
 }
 
+/** 弃剧确认并调用 /api/drop-show */
 async function __dropShowById(id, name){
   id=String(id||'').trim();
   if(!id)return;
@@ -11887,7 +12601,7 @@ async function __dropShowById(id, name){
   if(!(await __confirm({icon:'🗑',title:'弃看剧集',message:'确定要弃看「'+(name||'该剧')+'」吗？弃看后将从追剧日历和继续观看中移除，观看历史保留。',okText:'弃看',tone:'danger'})))return;
   try{
     await __enqueueTrakt(async()=>{
-      await __traktPost('/api/drop-show',{id:Number(id)});
+      await __apiWrite('/api/drop-show',{id:Number(id)},{okMsg:'已弃看剧集',failPrefix:'弃看失败'});
       try{
         var ds=JSON.parse(localStorage.getItem('mt:dropped')||'[]');
         if(!Array.isArray(ds))ds=[];
@@ -11902,7 +12616,6 @@ async function __dropShowById(id, name){
         const card=b.closest('.item');
         if(card)__fadeRemoveCard(card);
       });
-      __toast('已弃看剧集',{type:'success'});
       if(window.__loadedParts){
         delete window.__loadedParts.calendar;
         delete window.__loadedParts.playback;
@@ -11961,16 +12674,19 @@ document.addEventListener('click',async(e)=>{
   await __dropShowById(id,name);
 },true);
 
-document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-watched-id]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.watchedType,id=btn.dataset.watchedId;if(!type||!id)return;const item=btn.closest('.item'),nameEl=item?item.querySelector('.name'):null,name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'✓',title:'标记已看',message:'确定要把「'+(name||'该条目')+'」标记为已看吗？',okText:'标记',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueTrakt(async()=>{await __traktPost('/api/mark-watched',{type,id});__fadeRemoveCard(btn.closest('.item'));__toast('已标记为已看',{type:'success'});});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('标记失败',err);}},true);
-document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-unwatch-id]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.unwatchType,id=btn.dataset.unwatchId;if(!type||!id)return;const item=btn.closest('.item'),nameEl=item?item.querySelector('.name'):null,name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'↺',title:'取消观看',message:'确定要取消「'+(name||'该条目')+'」的观看记录吗？',okText:'取消观看',tone:'warn'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueTrakt(async()=>{await __traktPost('/api/unmark-watched',{type,id});__fadeRemoveCard(btn.closest('.item'));__toast('已取消观看记录',{type:'success'});});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('取消失败',err);}},true);
+document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-watched-id]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.watchedType,id=btn.dataset.watchedId;if(!type||!id)return;const item=btn.closest('.item'),nameEl=item?item.querySelector('.name'):null,name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'✓',title:'标记已看',message:'确定要把「'+(name||'该条目')+'」标记为已看吗？',okText:'标记',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueTrakt(async()=>{await __apiWrite('/api/mark-watched',{type,id},{okMsg:'已标记为已看',failPrefix:'标记失败'});__fadeRemoveCard(btn.closest('.item'));});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('标记失败',err);}},true);
+document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-unwatch-id]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.unwatchType,id=btn.dataset.unwatchId;if(!type||!id)return;const item=btn.closest('.item'),nameEl=item?item.querySelector('.name'):null,name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'↺',title:'取消观看',message:'确定要取消「'+(name||'该条目')+'」的观看记录吗？',okText:'取消观看',tone:'warn'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueTrakt(async()=>{await __apiWrite('/api/unmark-watched',{type,id},{okMsg:'已取消观看记录',failPrefix:'取消失败'});__fadeRemoveCard(btn.closest('.item'));});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('取消失败',err);}},true);
 var __searchTimer=null,__searchSeq=0;
+/** 搜索结果单条 HTML */
 function __renderSearchItem(it){var emoji=it.type==='movie'?'🎬':'📺';var poster=it.poster?'<img src="'+__esc(it.poster)+'" loading="lazy" alt="">':'<div class="poster-ph"><span>'+emoji+'</span></div>';var tag=it.type==='movie'?'电影':'剧集';var ov=it.overview?'<div class="overview">'+__esc(it.overview)+'</div>':'';return '<div class="item clickable" data-detail-type="'+it.type+'" data-detail-id="tmdb-'+it.tmdbId+'" role="button" tabindex="0"><div class="poster">'+poster+'</div><div class="info"><div class="name-row"><span class="name">'+__esc(it.title)+'</span></div><div class="meta">'+tag+(it.year?' · '+__esc(String(it.year)):'')+'</div>'+ov+'</div></div>';}
+/** 执行搜索并渲染结果 */
 async function __doSearch(q){var box=document.getElementById('search-results');if(!box)return;if(!q){__loadTrending();return;}var seq=++__searchSeq;box.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';try{var r=await fetch('/api/search?q='+encodeURIComponent(q));if(seq!==__searchSeq)return;if(!r.ok)throw new Error('HTTP '+r.status);var data=await r.json();if(seq!==__searchSeq)return;var items=(data&&data.items)||[];if(!items.length){box.innerHTML='<div class="empty"><p>没有找到相关结果</p></div>';return;}box.innerHTML=items.map(__renderSearchItem).join('');}catch(err){if(seq!==__searchSeq)return;box.innerHTML='<div class="empty"><p>搜索失败：'+__esc(err.message)+'</p></div>';}}
 var __trendingLoaded=false;
+/** 搜索页默认展示趋势 */
 async function __loadTrending(force){var box=document.getElementById('search-results');if(!box)return;var inp=document.getElementById('search-input');if(inp&&inp.value.trim())return;if(box.querySelector('.trending-head')&&!force)return;box.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';try{var r=await fetch('/api/trending');if(!r.ok)throw new Error('HTTP '+r.status);var data=await r.json();var items=(data&&data.items)||[];if(!items.length){box.innerHTML='<div class="empty"><p>暂无趋势内容</p></div>';return;}__trendingLoaded=true;box.innerHTML='<div class="trending-head">TMDB 今日趋势</div>'+items.map(__renderSearchItem).join('');}catch(err){box.innerHTML='<div class="empty"><p>趋势加载失败：'+__esc(err.message)+'</p></div>';}}
 window.__loadTrending=__loadTrending;
 (function(){var inp=document.getElementById('search-input');if(!inp)return;inp.addEventListener('input',function(){if(__searchTimer)clearTimeout(__searchTimer);var q=inp.value.trim();if(!q){__loadTrending();return;}__searchTimer=setTimeout(function(){__doSearch(q);},380);});inp.addEventListener('keydown',function(e){if(e.key==='Enter'){if(__searchTimer)clearTimeout(__searchTimer);var q=inp.value.trim();if(q)__doSearch(q);else __loadTrending(true);}});})();
-document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-wl-add-detail]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.wlAddDetailType,tmdbId=btn.dataset.wlAddDetail;if(!type||!tmdbId)return;const nameEl=document.querySelector('.detail-title');const name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'＋',title:'加入待看',message:'确定要把「'+(name||'该条目')+'」加入待看列表吗？',okText:'加入',tone:'success'})))return;const prevHtml=btn.innerHTML;btn.disabled=true;btn.classList.add('loading');try{await __enqueueWrite(async()=>{await __traktPost('/api/watchlist/add',{type:type,tmdbId:Number(tmdbId)||tmdbId});btn.classList.remove('loading');btn.classList.add('active');btn.disabled=true;btn.removeAttribute('data-wl-add-detail');btn.removeAttribute('data-wl-add-detail-type');btn.setAttribute('title','已在待看');btn.innerHTML='<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" stroke="none"><path d="M7 3h10a1 1 0 0 1 1 1v16l-6-3.5L6 20V4a1 1 0 0 1 1-1z"/></svg>';__toast('已加入待看列表',{type:'success'});try{if(window.__loadedParts)delete window.__loadedParts.watchlist;}catch(e){}try{if(typeof fetchPart==='function'){fetchPart('watchlist',true).then(function(d){if(!d)return;if(window.__applyPart)window.__applyPart('watchlist',d);if(window.__savePartSnap)window.__savePartSnap('watchlist',d);if(window.__loadedParts)window.__loadedParts.watchlist=d;}).catch(function(){});}}catch(e){}if(document.getElementById('watchlist-grid')&&typeof onWatchlistSortChange==='function'){try{onWatchlistSortChange('added');}catch(e){}}if(window.__refreshStats)window.__refreshStats();});}catch(err){btn.disabled=false;btn.classList.remove('loading');btn.innerHTML=prevHtml;__errToast('加入失败',err);}},true);
+document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-wl-add-detail]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.wlAddDetailType,tmdbId=btn.dataset.wlAddDetail;if(!type||!tmdbId)return;const nameEl=document.querySelector('.detail-title');const name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'＋',title:'加入待看',message:'确定要把「'+(name||'该条目')+'」加入待看列表吗？',okText:'加入',tone:'success'})))return;const prevHtml=btn.innerHTML;btn.disabled=true;btn.classList.add('loading');try{await __enqueueWrite(async()=>{await __apiWrite('/api/watchlist/add',{type:type,tmdbId:Number(tmdbId)||tmdbId},{okMsg:'已加入待看列表',failPrefix:'加入失败'});btn.classList.remove('loading');btn.classList.add('active');btn.disabled=true;btn.removeAttribute('data-wl-add-detail');btn.removeAttribute('data-wl-add-detail-type');btn.setAttribute('title','已在待看');btn.innerHTML='<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" stroke="none"><path d="M7 3h10a1 1 0 0 1 1 1v16l-6-3.5L6 20V4a1 1 0 0 1 1-1z"/></svg>';__toast('已加入待看列表',{type:'success'});try{if(window.__loadedParts)delete window.__loadedParts.watchlist;}catch(e){}try{if(typeof fetchPart==='function'){fetchPart('watchlist',true).then(function(d){if(!d)return;if(window.__applyPart)window.__applyPart('watchlist',d);if(window.__savePartSnap)window.__savePartSnap('watchlist',d);if(window.__loadedParts)window.__loadedParts.watchlist=d;}).catch(function(){});}}catch(e){}if(document.getElementById('watchlist-grid')&&typeof onWatchlistSortChange==='function'){try{onWatchlistSortChange('added');}catch(e){}}if(window.__refreshStats)window.__refreshStats();});}catch(err){btn.disabled=false;btn.classList.remove('loading');btn.innerHTML=prevHtml;__errToast('加入失败',err);}},true);
 var __listModalSections={
   playback:{title:'继续观看',kind:'playback'},
   guduo:{title:'骨朵热榜',kind:'tabsGrid',tabsApi:'/api/guduo-list?mode=categories',tabsKey:'categories',tabsParam:'category',noAll:true,defaultCat:'剧集',listApi:function(cat){return '/api/guduo-list?mode=grid&category='+encodeURIComponent(cat||'剧集');},gridId:'guduo-grid',tabsId:'guduo-filter-tabs'},
@@ -11980,6 +12696,7 @@ var __listModalSections={
   'douban-jpkr':{title:'豆瓣热播日韩剧',kind:'simpleGrid',listApi:function(){return '/api/douban-list?section=jpkr&mode=grid';},gridId:'douban-modal-grid'},
   'douban-western':{title:'豆瓣热播欧美剧',kind:'simpleGrid',listApi:function(){return '/api/douban-list?section=western&mode=grid';},gridId:'douban-modal-grid'}
 };
+/** 简单网格弹层（榜单「更多」） */
 function __openSimpleGridModal(body,cfg){
   var gid=cfg.gridId||'list-modal-grid';
   body.innerHTML='<div id="'+gid+'" class="grid"><div class="pane-loading"><div class="spinner"></div></div></div>';
@@ -11991,6 +12708,7 @@ function __openSimpleGridModal(body,cfg){
     if(window.__scheduleEnrich)window.__scheduleEnrich();
   }).catch(function(){if(grid)grid.innerHTML='<div class="empty"><p>加载失败，请稍后重试</p></div>';});
 }
+/** 带分类 Tab 的网格弹层 */
 function __openTabsGridModal(body,cfg){
   var tabsId=cfg.tabsId||'list-filter-tabs';
   var gid=cfg.gridId||'list-modal-grid';
@@ -12254,6 +12972,7 @@ window.openTheaterPlatformList=function(platform){
 })();
 window.closeListModal=function(){var modal=document.getElementById('list-modal');if(!modal)return;modal.classList.remove('open');document.body.style.overflow='';};
 document.addEventListener('keydown',function(e){if(e.key==='Escape'){var m=document.getElementById('list-modal');if(m&&m.classList.contains('open')){window.closeListModal();return;}}});
+/** 横向滑动榜单区块加载 */
 async function __loadHScroll(elId,url,keepId){
   var el=document.getElementById(elId);
   if(!el)return;
@@ -12272,13 +12991,22 @@ async function __loadHScroll(elId,url,keepId){
     if(window.__scheduleEnrich)window.__scheduleEnrich();
   }catch(e){el.innerHTML='<div class="h-scroll-empty"><p>加载失败，请稍后重试</p></div>';}
 }
+/**
+ * loadGuduoHScroll
+ */
 async function loadGuduoHScroll(category,force){category=category||'剧集';return __loadHScroll('guduo-hscroll','/api/guduo-list?mode=hscroll&category='+encodeURIComponent(category)+(force?'&force=1':''));}async function loadGuduoHomeTabs(){var tabsBox=document.getElementById('guduo-home-tabs');if(!tabsBox||tabsBox.dataset.loaded==='1')return;try{var r=await fetch('/api/guduo-list?mode=categories');var d=r.ok?await r.json():{categories:[]};var cats=(d&&d.categories)||[];if(!cats.length){}cats=cats.length?cats:['剧集','电影','动漫','综艺'];var html='';for(var i=0;i<cats.length;i++){var p=cats[i];html+='<button class="theater-filter-tab'+(i===0?' active':'')+'" data-category="'+__esc(p)+'">'+__esc(p)+'</button>';}tabsBox.innerHTML=html;tabsBox.style.display='';tabsBox.dataset.loaded='1';tabsBox.addEventListener('click',function(e){var btn=e.target.closest('.theater-filter-tab');if(!btn)return;tabsBox.querySelectorAll('.theater-filter-tab').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');loadGuduoHScroll(btn.getAttribute('data-category')||'剧集');});}catch(e){}}
 (function(){var sections=[['douban-domestic','domestic'],['douban-hktw','hktw'],['douban-jpkr','jpkr'],['douban-western','western']];function loadOne(id,section,force){return __loadHScroll(id+'-hscroll','/api/douban-list?section='+section+'&mode=hscroll'+(force?'&force=1':''),true);}function start(force){sections.forEach(function(pair){loadOne(pair[0],pair[1],force);});var guduoTab=document.querySelector('#guduo-home-tabs .theater-filter-tab.active');var guduoCat=guduoTab?guduoTab.getAttribute('data-category')||'剧集':'剧集';loadGuduoHScroll(guduoCat,force);if(force){var gt=document.getElementById('guduo-home-tabs');if(gt)gt.dataset.loaded='0';}loadGuduoHomeTabs();if(window.__reloadPlatformPreviews)window.__reloadPlatformPreviews(false);if(window.__reloadTheaterPreviews)window.__reloadTheaterPreviews(!!force);}if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',function(){start(false);});else start(false);window.__reloadDoubanSections=start;})();
 let modalLoadingId=0;window.__lastDetailType=null;window.__lastDetailId=null;async function openDetail(type,id,push=true){const modal=document.getElementById('modal'),body=document.getElementById('modal-body');if(!modal||!body)return;if(window.__stopTrailers)window.__stopTrailers();window.__lastDetailType=type;window.__lastDetailId=id;modal.classList.add('open');document.body.style.overflow='hidden';if(push&&location.pathname!=='/detail/'+type+'/'+id)history.pushState({detail:true},'','/detail/'+type+'/'+id);const reqId=++modalLoadingId;body.innerHTML='<div class="modal-loading"><div class="spinner"></div></div>';body.scrollTop=0;try{const r=await fetch('/api/detail?type='+encodeURIComponent(type)+'&id='+encodeURIComponent(id));if(reqId!==modalLoadingId)return;if(!r.ok)throw new Error('HTTP '+r.status);body.innerHTML=await r.text();if(window.__detailDeferLoad)window.__detailDeferLoad(type);}catch(e){if(reqId!==modalLoadingId)return;body.innerHTML='<div class="modal-error"><p>加载失败，请稍后重试</p><button class="btn-ghost" type="button" style="margin-top:14px" onclick="window.__retryDetail&&window.__retryDetail()">重试</button></div>';}}window.openDetail=openDetail;
 window.__retryDetail=function(){if(window.__lastDetailType&&window.__lastDetailId)openDetail(window.__lastDetailType,window.__lastDetailId,false);};
+/** 展开季时懒加载集列表 */
 function __loadSeasonBody(body,head){if(!body||!head)return;if(body.dataset.loaded||body.dataset.loading)return;body.dataset.loading='1';body.innerHTML='<div class="modal-loading" style="padding:24px"><div class="spinner"></div></div>';fetch('/api/season?show='+encodeURIComponent(head.dataset.show||'')+'&season='+encodeURIComponent(head.dataset.season)+'&tmdb='+encodeURIComponent(head.dataset.tmdb)+'&slug='+encodeURIComponent(head.dataset.slug||'')).then(function(r){return r.ok?r.text():'';}).then(function(html){body.innerHTML=html;body.dataset.loaded='1';delete body.dataset.loading;}).catch(function(){body.innerHTML='<div class="modal-error" style="padding:20px">加载失败</div>';delete body.dataset.loading;});}
 window.__detailDeferLoad=function(type){var wrap=document.getElementById('modal-body');if(!wrap)return;var root=wrap.querySelector('.detail-wrap')||wrap;var tmdbId=root.dataset.tmdbId||'';var imdbId=root.dataset.imdbId||'';var firstOpen=wrap.querySelector('.season-item.open .season-body');if(firstOpen&&!firstOpen.dataset.loaded&&!firstOpen.dataset.loading){var head=firstOpen.closest('.season-item').querySelector('.season-head');if(head)__loadSeasonBody(firstOpen,head);}var placeholders=wrap.querySelectorAll('[data-defer-section]');if(!placeholders.length)return;var url='/api/detail-extras?type='+encodeURIComponent(type)+'&tmdb='+encodeURIComponent(tmdbId)+'&imdb='+encodeURIComponent(imdbId);fetch(url,{credentials:'same-origin'}).then(function(r){return r.ok?r.json():null;}).then(function(data){if(!data)return;placeholders.forEach(function(el){var section=el.dataset.deferSection;var html=data[section+'Html']||'';if(section==='ratings'){if(html)el.innerHTML=html;else el.parentNode&&el.remove();return;}var parent=el.closest('.d-section')||el;if(!html){if(section==='trailers'){el.innerHTML='<p class="person-sub" style="padding:8px 0;color:#71717a;font-size:.85rem">暂无预告片</p>';el.removeAttribute('data-defer-section');}else{parent.style.display='none';}return;}el.innerHTML=html;el.removeAttribute('data-defer-section');});if(window.__scheduleEnrich)window.__scheduleEnrich();}).catch(function(){placeholders.forEach(function(el){if(el.dataset.deferSection==='ratings'){el.parentNode&&el.remove();return;}var parent=el.closest('.d-section')||el;parent.style.display='none';});});};
+/** 关闭详情时停止预告片播放 */
 function __stopTrailers(){try{var root=document.getElementById('modal-body')||document.getElementById('modal')||document;var frames=root.querySelectorAll('.trailer-frame iframe, iframe[src*="youtube"]');frames.forEach(function(iframe){try{iframe.src='about:blank';}catch(e){}try{iframe.remove();}catch(e){}});var cards=root.querySelectorAll('.trailer-card.playing');cards.forEach(function(c){c.classList.remove('playing');var f=c.querySelector('.trailer-frame');if(f)f.innerHTML='';});var vids=root.querySelectorAll('video');vids.forEach(function(v){try{v.pause();v.removeAttribute('src');v.load();}catch(e){}});}catch(e){}}
+/**
+ * closeDetail
+ */
+/** 关闭详情弹层 */
 function closeDetail(push=true){const modal=document.getElementById('modal');if(!modal)return;if(push&&location.pathname.startsWith('/detail/')){__stopTrailers();history.back();return;}__stopTrailers();modal.classList.remove('open');document.body.style.overflow='';}window.closeDetail=closeDetail;window.__stopTrailers=__stopTrailers;
 document.addEventListener('visibilitychange',function(){if(document.hidden&&window.__stopTrailers)window.__stopTrailers();});
 document.addEventListener('click',(e)=>{const el=e.target.closest('[data-detail-type]');if(!el)return;const t=el.dataset.detailType,i=el.dataset.detailId;if(!t||!i)return;if(e.target.closest('button,a,.ep-watch-btn,.d-mark-btn,.d-watchlist-btn,.poster-play,.cal-open-btn,.cal-drop-btn'))return;e.preventDefault();openDetail(t,i);});
@@ -12286,30 +13014,63 @@ document.addEventListener('click',(e)=>{const mb=document.getElementById('modal-
 document.addEventListener('keydown',(e)=>{if(e.key!=='Escape')return;const sc=document.getElementById('show-cal-modal');if(sc&&sc.classList.contains('open')){closeShowCal();return;}closeDetail();});
 document.addEventListener('click',(e)=>{const head=e.target.closest('.season-head');if(!head)return;toggleSeason(head);});
 document.addEventListener('click',(e)=>{const ep=e.target.closest('.episode');if(!ep)return;const url=ep.dataset.traktUrl;if(!url)return;if(e.target.closest('.ep-watch-btn'))return;e.preventDefault();e.stopPropagation();window.open(url,'_blank','noopener');});
+/**
+ * toggleSeason
+ */
+/** 展开/收起某一季 */
 async function toggleSeason(headEl){if(!headEl)return;const item=headEl.closest('.season-item');if(!item)return;const body=item.querySelector('.season-body');if(!body)return;if(item.classList.contains('open')){item.classList.remove('open');return;}item.classList.add('open');if(body.dataset.loaded)return;__loadSeasonBody(body,headEl);}
 window.addEventListener('popstate',()=>{const path=location.pathname;if(path.startsWith('/detail/')){const parts=path.split('/').filter(Boolean);if(parts.length===3)openDetail(parts[1],parts[2],false);}else{closeDetail(false);}});
+/** 已预取的详情 type/id，避免重复请求 */
 const __prefetched=new Set();
+/** 悬停/可见时预取详情，加快点开 */
 function __prefetchDetail(type,id){if(!type||!id)return;const key=type+'/'+id;if(__prefetched.has(key))return;if(__prefetched.size>=60){const first=__prefetched.values().next().value;if(first!==undefined)__prefetched.delete(first);}__prefetched.add(key);fetch('/api/detail?type='+encodeURIComponent(type)+'&id='+encodeURIComponent(id),{cache:'default'}).catch(()=>{});}
 document.addEventListener('touchstart',(e)=>{const el=e.target.closest('[data-detail-type]');if(el)__prefetchDetail(el.dataset.detailType,el.dataset.detailId);},{passive:true,capture:true});
 var __showCal={byDay:{},year:0,month:0};
+/** 两位补零 */
 function __pad2(n){return(n<10?'0':'')+n;}
+/** ISO 时间转到北京日期 YYYY-MM-DD */
 function __bjDay(iso){if(!iso)return '';var d=new Date(new Date(iso).getTime()+8*3600*1000);return d.getUTCFullYear()+'-'+__pad2(d.getUTCMonth()+1)+'-'+__pad2(d.getUTCDate());}
+/**
+ * openShowCalendar
+ */
+/** 打开单剧播出日历弹层 */
 function openShowCalendar(showId,showName,tmdbId){var modal=document.getElementById('show-cal-modal'),nameEl=document.getElementById('show-cal-name'),infoEl=document.getElementById('show-cal-info'),gridEl=document.getElementById('show-cal-grid'),detailEl=document.getElementById('show-cal-detail');if(!modal||!gridEl)return;var now=new Date();__showCal.year=now.getFullYear();__showCal.month=now.getMonth();__showCal.byDay={};modal.classList.add('open');nameEl.textContent=showName||'';infoEl.textContent='正在加载…';gridEl.innerHTML='<div class="modal-loading" style="grid-column:1/-1;padding:40px 10px"><div class="spinner"></div></div>';detailEl.innerHTML='';renderShowCal();var apiUrl='/api/show-calendar?id='+encodeURIComponent(showId);if(tmdbId)apiUrl+='&tmdb='+encodeURIComponent(tmdbId);fetch(apiUrl).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(data){if(data&&data.title)nameEl.textContent=data.title;var map={},eps=(data&&data.episodes)||[];for(var i=0;i<eps.length;i++){var ep=eps[i],day=__bjDay(ep.first_aired);if(!day)continue;if(!map[day])map[day]=[];map[day].push(ep);}__showCal.byDay=map;if(!eps.length){infoEl.textContent='暂无播出记录';}else{var keys=Object.keys(map).sort(),minLabel=keys[0].slice(0,7),maxLabel=keys[keys.length-1].slice(0,7);infoEl.textContent='共 '+keys.length+' 天有更新 · '+minLabel+' ~ '+maxLabel+'（点 ◀ ▶ 翻月）';}renderShowCal();}).catch(function(){infoEl.textContent='加载失败';gridEl.innerHTML='<div class="modal-error" style="grid-column:1/-1;padding:40px 10px">加载失败</div>';});}
+/**
+ * closeShowCal
+ */
+/** 关闭播出日历 */
 function closeShowCal(){var modal=document.getElementById('show-cal-modal');if(modal)modal.classList.remove('open');}window.closeShowCal=closeShowCal;
+/**
+ * calShiftMonth
+ */
+/** 日历翻月 */
 function calShiftMonth(delta){var m=__showCal.month+delta,y=__showCal.year;while(m<0){m+=12;y--;}while(m>11){m-=12;y++;}__showCal.month=m;__showCal.year=y;renderShowCal();}window.calShiftMonth=calShiftMonth;
+/**
+ * renderShowCal：数据/视图辅助。
+ */
+/** 渲染播出日历格子与当日集列表 */
 function renderShowCal(){var titleEl=document.getElementById('show-cal-month'),gridEl=document.getElementById('show-cal-grid'),detailEl=document.getElementById('show-cal-detail');if(!titleEl||!gridEl)return;var y=__showCal.year,m=__showCal.month;titleEl.textContent=y+' 年 '+(m+1)+' 月';var firstDow=new Date(Date.UTC(y,m,1)).getUTCDay(),daysInMonth=new Date(Date.UTC(y,m+1,0)).getUTCDate(),todayStr=__bjDay(new Date().toISOString()),html='',i;for(i=0;i<firstDow;i++){html+='<div class="sc-day sc-empty"></div>';}for(var d=1;d<=daysInMonth;d++){var dayStr=y+'-'+__pad2(m+1)+'-'+__pad2(d),eps=__showCal.byDay[dayStr]||[],cls='sc-day';if(eps.length){if(dayStr===todayStr)cls+=' sc-has sc-today-day';else if(dayStr<todayStr)cls+=' sc-has sc-past';else cls+=' sc-has sc-future';}var badge=eps.length?'<span class="sc-badge">'+eps.length+'</span>':'';html+='<div class="'+cls+'" data-day="'+dayStr+'"><span class="sc-num">'+d+'</span>'+badge+'</div>';}gridEl.innerHTML=html;detailEl.innerHTML='';var days=gridEl.querySelectorAll('.sc-day[data-day]');for(var j=0;j<days.length;j++){(function(el){el.addEventListener('click',function(){var day=el.getAttribute('data-day'),arr=__showCal.byDay[day]||[];if(!arr.length)return;var all=gridEl.querySelectorAll('.sc-day');for(var q=0;q<all.length;q++)all[q].classList.remove('sc-active');el.classList.add('sc-active');var dh='';for(var e=0;e<arr.length;e++){var ep=arr[e];dh+='<div class="sc-ep"><span class="sc-ep-tag">S'+__pad2(ep.season)+'E'+__pad2(ep.number)+'</span><span class="sc-ep-title">'+__esc(ep.title||'')+'</span></div>';}detailEl.innerHTML=dh;});})(days[j]);}}
 document.addEventListener('click',function(e){var btn=e.target.closest('[data-cal-show-id]');if(!btn)return;e.preventDefault();e.stopPropagation();openShowCalendar(btn.getAttribute('data-cal-show-id'),btn.getAttribute('data-cal-show-name')||'',btn.getAttribute('data-cal-show-tmdb')||'');},true);
-document.addEventListener('click',async(e)=>{const btn=e.target.closest('.ep-watch-btn');if(!btn)return;e.preventDefault();e.stopPropagation();const episodeId=btn.dataset.episodeId;if(!episodeId)return;if(!(await __confirm({icon:'✓',title:'标记本集已看',message:'确定要把这一集标记为已看吗？',okText:'标记',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueTrakt(async()=>{await __traktPost('/api/mark-watched',{type:'episode',id:episodeId});btn.textContent='已看';btn.classList.add('done');btn.classList.add('watched');btn.classList.remove('unwatched');btn.disabled=true;__toast('已标记为已看',{type:'success'});const parts=location.pathname.split('/').filter(Boolean);if(parts[0]==='detail'&&parts.length===3){setTimeout(()=>openDetail(parts[1],parts[2],false),400);}});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('标记失败',err);}},true);
-document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-mark-movie]');if(!btn)return;e.preventDefault();e.stopPropagation();const id=btn.dataset.markMovie;if(!id)return;if(!(await __confirm({icon:'✓',title:'标记已看',message:'确定要把这部电影标记为已看吗？',okText:'标记',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueTrakt(async()=>{await __traktPost('/api/mark-watched',{type:'movie',id});btn.textContent='✓ 已标记';btn.classList.add('done');__toast('已标记为已看',{type:'success'});const parts=location.pathname.split('/').filter(Boolean);if(parts[0]==='detail'&&parts.length===3){setTimeout(()=>openDetail(parts[1],parts[2],false),400);}if(window.__refreshStats)window.__refreshStats();});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('标记失败',err);}},true);
-document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-unmark-movie]');if(!btn)return;e.preventDefault();e.stopPropagation();const id=btn.dataset.unmarkMovie;if(!id)return;if(!(await __confirm({icon:'↺',title:'取消观看',message:'确定要取消这部电影的观看记录吗？',okText:'取消观看',tone:'warn'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueTrakt(async()=>{await __traktPost('/api/unmark-watched',{type:'movie',id});btn.textContent='已取消';__toast('已取消观看记录',{type:'success'});const parts=location.pathname.split('/').filter(Boolean);if(parts[0]==='detail'&&parts.length===3){setTimeout(()=>openDetail(parts[1],parts[2],false),400);}if(window.__refreshStats)window.__refreshStats();});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('取消失败',err);}},true);
-document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-mark-season-all]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const showId=btn.dataset.markSeasonAll,season=btn.dataset.seasonNum;if(!showId||season==null||season==='undefined')return;if(!(await __confirm({icon:'✓',title:'标记本季已看',message:'确定要把第 '+season+' 季所有已播出集数标记为已看吗？',okText:'标记',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueTrakt(async()=>{let data=await __traktPost('/api/mark-season-watched',{showId,season:Number(season)});if(data==null)data={};if(data&&data.marked===0){btn.disabled=false;btn.textContent=prev;__toast(data.message||'本季暂无可标记的已播出集数',{type:'warn'});return;}btn.textContent='✓ 已标记';btn.classList.add('done');__toast('已标记本季 '+(data&&data.marked?data.marked:0)+' 集',{type:'success'});const parts=location.pathname.split('/').filter(Boolean);if(parts[0]==='detail'&&parts.length===3){setTimeout(()=>openDetail(parts[1],parts[2],false),400);}if(window.__refreshStats)window.__refreshStats();});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('标记失败',err);}},true);
-let __enrichTimer=null;const __enrichPromises=new Map();
+document.addEventListener('click',async(e)=>{const btn=e.target.closest('.ep-watch-btn');if(!btn)return;e.preventDefault();e.stopPropagation();const episodeId=btn.dataset.episodeId;if(!episodeId)return;if(!(await __confirm({icon:'✓',title:'标记本集已看',message:'确定要把这一集标记为已看吗？',okText:'标记',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueTrakt(async()=>{await __apiWrite('/api/mark-watched',{type:'episode',id:episodeId},{okMsg:'已标记本集已看',failPrefix:'标记失败'});btn.textContent='已看';btn.classList.add('done');btn.classList.add('watched');btn.classList.remove('unwatched');btn.disabled=true;__toast('已标记为已看',{type:'success'});const parts=location.pathname.split('/').filter(Boolean);if(parts[0]==='detail'&&parts.length===3){setTimeout(()=>openDetail(parts[1],parts[2],false),400);}});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('标记失败',err);}},true);
+document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-mark-movie]');if(!btn)return;e.preventDefault();e.stopPropagation();const id=btn.dataset.markMovie;if(!id)return;if(!(await __confirm({icon:'✓',title:'标记已看',message:'确定要把这部电影标记为已看吗？',okText:'标记',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueTrakt(async()=>{await __apiWrite('/api/mark-watched',{type:'movie',id},{okMsg:'已标记为已看',failPrefix:'标记失败'});btn.textContent='✓ 已标记';btn.classList.add('done');const parts=location.pathname.split('/').filter(Boolean);if(parts[0]==='detail'&&parts.length===3){setTimeout(()=>openDetail(parts[1],parts[2],false),400);}if(window.__refreshStats)window.__refreshStats();});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('标记失败',err);}},true);
+document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-unmark-movie]');if(!btn)return;e.preventDefault();e.stopPropagation();const id=btn.dataset.unmarkMovie;if(!id)return;if(!(await __confirm({icon:'↺',title:'取消观看',message:'确定要取消这部电影的观看记录吗？',okText:'取消观看',tone:'warn'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueTrakt(async()=>{await __apiWrite('/api/unmark-watched',{type:'movie',id},{okMsg:'已取消观看记录',failPrefix:'取消失败'});btn.textContent='已取消';const parts=location.pathname.split('/').filter(Boolean);if(parts[0]==='detail'&&parts.length===3){setTimeout(()=>openDetail(parts[1],parts[2],false),400);}if(window.__refreshStats)window.__refreshStats();});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('取消失败',err);}},true);
+document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-mark-season-all]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const showId=btn.dataset.markSeasonAll,season=btn.dataset.seasonNum;if(!showId||season==null||season==='undefined')return;if(!(await __confirm({icon:'✓',title:'标记本季已看',message:'确定要把第 '+season+' 季所有已播出集数标记为已看吗？',okText:'标记',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueTrakt(async()=>{let data=await __apiWrite('/api/mark-season-watched',{showId,season:Number(season)},{silent:true,failPrefix:'标记失败'});if(data==null)data={};if(data&&data.marked===0){btn.disabled=false;btn.textContent=prev;__toast(data.message||'本季暂无可标记的已播出集数',{type:'warn'});return;}btn.textContent='✓ 已标记';btn.classList.add('done');__toast(data.message||('已标记本季 '+(data&&data.marked?data.marked:0)+' 集'),{type:'success'});const parts=location.pathname.split('/').filter(Boolean);if(parts[0]==='detail'&&parts.length===3){setTimeout(()=>openDetail(parts[1],parts[2],false),400);}if(window.__refreshStats)window.__refreshStats();});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('标记失败',err);}},true);
+/** enrich 防抖 timer */
+let __enrichTimer=null;
+/** 进行中的 enrich 请求去重 */
+const __enrichPromises=new Map();
+/** 防抖调度海报 enrich */
 function __scheduleEnrich(){if(__enrichTimer)return;__enrichTimer=setTimeout(__runEnrich,60);}window.__scheduleEnrich=__scheduleEnrich;
+/** 批量请求 /api/enrich 补全缺失海报与标题 */
 async function __runEnrich(){__enrichTimer=null;const els=[...document.querySelectorAll('[data-enrich-key]')];if(!els.length)return;const byKey=new Map();for(const el of els){const k=el.dataset.enrichKey;if(!k)continue;if(!byKey.has(k))byKey.set(k,[]);byKey.get(k).push(el);el.removeAttribute('data-enrich-key');}if(!byKey.size)return;const needFetch=[];for(const[k,group]of byKey.entries()){const existing=__enrichPromises.get(k);if(existing){existing.then(d=>{if(d)group.forEach(el=>__applyEnrich(el,d));});}else{needFetch.push(k);}}if(!needFetch.length)return;for(let bi=0;bi<needFetch.length;bi+=20){const chunk=needFetch.slice(bi,bi+20);const batchPromise=fetch('/api/enrich',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items:chunk.map(function(k){return{key:k};})})}).then(function(r){return r.ok?r.json():{};}).catch(function(){return{};});for(const k of chunk){const perKey=batchPromise.then(function(data){return(data&&data[k])||null;});__enrichPromises.set(k,perKey);perKey.then(function(d){if(d)byKey.get(k).forEach(function(el){__applyEnrich(el,d);});});}}if(__enrichPromises.size>400){const arr=[...__enrichPromises.keys()];for(let i=0;i<200;i++)__enrichPromises.delete(arr[i]);}}
+/** 把 enrich 结果写回 DOM 卡片 */
 function __applyEnrich(el,d){const posterBox=el.querySelector('.cw-poster')||el.querySelector('.poster');const locked=el.getAttribute('data-lock-poster')==='1';if(posterBox&&d.poster&&!locked){let cur=posterBox.querySelector('img');if(cur){if(cur.complete&&cur.naturalWidth>0)return;if(cur.src!==d.poster){cur.src=d.poster;cur.style.display='';const ph=posterBox.querySelector('.poster-ph');if(ph)ph.style.display='none';}}else{cur=posterBox.querySelector('.poster-ph');if(cur){const img=document.createElement('img');img.src=d.poster;img.loading='lazy';img.alt='';img.onerror=function(){this.style.display='none';if(this.nextElementSibling)this.nextElementSibling.style.display='flex';};const ph=document.createElement('div');ph.className='poster-ph';ph.style.display='none';ph.innerHTML=cur.innerHTML;cur.replaceWith(img,ph);}}}if(d.title){const nameEl=el.querySelector('.name');if(nameEl)nameEl.textContent=d.title;const cwTitle=el.querySelector('.cw-title');if(cwTitle)cwTitle.textContent=d.title;}if(d.overview){const info=el.querySelector('.info');if(info){let ov=info.querySelector('.overview');if(!ov){ov=document.createElement('div');ov.className='overview';const meta=info.querySelector('.meta');if(meta&&meta.nextSibling)info.insertBefore(ov,meta.nextSibling);else info.appendChild(ov);}ov.textContent=d.overview;}}}
 window.__summaryState={period:'month',ref:''};
+/** 小结默认时间锚点（北京时间月/年） */
 function __sumDefaultRef(period){var d=new Date(Date.now()+8*3600*1000);if(period==='year')return String(d.getUTCFullYear());return d.toISOString().slice(0,7);}
+/** 热力最大值，用于分级着色 */
 function __sumHeatmax(days){var m=1;if(days)for(var i=0;i<days.length;i++)if(days[i].count>m)m=days[i].count;return m;}
+/** 观看小结弹层 HTML */
 function __sumRender(data){if(!data||data.error)return '<div class="empty"><p>小结加载失败，请稍后重试</p></div>';var max=__sumHeatmax(data.days);var heat='';if(data.days&&data.days.length){heat='<div class="sum-heat">';for(var i=0;i<data.days.length;i++){var d=data.days[i],lv=Math.min(4,Math.ceil((d.count/max)*4));heat+='<span class="sum-heat-cell lv'+lv+'" title="'+__esc(d.date)+' · '+d.count+' 次"></span>';}heat+='</div>';}else heat='<p class="sum-muted">这段时间还没有观看记录</p>';function listBlock(title,rows,kind){if(!rows||!rows.length)return '';var h='<div class="sum-block"><h3 class="sum-h3">'+title+'</h3><div class="sum-list">';for(var i=0;i<rows.length;i++){var r=rows[i],meta='';if(kind==='movie')meta=r.plays+' 次'+(r.minutes?(' · '+r.minutes+' 分钟'):'');else meta=r.episodes+' 集 · '+r.plays+' 次';var clickable=r.detailType&&r.detailId;var openAttr=clickable?(' data-sum-type="'+__esc(r.detailType)+'" data-sum-id="'+__esc(r.detailId)+'" role="button" tabindex="0"'):'';var cls='sum-row'+(clickable?' sum-row-click':'');h+='<div class="'+cls+'"'+openAttr+'><span class="sum-rank">'+(i+1)+'</span><div class="sum-row-body"><div class="sum-row-title">'+__esc(r.title)+(r.year?(' <span class="sum-year">'+r.year+'</span>'):'')+'</div><div class="sum-row-meta">'+meta+'</div></div></div>';}return h+'</div></div>';}var busiest=data.busiest?'<div class="sum-chip">最忙一天 <strong>'+__esc(data.busiest.date)+'</strong> · '+data.busiest.count+' 次</div>':'';var trunc=data.truncated?'<p class="sum-muted">记录较多，仅统计本时段前 '+data.sampleSize+' 条</p>':'';return '<div class="sum-wrap">'+'<div class="sum-nav">'+'<button type="button" class="sum-nav-btn" onclick="window.__summaryNav(-1)" aria-label="上一时段">‹</button>'+'<div class="sum-nav-center">'+'<div class="sum-period-tabs">'+'<button type="button" class="sum-period-btn'+(data.period==='month'?' active':'')+'" onclick="window.__summarySetPeriod(\\'month\\')">月度</button>'+'<button type="button" class="sum-period-btn'+(data.period==='year'?' active':'')+'" onclick="window.__summarySetPeriod(\\'year\\')">年度</button>'+'</div>'+'<div class="sum-label">'+__esc(data.label)+'</div>'+'</div>'+'<button type="button" class="sum-nav-btn" onclick="window.__summaryNav(1)" aria-label="下一时段">›</button>'+'</div>'+'<div class="sum-stats">'+'<div class="sum-stat"><div class="sum-stat-num">'+data.movies+'</div><div class="sum-stat-label">电影</div></div>'+'<div class="sum-stat"><div class="sum-stat-num">'+data.shows+'</div><div class="sum-stat-label">剧集</div></div>'+'<div class="sum-stat"><div class="sum-stat-num">'+data.episodes+'</div><div class="sum-stat-label">集数</div></div>'+'<div class="sum-stat"><div class="sum-stat-num">'+data.hours+'</div><div class="sum-stat-label">小时</div></div>'+'</div>'+busiest+trunc+'<div class="sum-block"><h3 class="sum-h3">观看热力</h3>'+heat+'</div>'+listBlock('电影 TOP',data.topMovies,'movie')+listBlock('剧集 TOP',data.topShows,'show')+'</div>';}
 window.__summarySetPeriod=function(period){window.__summaryState.period=period;window.__summaryState.ref=__sumDefaultRef(period);window.__loadSummary(true);};
 window.__summaryNav=function(dir){var st=window.__summaryState;if(!st._prevRef&&!st._nextRef)return;if(dir<0&&st._prevRef)st.ref=st._prevRef;if(dir>0&&st._nextRef)st.ref=st._nextRef;window.__loadSummary(true);};
@@ -12378,10 +13139,4589 @@ window.addEventListener('load',()=>{setTimeout(__runEnrich,200);});`
   );
 }
 
+/** pageStyles() 生成结果缓存，进程内只构建一次 */
 let __pageStylesCache = null;
 
+/**
+ * 整包 CSS（/app.css 内容）；light 主题变量只定义一次。
+ */
 function pageStyles() {
   if (__pageStylesCache) return __pageStylesCache;
-  __pageStylesCache = `html{color-scheme:dark}html[data-theme="light"]{color-scheme:light}@media (prefers-color-scheme:light){html[data-theme="system"]{color-scheme:light}}html,body{background:var(--bg-solid);color:var(--text);margin:0;padding:0;min-height:100%;min-height:100dvh;transition:background-color 0.2s ease,color 0.2s ease}*{box-sizing:border-box;margin:0;padding:0}.splash{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;overflow:hidden;background:var(--splash-bg);transition:opacity 0.22s ease;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;-webkit-tap-highlight-color:transparent;animation:splashAutoHide 0.22s ease 0.45s forwards}.splash.hide{opacity:0;pointer-events:none;animation:none}@keyframes splashAutoHide{to{opacity:0;visibility:hidden;pointer-events:none}}.splash-glow{position:absolute;width:340px;height:340px;border-radius:50%;background:radial-gradient(circle,var(--splash-glow-color) 0%,rgba(125,157,212,0) 70%);animation:splashPulse 2.4s ease-in-out infinite}.splash-inner{position:relative;z-index:1;display:flex;flex-direction:column;align-items:center;gap:20px}.splash-logo{color:var(--splash-name-b);animation:splashPop 0.75s cubic-bezier(0.22,1.1,0.36,1) both}.splash-logo img{display:block}.splash-name{font-size:1.35rem;font-weight:800;letter-spacing:0.4px;background:var(--name-grad);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;animation:splashFadeUp 0.6s ease 0.28s both}.splash-bar{width:128px;height:3px;border-radius:99px;background:var(--bar-track);overflow:hidden;animation:splashFadeUp 0.6s ease 0.45s both}.splash-bar-fill{height:100%;width:42%;border-radius:99px;background:var(--splash-bar-fill);animation:splashSlide 1.15s cubic-bezier(0.65,0,0.35,1) infinite}@keyframes splashPulse{0%,100%{transform:scale(0.85);opacity:0.7}50%{transform:scale(1.12);opacity:1}}@keyframes splashPop{0%{opacity:0;transform:scale(0.55) rotate(-8deg)}60%{opacity:1;transform:scale(1.08) rotate(2deg)}100%{opacity:1;transform:scale(1) rotate(0)}}@keyframes splashFadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}@keyframes splashSlide{0%{transform:translateX(-130%)}100%{transform:translateX(330%)}}.spinner{width:30px;height:30px;border:3px solid var(--spinner-track);border-top-color:var(--spinner-active);border-radius:50%;animation:spin 0.8s linear infinite;margin:4px auto}@keyframes spin{to{transform:rotate(360deg)}}:root{--bg:#050505;--surface:#0e0e10;--surface-2:#16161a;--surface-3:#1c1c22;--border:rgba(255,255,255,0.08);--border-strong:rgba(255,255,255,0.14);--text:#f4f4f5;--text-dim:#a1a1aa;--text-mute:#71717a;--accent:#a78bfa;--accent-2:#c4b5fd;--accent-soft:rgba(167,139,250,0.12);--accent-glow:rgba(167,139,250,0.28);--success:#34d399;--blue:#c4b5fd;--radius-sm:10px;--radius-md:14px;--radius-lg:18px;--radius-xl:22px;--shadow-card:0 8px 32px rgba(0,0,0,0.55);--bg-solid:#000000;--panel-grad:linear-gradient(165deg,#16161a 0%,#0e0e10 100%);--hover-bg:rgba(255,255,255,0.04);--hover-bg-strong:rgba(255,255,255,0.09);--sticky-bg:rgba(5,5,5,0.88);--sticky-border:rgba(255,255,255,0.06);--sticky-shadow:0 10px 28px rgba(0,0,0,0.35);--overlay:rgba(2,4,8,0.78);--overlay-strong:rgba(0,0,0,0.78);--modal-bg:#000000;--toast-bg:rgba(20,22,28,0.96);--toast-text:#ffffff;--bar-track:rgba(255,255,255,0.1);--spinner-track:#212735;--spinner-active:#7d9dd4;--splash-bg:radial-gradient(circle at 50% 45%,#0a0a0a 0%,#000 62%);--launch-splash-bg:radial-gradient(120% 90% at 50% 108%,rgba(124,58,237,0.3) 0%,rgba(124,58,237,0) 55%),radial-gradient(110% 85% at 50% -12%,rgba(56,97,190,0.25) 0%,rgba(0,0,0,0) 55%),#000;--launch-glow:rgba(124,58,237,0.18);--splash-glow-color:rgba(125,157,212,0.55);--splash-name-b:#a8b2c4;--splash-bar-fill:linear-gradient(90deg,#7d9dd4,#a78bfa);--name-grad:linear-gradient(135deg,#fff 20%,#c4b5fd 90%);--num-grad:linear-gradient(180deg,#fff 0%,#c4b5fd 100%);--brand-grad:linear-gradient(135deg,#7c3aed 0%,#a78bfa 100%);--brand-grad-hover:linear-gradient(145deg,#8b5cf6,#a78bfa);--avatar-ring:rgba(167,139,250,0.45);--avatar-grad:linear-gradient(135deg,#1a2233,#2a3a55);--soft-card-grad:var(--soft-card-grad);--btn-hover-bg:rgba(167,139,250,0.1);--btn-hover-border:rgba(167,139,250,0.35);--btn-hover-shadow:0 4px 16px rgba(167,139,250,0.18);--danger-bg:rgba(224,85,96,0.1);--danger-border:rgba(224,85,96,0.35);--danger-shadow:0 4px 16px rgba(224,85,96,0.15);--poster-ph-bg:rgba(0,0,0,0.65);--shadow-avatar:rgba(0,0,0,0.5);--shadow-login:rgba(0,0,0,0.7);--detail-hero-grad:linear-gradient(180deg,rgba(10,14,24,0.6),rgba(10,14,24,0.95));--detail-bg-filter:brightness(0.5);--chip-bg:rgba(255,255,255,0.05);--chip-bg-hover:rgba(255,255,255,0.09);--chip-fg:#a1a1aa;--chip-fg-hover:#f4f4f5;--chip-border:rgba(255,255,255,0.08);--chip-accent:#a78bfa;--pill-bg:linear-gradient(165deg,rgba(255,255,255,0.09) 0%,rgba(255,255,255,0.04) 100%);--pill-border:rgba(255,255,255,0.12);--pill-shadow:0 8px 28px rgba(0,0,0,0.45),inset 0 1px 0 rgba(255,255,255,0.06);--pill-fg:rgba(255,255,255,0.55);--pill-act-hover:rgba(255,255,255,0.1);--platform-card-grad:linear-gradient(145deg,#1a1a1a 0%,#0a0a0a 100%);--platform-card-text:#ffffff;--platform-shadow-hover:rgba(0,0,0,0.65);--scrollbar:#2a3345;--link:#c4b5fd;--link-hover:#ddd6fe;--success-fg:#4ade80;--warn-fg:#ffb84d;--danger-fg:#ff8a8a;--cal-accent:#4a6db8;--cal-accent-2:#9db0d0;--cal-accent-3:#7d9dd4;--cal-cell-border:#3a4a68;--cal-soft:rgba(90,120,180,0.22);--cal-soft-border:rgba(140,170,220,0.35)}html[data-theme="light"]{--danger-fg:#ff7b85;--chip-bg:#f4f4f5;--chip-bg-hover:#e4e4e7;--chip-fg:#3f3f46;--chip-fg-hover:#18181b;--chip-border:rgba(0,0,0,0.1);--chip-accent:#7c3aed;--pill-bg:rgba(255,255,255,0.92);--pill-border:rgba(0,0,0,0.1);--pill-shadow:0 8px 28px rgba(0,0,0,0.08);--pill-fg:rgba(0,0,0,0.6);--pill-act-hover:rgba(0,0,0,0.06);--bg:#ffffff;--surface:#ffffff;--surface-2:#f7f7f8;--surface-3:#f1f1f3;--border:rgba(0,0,0,0.08);--border-strong:rgba(0,0,0,0.14);--text:#18181b;--text-dim:#52525b;--text-mute:#71717a;--accent:#7c3aed;--accent-2:#6d28d9;--accent-soft:rgba(124,58,237,0.09);--accent-glow:rgba(124,58,237,0.2);--success:#059669;--blue:#6d28d9;--shadow-card:0 8px 28px rgba(0,0,0,0.08);--bg-solid:#ffffff;--panel-grad:linear-gradient(165deg,#ffffff 0%,#f7f7f8 100%);--hover-bg:rgba(0,0,0,0.035);--hover-bg-strong:rgba(0,0,0,0.06);--sticky-bg:rgba(243,243,245,0.92);--sticky-border:rgba(0,0,0,0.07);--sticky-shadow:0 6px 20px rgba(0,0,0,0.1);--overlay:rgba(15,18,26,0.42);--overlay-strong:rgba(15,18,26,0.45);--modal-bg:#ffffff;--toast-bg:rgba(24,24,27,0.94);--toast-text:#ffffff;--bar-track:rgba(0,0,0,0.08);--spinner-track:#e4e4e7;--spinner-active:#7c3aed;--splash-bg:radial-gradient(circle at 50% 45%,#ffffff 0%,#f4f4f6 62%);--launch-splash-bg:radial-gradient(120% 90% at 50% 108%,rgba(124,58,237,0.12) 0%,rgba(124,58,237,0) 55%),radial-gradient(110% 85% at 50% -12%,rgba(56,97,190,0.1) 0%,rgba(255,255,255,0) 55%),#ffffff;--launch-glow:rgba(124,58,237,0.1);--splash-glow-color:rgba(124,58,237,0.22);--splash-name-b:#52525b;--splash-bar-fill:linear-gradient(90deg,#6d28d9,#7c3aed);--name-grad:linear-gradient(135deg,#18181b 20%,#7c3aed 90%);--num-grad:linear-gradient(180deg,#18181b 0%,#7c3aed 100%);--brand-grad:linear-gradient(135deg,#6d28d9 0%,#7c3aed 100%);--brand-grad-hover:linear-gradient(145deg,#7c3aed,#8b5cf6);--avatar-ring:rgba(124,58,237,0.4);--avatar-grad:linear-gradient(135deg,#ede9fe,#ddd6fe);--soft-card-grad:linear-gradient(135deg,#ffffff,#f1f1f3);--btn-hover-bg:rgba(124,58,237,0.1);--btn-hover-border:rgba(124,58,237,0.35);--btn-hover-shadow:0 4px 16px rgba(124,58,237,0.18);--danger-bg:rgba(248,113,113,0.16);--danger-border:rgba(248,113,113,0.5);--danger-shadow:0 4px 16px rgba(0,0,0,0.25);--poster-ph-bg:rgba(0,0,0,0.06);--platform-card-grad:linear-gradient(145deg,#f4f4f5 0%,#e9e9ec 100%);--platform-card-text:#3f3f46;--platform-shadow-hover:rgba(0,0,0,0.16);--scrollbar:#d4d4d8;--link:#6d28d9;--link-hover:#5b21b6;--success-fg:#059669;--warn-fg:#b45309;--cal-accent:#4a6db8;--cal-accent-2:#5b6b88;--cal-accent-3:#4a6db8;--cal-cell-border:#d4d9e6;--cal-soft:rgba(74,109,184,0.12);--cal-soft-border:rgba(74,109,184,0.3);--shadow-avatar:rgba(0,0,0,0.12);--shadow-login:rgba(0,0,0,0.1);--detail-hero-grad:linear-gradient(180deg,rgba(255,255,255,0.72),rgba(247,247,248,0.96));--detail-bg-filter:brightness(1.05) saturate(0.9)}@media (prefers-color-scheme:light){html[data-theme="system"]{--shadow-avatar:rgba(0,0,0,0.12);--shadow-login:rgba(0,0,0,0.1);--detail-hero-grad:linear-gradient(180deg,rgba(255,255,255,0.72),rgba(247,247,248,0.96));--detail-bg-filter:brightness(1.05) saturate(0.9);--danger-fg:#ff7b85;--chip-bg:#f4f4f5;--chip-bg-hover:#e4e4e7;--chip-fg:#3f3f46;--chip-fg-hover:#18181b;--chip-border:rgba(0,0,0,0.1);--chip-accent:#7c3aed;--pill-bg:rgba(255,255,255,0.92);--pill-border:rgba(0,0,0,0.1);--pill-shadow:0 8px 28px rgba(0,0,0,0.08);--pill-fg:rgba(0,0,0,0.6);--pill-act-hover:rgba(0,0,0,0.06);--bg:#ffffff;--surface:#ffffff;--surface-2:#f7f7f8;--surface-3:#f1f1f3;--border:rgba(0,0,0,0.08);--border-strong:rgba(0,0,0,0.14);--text:#18181b;--text-dim:#52525b;--text-mute:#71717a;--accent:#7c3aed;--accent-2:#6d28d9;--accent-soft:rgba(124,58,237,0.09);--accent-glow:rgba(124,58,237,0.2);--success:#059669;--blue:#6d28d9;--shadow-card:0 8px 28px rgba(0,0,0,0.08);--bg-solid:#ffffff;--panel-grad:linear-gradient(165deg,#ffffff 0%,#f7f7f8 100%);--hover-bg:rgba(0,0,0,0.035);--hover-bg-strong:rgba(0,0,0,0.06);--sticky-bg:rgba(243,243,245,0.92);--sticky-border:rgba(0,0,0,0.07);--sticky-shadow:0 6px 20px rgba(0,0,0,0.1);--overlay:rgba(15,18,26,0.42);--overlay-strong:rgba(15,18,26,0.45);--modal-bg:#ffffff;--toast-bg:rgba(24,24,27,0.94);--toast-text:#ffffff;--bar-track:rgba(0,0,0,0.08);--spinner-track:#e4e4e7;--spinner-active:#7c3aed;--splash-bg:radial-gradient(circle at 50% 45%,#ffffff 0%,#f4f4f6 62%);--launch-splash-bg:radial-gradient(120% 90% at 50% 108%,rgba(124,58,237,0.12) 0%,rgba(124,58,237,0) 55%),radial-gradient(110% 85% at 50% -12%,rgba(56,97,190,0.1) 0%,rgba(255,255,255,0) 55%),#ffffff;--launch-glow:rgba(124,58,237,0.1);--splash-glow-color:rgba(124,58,237,0.22);--splash-name-b:#52525b;--splash-bar-fill:linear-gradient(90deg,#6d28d9,#7c3aed);--name-grad:linear-gradient(135deg,#18181b 20%,#7c3aed 90%);--num-grad:linear-gradient(180deg,#18181b 0%,#7c3aed 100%);--brand-grad:linear-gradient(135deg,#6d28d9 0%,#7c3aed 100%);--brand-grad-hover:linear-gradient(145deg,#7c3aed,#8b5cf6);--avatar-ring:rgba(124,58,237,0.4);--avatar-grad:linear-gradient(135deg,#ede9fe,#ddd6fe);--soft-card-grad:linear-gradient(135deg,#ffffff,#f1f1f3);--btn-hover-bg:rgba(124,58,237,0.1);--btn-hover-border:rgba(124,58,237,0.35);--btn-hover-shadow:0 4px 16px rgba(124,58,237,0.18);--danger-bg:rgba(248,113,113,0.16);--danger-border:rgba(248,113,113,0.5);--danger-shadow:0 4px 16px rgba(0,0,0,0.25);--poster-ph-bg:rgba(0,0,0,0.06);--platform-card-grad:linear-gradient(145deg,#f4f4f5 0%,#e9e9ec 100%);--platform-card-text:#3f3f46;--platform-shadow-hover:rgba(0,0,0,0.16);--scrollbar:#d4d4d8;--link:#6d28d9;--link-hover:#5b21b6;--success-fg:#059669;--warn-fg:#b45309;--cal-accent:#4a6db8;--cal-accent-2:#5b6b88;--cal-accent-3:#4a6db8;--cal-cell-border:#d4d9e6;--cal-soft:rgba(74,109,184,0.12);--cal-soft-border:rgba(74,109,184,0.3)}}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;background:var(--bg-solid);background-attachment:fixed;color:var(--text);-webkit-font-smoothing:antialiased;line-height:1.5;overflow-x:hidden;overscroll-behavior-y:none}a{color:var(--accent-2);text-decoration:none;transition:color 0.15s}a:hover{color:var(--link-hover)}img{display:block;max-width:100%}.container{max-width:880px;width:100%;margin:0 auto;padding:0 16px calc(80px + env(safe-area-inset-bottom))}.app-version{text-align:center;font-size:0.7rem;color:var(--text-mute);opacity:0.7;padding:8px 0 4px;letter-spacing:0.4px;user-select:none}.pane-loading{padding:60px 20px;text-align:center}.load-more-wrap{text-align:center;margin-top:24px}.load-more{background:var(--surface-2);border:1px solid var(--border);color:var(--text);padding:11px 32px;border-radius:var(--radius-md);font-size:0.9rem;font-weight:600;cursor:pointer;transition:all 0.2s;font-family:inherit}.load-more:hover:not(:disabled){border-color:rgba(91,124,250,0.45);color:var(--accent-2);box-shadow:0 4px 20px var(--accent-glow);background:var(--surface-3)}.load-more:disabled{cursor:not-allowed}.login-wrap{min-height:100vh;min-height:100dvh;display:flex;align-items:center;justify-content:center;padding:20px}.login-card{width:100%;max-width:440px;background:var(--panel-grad);border:1px solid var(--border-strong);border-radius:24px;padding:44px 32px;text-align:center;box-shadow:0 24px 64px var(--shadow-login),inset 0 1px 0 var(--hover-bg-strong)}.login-logo{color:var(--splash-name-b);margin-bottom:16px}.login-title{font-size:1.75rem;font-weight:800;letter-spacing:-0.5px;background:var(--name-grad);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:6px}.login-sub{color:var(--text-dim);font-size:0.9rem;margin-bottom:28px}.btn-primary{background:var(--brand-grad);color:#fff;border:none;padding:13px 30px;border-radius:12px;font-size:0.95rem;font-weight:700;cursor:pointer;box-shadow:0 6px 24px var(--accent-glow)}.btn-primary:hover{filter:brightness(1.08);transform:translateY(-1px)}.btn-ghost{background:var(--chip-bg);color:var(--chip-fg);border:1px solid var(--chip-border);padding:8px 16px;border-radius:10px;font-size:0.85rem;cursor:pointer;transition:all 0.15s;font-family:inherit}.btn-ghost:hover{color:var(--chip-fg-hover);border-color:var(--chip-border);background:var(--chip-bg-hover)}.steps{display:flex;flex-direction:column;gap:6px}.step{display:flex;align-items:center;gap:10px;text-align:left;padding:4px 0;font-size:0.9rem}.step .n{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;background:var(--accent);color:#fff;border-radius:50%;font-size:0.72rem;font-weight:700;flex-shrink:0}.code-box{font-family:ui-monospace,Menlo,monospace;font-size:1.75rem;font-weight:800;letter-spacing:6px;color:#a8c0e8;background:rgba(90,120,180,0.12);border:1px solid rgba(140,170,220,0.35);border-radius:14px;padding:14px;margin:14px 0;user-select:all;text-align:center}.qr-box{background:#fff;border-radius:14px;padding:10px;display:inline-block;margin:6px 0 14px}.qr-box img{border-radius:8px}.status{display:inline-flex;align-items:center;gap:8px;font-size:0.88rem;padding:8px 16px;border-radius:20px;color:var(--text-dim);background:var(--surface-2)}.status.success{color:#4ade80;background:rgba(74,222,128,0.1)}.status.error{color:#e05560;background:rgba(224,85,96,0.12)}.err-box{background:rgba(224,85,96,0.1);border:1px solid rgba(224,85,96,0.28);border-radius:12px;padding:14px;text-align:left;margin-bottom:14px}.err-title{font-weight:600;color:#e05560;margin-bottom:4px;font-size:0.92rem}.err{color:#e8a3ab;font-size:0.85rem}.hint{color:var(--text-dim);font-size:0.82rem;margin-top:6px}.log-details{margin-top:18px;text-align:left}.log-details summary{cursor:pointer;font-size:0.76rem;color:var(--text-dim);padding:4px 0;user-select:none}.log-box{font-family:ui-monospace,Menlo,monospace;font-size:0.7rem;color:var(--text-dim);background:var(--surface-3);border:1px solid var(--border);border-radius:8px;padding:10px;max-height:160px;overflow:auto;margin-top:6px;line-height:1.6}.hero{display:flex;justify-content:space-between;align-items:center;padding:calc(8px + env(safe-area-inset-top)) 0 6px;gap:10px}.hero-left{display:flex;align-items:center;gap:12px;min-width:0}.hero-avatar{width:50px;height:50px;border-radius:50%;overflow:hidden;flex-shrink:0;background:var(--surface-2);border:2px solid var(--avatar-ring);box-shadow:0 0 0 3px var(--accent-soft),0 4px 20px var(--shadow-avatar)}.hero-avatar img{width:100%;height:100%;object-fit:cover;display:block}.hero-avatar-ph{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:1.25rem;background:var(--avatar-grad)}.hero-text{min-width:0;flex:1;display:flex;flex-direction:column;align-items:flex-start;gap:1px}.hero-name{font-size:1.45rem;font-weight:800;letter-spacing:-0.4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:var(--name-grad);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}.updated-times{display:flex;flex-direction:column;gap:1px}.updated-at{font-size:0.72rem;color:var(--text-mute);font-weight:400;letter-spacing:0.2px;transition:color 0.4s ease;line-height:1.35}.updated-at:empty{display:none}.updated-times:empty{display:none}.updated-at.flash{animation:updatedFlash 1.1s ease-out}.updated-at.src-live{color:#4ade80}.updated-at.src-cache{color:var(--text-mute)}@keyframes updatedFlash{0%{color:var(--accent-2)}100%{color:var(--text-mute)}}.hero-actions{display:flex;gap:8px;flex-shrink:0}.btn-action{display:inline-flex;align-items:center;gap:6px;background:var(--chip-bg);color:var(--chip-fg);border:1px solid var(--chip-border);padding:8px 14px;border-radius:10px;font-size:0.82rem;font-weight:600;cursor:pointer;font-family:inherit;transition:all 0.18s ease;-webkit-tap-highlight-color:transparent}.btn-action svg{flex-shrink:0;transition:transform 0.25s ease}.btn-action:hover{color:var(--chip-fg-hover);border-color:var(--btn-hover-border);background:var(--btn-hover-bg);box-shadow:var(--btn-hover-shadow)}.btn-action:hover svg{transform:rotate(180deg)}.btn-action:active{transform:scale(0.97)}#btn-logout:hover{color:var(--danger-fg);background:var(--danger-bg);border-color:var(--danger-border);box-shadow:var(--danger-shadow)}#btn-logout:hover svg{transform:translateX(2px)}#btn-theme:hover{color:var(--chip-accent)}#btn-theme:hover svg{transform:none}#btn-theme svg{transition:opacity 0.2s ease,transform 0.2s ease}#btn-theme .theme-icon{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}@media (max-width:768px){.btn-action span{display:none}.btn-action{padding:9px}.hero-actions{gap:6px}}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;background:var(--panel-grad);border:1px solid var(--border);border-radius:var(--radius-lg);padding:8px 6px;margin-bottom:8px;box-shadow:var(--shadow-card),inset 0 1px 0 rgba(255,255,255,0.04);position:relative;overflow:hidden}.stats::before{content:"";position:absolute;top:0;left:10%;right:10%;height:1px;background:linear-gradient(90deg,transparent,rgba(167,139,250,0.35),transparent)}.stat{position:relative;text-align:center;display:flex;flex-direction:column;align-items:center;gap:2px;padding:6px 2px;border-radius:12px;transition:background 0.2s ease}.stat:hover{background:rgba(255,255,255,0.025)}.stat + .stat::before{content:"";position:absolute;left:-4px;top:18%;bottom:18%;width:1px;background:linear-gradient(180deg,transparent,rgba(255,255,255,0.08),transparent)}.stat-icon{width:26px;height:26px;border-radius:8px;display:flex;align-items:center;justify-content:center;margin-bottom:2px;transition:transform 0.25s ease,box-shadow 0.25s ease}.stat:hover .stat-icon{transform:translateY(-1px) scale(1.06)}.stat-movie .stat-icon{background:linear-gradient(135deg,rgba(167,139,250,0.18),rgba(167,139,250,0.06));color:#c4b5fd;box-shadow:0 4px 14px rgba(167,139,250,0.18),inset 0 0 0 1px rgba(167,139,250,0.18)}.stat-show .stat-icon{background:linear-gradient(135deg,rgba(96,165,250,0.18),rgba(96,165,250,0.06));color:#93c5fd;box-shadow:0 4px 14px rgba(96,165,250,0.18),inset 0 0 0 1px rgba(96,165,250,0.18)}.stat-episode .stat-icon{background:linear-gradient(135deg,rgba(52,211,153,0.18),rgba(52,211,153,0.06));color:#6ee7b7;box-shadow:0 4px 14px rgba(52,211,153,0.18),inset 0 0 0 1px rgba(52,211,153,0.18)}.stat-hours .stat-icon{background:linear-gradient(135deg,rgba(251,191,36,0.18),rgba(251,191,36,0.06));color:#fcd34d;box-shadow:0 4px 14px rgba(251,191,36,0.18),inset 0 0 0 1px rgba(251,191,36,0.18)}.stat-num{font-size:1.2rem;font-weight:800;letter-spacing:-0.6px;line-height:1.1;background:var(--num-grad);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}.stat-label{font-size:0.7rem;color:var(--text-mute);font-weight:500}.tabs{display:flex;gap:4px;margin-bottom:0}.top-sticky{position:sticky;top:0;z-index:40;margin:0 -16px;padding:0 16px;background:var(--sticky-bg);backdrop-filter:blur(18px) saturate(1.2);-webkit-backdrop-filter:blur(18px) saturate(1.2);border-bottom:1px solid var(--sticky-border);box-shadow:var(--sticky-shadow)}.top-sticky .hero{padding-top:calc(20px + env(safe-area-inset-top));padding-bottom:4px}.top-sticky .stats{margin-bottom:4px}@media (min-width:768px){.top-sticky{margin:0 -28px;padding:0 28px 8px}}@media (min-width:1024px){.top-sticky{margin:0 -36px;padding:0 36px 8px}}@media (min-width:1280px){.top-sticky{margin:0 -40px;padding:0 40px 8px}}.tab{flex:1 1 0;min-width:0;background:transparent;border:none;color:var(--text-dim);padding:7px 2px;border-radius:999px;font-size:0.75rem;font-weight:600;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:center;display:flex;align-items:center;justify-content:center;gap:5px;transition:color 0.2s ease,background 0.2s ease;font-family:inherit;outline:none !important}.tab svg{flex-shrink:0;opacity:0.9}.tab span{overflow:hidden;text-overflow:ellipsis}.tab:hover{color:var(--text);background:rgba(255,255,255,0.06)}.tab.active{background:var(--brand-grad);color:#fff;font-weight:700}.pane{display:none}.pane.active{display:block;animation:fadeIn 0.3s ease;padding-top:12px}@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}.grid{display:flex;flex-direction:column;gap:10px}.item{position:relative;display:flex;gap:14px;background:var(--panel-grad);border:1px solid var(--border);border-radius:var(--radius-lg);padding:12px;transition:transform 0.2s ease,border-color 0.2s,box-shadow 0.2s;animation:fadeInUp 0.4s ease backwards;overflow:hidden;box-shadow:0 4px 20px var(--shadow-card),inset 0 1px 0 var(--hover-bg);text-decoration:none;color:inherit}.item.clickable{cursor:pointer}.item.clickable:active{transform:scale(0.985);background:var(--surface-2)}@keyframes fadeInUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}.item:hover{border-color:rgba(167,139,250,0.25);box-shadow:0 8px 28px rgba(0,0,0,0.45),0 0 0 1px rgba(167,139,250,0.08);transform:translateY(-1px)}.wl-remove,.wl-drop,.wl-watched,.wl-unwatch{position:absolute;top:6px;right:6px;width:26px;height:26px;border-radius:50%;background:rgba(0,0,0,0.65);line-height:1;cursor:pointer;z-index:3;display:flex;align-items:center;justify-content:center;padding:0;font-family:inherit;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);transition:background 0.15s,transform 0.15s,opacity 0.15s,color 0.15s}.wl-remove{color:#fff;border:1px solid rgba(255,255,255,0.22);font-size:1rem;font-weight:400;opacity:0.88}.wl-remove:hover{background:rgba(200,70,80,0.92);opacity:1;transform:scale(1.06)}.wl-drop{position:absolute;top:6px;right:6px;width:30px;height:30px;border-radius:50%;background:rgba(0,0,0,0.72);color:#ff8a8a;border:1px solid rgba(255,120,120,0.55);font-size:0.85rem;opacity:1;z-index:5;display:flex;align-items:center;justify-content:center;padding:0;cursor:pointer;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}.wl-drop:hover{background:rgba(200,70,80,0.95);color:#fff;transform:scale(1.08)}.wl-drop svg{display:block;pointer-events:none}.wl-drop:disabled{opacity:0.5;cursor:wait}.cal-action-row{display:flex;gap:8px;margin-top:8px;align-self:flex-start;flex-wrap:wrap}.cal-open-btn,.cal-drop-btn{align-self:auto;margin-top:0;margin-left:0;display:inline-flex;align-items:center;justify-content:center;padding:5px 12px;border-radius:8px;font-size:0.74rem;font-weight:600;cursor:pointer;font-family:inherit;transition:all 0.15s;white-space:nowrap}.cal-open-btn{background:rgba(90,120,180,0.14);border:1px solid rgba(140,170,220,0.35);color:#9db5e0}.cal-open-btn:hover{background:rgba(120,150,210,0.28);color:#c2d4f0;border-color:rgba(140,170,220,0.65)}.cal-open-btn svg{flex-shrink:0;pointer-events:none}.cal-drop-btn{background:rgba(224,85,96,0.14);border:1px solid rgba(224,85,96,0.4);color:#ff8a8a}.cal-drop-btn:hover{background:rgba(224,85,96,0.3);color:#ffb3b3;border-color:rgba(224,85,96,0.65)}.cal-drop-btn svg{flex-shrink:0;pointer-events:none}.cal-drop-btn:disabled{opacity:0.5;cursor:wait}.wl-watched{color:#4ade80;border:1px solid rgba(74,222,128,0.45);font-size:0.85rem;font-weight:700;opacity:0.9}.wl-watched:hover{background:rgba(74,222,128,0.95);color:#000;opacity:1;transform:scale(1.06)}.wl-unwatch{color:#ffb84d;border:1px solid rgba(255,184,77,0.45);font-size:0.9rem;font-weight:700;opacity:0.9}.wl-unwatch:hover{background:rgba(255,184,77,0.95);color:#000;opacity:1;transform:scale(1.06)}.wl-remove:disabled,.wl-watched:disabled,.wl-unwatch:disabled{opacity:0.5;cursor:wait}.poster{width:76px;height:114px;border-radius:10px;overflow:hidden;flex-shrink:0;background:var(--surface-2);position:relative}.poster img{width:100%;height:100%;object-fit:cover}.poster-ph{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:1.8rem;background:var(--soft-card-grad);color:var(--text-dim)}.poster-play{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:46px;height:46px;border-radius:50%;background:rgba(8,10,18,0.72);color:#fff;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);opacity:1;transition:opacity 0.2s ease,transform 0.2s ease,background 0.15s ease,box-shadow 0.2s ease;text-decoration:none;border:1px solid rgba(255,255,255,0.24);z-index:4;box-shadow:0 4px 18px rgba(0,0,0,0.55);-webkit-tap-highlight-color:transparent}.poster-play svg{display:block;margin-left:2px;pointer-events:none;width:24px;height:24px}.item:hover .poster-play{opacity:1}.poster-play:hover{background:linear-gradient(145deg,#8b5cf6,#a78bfa);transform:translate(-50%,-50%) scale(1.1);color:#fff;border-color:rgba(255,255,255,0.4);box-shadow:0 8px 28px rgba(139,92,246,0.6)}.poster-play:active{transform:translate(-50%,-50%) scale(0.94)}.info{flex:1;min-width:0;display:flex;flex-direction:column;justify-content:center;gap:4px}.name-row{display:flex;align-items:baseline;gap:0;overflow:hidden;white-space:nowrap;line-height:1.3;letter-spacing:-0.2px}.name{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:1rem;font-weight:700;color:var(--text)}.tag{flex:0 0 auto;font-size:inherit;font-weight:inherit;letter-spacing:0;white-space:nowrap}.tag.upcoming{color:#ffb84d}.tag.aired{color:#4ade80}.tag.soon{color:#fbbf24}.overview{font-size:0.8rem;color:var(--text-dim);overflow:hidden;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;line-height:1.45;margin-top:4px}.meta{font-size:0.8rem;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.meta.dim{color:#7a8394;font-size:0.78rem;margin-top:2px}.bar{height:3px;background:rgba(255,255,255,0.06);border-radius:99px;overflow:hidden;margin-top:8px}.bar-fill{height:100%;background:linear-gradient(90deg,#7c3aed,#c4b5fd);border-radius:99px;box-shadow:0 0 10px rgba(167,139,250,0.5)}.search-bar{margin-bottom:16px}.search-input{width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:12px 16px;border-radius:12px;font-size:0.95rem;font-family:inherit;outline:none;transition:border-color 0.15s,background 0.15s;-webkit-appearance:none;appearance:none}.search-input:focus{border-color:var(--accent);background:var(--surface-2);box-shadow:0 0 0 3px var(--accent-soft)}.search-input::placeholder{color:var(--text-mute)}.trending-head{display:flex;align-items:center;gap:8px;font-size:0.88rem;font-weight:700;color:var(--text);margin:4px 0 14px;padding-left:2px;letter-spacing:0.2px}.trending-head::before{content:"";width:3px;height:14px;border-radius:2px;background:linear-gradient(180deg,#f97316,#ef4444)}.home-section{margin-bottom:12px}.home-section-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}.home-section-title{font-size:1rem;font-weight:700;letter-spacing:0.2px;display:flex;align-items:center;gap:8px}.home-section-title::before{content:"";width:3px;height:16px;border-radius:2px;background:linear-gradient(180deg,#a78bfa,#7c3aed)}.home-more-btn{background:transparent;border:none;color:var(--text-dim);font-size:0.82rem;font-weight:600;cursor:pointer;font-family:inherit;padding:6px 10px;border-radius:8px;transition:all 0.15s;display:inline-flex;align-items:center;gap:4px}.home-more-btn:hover{color:var(--accent-2);background:rgba(167,139,250,0.1)}.home-more-btn svg{transition:transform 0.2s ease}.platform-section{margin-bottom:14px}.platform-rows{display:flex;flex-direction:column;gap:8px}.platform-row{display:flex;align-items:center;gap:8px;min-width:0}.platform-cards{display:flex;gap:10px;overflow-x:auto;padding:2px 2px 6px;-webkit-overflow-scrolling:touch;scrollbar-width:none;flex:1;min-width:0;scroll-snap-type:x proximity}.platform-cards::-webkit-scrollbar{display:none}.platform-card{flex:0 0 auto;width:min(42vw,168px);height:74px;border:none;border-radius:14px;background:var(--platform-card-grad);box-shadow:0 8px 20px var(--shadow-card),inset 0 1px 0 var(--hover-bg-strong);display:flex;align-items:stretch;padding:0;cursor:pointer;overflow:hidden;position:relative;scroll-snap-align:start;transition:transform 0.18s ease,box-shadow 0.18s ease;-webkit-tap-highlight-color:transparent;font:inherit;color:var(--platform-card-text)}.platform-card:hover{transform:translateY(-3px);box-shadow:0 16px 36px var(--platform-shadow-hover),inset 0 1px 0 var(--hover-bg-strong)}html[data-theme="light"] .platform-card:hover{box-shadow:0 4px 12px rgba(0,0,0,0.03),inset 0 1px 0 #ffffff}@media (prefers-color-scheme:light){html[data-theme="system"] .platform-card:hover{box-shadow:0 4px 12px rgba(0,0,0,0.03),inset 0 1px 0 #ffffff}}.platform-card:active{transform:scale(0.985)}.platform-card-left{flex:0 0 40%;max-width:40%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0;padding:6px 2px 6px 6px;z-index:2;position:relative}.platform-card-logo{width:60px;height:60px;border-radius:0;object-fit:contain;object-position:center;flex-shrink:0;box-shadow:none;background:transparent;padding:0;box-sizing:border-box;display:block}.platform-card-name{display:none}.platform-card-right{flex:1;position:relative;min-width:0;overflow:hidden}.platform-card-posters{position:absolute;right:-4px;top:50%;transform:translateY(-50%);width:96px;height:66px}.platform-card-poster{position:absolute;width:32px;height:48px;border-radius:6px;object-fit:cover;box-shadow:0 4px 10px rgba(0,0,0,0.28);border:1.5px solid rgba(255,255,255,0.95);background:#c5c9d0;top:50%;margin-top:-24px}.platform-card-poster-ph{background:linear-gradient(145deg,#d0d4db 0%,#b8bec8 100%)}.platform-card-poster.p0{right:4px;z-index:5;transform:rotate(8deg)}.platform-card-poster.p1{right:20px;z-index:4;transform:rotate(3deg)}.platform-card-poster.p2{right:36px;z-index:3;transform:rotate(-4deg)}.platform-card-poster.p3{right:52px;z-index:2;transform:rotate(-10deg)}@media (min-width:768px){.platform-card{flex:1 1 260px;min-width:260px;width:auto;height:96px;border-radius:16px}.platform-card-logo{width:76px;height:76px;border-radius:0;padding:0}.platform-card-posters{width:140px;height:88px}.platform-card-poster{width:48px;height:72px;margin-top:-36px;border-radius:8px}.platform-card-poster.p0{right:8px}.platform-card-poster.p1{right:30px}.platform-card-poster.p2{right:52px}.platform-card-poster.p3{right:74px}.platform-cards{gap:12px}}.h-scroll-wrap{margin:0 -16px;padding:0 16px}.h-scroll{display:flex;gap:12px;overflow-x:auto;padding:2px 0 8px;-webkit-overflow-scrolling:touch;scrollbar-width:none;scroll-snap-type:x proximity}.h-scroll::-webkit-scrollbar{display:none}.h-scroll-empty{padding:30px 0;text-align:center}.h-scroll .item{flex:0 0 auto;width:132px;display:flex;flex-direction:column;gap:0;padding:0;border-radius:12px;background:transparent;border:none;overflow:visible;animation:none;box-shadow:none;scroll-snap-align:start;transform:none}.h-scroll .item:hover{background:transparent;border:none;box-shadow:none;transform:none}.h-scroll .item.clickable:active{transform:scale(0.96);background:transparent}.h-scroll .item .poster{width:100%;height:auto;aspect-ratio:2/3;border-radius:12px;box-shadow:0 4px 16px rgba(0,0,0,0.5);transition:transform 0.25s ease,box-shadow 0.25s ease}.h-scroll .item:hover .poster{transform:translateY(-3px);box-shadow:0 12px 28px rgba(91,124,250,0.3),0 4px 16px rgba(0,0,0,0.6)}.h-scroll .item .info{display:block;padding:8px 2px 0;flex:none;justify-content:flex-start}.h-scroll .item .name{font-size:0.82rem;line-height:1.3}.h-scroll .item .overview{display:none}.h-scroll .item .meta{font-size:0.72rem;margin-top:2px;color:var(--text-dim)}.h-scroll .item .meta.dim{font-size:0.7rem}.h-scroll .hist-days{display:flex;flex-direction:column;gap:24px;width:100%;padding-top:4px}.hist-day-head{display:flex;align-items:center;gap:12px;margin:0 0 12px;padding:0 2px}.hist-day-num{flex-shrink:0;width:42px;height:42px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:1.05rem;font-weight:800;color:var(--text);background:var(--surface-2,#1c1f2a);border:1px solid var(--border,rgba(255,255,255,.08))}.hist-day-num.is-today{background:linear-gradient(135deg,#7c3aed,#a78bfa);color:#fff;border-color:transparent}.hist-day-text{flex:1;min-width:0}.hist-day-main{font-size:0.95rem;font-weight:700;line-height:1.2}.hist-day-sub{font-size:0.72rem;color:var(--text-dim);margin-top:2px}.hist-day-count{font-size:0.72rem;color:var(--text-mute,var(--text-dim));flex-shrink:0}.hist-day-grid{margin:0}#history.pane{padding-top:8px}#history>.grid{display:block;padding:20px 0 12px}#history>.grid>.hist-days{width:100%}.cw-card{flex:0 0 auto;width:min(78vw,280px);max-width:280px;display:flex;flex-direction:column;gap:0;padding:0;border-radius:12px;background:transparent;border:none;overflow:visible;scroll-snap-align:start;position:relative}.h-scroll .cw-card:hover{background:transparent;border:none;box-shadow:none;transform:none}.h-scroll .cw-card.clickable:active{transform:scale(0.97)}.cw-poster{position:relative;width:100%;aspect-ratio:16/9;border-radius:12px;overflow:hidden;background:var(--surface-2);box-shadow:0 4px 16px rgba(0,0,0,0.5)}html[data-theme="light"] .cw-poster{box-shadow:0 4px 12px rgba(0,0,0,0.06)}@media (prefers-color-scheme:light){html[data-theme="system"] .cw-poster{box-shadow:0 4px 12px rgba(0,0,0,0.06)}}.cw-poster img{width:100%;height:100%;object-fit:cover;display:block}.cw-poster .poster-ph{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:2rem;color:var(--text-dim);background:var(--soft-card-grad,var(--surface-2))}.cw-overlay{position:absolute;left:8px;bottom:12px;z-index:2;font-size:0.72rem;font-weight:700;color:#fff;text-shadow:0 1px 4px rgba(0,0,0,0.85);background:rgba(0,0,0,0.45);padding:3px 8px;border-radius:6px;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);max-width:calc(100% - 16px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.cw-bar{position:absolute;left:0;right:0;bottom:0;height:3px;background:rgba(255,255,255,0.18);z-index:3}.cw-bar-fill{height:100%;background:linear-gradient(90deg,#a78bfa,#7c3aed);border-radius:0 2px 2px 0}.cw-info{padding:6px 2px 0;min-width:0;display:flex;flex-direction:column;gap:1px}.cw-title-row{display:flex;align-items:center;gap:4px;min-width:0;position:relative;line-height:1.25;padding-right:28px}.cw-title{flex:1;min-width:0;font-size:0.82rem;font-weight:600;line-height:1.25;color:var(--text);display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}.cw-badge-rewatch{display:inline-flex;align-items:center;justify-content:center;padding:0 5px;height:16px;font-size:0.62rem;font-weight:700;color:#fff;background:linear-gradient(135deg,#8b5cf6,#a78bfa);border-radius:4px;margin-left:4px;flex-shrink:0;transform:translateY(-1px)}.cw-watching{font-size:0.72rem;font-weight:500;line-height:1.25;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.cw-meta{margin-top:0;font-size:0.68rem;line-height:1.25;color:var(--text-mute,var(--text-dim))}.cw-more{position:absolute;right:-8px;top:50%;transform:translateY(-50%);width:36px;height:36px;margin:0;border:none;background:transparent;color:var(--text-dim);border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;font-family:inherit;transition:color 0.15s,background 0.15s;-webkit-tap-highlight-color:transparent;z-index:6;touch-action:manipulation}.cw-more::before{content:"";position:absolute;inset:-6px;border-radius:50%}.cw-more:hover,.cw-more:active{color:var(--text);background:rgba(255,255,255,0.1)}.cw-sheet{position:fixed;inset:0;z-index:500;display:none}.cw-sheet.open{display:block}.cw-sheet-backdrop{position:absolute;inset:0;background:rgba(0,0,0,0.55);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px)}.cw-sheet-panel{position:absolute;left:12px;right:12px;bottom:calc(12px + env(safe-area-inset-bottom,0px));background:var(--panel-grad,#1a1d27);border:1px solid var(--border-strong,rgba(255,255,255,0.12));border-radius:16px;box-shadow:0 16px 48px rgba(0,0,0,0.65);padding:8px;animation:cwSheetIn 0.2s cubic-bezier(0.2,0.9,0.3,1)}@keyframes cwSheetIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}.cw-sheet-title{font-size:0.78rem;color:var(--text-dim);padding:8px 14px 6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.cw-sheet-item{display:block;width:100%;text-align:left;border:none;background:transparent;color:var(--text);font-size:1rem;font-weight:600;font-family:inherit;padding:16px 14px;border-radius:12px;cursor:pointer;min-height:48px;-webkit-tap-highlight-color:transparent;touch-action:manipulation}.cw-sheet-item:active{background:rgba(255,255,255,0.08)}.cw-sheet-item.danger{color:#ff8a8a}.cw-sheet-cancel{margin-top:4px;border-top:1px solid var(--border,rgba(255,255,255,0.08));color:var(--text-dim);font-weight:500}@media (min-width:700px){.cw-sheet-panel{left:50%;right:auto;bottom:auto;top:50%;transform:translate(-50%,-50%);width:min(340px,92vw);animation:cwSheetInCenter 0.2s cubic-bezier(0.2,0.9,0.3,1)}@keyframes cwSheetInCenter{from{opacity:0;transform:translate(-50%,-48%) scale(0.96)}to{opacity:1;transform:translate(-50%,-50%) scale(1)}}}.cw-modal-grid{padding:2px 0 4px}.cw-card .wl-watched{top:6px;right:6px}@media (min-width:768px){.h-scroll .cw-card{width:260px}.cw-title{font-size:0.86rem}}.h-scroll .item .bar{margin-top:6px}.h-scroll .item .wl-watched,.h-scroll .item .wl-remove,.h-scroll .item .wl-drop,.h-scroll .item .wl-unwatch{top:6px;right:6px;width:24px;height:24px;font-size:0.75rem}.h-scroll .item .cal-action-row,.h-scroll .item .cal-open-btn{display:none}.h-scroll .item .poster-play{width:46px;height:46px;opacity:1}.h-scroll .item .poster-play svg{width:24px;height:24px}@media (min-width:768px){.h-scroll-wrap{margin:0;padding:0}.h-scroll .item{width:168px}}@media (min-width:1024px){.h-scroll .item{width:188px}}@media (min-width:1280px){.h-scroll .item{width:200px}}@media (min-width:1600px){.h-scroll .item{width:214px}}@media (min-width:1920px){.container{width:100%;padding-left:48px;padding-right:48px}.h-scroll .item{width:228px}}@media (min-width:2200px){.h-scroll .item{width:240px}}.grid .item .cw-more{margin-left:auto;flex-shrink:0;width:28px;height:28px;border:none;background:transparent;color:var(--text-dim);border-radius:8px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;padding:0}.grid .item .cw-more:hover{color:var(--text);background:var(--chip-bg)}.grid .item .name-row{display:flex;align-items:center;gap:6px}.cw-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.cw-act-btn{flex:1 1 auto;min-width:0;padding:8px 12px;border-radius:10px;font-size:0.78rem;font-weight:600;font-family:inherit;cursor:pointer;border:1px solid var(--chip-border);background:var(--chip-bg);color:var(--chip-fg);transition:background 0.15s,border-color 0.15s,color 0.15s;-webkit-tap-highlight-color:transparent}.cw-act-btn:hover{background:var(--chip-bg-hover);color:var(--chip-fg-hover)}.cw-act-btn.danger{border-color:rgba(224,85,96,0.35);background:rgba(224,85,96,0.1);color:#ff8a8a}.cw-act-btn.danger:hover{background:rgba(224,85,96,0.18);color:#ffb0b0}.h-scroll .cw-actions{flex-direction:column;gap:6px}.h-scroll .cw-act-btn{width:100%;padding:7px 10px;font-size:0.72rem}.list-modal{position:fixed;inset:0;z-index:150;display:none}.list-modal.open{display:block}.list-modal-backdrop{position:absolute;inset:0;background:rgba(2,4,8,0.8);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);animation:fadeIn 0.2s ease}.list-modal-panel{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:min(94vw,1000px);max-height:88vh;display:flex;flex-direction:column;background:var(--panel-grad);border:1px solid var(--border-strong);border-radius:18px;box-shadow:0 30px 80px rgba(0,0,0,0.85);overflow:hidden;animation:modalIn 0.25s cubic-bezier(0.2,0.9,0.3,1)}.list-modal-head{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);flex-shrink:0}.list-modal-title{font-size:1.05rem;font-weight:700}.list-modal-close{width:40px;height:40px;border-radius:50%;border:1px solid var(--chip-border);background:var(--chip-bg);color:var(--chip-fg);font-size:1.2rem;cursor:pointer;font-family:inherit;line-height:1;display:flex;align-items:center;justify-content:center;transition:all 0.15s}.list-modal-close:hover{color:#fff;border-color:var(--border-strong);background:rgba(255,255,255,0.08)}.list-modal-body{overflow-y:auto;padding:16px 20px 24px;-webkit-overflow-scrolling:touch}.douban-filter-tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}.douban-filter-tab{background:var(--chip-bg);border:1px solid var(--chip-border);color:var(--chip-fg);padding:7px 16px;border-radius:999px;font-size:0.82rem;font-weight:600;cursor:pointer;font-family:inherit;transition:all 0.15s;-webkit-tap-highlight-color:transparent}.douban-filter-tab:hover{color:var(--chip-fg-hover);border-color:var(--chip-border);background:var(--chip-bg-hover)}.douban-filter-tab.active{background:var(--brand-grad);color:#fff;border-color:transparent;box-shadow:0 4px 14px rgba(167,139,250,0.3)}.theater-home-tabs{display:flex;gap:8px;overflow-x:auto;padding:0 16px 12px;margin:0 -16px;scrollbar-width:none;-webkit-overflow-scrolling:touch;scroll-snap-type:x proximity}.theater-home-tabs::-webkit-scrollbar{display:none}.theater-filter-tab{flex-shrink:0;background:var(--chip-bg);border:1px solid var(--chip-border);color:var(--chip-fg);padding:6px 14px;border-radius:999px;font-size:0.78rem;font-weight:600;cursor:pointer;font-family:inherit;transition:all 0.15s;-webkit-tap-highlight-color:transparent;scroll-snap-align:start}.theater-filter-tab:hover{color:var(--chip-fg-hover);border-color:var(--chip-border);background:var(--chip-bg-hover)}.theater-filter-tab.active{background:var(--brand-grad);color:#fff;border-color:transparent;box-shadow:0 4px 14px rgba(167,139,250,0.3)}@media (min-width:768px){.theater-home-tabs{margin:0;padding-left:0;padding-right:0}}@media (max-width:599px){.list-modal-panel{top:auto;bottom:0;left:0;right:0;transform:none;width:100%;max-height:92vh;border-radius:18px 18px 0 0}}.show-cal-modal{position:fixed;inset:0;z-index:240;display:none}.show-cal-modal.open{display:block}.show-cal-backdrop{position:absolute;inset:0;background:var(--overlay);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);animation:fadeIn 0.2s ease}.show-cal-panel{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:min(92vw,440px);max-height:90vh;overflow-y:auto;background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:20px;box-shadow:0 30px 80px rgba(0,0,0,0.8);animation:modalIn 0.25s cubic-bezier(0.2,0.9,0.3,1)}.show-cal-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}.show-cal-name{font-size:0.95rem;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}.show-cal-close{width:40px;height:40px;flex-shrink:0;background:var(--chip-bg);border:1px solid var(--chip-border);color:var(--chip-fg);border-radius:50%;cursor:pointer;font-size:1.2rem;line-height:1;display:flex;align-items:center;justify-content:center;transition:all 0.15s;font-family:inherit}.show-cal-close:hover{color:var(--chip-fg-hover);border-color:var(--chip-border);background:var(--chip-bg-hover)}.show-cal-info{font-size:0.72rem;color:var(--text-dim);margin-bottom:12px;line-height:1.4}.show-cal-nav{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;font-size:0.88rem;color:var(--text);font-weight:600}.show-cal-nav button{width:30px;height:30px;background:var(--chip-bg);border:1px solid var(--chip-border);color:var(--chip-fg);border-radius:8px;cursor:pointer;font-size:1rem;line-height:1;display:flex;align-items:center;justify-content:center;transition:all 0.15s;font-family:inherit}.show-cal-nav button:hover{color:var(--chip-fg-hover);border-color:var(--chip-border);background:var(--chip-bg-hover)}.show-cal-weekdays{display:grid;grid-template-columns:repeat(7,1fr);text-align:center;font-size:0.7rem;color:var(--text-dim);margin-bottom:6px}.show-cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:4px}.sc-day{position:relative;aspect-ratio:1;display:flex;align-items:center;justify-content:center;border-radius:8px;font-size:0.8rem;color:var(--text-dim);cursor:default;border:1px solid transparent;transition:background 0.15s,border-color 0.15s}.sc-day.sc-has{cursor:pointer;font-weight:700}.sc-day.sc-past{background:var(--cal-soft);color:var(--cal-accent-2);border-color:rgba(120,150,210,0.5)}.sc-day.sc-past:hover{background:var(--cal-soft-border);color:#d0dcf0}.sc-day.sc-today-day{background:var(--cal-accent);color:#fff;border-color:#7d9dd4;box-shadow:0 0 14px rgba(125,157,212,0.7)}.sc-day.sc-today-day:hover{background:#5b7fc4}.sc-day.sc-future{background:rgba(255,184,77,0.18);color:#ffd693;border-color:rgba(255,184,77,0.55)}.sc-day.sc-future:hover{background:rgba(255,184,77,0.4);color:#fff0d0}.sc-day.sc-active{outline:2px solid #fff;outline-offset:-2px}.sc-day.sc-empty{visibility:hidden}.sc-badge{position:absolute;top:2px;right:2px;min-width:14px;height:14px;padding:0 3px;border-radius:7px;background:var(--cal-accent);color:#fff;font-size:0.6rem;font-weight:700;line-height:14px;text-align:center}.sc-day.sc-future .sc-badge{background:#d99a3a}.show-cal-legend{display:flex;flex-wrap:wrap;gap:12px;justify-content:center;margin-top:14px;font-size:0.7rem;color:var(--text-dim)}.legend-item{display:inline-flex;align-items:center;gap:5px}.legend-dot{display:inline-block;width:10px;height:10px;border-radius:3px}.legend-past{background:var(--cal-soft-border);border:1px solid rgba(140,170,220,0.8)}.legend-today{background:var(--cal-accent);border:1px solid #7d9dd4}.legend-future{background:rgba(255,184,77,0.4);border:1px solid rgba(255,184,77,0.8)}.show-cal-detail{margin-top:14px;border-top:1px solid var(--border);padding-top:12px;min-height:20px}.sc-ep{display:flex;gap:10px;align-items:baseline;padding:6px 0;font-size:0.82rem}.sc-ep-tag{font-family:ui-monospace,Menlo,monospace;font-size:0.72rem;font-weight:700;color:#7d9dd4;flex-shrink:0}.sc-ep-title{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ext-rating{display:inline-flex;align-items:center;gap:6px;padding:4px 10px 4px 8px;border-radius:8px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);line-height:1;font-size:0.82rem;color:var(--text);white-space:nowrap;text-decoration:none;transition:background 0.15s,border-color 0.15s,transform 0.12s}.ext-rating:hover{background:rgba(255,255,255,0.1);border-color:rgba(255,255,255,0.16)}.ext-logo{display:block;flex-shrink:0;border-radius:2px}.ext-score{font-weight:800;letter-spacing:0.2px;font-variant-numeric:tabular-nums}.ext-rating.ext-imdb{background:rgba(245,197,24,0.14);border-color:rgba(245,197,24,0.35);color:#f5c518}.ext-rating.ext-imdb .ext-score{color:#f5c518}.ext-rating.ext-rt{background:rgba(250,50,10,0.12);border-color:rgba(250,50,10,0.32);color:#ff7666}.ext-rating.ext-rt .ext-score{color:#ff7666}.ext-rating.ext-mc{background:rgba(255,255,255,0.05);border-color:rgba(255,255,255,0.12);color:var(--text)}.ext-rating.ext-trakt{background:rgba(237,28,36,0.12);border-color:rgba(237,28,36,0.32);color:#ff6b70}.ext-rating.ext-trakt .ext-score{color:#ff6b70}.ext-rating.ext-tmdb{background:rgba(1,180,228,0.12);border-color:rgba(1,180,228,0.32);color:#4dd0e1}.ext-rating.ext-tmdb .ext-score{color:#4dd0e1}.ext-rating.ext-douban{background:rgba(46,150,61,0.12);border-color:rgba(46,150,61,0.38);color:#4ecb71}.ext-rating.ext-douban:hover{background:rgba(46,150,61,0.22);border-color:rgba(46,150,61,0.6);color:#6fe089}.detail-ext-ratings{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:8px;align-items:center}@media (min-width:600px){.container{padding-left:20px;padding-right:20px}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}.item{border-radius:14px}.poster{width:72px;height:108px}}@media (min-width:768px){.container{width:100%;padding:0 28px calc(76px + env(safe-area-inset-bottom))}.hero{padding:12px 0 8px;gap:8px}.hero-avatar{width:56px;height:56px}.hero-name{font-size:1.55rem}.stats{gap:6px;padding:10px 8px;margin-bottom:8px}.stat-num{font-size:1.5rem}.stat-label{font-size:0.76rem}.stat-icon{width:34px;height:34px;border-radius:10px}.tabs{position:relative;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch;padding-bottom:2px}.tabs::-webkit-scrollbar{display:none}.tab{flex:0 0 auto;padding:9px 14px;font-size:0.87rem}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:16px}.item{display:flex;flex-direction:column;gap:0;padding:0;border-radius:12px;background:transparent;border:none;overflow:visible}.item:hover{background:transparent;border:none}.item.clickable:active{transform:none;background:transparent}.poster{width:100%;height:auto;aspect-ratio:2/3;border-radius:12px;transition:transform 0.25s ease,box-shadow 0.25s ease;box-shadow:0 4px 16px rgba(0,0,0,0.5)}.item:hover .poster{transform:translateY(-4px);box-shadow:0 12px 32px rgba(91,124,250,0.3),0 4px 16px rgba(0,0,0,0.6)}.info{display:block;padding:10px 2px 0;flex:none;justify-content:flex-start}.name{font-size:0.88rem}.overview{-webkit-line-clamp:2;font-size:0.74rem;margin-top:4px}.meta{font-size:0.76rem;margin-top:3px}.meta.dim{font-size:0.72rem}.bar{margin-top:8px}.wl-remove,.wl-watched,.wl-unwatch{top:8px;right:8px;width:28px;height:28px}.day-num{font-size:1.6rem}}@media (min-width:1024px){.container{width:100%;padding:0 36px 100px}.hero{padding:14px 0 8px}.hero-name{font-size:1.7rem}.stats{gap:8px;padding:12px 10px;margin-bottom:10px}.stat-num{font-size:1.7rem}.stat-label{font-size:0.78rem}.stat-icon{width:36px;height:36px}.grid{grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:20px}.name{font-size:0.9rem}.overview{-webkit-line-clamp:3;font-size:0.76rem}.wl-remove,.wl-watched,.wl-unwatch{top:10px;right:10px;width:30px;height:30px}.wl-watched,.wl-unwatch{font-size:0.95rem}}@media (min-width:1280px){.container{width:100%;padding:0 40px 110px}.grid{grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:22px}.hero-name{font-size:1.85rem}}@media (min-width:1600px){.container{width:100%}.grid{grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:24px}}.day{margin-bottom:18px}.day-head{display:flex;align-items:center;gap:12px;margin-bottom:12px;padding-left:2px}.day-num{font-size:1.8rem;font-weight:800;color:#7d9dd4;line-height:1;letter-spacing:-1px}.day-mon{font-size:0.75rem;color:var(--text-dim)}.day-wd{font-size:0.85rem;font-weight:600;color:var(--text)}.today{background:var(--accent);color:#fff;font-size:0.68rem;padding:3px 9px;border-radius:999px;font-weight:700;margin-left:auto}.empty{text-align:center;padding:80px 20px;color:var(--text-dim)}.empty p{margin-top:14px;font-size:0.92rem}@media (min-width:700px){.empty{padding:120px 20px}}.modal{position:fixed;inset:0;z-index:220;display:none}.modal.open{display:block}.modal-backdrop{position:absolute;inset:0;background:var(--overlay-strong);backdrop-filter:blur(12px) saturate(1.1);-webkit-backdrop-filter:blur(12px) saturate(1.1);animation:fadeIn 0.2s ease}.modal-panel{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:12px;padding-top:calc(12px + env(safe-area-inset-top));padding-bottom:calc(12px + env(safe-area-inset-bottom));pointer-events:none}.modal-shell{pointer-events:auto;position:relative;display:flex;flex-direction:column;width:100%;max-width:min(1120px,100%);max-height:100%;background:var(--modal-bg);border:1px solid var(--border);border-radius:18px;box-shadow:0 40px 100px rgba(0,0,0,0.85);animation:modalIn 0.28s cubic-bezier(0.2,0.9,0.3,1);overflow:hidden}.modal-body{position:relative;width:100%;flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;background:var(--modal-bg);-webkit-overflow-scrolling:touch;overscroll-behavior:contain}.modal-close{position:absolute;top:12px;right:12px;z-index:5;width:40px;height:40px;border-radius:50%;background:rgba(13,16,23,0.86);border:1px solid rgba(255,255,255,0.18);color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);transition:background 0.15s,transform 0.15s,border-color 0.15s;padding:0;box-shadow:0 4px 16px rgba(0,0,0,0.55);touch-action:manipulation;-webkit-tap-highlight-color:transparent}.modal-close::before{content:"";position:absolute;inset:-8px;border-radius:50%}.modal-close:hover{background:rgba(30,38,58,0.95);transform:scale(1.05);border-color:rgba(255,255,255,0.28)}.modal-close:active{transform:scale(0.94);background:rgba(50,60,88,0.95)}@media (max-width:599px){.modal-panel{padding:0;align-items:stretch;justify-content:flex-start}.modal-shell{position:absolute;left:0;right:0;top:calc(10px + env(safe-area-inset-top));bottom:0;max-width:100%;max-height:none;width:100%;border-radius:16px 16px 0 0;border:none;border-top:1px solid var(--border)}.modal-body{padding-bottom:env(safe-area-inset-bottom)}.detail-inner{padding-top:24px}.detail-body{padding-bottom:calc(28px + env(safe-area-inset-bottom))}.modal-close{top:12px;right:12px;width:40px;height:40px;background:rgba(13,16,23,0.94);border-color:rgba(255,255,255,0.24);box-shadow:0 6px 22px rgba(0,0,0,0.65),inset 0 1px 0 rgba(255,255,255,0.08)}.modal-close::before{inset:-12px}.modal-close:active{transform:scale(0.9);background:rgba(50,60,88,0.96)}}@media (min-width:768px) and (max-width:1023px){.modal-shell{max-width:min(880px,92vw)}}@media (min-width:700px){.modal-panel{padding:40px 24px}}@keyframes modalIn{from{opacity:0;transform:translateY(14px) scale(0.98)}to{opacity:1;transform:translateY(0) scale(1)}}.modal-loading{padding:100px 20px;text-align:center}.modal-error{padding:80px 20px;text-align:center;color:#9db5e0;font-size:0.9rem}.detail-hero{position:relative;overflow:hidden;background:var(--surface);border-radius:18px 18px 0 0}.detail-bg{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:blur(30px) saturate(1.2) var(--detail-bg-filter,brightness(0.5));transform:scale(1.15);z-index:0}.detail-hero::after{content:"";position:absolute;inset:0;z-index:1;background:var(--detail-hero-grad)}.detail-inner{position:relative;z-index:2;display:flex;flex-direction:column;align-items:center;text-align:center;gap:16px;padding:24px 20px 24px}.detail-poster{width:min(48vw,200px);height:auto;aspect-ratio:2/3;border-radius:14px;object-fit:cover;flex-shrink:0;box-shadow:0 16px 40px var(--shadow-login);margin:0 auto}.detail-poster-ph{display:flex;align-items:center;justify-content:center;background:var(--surface-2);font-size:2.8rem;color:var(--text-dim);width:min(48vw,200px);aspect-ratio:2/3}.detail-info{flex:1;min-width:0;display:flex;flex-direction:column;gap:8px;align-items:center;width:100%}.detail-title{font-size:1.45rem;font-weight:800;letter-spacing:-0.4px;line-height:1.25;color:var(--text)}.detail-tagline{font-size:0.85rem;color:var(--text-dim);font-style:italic}.detail-meta{display:flex;flex-wrap:wrap;gap:10px;font-size:0.85rem;color:var(--text-dim);justify-content:center}.detail-genres{font-size:0.82rem;color:var(--text-dim)}.detail-overview{font-size:0.88rem;color:var(--text-dim);line-height:1.55;margin-top:4px;display:-webkit-box;-webkit-line-clamp:5;-webkit-box-orient:vertical;overflow:hidden;text-align:center;cursor:pointer;-webkit-tap-highlight-color:transparent;transition:color 0.15s}.detail-overview:active{color:var(--text)}.detail-overview.expanded{display:block;-webkit-line-clamp:unset;overflow:visible;cursor:pointer}.d-status{display:flex;gap:12px;align-items:center;background:var(--panel-grad);border:1px solid var(--border);border-radius:14px;padding:12px 14px;margin-top:8px;width:100%;justify-content:flex-start}.d-status.done{border-color:rgba(74,222,128,0.3);background:rgba(74,222,128,0.06)}.d-status-progress{flex-direction:column;align-items:stretch;gap:10px}.d-status-row{display:flex;gap:12px;align-items:center;width:100%}.d-status-icon{width:32px;height:32px;border-radius:50%;background:var(--surface-2);color:var(--text-dim);display:flex;align-items:center;justify-content:center;font-weight:700;flex-shrink:0;font-size:0.95rem}.d-status.done .d-status-icon{background:rgba(74,222,128,0.15);color:#4ade80}.d-status-body{flex:1;min-width:0;text-align:left}.d-status-title{font-size:0.88rem;font-weight:600}.d-status-sub{font-size:0.76rem;color:var(--text-dim);margin-top:2px}.d-action-bar{display:inline-flex;align-items:center;gap:2px;margin-top:16px;padding:4px;background:var(--pill-bg);border:1px solid var(--pill-border);border-radius:999px;box-shadow:var(--pill-shadow);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}.d-act{display:inline-flex;align-items:center;justify-content:center;width:44px;height:44px;border-radius:50%;border:none;background:transparent;color:var(--pill-fg);cursor:pointer;padding:0;font-family:inherit;transition:background 0.18s ease,color 0.18s ease,transform 0.12s ease,box-shadow 0.18s ease;-webkit-tap-highlight-color:transparent;text-decoration:none;flex-shrink:0;position:relative}.d-act svg{display:block;pointer-events:none}.d-act:hover{background:var(--pill-act-hover);color:#fff}.d-act:active{transform:scale(0.9)}.d-act:disabled{opacity:0.5;cursor:default;pointer-events:none}.d-act-watched.active{background:linear-gradient(145deg,#8b5cf6 0%,#a78bfa 55%,#c4b5fd 100%);color:#fff;box-shadow:0 4px 16px rgba(139,92,246,0.5),inset 0 1px 0 rgba(255,255,255,0.25)}.d-act-watched.active:hover{filter:brightness(1.1);color:#fff}.d-act-wl.active{color:#c4b5fd;background:rgba(167,139,250,0.12)}.d-act-wl.active:hover{background:rgba(167,139,250,0.2);color:var(--accent)}.d-act-play{color:var(--pill-fg)}.d-act-play:hover{background:rgba(167,139,250,0.15);color:var(--accent)}.detail-body{padding:20px 22px 24px}.d-section{margin-top:8px;margin-bottom:26px}.d-section:last-child{margin-bottom:0}.d-section-title{font-size:1rem;font-weight:700;letter-spacing:0.2px;margin-bottom:14px;color:var(--text);display:flex;align-items:center;gap:8px}.d-section-title::before{content:"";width:3px;height:16px;border-radius:2px;background:#7d9dd4}.cast-scroll{display:flex;gap:14px;overflow-x:auto;padding-bottom:8px;scrollbar-width:none}.cast-scroll::-webkit-scrollbar{display:none}.cast{flex-shrink:0;width:84px;text-align:center}.cast-img{width:84px;height:84px;border-radius:50%;object-fit:cover;background:var(--surface-2)}.cast-ph{display:flex;align-items:center;justify-content:center;color:var(--text-dim);font-size:1.6rem;font-weight:600;background:var(--soft-card-grad)}.cast-name{font-size:0.75rem;font-weight:600;margin-top:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.cast-role{font-size:0.68rem;color:var(--text-dim);margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.seasons{display:flex;flex-direction:column;gap:8px}.season-item{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;transition:border-color 0.15s}.season-item.open{border-color:var(--scrollbar)}.season-head{width:100%;background:none;border:none;color:inherit;display:flex;align-items:center;gap:10px;padding:14px 16px;cursor:pointer;font-family:inherit;text-align:left;transition:background 0.15s}.season-head:hover{background:var(--surface-2)}.season-title{font-weight:600;font-size:0.9rem;flex:1}.season-meta{font-size:0.76rem;color:var(--text-dim)}.chev{width:16px;height:16px;color:var(--text-dim);transition:transform 0.2s ease;flex-shrink:0}.season-item.open .chev{transform:rotate(180deg)}.season-body{display:none;border-top:1px solid var(--border);background:rgba(0,0,0,0.12)}.season-item.open .season-body{display:block}.season-body .episode:first-child{border-top:none}.ep-empty{padding:20px;text-align:center;color:var(--text-dim);font-size:0.85rem}.episode{display:flex;gap:14px;padding:14px;border-bottom:1px solid var(--border);align-items:stretch;transition:background 0.15s}.episode:last-child{border-bottom:none}.episode.clickable{cursor:pointer}.episode.clickable:hover{background:var(--surface-2)}.episode.clickable:active{background:var(--surface-3)}.episode.clickable:hover .ep-title{color:#7d9dd4}.episode.watched .ep-title{color:var(--text-dim)}.episode.watched.clickable:hover .ep-title{color:#7d9dd4}.ep-still-wrap{position:relative;flex-shrink:0;width:140px;border-radius:10px;overflow:hidden;background:var(--surface-2);aspect-ratio:16/9;align-self:flex-start}.ep-still{width:100%;height:100%;object-fit:cover;display:block}.ep-still-ph{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:1.6rem;color:var(--text-dim);background:var(--soft-card-grad,var(--surface-2))}.ep-still-badge{position:absolute;top:6px;left:6px;font-size:0.65rem;font-weight:700;padding:2px 6px;border-radius:6px;background:rgba(52,211,153,0.9);color:#052e1c}.ep-body{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}.ep-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}.ep-title-line{display:flex;align-items:baseline;gap:8px;min-width:0;flex:1}.ep-num{font-family:ui-monospace,Menlo,monospace;font-size:0.95rem;color:var(--text-dim);font-weight:800;flex-shrink:0;letter-spacing:0.3px}.ep-title{font-size:0.95rem;font-weight:700;line-height:1.35;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ep-meta{display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:0.75rem;color:var(--text-dim);margin-top:2px}.ep-vote{display:inline-flex;align-items:center;gap:3px;padding:1px 7px;border-radius:999px;background:rgba(167,139,250,0.14);color:#c4b5fd;font-weight:700;font-size:0.72rem}.ep-dot{opacity:0.45}.ep-overview{font-size:0.8rem;color:var(--text-dim);margin-top:4px;line-height:1.55;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.ep-actions{flex-shrink:0;display:flex;align-items:center;gap:8px}.ep-play-btn{width:30px;height:30px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;background:rgba(167,139,250,0.16);border:1px solid rgba(167,139,250,0.28);color:#c4b5fd;text-decoration:none;transition:background 0.15s,transform 0.12s;-webkit-tap-highlight-color:transparent}.ep-play-btn:hover{background:rgba(167,139,250,0.28);color:#ddd6fe}.ep-play-btn:active{transform:scale(0.94)}.ep-status{font-size:0.78rem;font-weight:600;white-space:nowrap;line-height:1;padding:0;border:none;background:none;font-family:inherit}.ep-status.watched{color:#4ade80;cursor:default}.ep-status.unwatched{color:var(--text-dim)}button.ep-status.unwatched{cursor:pointer;-webkit-tap-highlight-color:transparent}button.ep-status.unwatched:hover{color:#6ee7b7}@media (max-width:520px){.episode{gap:10px;padding:12px}.ep-still-wrap{width:112px}.ep-title{font-size:0.88rem;white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}.ep-overview{-webkit-line-clamp:2;font-size:0.76rem}}.ep-watch-btn:disabled{opacity:0.6;cursor:wait}.ep-status.done,.ep-watch-btn.done{color:#4ade80 !important;cursor:default}.modal-body .grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:16px}@media (min-width:700px){.detail-inner{flex-direction:row;align-items:flex-start;text-align:left;padding:34px;gap:30px}.detail-poster{width:220px;height:auto;aspect-ratio:2/3;margin:0}.detail-info{align-items:flex-start}.detail-meta{justify-content:flex-start}.detail-overview{text-align:left}.detail-title{font-size:1.85rem}.detail-overview{font-size:0.92rem;-webkit-line-clamp:6}.detail-body{padding:30px 34px 34px}.cast{width:96px}.cast-img{width:96px;height:96px}.modal-body .grid{grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:20px}.detail-ext-ratings{justify-content:flex-start}.d-action-bar{align-self:flex-start}}.confirm-modal{position:fixed;inset:0;z-index:620;display:none}.confirm-modal.open{display:block}.confirm-backdrop{position:absolute;inset:0;background:var(--overlay);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);animation:fadeIn 0.18s ease}.confirm-panel{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:min(88vw,340px);background:var(--panel-grad);border:1px solid var(--border-strong);border-radius:18px;padding:24px 22px 18px;box-shadow:0 30px 80px rgba(0,0,0,0.8);text-align:center;animation:confirmIn 0.22s cubic-bezier(0.2,0.9,0.3,1)}@keyframes confirmIn{from{opacity:0;transform:translate(-50%,-48%) scale(0.95)}to{opacity:1;transform:translate(-50%,-50%) scale(1)}}.confirm-icon{width:48px;height:48px;margin:0 auto 12px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:1.4rem;background:var(--accent-soft);color:var(--accent-2)}.confirm-icon.danger{background:rgba(224,85,96,0.14);color:#ff7b85}.confirm-icon.warn{background:rgba(255,184,77,0.14);color:#ffb84d}.confirm-icon.success{background:rgba(52,211,153,0.14);color:#34d399}.confirm-title{font-size:1.02rem;font-weight:700;margin-bottom:6px;color:var(--text)}.confirm-msg{font-size:0.84rem;color:var(--text-dim);line-height:1.55;word-break:break-word}.confirm-actions{display:flex;gap:10px;margin-top:20px}.confirm-btn{flex:1;padding:11px 14px;border-radius:12px;font-size:0.88rem;font-weight:700;font-family:inherit;cursor:pointer;border:1px solid transparent;transition:all 0.15s;-webkit-tap-highlight-color:transparent}.confirm-cancel{background:var(--chip-bg);border-color:var(--chip-border);color:var(--chip-fg)}.confirm-cancel:hover{background:var(--chip-bg-hover);color:var(--chip-fg-hover)}.confirm-ok{background:var(--brand-grad);color:#fff;box-shadow:0 6px 20px rgba(167,139,250,0.3)}.confirm-ok:hover{filter:brightness(1.08)}.confirm-ok.danger{background:linear-gradient(135deg,#dc2626 0%,#f87171 100%);box-shadow:0 6px 20px rgba(248,113,113,0.28)}.confirm-ok:disabled,.confirm-cancel:disabled{opacity:0.6;cursor:wait}.hero-avatar{border:2px solid rgba(167,139,250,0.5);padding:0;cursor:pointer;font:inherit;color:inherit}.hero-avatar:hover{box-shadow:0 0 0 3px rgba(167,139,250,0.28),0 4px 20px rgba(0,0,0,0.5);transform:scale(1.03)}.hero-avatar:active{transform:scale(0.97)}.summary-modal{position:fixed;inset:0;z-index:160;display:none}.summary-modal.open{display:block}.summary-backdrop{position:absolute;inset:0;background:var(--overlay);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}.summary-panel{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:min(94vw,480px);max-height:88vh;display:flex;flex-direction:column;background:var(--panel-grad);border:1px solid var(--border-strong);border-radius:18px;box-shadow:0 30px 80px rgba(0,0,0,0.85);overflow:hidden}.summary-head{display:flex;align-items:center;justify-content:space-between;padding:16px 18px 10px;border-bottom:1px solid var(--border);flex-shrink:0}.summary-title{font-size:1.05rem;font-weight:700}.summary-close{width:40px;height:40px;border-radius:50%;border:1px solid var(--chip-border);background:var(--chip-bg);color:var(--chip-fg);font-size:1.2rem;cursor:pointer;font-family:inherit;line-height:1}.summary-close:hover{color:#fff;border-color:var(--border-strong)}.summary-body{overflow-y:auto;padding:12px 16px 20px;-webkit-overflow-scrolling:touch}@media (max-width:599px){.summary-panel{top:auto;bottom:0;left:0;right:0;transform:none;width:100%;max-height:92vh;border-radius:18px 18px 0 0}}.sum-wrap{padding:4px 0 24px}.sum-nav{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:18px}.sum-nav-btn{width:36px;height:36px;border-radius:10px;border:1px solid var(--chip-border);background:var(--chip-bg);color:var(--text-dim);font-size:1.2rem;cursor:pointer;font-family:inherit;transition:all 0.15s}.sum-nav-btn:hover{color:#fff;border-color:var(--border-strong);background:rgba(167,139,250,0.12)}.sum-nav-center{flex:1;text-align:center;min-width:0}.sum-period-tabs{display:inline-flex;gap:4px;background:var(--chip-bg);border:1px solid var(--border);border-radius:999px;padding:3px;margin-bottom:8px}.sum-period-btn{border:none;background:transparent;color:var(--text-dim);padding:6px 14px;border-radius:999px;font-size:0.8rem;font-weight:600;cursor:pointer;font-family:inherit}.sum-period-btn.active{background:var(--brand-grad);color:#fff}.sum-label{font-size:1.05rem;font-weight:700;letter-spacing:0.2px}.sum-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px}.sum-stat{text-align:center;background:var(--panel-grad);border:1px solid var(--border);border-radius:14px;padding:14px 6px}.sum-stat-num{font-size:1.35rem;font-weight:800;letter-spacing:-0.5px;background:var(--num-grad);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}.sum-stat-label{font-size:0.7rem;color:var(--text-mute);margin-top:2px}.sum-chip{display:inline-flex;align-items:center;gap:6px;padding:8px 12px;border-radius:10px;background:rgba(167,139,250,0.1);border:1px solid rgba(167,139,250,0.25);color:var(--text-dim);font-size:0.82rem;margin-bottom:12px}.sum-chip strong{color:var(--accent)}.sum-muted{font-size:0.8rem;color:var(--text-mute);margin:6px 0 12px}.sum-block{margin-top:18px}.sum-h3{font-size:0.92rem;font-weight:700;margin-bottom:10px;display:flex;align-items:center;gap:8px}.sum-h3::before{content:"";width:3px;height:14px;border-radius:2px;background:linear-gradient(180deg,#a78bfa,#7c3aed)}.sum-heat{display:flex;flex-wrap:wrap;gap:4px}.sum-heat-cell{width:12px;height:12px;border-radius:3px;background:rgba(255,255,255,0.06)}.sum-heat-cell.lv1{background:rgba(167,139,250,0.25)}.sum-heat-cell.lv2{background:rgba(167,139,250,0.45)}.sum-heat-cell.lv3{background:rgba(167,139,250,0.7)}.sum-heat-cell.lv4{background:#a78bfa}.sum-list{display:flex;flex-direction:column;gap:8px}.sum-row{display:flex;align-items:center;gap:12px;padding:10px 12px;background:var(--panel-grad);border:1px solid var(--border);border-radius:12px}.sum-rank{width:22px;height:22px;border-radius:6px;background:rgba(167,139,250,0.15);color:#c4b5fd;font-size:0.72rem;font-weight:800;display:flex;align-items:center;justify-content:center;flex-shrink:0}.sum-row-body{min-width:0;flex:1}.sum-row-title{font-size:0.9rem;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sum-year{font-weight:500;color:var(--text-mute);font-size:0.8rem}.sum-row-meta{font-size:0.75rem;color:var(--text-dim);margin-top:2px}@media (max-width:420px){.sum-stats{gap:6px}.sum-stat{padding:12px 4px}.sum-stat-num{font-size:1.15rem}}#toast-container{position:fixed;left:50%;bottom:calc(28px + env(safe-area-inset-bottom));transform:translateX(-50%);z-index:99999;display:flex;flex-direction:column;gap:8px;pointer-events:none;max-width:min(92vw,440px);width:max-content}.toast{pointer-events:auto;display:flex;align-items:center;gap:10px;padding:11px 16px;border-radius:12px;font-size:0.86rem;font-weight:500;color:var(--toast-text);background:var(--toast-bg);border:1px solid rgba(255,255,255,0.1);box-shadow:0 12px 32px rgba(0,0,0,0.55);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);opacity:0;transform:translateY(12px) scale(0.96);transition:opacity 0.22s ease,transform 0.22s ease;cursor:pointer;line-height:1.45;word-break:break-word;max-width:min(92vw,440px)}.toast.toast-in{opacity:1;transform:translateY(0) scale(1)}.toast.toast-out{opacity:0;transform:translateY(8px) scale(0.96)}.toast-icon{flex-shrink:0;width:20px;height:20px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:0.72rem;font-weight:800;line-height:1}.toast-info .toast-icon{background:rgba(125,157,212,0.22);color:#a8c0e8}.toast-success .toast-icon{background:rgba(52,211,153,0.22);color:#6ee7b7}.toast-error .toast-icon{background:rgba(224,85,96,0.24);color:#ff8a8a}.toast-warn .toast-icon{background:rgba(255,184,77,0.22);color:#ffd693}.toast-success{border-color:rgba(52,211,153,0.35)}.toast-error{border-color:rgba(224,85,96,0.35)}.toast-warn{border-color:rgba(255,184,77,0.35)}@media (max-width:420px){.toast{font-size:0.82rem;padding:10px 14px}}.cast.clickable{cursor:pointer}.cast.clickable:hover .cast-img{transform:translateY(-2px) scale(1.03);box-shadow:0 8px 20px rgba(167,139,250,0.28)}.cast.clickable:hover .cast-name{color:#c4b5fd}.cast-img{transition:transform 0.2s ease,box-shadow 0.2s ease}.cast-name{transition:color 0.15s ease}.trailer-grid{display:grid;grid-template-columns:1fr;gap:14px}@media (min-width:600px){.trailer-grid{grid-template-columns:repeat(2,1fr)}}.trailer-card{position:relative;aspect-ratio:16/9;border-radius:12px;overflow:hidden;background:linear-gradient(135deg,#1a1528 0%,#0e0e10 100%);cursor:pointer;border:1px solid var(--border);transition:border-color 0.15s,transform 0.15s}.trailer-card:hover{border-color:rgba(167,139,250,0.4);transform:translateY(-1px)}.trailer-thumb{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block;z-index:1}.trailer-card.no-thumb .trailer-thumb{display:none}.trailer-play{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:52px;height:52px;border-radius:50%;background:rgba(8,10,18,0.72);border:1px solid rgba(255,255,255,0.28);color:#fff;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);transition:background 0.15s,transform 0.15s;pointer-events:none;z-index:3}.trailer-card:hover .trailer-play{background:linear-gradient(145deg,#8b5cf6,#a78bfa);transform:translate(-50%,-50%) scale(1.08)}.trailer-play svg{display:block;margin-left:2px}.trailer-name{position:absolute;left:0;right:0;bottom:0;padding:22px 12px 9px;font-size:0.8rem;font-weight:600;color:#fff;background:linear-gradient(180deg,transparent,rgba(0,0,0,0.85));overflow:hidden;text-overflow:ellipsis;white-space:nowrap;z-index:3}.trailer-card.playing .trailer-thumb,.trailer-card.playing .trailer-play,.trailer-card.playing .trailer-name{display:none}.trailer-frame{position:absolute;inset:0;width:100%;height:100%;background:var(--surface-2);z-index:2}.trailer-frame:empty{display:none}.trailer-frame iframe{position:absolute;inset:0;width:100%;height:100%;border:0;display:block}.trailer-card.playing .trailer-thumb,.trailer-card.playing .trailer-play{opacity:0;pointer-events:none}.trailer-yt-open{position:absolute;left:50%;bottom:10px;transform:translateX(-50%);z-index:3;padding:6px 12px;border-radius:999px;background:rgba(0,0,0,.72);color:#fff;font-size:.75rem;text-decoration:none;border:1px solid rgba(255,255,255,.18)}.person-modal{position:fixed;inset:0;z-index:230;display:none}.person-modal.open{display:block}.person-backdrop{position:absolute;inset:0;background:var(--overlay);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);animation:fadeIn 0.2s ease}.person-panel{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:min(94vw,760px);max-height:88vh;display:flex;flex-direction:column;background:var(--panel-grad);border:1px solid var(--border-strong);border-radius:18px;box-shadow:0 30px 80px rgba(0,0,0,0.85);overflow:hidden;animation:modalIn 0.25s cubic-bezier(0.2,0.9,0.3,1)}.person-panel-head{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid var(--border);flex-shrink:0}.person-panel-name{font-size:1rem;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}.person-close{width:40px;height:40px;flex-shrink:0;border-radius:50%;border:1px solid var(--chip-border);background:var(--chip-bg);color:var(--chip-fg);font-size:1.2rem;cursor:pointer;font-family:inherit;line-height:1;display:flex;align-items:center;justify-content:center;transition:all 0.15s}.person-close:hover{color:#fff;border-color:var(--border-strong)}.person-panel-body{overflow-y:auto;padding:18px 20px 24px;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}@media (max-width:599px){.person-panel{top:auto;bottom:0;left:0;right:0;transform:none;width:100%;max-height:92vh;border-radius:18px 18px 0 0}}.person-head{display:flex;gap:18px;margin-bottom:18px}.person-photo{width:110px;height:165px;border-radius:12px;object-fit:cover;flex-shrink:0;background:var(--surface-2);box-shadow:0 8px 24px rgba(0,0,0,0.5)}.person-photo-ph{display:flex;align-items:center;justify-content:center;font-size:2rem;color:var(--text-dim);background:var(--soft-card-grad)}.person-info{flex:1;min-width:0;display:flex;flex-direction:column;gap:6px}.person-name{font-size:1.3rem;font-weight:800;letter-spacing:-0.4px;line-height:1.25}.person-sub{font-size:0.82rem;color:var(--text-dim)}.person-rows{display:flex;flex-direction:column;gap:4px;margin-top:4px}.person-row{font-size:0.78rem;color:var(--text-dim);line-height:1.5}.person-row b{color:var(--text);font-weight:600;margin-right:6px}.person-bio{font-size:0.86rem;color:#c0c8d6;line-height:1.65;white-space:pre-line;margin-bottom:22px;padding-top:4px;border-top:1px solid var(--border)}.person-credits-title{font-size:0.95rem;font-weight:700;margin-bottom:14px;display:flex;align-items:center;gap:8px}.person-credits-title::before{content:"";width:3px;height:14px;border-radius:2px;background:linear-gradient(180deg,#a78bfa,#7c3aed)}@media (max-width:480px){.person-head{flex-direction:column;align-items:center;text-align:center;gap:12px}.person-info{align-items:center}.person-photo{width:130px;height:195px}.person-rows{align-items:center}}.btn-action.loading{color:var(--accent-2);border-color:rgba(167,139,250,0.45);background:rgba(167,139,250,0.12);pointer-events:none}.btn-action.loading svg{transform-origin:50% 50%;animation:btnSpin 0.7s linear infinite}@keyframes btnSpin{to{transform:rotate(360deg)}}.btn-action.loading span::after{content:"";display:inline-block;width:0;overflow:hidden;animation:btnDots 1.2s steps(4,end) infinite}@keyframes btnDots{0%{content:""}25%{content:"."}50%{content:".."}75%{content:"..."}}@media (max-width:767px){.h-scroll .item.cw-card{width:210px!important;max-width:210px!important}.h-scroll .item.cw-card .cw-title{font-size:0.86rem}.h-scroll .item.cw-card .cw-watching{font-size:0.74rem}.h-scroll .item.cw-card .cw-meta{font-size:0.7rem}.h-scroll .item.cw-card .cw-overlay{font-size:0.72rem}}@media (min-width:768px){.h-scroll .item.cw-card{width:300px!important;max-width:300px!important}.h-scroll .item.cw-card .cw-title{font-size:0.92rem}.h-scroll .item.cw-card .cw-watching{font-size:0.8rem}}.hist-day{margin-top:28px}.hist-day:first-child{margin-top:4px}.hist-day-head{margin-top:0;margin-bottom:14px}`;
+  const LIGHT_THEME_VARS = `
+  --danger-fg:#ff7b85;
+  --chip-bg:#f4f4f5;
+  --chip-bg-hover:#e4e4e7;
+  --chip-fg:#3f3f46;
+  --chip-fg-hover:#18181b;
+  --chip-border:rgba(0,0,0,0.1);
+  --chip-accent:#7c3aed;
+  --pill-bg:rgba(255,255,255,0.92);
+  --pill-border:rgba(0,0,0,0.1);
+  --pill-shadow:0 8px 28px rgba(0,0,0,0.08);
+  --pill-fg:rgba(0,0,0,0.6);
+  --pill-act-hover:rgba(0,0,0,0.06);
+  --bg:#ffffff;
+  --surface:#ffffff;
+  --surface-2:#f7f7f8;
+  --surface-3:#f1f1f3;
+  --border:rgba(0,0,0,0.08);
+  --border-strong:rgba(0,0,0,0.14);
+  --text:#18181b;
+  --text-dim:#52525b;
+  --text-mute:#71717a;
+  --accent:#7c3aed;
+  --accent-2:#6d28d9;
+  --accent-soft:rgba(124,58,237,0.09);
+  --accent-glow:rgba(124,58,237,0.2);
+  --success:#059669;
+  --blue:#6d28d9;
+  --shadow-card:0 8px 28px rgba(0,0,0,0.08);
+  --bg-solid:#ffffff;
+  --panel-grad:linear-gradient(165deg,#ffffff 0%,#f7f7f8 100%);
+  --hover-bg:rgba(0,0,0,0.035);
+  --hover-bg-strong:rgba(0,0,0,0.06);
+  --sticky-bg:rgba(243,243,245,0.92);
+  --sticky-border:rgba(0,0,0,0.07);
+  --sticky-shadow:0 6px 20px rgba(0,0,0,0.1);
+  --overlay:rgba(15,18,26,0.42);
+  --overlay-strong:rgba(15,18,26,0.45);
+  --modal-bg:#ffffff;
+  --toast-bg:rgba(24,24,27,0.94);
+  --toast-text:#ffffff;
+  --bar-track:rgba(0,0,0,0.08);
+  --spinner-track:#e4e4e7;
+  --spinner-active:#7c3aed;
+  --splash-bg:radial-gradient(circle at 50% 45%,#ffffff 0%,#f4f4f6 62%);
+  --launch-splash-bg:radial-gradient(120% 90% at 50% 108%,rgba(124,58,237,0.12) 0%,rgba(124,58,237,0) 55%),radial-gradient(110% 85% at 50% -12%,rgba(56,97,190,0.1) 0%,rgba(255,255,255,0) 55%),#ffffff;
+  --launch-glow:rgba(124,58,237,0.1);
+  --splash-glow-color:rgba(124,58,237,0.22);
+  --splash-name-b:#52525b;
+  --splash-bar-fill:linear-gradient(90deg,#6d28d9,#7c3aed);
+  --name-grad:linear-gradient(135deg,#18181b 20%,#7c3aed 90%);
+  --num-grad:linear-gradient(180deg,#18181b 0%,#7c3aed 100%);
+  --brand-grad:linear-gradient(135deg,#6d28d9 0%,#7c3aed 100%);
+  --brand-grad-hover:linear-gradient(145deg,#7c3aed,#8b5cf6);
+  --avatar-ring:rgba(124,58,237,0.4);
+  --avatar-grad:linear-gradient(135deg,#ede9fe,#ddd6fe);
+  --soft-card-grad:linear-gradient(135deg,#ffffff,#f1f1f3);
+  --btn-hover-bg:rgba(124,58,237,0.1);
+  --btn-hover-border:rgba(124,58,237,0.35);
+  --btn-hover-shadow:0 4px 16px rgba(124,58,237,0.18);
+  --danger-bg:rgba(248,113,113,0.16);
+  --danger-border:rgba(248,113,113,0.5);
+  --danger-shadow:0 4px 16px rgba(0,0,0,0.25);
+  --poster-ph-bg:rgba(0,0,0,0.06);
+  --platform-card-grad:linear-gradient(145deg,#f4f4f5 0%,#e9e9ec 100%);
+  --platform-card-text:#3f3f46;
+  --platform-shadow-hover:rgba(0,0,0,0.16);
+  --scrollbar:#d4d4d8;
+  --link:#6d28d9;
+  --link-hover:#5b21b6;
+  --success-fg:#059669;
+  --warn-fg:#b45309;
+  --cal-accent:#4a6db8;
+  --cal-accent-2:#5b6b88;
+  --cal-accent-3:#4a6db8;
+  --cal-cell-border:#d4d9e6;
+  --cal-soft:rgba(74,109,184,0.12);
+  --cal-soft-border:rgba(74,109,184,0.3);
+  --shadow-avatar:rgba(0,0,0,0.12);
+  --shadow-login:rgba(0,0,0,0.1);
+  --detail-hero-grad:linear-gradient(180deg,rgba(255,255,255,0.72),rgba(247,247,248,0.96));
+  --detail-bg-filter:brightness(1.05) saturate(0.9);
+`;
+  __pageStylesCache = `
+html{
+  color-scheme:dark
+}
+html[data-theme="light"]{
+  color-scheme:light
+}
+@media (prefers-color-scheme:light){
+  html[data-theme="system"]{
+    color-scheme:light
+  }
+}
+html,body{
+  background:var(--bg-solid);
+  color:var(--text);
+  margin:0;
+  padding:0;
+  min-height:100%;
+  min-height:100dvh;
+  transition:background-color 0.2s ease,color 0.2s ease
+}
+*{
+  box-sizing:border-box;
+  margin:0;
+  padding:0
+}
+.splash{
+  position:fixed;
+  inset:0;
+  z-index:9999;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  overflow:hidden;
+  background:var(--splash-bg);
+  transition:opacity 0.22s ease;
+  font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+  -webkit-tap-highlight-color:transparent;
+  animation:splashAutoHide 0.22s ease 0.45s forwards
+}
+.splash.hide{
+  opacity:0;
+  pointer-events:none;
+  animation:none
+}
+@keyframes splashAutoHide{
+  to{
+    opacity:0;
+    visibility:hidden;
+    pointer-events:none
+  }
+}
+.splash-glow{
+  position:absolute;
+  width:340px;
+  height:340px;
+  border-radius:50%;
+  background:radial-gradient(circle,var(--splash-glow-color) 0%,rgba(125,157,212,0) 70%);
+  animation:splashPulse 2.4s ease-in-out infinite
+}
+.splash-inner{
+  position:relative;
+  z-index:1;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  gap:20px
+}
+.splash-logo{
+  color:var(--splash-name-b);
+  animation:splashPop 0.75s cubic-bezier(0.22,1.1,0.36,1) both
+}
+.splash-logo img{
+  display:block
+}
+.splash-name{
+  font-size:1.35rem;
+  font-weight:800;
+  letter-spacing:0.4px;
+  background:var(--name-grad);
+  -webkit-background-clip:text;
+  background-clip:text;
+  -webkit-text-fill-color:transparent;
+  animation:splashFadeUp 0.6s ease 0.28s both
+}
+.splash-bar{
+  width:128px;
+  height:3px;
+  border-radius:99px;
+  background:var(--bar-track);
+  overflow:hidden;
+  animation:splashFadeUp 0.6s ease 0.45s both
+}
+.splash-bar-fill{
+  height:100%;
+  width:42%;
+  border-radius:99px;
+  background:var(--splash-bar-fill);
+  animation:splashSlide 1.15s cubic-bezier(0.65,0,0.35,1) infinite
+}
+@keyframes splashPulse{
+  0%,100%{
+    transform:scale(0.85);
+    opacity:0.7
+  }
+  50%{
+    transform:scale(1.12);
+    opacity:1
+  }
+}
+@keyframes splashPop{
+  0%{
+    opacity:0;
+    transform:scale(0.55) rotate(-8deg)
+  }
+  60%{
+    opacity:1;
+    transform:scale(1.08) rotate(2deg)
+  }
+  100%{
+    opacity:1;
+    transform:scale(1) rotate(0)
+  }
+}
+@keyframes splashFadeUp{
+  from{
+    opacity:0;
+    transform:translateY(8px)
+  }
+  to{
+    opacity:1;
+    transform:none
+  }
+}
+@keyframes splashSlide{
+  0%{
+    transform:translateX(-130%)
+  }
+  100%{
+    transform:translateX(330%)
+  }
+}
+.spinner{
+  width:30px;
+  height:30px;
+  border:3px solid var(--spinner-track);
+  border-top-color:var(--spinner-active);
+  border-radius:50%;
+  animation:spin 0.8s linear infinite;
+  margin:4px auto
+}
+@keyframes spin{
+  to{
+    transform:rotate(360deg)
+  }
+}
+:root{
+  --bg:#050505;
+  --surface:#0e0e10;
+  --surface-2:#16161a;
+  --surface-3:#1c1c22;
+  --border:rgba(255,255,255,0.08);
+  --border-strong:rgba(255,255,255,0.14);
+  --text:#f4f4f5;
+  --text-dim:#a1a1aa;
+  --text-mute:#71717a;
+  --accent:#a78bfa;
+  --accent-2:#c4b5fd;
+  --accent-soft:rgba(167,139,250,0.12);
+  --accent-glow:rgba(167,139,250,0.28);
+  --success:#34d399;
+  --blue:#c4b5fd;
+  --radius-sm:10px;
+  --radius-md:14px;
+  --radius-lg:18px;
+  --radius-xl:22px;
+  --shadow-card:0 8px 32px rgba(0,0,0,0.55);
+  --bg-solid:#000000;
+  --panel-grad:linear-gradient(165deg,#16161a 0%,#0e0e10 100%);
+  --hover-bg:rgba(255,255,255,0.04);
+  --hover-bg-strong:rgba(255,255,255,0.09);
+  --sticky-bg:rgba(5,5,5,0.88);
+  --sticky-border:rgba(255,255,255,0.06);
+  --sticky-shadow:0 10px 28px rgba(0,0,0,0.35);
+  --overlay:rgba(2,4,8,0.78);
+  --overlay-strong:rgba(0,0,0,0.78);
+  --modal-bg:#000000;
+  --toast-bg:rgba(20,22,28,0.96);
+  --toast-text:#ffffff;
+  --bar-track:rgba(255,255,255,0.1);
+  --spinner-track:#212735;
+  --spinner-active:#7d9dd4;
+  --splash-bg:radial-gradient(circle at 50% 45%,#0a0a0a 0%,#000 62%);
+  --launch-splash-bg:radial-gradient(120% 90% at 50% 108%,rgba(124,58,237,0.3) 0%,rgba(124,58,237,0) 55%),radial-gradient(110% 85% at 50% -12%,rgba(56,97,190,0.25) 0%,rgba(0,0,0,0) 55%),#000;
+  --launch-glow:rgba(124,58,237,0.18);
+  --splash-glow-color:rgba(125,157,212,0.55);
+  --splash-name-b:#a8b2c4;
+  --splash-bar-fill:linear-gradient(90deg,#7d9dd4,#a78bfa);
+  --name-grad:linear-gradient(135deg,#fff 20%,#c4b5fd 90%);
+  --num-grad:linear-gradient(180deg,#fff 0%,#c4b5fd 100%);
+  --brand-grad:linear-gradient(135deg,#7c3aed 0%,#a78bfa 100%);
+  --brand-grad-hover:linear-gradient(145deg,#8b5cf6,#a78bfa);
+  --avatar-ring:rgba(167,139,250,0.45);
+  --avatar-grad:linear-gradient(135deg,#1a2233,#2a3a55);
+  --soft-card-grad:var(--soft-card-grad);
+  --btn-hover-bg:rgba(167,139,250,0.1);
+  --btn-hover-border:rgba(167,139,250,0.35);
+  --btn-hover-shadow:0 4px 16px rgba(167,139,250,0.18);
+  --danger-bg:rgba(224,85,96,0.1);
+  --danger-border:rgba(224,85,96,0.35);
+  --danger-shadow:0 4px 16px rgba(224,85,96,0.15);
+  --poster-ph-bg:rgba(0,0,0,0.65);
+  --shadow-avatar:rgba(0,0,0,0.5);
+  --shadow-login:rgba(0,0,0,0.7);
+  --detail-hero-grad:linear-gradient(180deg,rgba(10,14,24,0.6),rgba(10,14,24,0.95));
+  --detail-bg-filter:brightness(0.5);
+  --chip-bg:rgba(255,255,255,0.05);
+  --chip-bg-hover:rgba(255,255,255,0.09);
+  --chip-fg:#a1a1aa;
+  --chip-fg-hover:#f4f4f5;
+  --chip-border:rgba(255,255,255,0.08);
+  --chip-accent:#a78bfa;
+  --pill-bg:linear-gradient(165deg,rgba(255,255,255,0.09) 0%,rgba(255,255,255,0.04) 100%);
+  --pill-border:rgba(255,255,255,0.12);
+  --pill-shadow:0 8px 28px rgba(0,0,0,0.45),inset 0 1px 0 rgba(255,255,255,0.06);
+  --pill-fg:rgba(255,255,255,0.55);
+  --pill-act-hover:rgba(255,255,255,0.1);
+  --platform-card-grad:linear-gradient(145deg,#1a1a1a 0%,#0a0a0a 100%);
+  --platform-card-text:#ffffff;
+  --platform-shadow-hover:rgba(0,0,0,0.65);
+  --scrollbar:#2a3345;
+  --link:#c4b5fd;
+  --link-hover:#ddd6fe;
+  --success-fg:#4ade80;
+  --warn-fg:#ffb84d;
+  --danger-fg:#ff8a8a;
+  --cal-accent:#4a6db8;
+  --cal-accent-2:#9db0d0;
+  --cal-accent-3:#7d9dd4;
+  --cal-cell-border:#3a4a68;
+  --cal-soft:rgba(90,120,180,0.22);
+  --cal-soft-border:rgba(140,170,220,0.35)
+}
+html[data-theme="light"]{
+  ${LIGHT_THEME_VARS}
+}
+@media (prefers-color-scheme:light){
+  html[data-theme="system"]{
+    ${LIGHT_THEME_VARS}
+  }
+}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  background:var(--bg-solid);
+  background-attachment:fixed;
+  color:var(--text);
+  -webkit-font-smoothing:antialiased;
+  line-height:1.5;
+  overflow-x:hidden;
+  overscroll-behavior-y:none
+}
+a{
+  color:var(--accent-2);
+  text-decoration:none;
+  transition:color 0.15s
+}
+a:hover{
+  color:var(--link-hover)
+}
+img{
+  display:block;
+  max-width:100%
+}
+.container{
+  max-width:880px;
+  width:100%;
+  margin:0 auto;
+  padding:0 16px calc(80px + env(safe-area-inset-bottom))
+}
+.app-version{
+  text-align:center;
+  font-size:0.7rem;
+  color:var(--text-mute);
+  opacity:0.7;
+  padding:8px 0 4px;
+  letter-spacing:0.4px;
+  user-select:none
+}
+.pane-loading{
+  padding:60px 20px;
+  text-align:center
+}
+.load-more-wrap{
+  text-align:center;
+  margin-top:24px
+}
+.load-more{
+  background:var(--surface-2);
+  border:1px solid var(--border);
+  color:var(--text);
+  padding:11px 32px;
+  border-radius:var(--radius-md);
+  font-size:0.9rem;
+  font-weight:600;
+  cursor:pointer;
+  transition:all 0.2s;
+  font-family:inherit
+}
+.load-more:hover:not(:disabled){
+  border-color:rgba(91,124,250,0.45);
+  color:var(--accent-2);
+  box-shadow:0 4px 20px var(--accent-glow);
+  background:var(--surface-3)
+}
+.load-more:disabled{
+  cursor:not-allowed
+}
+.login-wrap{
+  min-height:100vh;
+  min-height:100dvh;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:20px
+}
+.login-card{
+  width:100%;
+  max-width:440px;
+  background:var(--panel-grad);
+  border:1px solid var(--border-strong);
+  border-radius:24px;
+  padding:44px 32px;
+  text-align:center;
+  box-shadow:0 24px 64px var(--shadow-login),inset 0 1px 0 var(--hover-bg-strong)
+}
+.login-logo{
+  color:var(--splash-name-b);
+  margin-bottom:16px
+}
+.login-title{
+  font-size:1.75rem;
+  font-weight:800;
+  letter-spacing:-0.5px;
+  background:var(--name-grad);
+  -webkit-background-clip:text;
+  background-clip:text;
+  -webkit-text-fill-color:transparent;
+  margin-bottom:6px
+}
+.login-sub{
+  color:var(--text-dim);
+  font-size:0.9rem;
+  margin-bottom:28px
+}
+.btn-primary{
+  background:var(--brand-grad);
+  color:#fff;
+  border:none;
+  padding:13px 30px;
+  border-radius:12px;
+  font-size:0.95rem;
+  font-weight:700;
+  cursor:pointer;
+  box-shadow:0 6px 24px var(--accent-glow)
+}
+.btn-primary:hover{
+  filter:brightness(1.08);
+  transform:translateY(-1px)
+}
+.btn-ghost{
+  background:var(--chip-bg);
+  color:var(--chip-fg);
+  border:1px solid var(--chip-border);
+  padding:8px 16px;
+  border-radius:10px;
+  font-size:0.85rem;
+  cursor:pointer;
+  transition:all 0.15s;
+  font-family:inherit
+}
+.btn-ghost:hover{
+  color:var(--chip-fg-hover);
+  border-color:var(--chip-border);
+  background:var(--chip-bg-hover)
+}
+.steps{
+  display:flex;
+  flex-direction:column;
+  gap:6px
+}
+.step{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  text-align:left;
+  padding:4px 0;
+  font-size:0.9rem
+}
+.step .n{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  width:22px;
+  height:22px;
+  background:var(--accent);
+  color:#fff;
+  border-radius:50%;
+  font-size:0.72rem;
+  font-weight:700;
+  flex-shrink:0
+}
+.code-box{
+  font-family:ui-monospace,Menlo,monospace;
+  font-size:1.75rem;
+  font-weight:800;
+  letter-spacing:6px;
+  color:#a8c0e8;
+  background:rgba(90,120,180,0.12);
+  border:1px solid rgba(140,170,220,0.35);
+  border-radius:14px;
+  padding:14px;
+  margin:14px 0;
+  user-select:all;
+  text-align:center
+}
+.qr-box{
+  background:#fff;
+  border-radius:14px;
+  padding:10px;
+  display:inline-block;
+  margin:6px 0 14px
+}
+.qr-box img{
+  border-radius:8px
+}
+.status{
+  display:inline-flex;
+  align-items:center;
+  gap:8px;
+  font-size:0.88rem;
+  padding:8px 16px;
+  border-radius:20px;
+  color:var(--text-dim);
+  background:var(--surface-2)
+}
+.status.success{
+  color:#4ade80;
+  background:rgba(74,222,128,0.1)
+}
+.status.error{
+  color:#e05560;
+  background:rgba(224,85,96,0.12)
+}
+.err-box{
+  background:rgba(224,85,96,0.1);
+  border:1px solid rgba(224,85,96,0.28);
+  border-radius:12px;
+  padding:14px;
+  text-align:left;
+  margin-bottom:14px
+}
+.err-title{
+  font-weight:600;
+  color:#e05560;
+  margin-bottom:4px;
+  font-size:0.92rem
+}
+.err{
+  color:#e8a3ab;
+  font-size:0.85rem
+}
+.hint{
+  color:var(--text-dim);
+  font-size:0.82rem;
+  margin-top:6px
+}
+.log-details{
+  margin-top:18px;
+  text-align:left
+}
+.log-details summary{
+  cursor:pointer;
+  font-size:0.76rem;
+  color:var(--text-dim);
+  padding:4px 0;
+  user-select:none
+}
+.log-box{
+  font-family:ui-monospace,Menlo,monospace;
+  font-size:0.7rem;
+  color:var(--text-dim);
+  background:var(--surface-3);
+  border:1px solid var(--border);
+  border-radius:8px;
+  padding:10px;
+  max-height:160px;
+  overflow:auto;
+  margin-top:6px;
+  line-height:1.6
+}
+.hero{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  padding:calc(8px + env(safe-area-inset-top)) 0 6px;
+  gap:10px
+}
+.hero-left{
+  display:flex;
+  align-items:center;
+  gap:12px;
+  min-width:0
+}
+.hero-avatar{
+  width:50px;
+  height:50px;
+  border-radius:50%;
+  overflow:hidden;
+  flex-shrink:0;
+  background:var(--surface-2);
+  border:2px solid var(--avatar-ring);
+  box-shadow:0 0 0 3px var(--accent-soft),0 4px 20px var(--shadow-avatar)
+}
+.hero-avatar img{
+  width:100%;
+  height:100%;
+  object-fit:cover;
+  display:block
+}
+.hero-avatar-ph{
+  width:100%;
+  height:100%;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:1.25rem;
+  background:var(--avatar-grad)
+}
+.hero-text{
+  min-width:0;
+  flex:1;
+  display:flex;
+  flex-direction:column;
+  align-items:flex-start;
+  gap:1px
+}
+.hero-name{
+  font-size:1.45rem;
+  font-weight:800;
+  letter-spacing:-0.4px;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+  background:var(--name-grad);
+  -webkit-background-clip:text;
+  background-clip:text;
+  -webkit-text-fill-color:transparent
+}
+.updated-times{
+  display:flex;
+  flex-direction:column;
+  gap:1px
+}
+.updated-at{
+  font-size:0.72rem;
+  color:var(--text-mute);
+  font-weight:400;
+  letter-spacing:0.2px;
+  transition:color 0.4s ease;
+  line-height:1.35
+}
+.updated-at:empty{
+  display:none
+}
+.updated-times:empty{
+  display:none
+}
+.updated-at.flash{
+  animation:updatedFlash 1.1s ease-out
+}
+.updated-at.src-live{
+  color:#4ade80
+}
+.updated-at.src-cache{
+  color:var(--text-mute)
+}
+@keyframes updatedFlash{
+  0%{
+    color:var(--accent-2)
+  }
+  100%{
+    color:var(--text-mute)
+  }
+}
+.hero-actions{
+  display:flex;
+  gap:8px;
+  flex-shrink:0
+}
+.btn-action{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  background:var(--chip-bg);
+  color:var(--chip-fg);
+  border:1px solid var(--chip-border);
+  padding:8px 14px;
+  border-radius:10px;
+  font-size:0.82rem;
+  font-weight:600;
+  cursor:pointer;
+  font-family:inherit;
+  transition:all 0.18s ease;
+  -webkit-tap-highlight-color:transparent
+}
+.btn-action svg{
+  flex-shrink:0;
+  transition:transform 0.25s ease
+}
+.btn-action:hover{
+  color:var(--chip-fg-hover);
+  border-color:var(--btn-hover-border);
+  background:var(--btn-hover-bg);
+  box-shadow:var(--btn-hover-shadow)
+}
+.btn-action:hover svg{
+  transform:rotate(180deg)
+}
+.btn-action:active{
+  transform:scale(0.97)
+}
+#btn-logout:hover{
+  color:var(--danger-fg);
+  background:var(--danger-bg);
+  border-color:var(--danger-border);
+  box-shadow:var(--danger-shadow)
+}
+#btn-logout:hover svg{
+  transform:translateX(2px)
+}
+#btn-theme:hover{
+  color:var(--chip-accent)
+}
+#btn-theme:hover svg{
+  transform:none
+}
+#btn-theme svg{
+  transition:opacity 0.2s ease,transform 0.2s ease
+}
+#btn-theme .theme-icon{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  flex-shrink:0
+}
+@media (max-width:768px){
+  .btn-action span{
+    display:none
+  }
+  .btn-action{
+    padding:9px
+  }
+  .hero-actions{
+    gap:6px
+  }
+}
+.stats{
+  display:grid;
+  grid-template-columns:repeat(4,1fr);
+  gap:4px;
+  background:var(--panel-grad);
+  border:1px solid var(--border);
+  border-radius:var(--radius-lg);
+  padding:8px 6px;
+  margin-bottom:8px;
+  box-shadow:var(--shadow-card),inset 0 1px 0 rgba(255,255,255,0.04);
+  position:relative;
+  overflow:hidden
+}
+.stats::before{
+  content:"";
+  position:absolute;
+  top:0;
+  left:10%;
+  right:10%;
+  height:1px;
+  background:linear-gradient(90deg,transparent,rgba(167,139,250,0.35),transparent)
+}
+.stat{
+  position:relative;
+  text-align:center;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  gap:2px;
+  padding:6px 2px;
+  border-radius:12px;
+  transition:background 0.2s ease
+}
+.stat:hover{
+  background:rgba(255,255,255,0.025)
+}
+.stat + .stat::before{
+  content:"";
+  position:absolute;
+  left:-4px;
+  top:18%;
+  bottom:18%;
+  width:1px;
+  background:linear-gradient(180deg,transparent,rgba(255,255,255,0.08),transparent)
+}
+.stat-icon{
+  width:26px;
+  height:26px;
+  border-radius:8px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  margin-bottom:2px;
+  transition:transform 0.25s ease,box-shadow 0.25s ease
+}
+.stat:hover .stat-icon{
+  transform:translateY(-1px) scale(1.06)
+}
+.stat-movie .stat-icon{
+  background:linear-gradient(135deg,rgba(167,139,250,0.18),rgba(167,139,250,0.06));
+  color:#c4b5fd;
+  box-shadow:0 4px 14px rgba(167,139,250,0.18),inset 0 0 0 1px rgba(167,139,250,0.18)
+}
+.stat-show .stat-icon{
+  background:linear-gradient(135deg,rgba(96,165,250,0.18),rgba(96,165,250,0.06));
+  color:#93c5fd;
+  box-shadow:0 4px 14px rgba(96,165,250,0.18),inset 0 0 0 1px rgba(96,165,250,0.18)
+}
+.stat-episode .stat-icon{
+  background:linear-gradient(135deg,rgba(52,211,153,0.18),rgba(52,211,153,0.06));
+  color:#6ee7b7;
+  box-shadow:0 4px 14px rgba(52,211,153,0.18),inset 0 0 0 1px rgba(52,211,153,0.18)
+}
+.stat-hours .stat-icon{
+  background:linear-gradient(135deg,rgba(251,191,36,0.18),rgba(251,191,36,0.06));
+  color:#fcd34d;
+  box-shadow:0 4px 14px rgba(251,191,36,0.18),inset 0 0 0 1px rgba(251,191,36,0.18)
+}
+.stat-num{
+  font-size:1.2rem;
+  font-weight:800;
+  letter-spacing:-0.6px;
+  line-height:1.1;
+  background:var(--num-grad);
+  -webkit-background-clip:text;
+  background-clip:text;
+  -webkit-text-fill-color:transparent
+}
+.stat-label{
+  font-size:0.7rem;
+  color:var(--text-mute);
+  font-weight:500
+}
+.tabs{
+  display:flex;
+  gap:4px;
+  margin-bottom:0
+}
+.top-sticky{
+  position:sticky;
+  top:0;
+  z-index:40;
+  margin:0 -16px;
+  padding:0 16px;
+  background:var(--sticky-bg);
+  backdrop-filter:blur(18px) saturate(1.2);
+  -webkit-backdrop-filter:blur(18px) saturate(1.2);
+  border-bottom:1px solid var(--sticky-border);
+  box-shadow:var(--sticky-shadow)
+}
+.top-sticky .hero{
+  padding-top:calc(20px + env(safe-area-inset-top));
+  padding-bottom:4px
+}
+.top-sticky .stats{
+  margin-bottom:4px
+}
+@media (min-width:768px){
+  .top-sticky{
+    margin:0 -28px;
+    padding:0 28px 8px
+  }
+}
+@media (min-width:1024px){
+  .top-sticky{
+    margin:0 -36px;
+    padding:0 36px 8px
+  }
+}
+@media (min-width:1280px){
+  .top-sticky{
+    margin:0 -40px;
+    padding:0 40px 8px
+  }
+}
+.tab{
+  flex:1 1 0;
+  min-width:0;
+  background:transparent;
+  border:none;
+  color:var(--text-dim);
+  padding:7px 2px;
+  border-radius:999px;
+  font-size:0.75rem;
+  font-weight:600;
+  cursor:pointer;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  text-align:center;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  gap:5px;
+  transition:color 0.2s ease,background 0.2s ease;
+  font-family:inherit;
+  outline:none !important
+}
+.tab svg{
+  flex-shrink:0;
+  opacity:0.9
+}
+.tab span{
+  overflow:hidden;
+  text-overflow:ellipsis
+}
+.tab:hover{
+  color:var(--text);
+  background:rgba(255,255,255,0.06)
+}
+.tab.active{
+  background:var(--brand-grad);
+  color:#fff;
+  font-weight:700
+}
+.pane{
+  display:none
+}
+.pane.active{
+  display:block;
+  animation:fadeIn 0.3s ease;
+  padding-top:12px
+}
+@keyframes fadeIn{
+  from{
+    opacity:0;
+    transform:translateY(8px)
+  }
+  to{
+    opacity:1;
+    transform:translateY(0)
+  }
+}
+.grid{
+  display:flex;
+  flex-direction:column;
+  gap:10px
+}
+.item{
+  position:relative;
+  display:flex;
+  gap:14px;
+  background:var(--panel-grad);
+  border:1px solid var(--border);
+  border-radius:var(--radius-lg);
+  padding:12px;
+  transition:transform 0.2s ease,border-color 0.2s,box-shadow 0.2s;
+  animation:fadeInUp 0.4s ease backwards;
+  overflow:hidden;
+  box-shadow:0 4px 20px var(--shadow-card),inset 0 1px 0 var(--hover-bg);
+  text-decoration:none;
+  color:inherit
+}
+.item.clickable{
+  cursor:pointer
+}
+.item.clickable:active{
+  transform:scale(0.985);
+  background:var(--surface-2)
+}
+@keyframes fadeInUp{
+  from{
+    opacity:0;
+    transform:translateY(10px)
+  }
+  to{
+    opacity:1;
+    transform:translateY(0)
+  }
+}
+.item:hover{
+  border-color:rgba(167,139,250,0.25);
+  box-shadow:0 8px 28px rgba(0,0,0,0.45),0 0 0 1px rgba(167,139,250,0.08);
+  transform:translateY(-1px)
+}
+.wl-remove,.wl-drop,.wl-watched,.wl-unwatch{
+  position:absolute;
+  top:6px;
+  right:6px;
+  width:26px;
+  height:26px;
+  border-radius:50%;
+  background:rgba(0,0,0,0.65);
+  line-height:1;
+  cursor:pointer;
+  z-index:3;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:0;
+  font-family:inherit;
+  backdrop-filter:blur(8px);
+  -webkit-backdrop-filter:blur(8px);
+  transition:background 0.15s,transform 0.15s,opacity 0.15s,color 0.15s
+}
+.wl-remove{
+  color:#fff;
+  border:1px solid rgba(255,255,255,0.22);
+  font-size:1rem;
+  font-weight:400;
+  opacity:0.88
+}
+.wl-remove:hover{
+  background:rgba(200,70,80,0.92);
+  opacity:1;
+  transform:scale(1.06)
+}
+.wl-drop{
+  position:absolute;
+  top:6px;
+  right:6px;
+  width:30px;
+  height:30px;
+  border-radius:50%;
+  background:rgba(0,0,0,0.72);
+  color:#ff8a8a;
+  border:1px solid rgba(255,120,120,0.55);
+  font-size:0.85rem;
+  opacity:1;
+  z-index:5;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:0;
+  cursor:pointer;
+  backdrop-filter:blur(8px);
+  -webkit-backdrop-filter:blur(8px)
+}
+.wl-drop:hover{
+  background:rgba(200,70,80,0.95);
+  color:#fff;
+  transform:scale(1.08)
+}
+.wl-drop svg{
+  display:block;
+  pointer-events:none
+}
+.wl-drop:disabled{
+  opacity:0.5;
+  cursor:wait
+}
+.cal-action-row{
+  display:flex;
+  gap:8px;
+  margin-top:8px;
+  align-self:flex-start;
+  flex-wrap:wrap
+}
+.cal-open-btn,.cal-drop-btn{
+  align-self:auto;
+  margin-top:0;
+  margin-left:0;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  padding:5px 12px;
+  border-radius:8px;
+  font-size:0.74rem;
+  font-weight:600;
+  cursor:pointer;
+  font-family:inherit;
+  transition:all 0.15s;
+  white-space:nowrap
+}
+.cal-open-btn{
+  background:rgba(90,120,180,0.14);
+  border:1px solid rgba(140,170,220,0.35);
+  color:#9db5e0
+}
+.cal-open-btn:hover{
+  background:rgba(120,150,210,0.28);
+  color:#c2d4f0;
+  border-color:rgba(140,170,220,0.65)
+}
+.cal-open-btn svg{
+  flex-shrink:0;
+  pointer-events:none
+}
+.cal-drop-btn{
+  background:rgba(224,85,96,0.14);
+  border:1px solid rgba(224,85,96,0.4);
+  color:#ff8a8a
+}
+.cal-drop-btn:hover{
+  background:rgba(224,85,96,0.3);
+  color:#ffb3b3;
+  border-color:rgba(224,85,96,0.65)
+}
+.cal-drop-btn svg{
+  flex-shrink:0;
+  pointer-events:none
+}
+.cal-drop-btn:disabled{
+  opacity:0.5;
+  cursor:wait
+}
+.wl-watched{
+  color:#4ade80;
+  border:1px solid rgba(74,222,128,0.45);
+  font-size:0.85rem;
+  font-weight:700;
+  opacity:0.9
+}
+.wl-watched:hover{
+  background:rgba(74,222,128,0.95);
+  color:#000;
+  opacity:1;
+  transform:scale(1.06)
+}
+.wl-unwatch{
+  color:#ffb84d;
+  border:1px solid rgba(255,184,77,0.45);
+  font-size:0.9rem;
+  font-weight:700;
+  opacity:0.9
+}
+.wl-unwatch:hover{
+  background:rgba(255,184,77,0.95);
+  color:#000;
+  opacity:1;
+  transform:scale(1.06)
+}
+.wl-remove:disabled,.wl-watched:disabled,.wl-unwatch:disabled{
+  opacity:0.5;
+  cursor:wait
+}
+.poster{
+  width:76px;
+  height:114px;
+  border-radius:10px;
+  overflow:hidden;
+  flex-shrink:0;
+  background:var(--surface-2);
+  position:relative
+}
+.poster img{
+  width:100%;
+  height:100%;
+  object-fit:cover
+}
+.poster-ph{
+  width:100%;
+  height:100%;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:1.8rem;
+  background:var(--soft-card-grad);
+  color:var(--text-dim)
+}
+.poster-play{
+  position:absolute;
+  top:50%;
+  left:50%;
+  transform:translate(-50%,-50%);
+  width:46px;
+  height:46px;
+  border-radius:50%;
+  background:rgba(8,10,18,0.72);
+  color:#fff;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  backdrop-filter:blur(10px);
+  -webkit-backdrop-filter:blur(10px);
+  opacity:1;
+  transition:opacity 0.2s ease,transform 0.2s ease,background 0.15s ease,box-shadow 0.2s ease;
+  text-decoration:none;
+  border:1px solid rgba(255,255,255,0.24);
+  z-index:4;
+  box-shadow:0 4px 18px rgba(0,0,0,0.55);
+  -webkit-tap-highlight-color:transparent
+}
+.poster-play svg{
+  display:block;
+  margin-left:2px;
+  pointer-events:none;
+  width:24px;
+  height:24px
+}
+.item:hover .poster-play{
+  opacity:1
+}
+.poster-play:hover{
+  background:linear-gradient(145deg,#8b5cf6,#a78bfa);
+  transform:translate(-50%,-50%) scale(1.1);
+  color:#fff;
+  border-color:rgba(255,255,255,0.4);
+  box-shadow:0 8px 28px rgba(139,92,246,0.6)
+}
+.poster-play:active{
+  transform:translate(-50%,-50%) scale(0.94)
+}
+.info{
+  flex:1;
+  min-width:0;
+  display:flex;
+  flex-direction:column;
+  justify-content:center;
+  gap:4px
+}
+.name-row{
+  display:flex;
+  align-items:baseline;
+  gap:0;
+  overflow:hidden;
+  white-space:nowrap;
+  line-height:1.3;
+  letter-spacing:-0.2px
+}
+.name{
+  flex:0 1 auto;
+  min-width:0;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+  font-size:1rem;
+  font-weight:700;
+  color:var(--text)
+}
+.tag{
+  flex:0 0 auto;
+  font-size:inherit;
+  font-weight:inherit;
+  letter-spacing:0;
+  white-space:nowrap
+}
+.tag.upcoming{
+  color:#ffb84d
+}
+.tag.aired{
+  color:#4ade80
+}
+.tag.soon{
+  color:#fbbf24
+}
+.overview{
+  font-size:0.8rem;
+  color:var(--text-dim);
+  overflow:hidden;
+  display:-webkit-box;
+  -webkit-line-clamp:3;
+  -webkit-box-orient:vertical;
+  line-height:1.45;
+  margin-top:4px
+}
+.meta{
+  font-size:0.8rem;
+  color:var(--text-dim);
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap
+}
+.meta.dim{
+  color:#7a8394;
+  font-size:0.78rem;
+  margin-top:2px
+}
+.bar{
+  height:3px;
+  background:rgba(255,255,255,0.06);
+  border-radius:99px;
+  overflow:hidden;
+  margin-top:8px
+}
+.bar-fill{
+  height:100%;
+  background:linear-gradient(90deg,#7c3aed,#c4b5fd);
+  border-radius:99px;
+  box-shadow:0 0 10px rgba(167,139,250,0.5)
+}
+.search-bar{
+  margin-bottom:16px
+}
+.search-input{
+  width:100%;
+  background:var(--surface);
+  border:1px solid var(--border);
+  color:var(--text);
+  padding:12px 16px;
+  border-radius:12px;
+  font-size:0.95rem;
+  font-family:inherit;
+  outline:none;
+  transition:border-color 0.15s,background 0.15s;
+  -webkit-appearance:none;
+  appearance:none
+}
+.search-input:focus{
+  border-color:var(--accent);
+  background:var(--surface-2);
+  box-shadow:0 0 0 3px var(--accent-soft)
+}
+.search-input::placeholder{
+  color:var(--text-mute)
+}
+.trending-head{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  font-size:0.88rem;
+  font-weight:700;
+  color:var(--text);
+  margin:4px 0 14px;
+  padding-left:2px;
+  letter-spacing:0.2px
+}
+.trending-head::before{
+  content:"";
+  width:3px;
+  height:14px;
+  border-radius:2px;
+  background:linear-gradient(180deg,#f97316,#ef4444)
+}
+.home-section{
+  margin-bottom:12px
+}
+.home-section-head{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:8px;
+  margin-bottom:6px
+}
+.home-section-title{
+  font-size:1rem;
+  font-weight:700;
+  letter-spacing:0.2px;
+  display:flex;
+  align-items:center;
+  gap:8px
+}
+.home-section-title::before{
+  content:"";
+  width:3px;
+  height:16px;
+  border-radius:2px;
+  background:linear-gradient(180deg,#a78bfa,#7c3aed)
+}
+.home-more-btn{
+  background:transparent;
+  border:none;
+  color:var(--text-dim);
+  font-size:0.82rem;
+  font-weight:600;
+  cursor:pointer;
+  font-family:inherit;
+  padding:6px 10px;
+  border-radius:8px;
+  transition:all 0.15s;
+  display:inline-flex;
+  align-items:center;
+  gap:4px
+}
+.home-more-btn:hover{
+  color:var(--accent-2);
+  background:rgba(167,139,250,0.1)
+}
+.home-more-btn svg{
+  transition:transform 0.2s ease
+}
+.platform-section{
+  margin-bottom:14px
+}
+.platform-rows{
+  display:flex;
+  flex-direction:column;
+  gap:8px
+}
+.platform-row{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  min-width:0
+}
+.platform-cards{
+  display:flex;
+  gap:10px;
+  overflow-x:auto;
+  padding:2px 2px 6px;
+  -webkit-overflow-scrolling:touch;
+  scrollbar-width:none;
+  flex:1;
+  min-width:0;
+  scroll-snap-type:x proximity
+}
+.platform-cards::-webkit-scrollbar{
+  display:none
+}
+.platform-card{
+  flex:0 0 auto;
+  width:min(42vw,168px);
+  height:74px;
+  border:none;
+  border-radius:14px;
+  background:var(--platform-card-grad);
+  box-shadow:0 8px 20px var(--shadow-card),inset 0 1px 0 var(--hover-bg-strong);
+  display:flex;
+  align-items:stretch;
+  padding:0;
+  cursor:pointer;
+  overflow:hidden;
+  position:relative;
+  scroll-snap-align:start;
+  transition:transform 0.18s ease,box-shadow 0.18s ease;
+  -webkit-tap-highlight-color:transparent;
+  font:inherit;
+  color:var(--platform-card-text)
+}
+.platform-card:hover{
+  transform:translateY(-3px);
+  box-shadow:0 16px 36px var(--platform-shadow-hover),inset 0 1px 0 var(--hover-bg-strong)
+}
+html[data-theme="light"] .platform-card:hover{
+  box-shadow:0 4px 12px rgba(0,0,0,0.03),inset 0 1px 0 #ffffff
+}
+@media (prefers-color-scheme:light){
+  html[data-theme="system"] .platform-card:hover{
+    box-shadow:0 4px 12px rgba(0,0,0,0.03),inset 0 1px 0 #ffffff
+  }
+}
+.platform-card:active{
+  transform:scale(0.985)
+}
+.platform-card-left{
+  flex:0 0 40%;
+  max-width:40%;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  justify-content:center;
+  gap:0;
+  padding:6px 2px 6px 6px;
+  z-index:2;
+  position:relative
+}
+.platform-card-logo{
+  width:60px;
+  height:60px;
+  border-radius:0;
+  object-fit:contain;
+  object-position:center;
+  flex-shrink:0;
+  box-shadow:none;
+  background:transparent;
+  padding:0;
+  box-sizing:border-box;
+  display:block
+}
+.platform-card-name{
+  display:none
+}
+.platform-card-right{
+  flex:1;
+  position:relative;
+  min-width:0;
+  overflow:hidden
+}
+.platform-card-posters{
+  position:absolute;
+  right:-4px;
+  top:50%;
+  transform:translateY(-50%);
+  width:96px;
+  height:66px
+}
+.platform-card-poster{
+  position:absolute;
+  width:32px;
+  height:48px;
+  border-radius:6px;
+  object-fit:cover;
+  box-shadow:0 4px 10px rgba(0,0,0,0.28);
+  border:1.5px solid rgba(255,255,255,0.95);
+  background:#c5c9d0;
+  top:50%;
+  margin-top:-24px
+}
+.platform-card-poster-ph{
+  background:linear-gradient(145deg,#d0d4db 0%,#b8bec8 100%)
+}
+.platform-card-poster.p0{
+  right:4px;
+  z-index:5;
+  transform:rotate(8deg)
+}
+.platform-card-poster.p1{
+  right:20px;
+  z-index:4;
+  transform:rotate(3deg)
+}
+.platform-card-poster.p2{
+  right:36px;
+  z-index:3;
+  transform:rotate(-4deg)
+}
+.platform-card-poster.p3{
+  right:52px;
+  z-index:2;
+  transform:rotate(-10deg)
+}
+@media (min-width:768px){
+  .platform-card{
+    flex:1 1 260px;
+    min-width:260px;
+    width:auto;
+    height:96px;
+    border-radius:16px
+  }
+  .platform-card-logo{
+    width:76px;
+    height:76px;
+    border-radius:0;
+    padding:0
+  }
+  .platform-card-posters{
+    width:140px;
+    height:88px
+  }
+  .platform-card-poster{
+    width:48px;
+    height:72px;
+    margin-top:-36px;
+    border-radius:8px
+  }
+  .platform-card-poster.p0{
+    right:8px
+  }
+  .platform-card-poster.p1{
+    right:30px
+  }
+  .platform-card-poster.p2{
+    right:52px
+  }
+  .platform-card-poster.p3{
+    right:74px
+  }
+  .platform-cards{
+    gap:12px
+  }
+}
+.h-scroll-wrap{
+  margin:0 -16px;
+  padding:0 16px
+}
+.h-scroll{
+  display:flex;
+  gap:12px;
+  overflow-x:auto;
+  padding:2px 0 8px;
+  -webkit-overflow-scrolling:touch;
+  scrollbar-width:none;
+  scroll-snap-type:x proximity
+}
+.h-scroll::-webkit-scrollbar{
+  display:none
+}
+.h-scroll-empty{
+  padding:30px 0;
+  text-align:center
+}
+.h-scroll .item{
+  flex:0 0 auto;
+  width:132px;
+  display:flex;
+  flex-direction:column;
+  gap:0;
+  padding:0;
+  border-radius:12px;
+  background:transparent;
+  border:none;
+  overflow:visible;
+  animation:none;
+  box-shadow:none;
+  scroll-snap-align:start;
+  transform:none
+}
+.h-scroll .item:hover{
+  background:transparent;
+  border:none;
+  box-shadow:none;
+  transform:none
+}
+.h-scroll .item.clickable:active{
+  transform:scale(0.96);
+  background:transparent
+}
+.h-scroll .item .poster{
+  width:100%;
+  height:auto;
+  aspect-ratio:2/3;
+  border-radius:12px;
+  box-shadow:0 4px 16px rgba(0,0,0,0.5);
+  transition:transform 0.25s ease,box-shadow 0.25s ease
+}
+.h-scroll .item:hover .poster{
+  transform:translateY(-3px);
+  box-shadow:0 12px 28px rgba(91,124,250,0.3),0 4px 16px rgba(0,0,0,0.6)
+}
+.h-scroll .item .info{
+  display:block;
+  padding:8px 2px 0;
+  flex:none;
+  justify-content:flex-start
+}
+.h-scroll .item .name{
+  font-size:0.82rem;
+  line-height:1.3
+}
+.h-scroll .item .overview{
+  display:none
+}
+.h-scroll .item .meta{
+  font-size:0.72rem;
+  margin-top:2px;
+  color:var(--text-dim)
+}
+.h-scroll .item .meta.dim{
+  font-size:0.7rem
+}
+.h-scroll .hist-days{
+  display:flex;
+  flex-direction:column;
+  gap:24px;
+  width:100%;
+  padding-top:4px
+}
+.hist-day-head{
+  display:flex;
+  align-items:center;
+  gap:12px;
+  margin:0 0 12px;
+  padding:0 2px
+}
+.hist-day-num{
+  flex-shrink:0;
+  width:42px;
+  height:42px;
+  border-radius:50%;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:1.05rem;
+  font-weight:800;
+  color:var(--text);
+  background:var(--surface-2,#1c1f2a);
+  border:1px solid var(--border,rgba(255,255,255,.08))
+}
+.hist-day-num.is-today{
+  background:linear-gradient(135deg,#7c3aed,#a78bfa);
+  color:#fff;
+  border-color:transparent
+}
+.hist-day-text{
+  flex:1;
+  min-width:0
+}
+.hist-day-main{
+  font-size:0.95rem;
+  font-weight:700;
+  line-height:1.2
+}
+.hist-day-sub{
+  font-size:0.72rem;
+  color:var(--text-dim);
+  margin-top:2px
+}
+.hist-day-count{
+  font-size:0.72rem;
+  color:var(--text-mute,var(--text-dim));
+  flex-shrink:0
+}
+.hist-day-grid{
+  margin:0
+}
+#history.pane{
+  padding-top:8px
+}
+#history>.grid{
+  display:block;
+  padding:20px 0 12px
+}
+#history>.grid>.hist-days{
+  width:100%
+}
+.cw-card{
+  flex:0 0 auto;
+  width:min(78vw,280px);
+  max-width:280px;
+  display:flex;
+  flex-direction:column;
+  gap:0;
+  padding:0;
+  border-radius:12px;
+  background:transparent;
+  border:none;
+  overflow:visible;
+  scroll-snap-align:start;
+  position:relative
+}
+.h-scroll .cw-card:hover{
+  background:transparent;
+  border:none;
+  box-shadow:none;
+  transform:none
+}
+.h-scroll .cw-card.clickable:active{
+  transform:scale(0.97)
+}
+.cw-poster{
+  position:relative;
+  width:100%;
+  aspect-ratio:16/9;
+  border-radius:12px;
+  overflow:hidden;
+  background:var(--surface-2);
+  box-shadow:0 4px 16px rgba(0,0,0,0.5)
+}
+html[data-theme="light"] .cw-poster{
+  box-shadow:0 4px 12px rgba(0,0,0,0.06)
+}
+@media (prefers-color-scheme:light){
+  html[data-theme="system"] .cw-poster{
+    box-shadow:0 4px 12px rgba(0,0,0,0.06)
+  }
+}
+.cw-poster img{
+  width:100%;
+  height:100%;
+  object-fit:cover;
+  display:block
+}
+.cw-poster .poster-ph{
+  width:100%;
+  height:100%;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:2rem;
+  color:var(--text-dim);
+  background:var(--soft-card-grad,var(--surface-2))
+}
+.cw-overlay{
+  position:absolute;
+  left:8px;
+  bottom:12px;
+  z-index:2;
+  font-size:0.72rem;
+  font-weight:700;
+  color:#fff;
+  text-shadow:0 1px 4px rgba(0,0,0,0.85);
+  background:rgba(0,0,0,0.45);
+  padding:3px 8px;
+  border-radius:6px;
+  backdrop-filter:blur(6px);
+  -webkit-backdrop-filter:blur(6px);
+  max-width:calc(100% - 16px);
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap
+}
+.cw-bar{
+  position:absolute;
+  left:0;
+  right:0;
+  bottom:0;
+  height:3px;
+  background:rgba(255,255,255,0.18);
+  z-index:3
+}
+.cw-bar-fill{
+  height:100%;
+  background:linear-gradient(90deg,#a78bfa,#7c3aed);
+  border-radius:0 2px 2px 0
+}
+.cw-info{
+  padding:6px 2px 0;
+  min-width:0;
+  display:flex;
+  flex-direction:column;
+  gap:1px
+}
+.cw-title-row{
+  display:flex;
+  align-items:center;
+  gap:4px;
+  min-width:0;
+  position:relative;
+  line-height:1.25;
+  padding-right:28px
+}
+.cw-title{
+  flex:1;
+  min-width:0;
+  font-size:0.82rem;
+  font-weight:600;
+  line-height:1.25;
+  color:var(--text);
+  display:-webkit-box;
+  -webkit-line-clamp:1;
+  -webkit-box-orient:vertical;
+  overflow:hidden;
+  word-break:break-word
+}
+.cw-badge-rewatch{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  padding:0 5px;
+  height:16px;
+  font-size:0.62rem;
+  font-weight:700;
+  color:#fff;
+  background:linear-gradient(135deg,#8b5cf6,#a78bfa);
+  border-radius:4px;
+  margin-left:4px;
+  flex-shrink:0;
+  transform:translateY(-1px)
+}
+.cw-watching{
+  font-size:0.72rem;
+  font-weight:500;
+  line-height:1.25;
+  color:var(--text-dim);
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap
+}
+.cw-meta{
+  margin-top:0;
+  font-size:0.68rem;
+  line-height:1.25;
+  color:var(--text-mute,var(--text-dim))
+}
+.cw-more{
+  position:absolute;
+  right:-8px;
+  top:50%;
+  transform:translateY(-50%);
+  width:36px;
+  height:36px;
+  margin:0;
+  border:none;
+  background:transparent;
+  color:var(--text-dim);
+  border-radius:50%;
+  cursor:pointer;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:0;
+  font-family:inherit;
+  transition:color 0.15s,background 0.15s;
+  -webkit-tap-highlight-color:transparent;
+  z-index:6;
+  touch-action:manipulation
+}
+.cw-more::before{
+  content:"";
+  position:absolute;
+  inset:-6px;
+  border-radius:50%
+}
+.cw-more:hover,.cw-more:active{
+  color:var(--text);
+  background:rgba(255,255,255,0.1)
+}
+.cw-sheet{
+  position:fixed;
+  inset:0;
+  z-index:500;
+  display:none
+}
+.cw-sheet.open{
+  display:block
+}
+.cw-sheet-backdrop{
+  position:absolute;
+  inset:0;
+  background:rgba(0,0,0,0.55);
+  backdrop-filter:blur(4px);
+  -webkit-backdrop-filter:blur(4px)
+}
+.cw-sheet-panel{
+  position:absolute;
+  left:12px;
+  right:12px;
+  bottom:calc(12px + env(safe-area-inset-bottom,0px));
+  background:var(--panel-grad,#1a1d27);
+  border:1px solid var(--border-strong,rgba(255,255,255,0.12));
+  border-radius:16px;
+  box-shadow:0 16px 48px rgba(0,0,0,0.65);
+  padding:8px;
+  animation:cwSheetIn 0.2s cubic-bezier(0.2,0.9,0.3,1)
+}
+@keyframes cwSheetIn{
+  from{
+    opacity:0;
+    transform:translateY(12px)
+  }
+  to{
+    opacity:1;
+    transform:translateY(0)
+  }
+}
+.cw-sheet-title{
+  font-size:0.78rem;
+  color:var(--text-dim);
+  padding:8px 14px 6px;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap
+}
+.cw-sheet-item{
+  display:block;
+  width:100%;
+  text-align:left;
+  border:none;
+  background:transparent;
+  color:var(--text);
+  font-size:1rem;
+  font-weight:600;
+  font-family:inherit;
+  padding:16px 14px;
+  border-radius:12px;
+  cursor:pointer;
+  min-height:48px;
+  -webkit-tap-highlight-color:transparent;
+  touch-action:manipulation
+}
+.cw-sheet-item:active{
+  background:rgba(255,255,255,0.08)
+}
+.cw-sheet-item.danger{
+  color:#ff8a8a
+}
+.cw-sheet-cancel{
+  margin-top:4px;
+  border-top:1px solid var(--border,rgba(255,255,255,0.08));
+  color:var(--text-dim);
+  font-weight:500
+}
+@media (min-width:700px){
+  .cw-sheet-panel{
+    left:50%;
+    right:auto;
+    bottom:auto;
+    top:50%;
+    transform:translate(-50%,-50%);
+    width:min(340px,92vw);
+    animation:cwSheetInCenter 0.2s cubic-bezier(0.2,0.9,0.3,1)
+  }
+  @keyframes cwSheetInCenter{
+    from{
+      opacity:0;
+      transform:translate(-50%,-48%) scale(0.96)
+    }
+    to{
+      opacity:1;
+      transform:translate(-50%,-50%) scale(1)
+    }
+  }
+}
+.cw-modal-grid{
+  padding:2px 0 4px
+}
+.cw-card .wl-watched{
+  top:6px;
+  right:6px
+}
+@media (min-width:768px){
+  .h-scroll .cw-card{
+    width:260px
+  }
+  .cw-title{
+    font-size:0.86rem
+  }
+}
+.h-scroll .item .bar{
+  margin-top:6px
+}
+.h-scroll .item .wl-watched,.h-scroll .item .wl-remove,.h-scroll .item .wl-drop,.h-scroll .item .wl-unwatch{
+  top:6px;
+  right:6px;
+  width:24px;
+  height:24px;
+  font-size:0.75rem
+}
+.h-scroll .item .cal-action-row,.h-scroll .item .cal-open-btn{
+  display:none
+}
+.h-scroll .item .poster-play{
+  width:46px;
+  height:46px;
+  opacity:1
+}
+.h-scroll .item .poster-play svg{
+  width:24px;
+  height:24px
+}
+@media (min-width:768px){
+  .h-scroll-wrap{
+    margin:0;
+    padding:0
+  }
+  .h-scroll .item{
+    width:168px
+  }
+}
+@media (min-width:1024px){
+  .h-scroll .item{
+    width:188px
+  }
+}
+@media (min-width:1280px){
+  .h-scroll .item{
+    width:200px
+  }
+}
+@media (min-width:1600px){
+  .h-scroll .item{
+    width:214px
+  }
+}
+@media (min-width:1920px){
+  .container{
+    width:100%;
+    padding-left:48px;
+    padding-right:48px
+  }
+  .h-scroll .item{
+    width:228px
+  }
+}
+@media (min-width:2200px){
+  .h-scroll .item{
+    width:240px
+  }
+}
+.grid .item .cw-more{
+  margin-left:auto;
+  flex-shrink:0;
+  width:28px;
+  height:28px;
+  border:none;
+  background:transparent;
+  color:var(--text-dim);
+  border-radius:8px;
+  cursor:pointer;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  padding:0
+}
+.grid .item .cw-more:hover{
+  color:var(--text);
+  background:var(--chip-bg)
+}
+.grid .item .name-row{
+  display:flex;
+  align-items:center;
+  gap:6px
+}
+.cw-actions{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  margin-top:10px
+}
+.cw-act-btn{
+  flex:1 1 auto;
+  min-width:0;
+  padding:8px 12px;
+  border-radius:10px;
+  font-size:0.78rem;
+  font-weight:600;
+  font-family:inherit;
+  cursor:pointer;
+  border:1px solid var(--chip-border);
+  background:var(--chip-bg);
+  color:var(--chip-fg);
+  transition:background 0.15s,border-color 0.15s,color 0.15s;
+  -webkit-tap-highlight-color:transparent
+}
+.cw-act-btn:hover{
+  background:var(--chip-bg-hover);
+  color:var(--chip-fg-hover)
+}
+.cw-act-btn.danger{
+  border-color:rgba(224,85,96,0.35);
+  background:rgba(224,85,96,0.1);
+  color:#ff8a8a
+}
+.cw-act-btn.danger:hover{
+  background:rgba(224,85,96,0.18);
+  color:#ffb0b0
+}
+.h-scroll .cw-actions{
+  flex-direction:column;
+  gap:6px
+}
+.h-scroll .cw-act-btn{
+  width:100%;
+  padding:7px 10px;
+  font-size:0.72rem
+}
+.list-modal{
+  position:fixed;
+  inset:0;
+  z-index:150;
+  display:none
+}
+.list-modal.open{
+  display:block
+}
+.list-modal-backdrop{
+  position:absolute;
+  inset:0;
+  background:rgba(2,4,8,0.8);
+  backdrop-filter:blur(8px);
+  -webkit-backdrop-filter:blur(8px);
+  animation:fadeIn 0.2s ease
+}
+.list-modal-panel{
+  position:absolute;
+  top:50%;
+  left:50%;
+  transform:translate(-50%,-50%);
+  width:min(94vw,1000px);
+  max-height:88vh;
+  display:flex;
+  flex-direction:column;
+  background:var(--panel-grad);
+  border:1px solid var(--border-strong);
+  border-radius:18px;
+  box-shadow:0 30px 80px rgba(0,0,0,0.85);
+  overflow:hidden;
+  animation:modalIn 0.25s cubic-bezier(0.2,0.9,0.3,1)
+}
+.list-modal-head{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  padding:16px 20px;
+  border-bottom:1px solid var(--border);
+  flex-shrink:0
+}
+.list-modal-title{
+  font-size:1.05rem;
+  font-weight:700
+}
+.list-modal-close{
+  width:40px;
+  height:40px;
+  border-radius:50%;
+  border:1px solid var(--chip-border);
+  background:var(--chip-bg);
+  color:var(--chip-fg);
+  font-size:1.2rem;
+  cursor:pointer;
+  font-family:inherit;
+  line-height:1;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  transition:all 0.15s
+}
+.list-modal-close:hover{
+  color:#fff;
+  border-color:var(--border-strong);
+  background:rgba(255,255,255,0.08)
+}
+.list-modal-body{
+  overflow-y:auto;
+  padding:16px 20px 24px;
+  -webkit-overflow-scrolling:touch
+}
+.douban-filter-tabs{
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+  margin-bottom:16px
+}
+.douban-filter-tab{
+  background:var(--chip-bg);
+  border:1px solid var(--chip-border);
+  color:var(--chip-fg);
+  padding:7px 16px;
+  border-radius:999px;
+  font-size:0.82rem;
+  font-weight:600;
+  cursor:pointer;
+  font-family:inherit;
+  transition:all 0.15s;
+  -webkit-tap-highlight-color:transparent
+}
+.douban-filter-tab:hover{
+  color:var(--chip-fg-hover);
+  border-color:var(--chip-border);
+  background:var(--chip-bg-hover)
+}
+.douban-filter-tab.active{
+  background:var(--brand-grad);
+  color:#fff;
+  border-color:transparent;
+  box-shadow:0 4px 14px rgba(167,139,250,0.3)
+}
+.theater-home-tabs{
+  display:flex;
+  gap:8px;
+  overflow-x:auto;
+  padding:0 16px 12px;
+  margin:0 -16px;
+  scrollbar-width:none;
+  -webkit-overflow-scrolling:touch;
+  scroll-snap-type:x proximity
+}
+.theater-home-tabs::-webkit-scrollbar{
+  display:none
+}
+.theater-filter-tab{
+  flex-shrink:0;
+  background:var(--chip-bg);
+  border:1px solid var(--chip-border);
+  color:var(--chip-fg);
+  padding:6px 14px;
+  border-radius:999px;
+  font-size:0.78rem;
+  font-weight:600;
+  cursor:pointer;
+  font-family:inherit;
+  transition:all 0.15s;
+  -webkit-tap-highlight-color:transparent;
+  scroll-snap-align:start
+}
+.theater-filter-tab:hover{
+  color:var(--chip-fg-hover);
+  border-color:var(--chip-border);
+  background:var(--chip-bg-hover)
+}
+.theater-filter-tab.active{
+  background:var(--brand-grad);
+  color:#fff;
+  border-color:transparent;
+  box-shadow:0 4px 14px rgba(167,139,250,0.3)
+}
+@media (min-width:768px){
+  .theater-home-tabs{
+    margin:0;
+    padding-left:0;
+    padding-right:0
+  }
+}
+@media (max-width:599px){
+  .list-modal-panel{
+    top:auto;
+    bottom:0;
+    left:0;
+    right:0;
+    transform:none;
+    width:100%;
+    max-height:92vh;
+    border-radius:18px 18px 0 0
+  }
+}
+.show-cal-modal{
+  position:fixed;
+  inset:0;
+  z-index:240;
+  display:none
+}
+.show-cal-modal.open{
+  display:block
+}
+.show-cal-backdrop{
+  position:absolute;
+  inset:0;
+  background:var(--overlay);
+  backdrop-filter:blur(8px);
+  -webkit-backdrop-filter:blur(8px);
+  animation:fadeIn 0.2s ease
+}
+.show-cal-panel{
+  position:absolute;
+  top:50%;
+  left:50%;
+  transform:translate(-50%,-50%);
+  width:min(92vw,440px);
+  max-height:90vh;
+  overflow-y:auto;
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:16px;
+  padding:20px;
+  box-shadow:0 30px 80px rgba(0,0,0,0.8);
+  animation:modalIn 0.25s cubic-bezier(0.2,0.9,0.3,1)
+}
+.show-cal-head{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  margin-bottom:8px
+}
+.show-cal-name{
+  font-size:0.95rem;
+  font-weight:700;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+  flex:1;
+  min-width:0
+}
+.show-cal-close{
+  width:40px;
+  height:40px;
+  flex-shrink:0;
+  background:var(--chip-bg);
+  border:1px solid var(--chip-border);
+  color:var(--chip-fg);
+  border-radius:50%;
+  cursor:pointer;
+  font-size:1.2rem;
+  line-height:1;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  transition:all 0.15s;
+  font-family:inherit
+}
+.show-cal-close:hover{
+  color:var(--chip-fg-hover);
+  border-color:var(--chip-border);
+  background:var(--chip-bg-hover)
+}
+.show-cal-info{
+  font-size:0.72rem;
+  color:var(--text-dim);
+  margin-bottom:12px;
+  line-height:1.4
+}
+.show-cal-nav{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  margin-bottom:12px;
+  font-size:0.88rem;
+  color:var(--text);
+  font-weight:600
+}
+.show-cal-nav button{
+  width:30px;
+  height:30px;
+  background:var(--chip-bg);
+  border:1px solid var(--chip-border);
+  color:var(--chip-fg);
+  border-radius:8px;
+  cursor:pointer;
+  font-size:1rem;
+  line-height:1;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  transition:all 0.15s;
+  font-family:inherit
+}
+.show-cal-nav button:hover{
+  color:var(--chip-fg-hover);
+  border-color:var(--chip-border);
+  background:var(--chip-bg-hover)
+}
+.show-cal-weekdays{
+  display:grid;
+  grid-template-columns:repeat(7,1fr);
+  text-align:center;
+  font-size:0.7rem;
+  color:var(--text-dim);
+  margin-bottom:6px
+}
+.show-cal-grid{
+  display:grid;
+  grid-template-columns:repeat(7,1fr);
+  gap:4px
+}
+.sc-day{
+  position:relative;
+  aspect-ratio:1;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  border-radius:8px;
+  font-size:0.8rem;
+  color:var(--text-dim);
+  cursor:default;
+  border:1px solid transparent;
+  transition:background 0.15s,border-color 0.15s
+}
+.sc-day.sc-has{
+  cursor:pointer;
+  font-weight:700
+}
+.sc-day.sc-past{
+  background:var(--cal-soft);
+  color:var(--cal-accent-2);
+  border-color:rgba(120,150,210,0.5)
+}
+.sc-day.sc-past:hover{
+  background:var(--cal-soft-border);
+  color:#d0dcf0
+}
+.sc-day.sc-today-day{
+  background:var(--cal-accent);
+  color:#fff;
+  border-color:#7d9dd4;
+  box-shadow:0 0 14px rgba(125,157,212,0.7)
+}
+.sc-day.sc-today-day:hover{
+  background:#5b7fc4
+}
+.sc-day.sc-future{
+  background:rgba(255,184,77,0.18);
+  color:#ffd693;
+  border-color:rgba(255,184,77,0.55)
+}
+.sc-day.sc-future:hover{
+  background:rgba(255,184,77,0.4);
+  color:#fff0d0
+}
+.sc-day.sc-active{
+  outline:2px solid #fff;
+  outline-offset:-2px
+}
+.sc-day.sc-empty{
+  visibility:hidden
+}
+.sc-badge{
+  position:absolute;
+  top:2px;
+  right:2px;
+  min-width:14px;
+  height:14px;
+  padding:0 3px;
+  border-radius:7px;
+  background:var(--cal-accent);
+  color:#fff;
+  font-size:0.6rem;
+  font-weight:700;
+  line-height:14px;
+  text-align:center
+}
+.sc-day.sc-future .sc-badge{
+  background:#d99a3a
+}
+.show-cal-legend{
+  display:flex;
+  flex-wrap:wrap;
+  gap:12px;
+  justify-content:center;
+  margin-top:14px;
+  font-size:0.7rem;
+  color:var(--text-dim)
+}
+.legend-item{
+  display:inline-flex;
+  align-items:center;
+  gap:5px
+}
+.legend-dot{
+  display:inline-block;
+  width:10px;
+  height:10px;
+  border-radius:3px
+}
+.legend-past{
+  background:var(--cal-soft-border);
+  border:1px solid rgba(140,170,220,0.8)
+}
+.legend-today{
+  background:var(--cal-accent);
+  border:1px solid #7d9dd4
+}
+.legend-future{
+  background:rgba(255,184,77,0.4);
+  border:1px solid rgba(255,184,77,0.8)
+}
+.show-cal-detail{
+  margin-top:14px;
+  border-top:1px solid var(--border);
+  padding-top:12px;
+  min-height:20px
+}
+.sc-ep{
+  display:flex;
+  gap:10px;
+  align-items:baseline;
+  padding:6px 0;
+  font-size:0.82rem
+}
+.sc-ep-tag{
+  font-family:ui-monospace,Menlo,monospace;
+  font-size:0.72rem;
+  font-weight:700;
+  color:#7d9dd4;
+  flex-shrink:0
+}
+.sc-ep-title{
+  color:var(--text);
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap
+}
+.ext-rating{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  padding:4px 10px 4px 8px;
+  border-radius:8px;
+  background:rgba(255,255,255,0.06);
+  border:1px solid rgba(255,255,255,0.1);
+  line-height:1;
+  font-size:0.82rem;
+  color:var(--text);
+  white-space:nowrap;
+  text-decoration:none;
+  transition:background 0.15s,border-color 0.15s,transform 0.12s
+}
+.ext-rating:hover{
+  background:rgba(255,255,255,0.1);
+  border-color:rgba(255,255,255,0.16)
+}
+.ext-logo{
+  display:block;
+  flex-shrink:0;
+  border-radius:2px
+}
+.ext-score{
+  font-weight:800;
+  letter-spacing:0.2px;
+  font-variant-numeric:tabular-nums
+}
+.ext-rating.ext-imdb{
+  background:rgba(245,197,24,0.14);
+  border-color:rgba(245,197,24,0.35);
+  color:#f5c518
+}
+.ext-rating.ext-imdb .ext-score{
+  color:#f5c518
+}
+.ext-rating.ext-rt{
+  background:rgba(250,50,10,0.12);
+  border-color:rgba(250,50,10,0.32);
+  color:#ff7666
+}
+.ext-rating.ext-rt .ext-score{
+  color:#ff7666
+}
+.ext-rating.ext-mc{
+  background:rgba(255,255,255,0.05);
+  border-color:rgba(255,255,255,0.12);
+  color:var(--text)
+}
+.ext-rating.ext-trakt{
+  background:rgba(237,28,36,0.12);
+  border-color:rgba(237,28,36,0.32);
+  color:#ff6b70
+}
+.ext-rating.ext-trakt .ext-score{
+  color:#ff6b70
+}
+.ext-rating.ext-tmdb{
+  background:rgba(1,180,228,0.12);
+  border-color:rgba(1,180,228,0.32);
+  color:#4dd0e1
+}
+.ext-rating.ext-tmdb .ext-score{
+  color:#4dd0e1
+}
+.ext-rating.ext-douban{
+  background:rgba(46,150,61,0.12);
+  border-color:rgba(46,150,61,0.38);
+  color:#4ecb71
+}
+.ext-rating.ext-douban:hover{
+  background:rgba(46,150,61,0.22);
+  border-color:rgba(46,150,61,0.6);
+  color:#6fe089
+}
+.detail-ext-ratings{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  justify-content:center;
+  margin-top:8px;
+  align-items:center
+}
+@media (min-width:600px){
+  .container{
+    padding-left:20px;
+    padding-right:20px
+  }
+  .grid{
+    display:grid;
+    grid-template-columns:repeat(2,1fr);
+    gap:12px
+  }
+  .item{
+    border-radius:14px
+  }
+  .poster{
+    width:72px;
+    height:108px
+  }
+}
+@media (min-width:768px){
+  .container{
+    width:100%;
+    padding:0 28px calc(76px + env(safe-area-inset-bottom))
+  }
+  .hero{
+    padding:12px 0 8px;
+    gap:8px
+  }
+  .hero-avatar{
+    width:56px;
+    height:56px
+  }
+  .hero-name{
+    font-size:1.55rem
+  }
+  .stats{
+    gap:6px;
+    padding:10px 8px;
+    margin-bottom:8px
+  }
+  .stat-num{
+    font-size:1.5rem
+  }
+  .stat-label{
+    font-size:0.76rem
+  }
+  .stat-icon{
+    width:34px;
+    height:34px;
+    border-radius:10px
+  }
+  .tabs{
+    position:relative;
+    overflow-x:auto;
+    scrollbar-width:none;
+    -webkit-overflow-scrolling:touch;
+    padding-bottom:2px
+  }
+  .tabs::-webkit-scrollbar{
+    display:none
+  }
+  .tab{
+    flex:0 0 auto;
+    padding:9px 14px;
+    font-size:0.87rem
+  }
+  .grid{
+    display:grid;
+    grid-template-columns:repeat(auto-fill,minmax(150px,1fr));
+    gap:16px
+  }
+  .item{
+    display:flex;
+    flex-direction:column;
+    gap:0;
+    padding:0;
+    border-radius:12px;
+    background:transparent;
+    border:none;
+    overflow:visible
+  }
+  .item:hover{
+    background:transparent;
+    border:none
+  }
+  .item.clickable:active{
+    transform:none;
+    background:transparent
+  }
+  .poster{
+    width:100%;
+    height:auto;
+    aspect-ratio:2/3;
+    border-radius:12px;
+    transition:transform 0.25s ease,box-shadow 0.25s ease;
+    box-shadow:0 4px 16px rgba(0,0,0,0.5)
+  }
+  .item:hover .poster{
+    transform:translateY(-4px);
+    box-shadow:0 12px 32px rgba(91,124,250,0.3),0 4px 16px rgba(0,0,0,0.6)
+  }
+  .info{
+    display:block;
+    padding:10px 2px 0;
+    flex:none;
+    justify-content:flex-start
+  }
+  .name{
+    font-size:0.88rem
+  }
+  .overview{
+    -webkit-line-clamp:2;
+    font-size:0.74rem;
+    margin-top:4px
+  }
+  .meta{
+    font-size:0.76rem;
+    margin-top:3px
+  }
+  .meta.dim{
+    font-size:0.72rem
+  }
+  .bar{
+    margin-top:8px
+  }
+  .wl-remove,.wl-watched,.wl-unwatch{
+    top:8px;
+    right:8px;
+    width:28px;
+    height:28px
+  }
+  .day-num{
+    font-size:1.6rem
+  }
+}
+@media (min-width:1024px){
+  .container{
+    width:100%;
+    padding:0 36px 100px
+  }
+  .hero{
+    padding:14px 0 8px
+  }
+  .hero-name{
+    font-size:1.7rem
+  }
+  .stats{
+    gap:8px;
+    padding:12px 10px;
+    margin-bottom:10px
+  }
+  .stat-num{
+    font-size:1.7rem
+  }
+  .stat-label{
+    font-size:0.78rem
+  }
+  .stat-icon{
+    width:36px;
+    height:36px
+  }
+  .grid{
+    grid-template-columns:repeat(auto-fill,minmax(168px,1fr));
+    gap:20px
+  }
+  .name{
+    font-size:0.9rem
+  }
+  .overview{
+    -webkit-line-clamp:3;
+    font-size:0.76rem
+  }
+  .wl-remove,.wl-watched,.wl-unwatch{
+    top:10px;
+    right:10px;
+    width:30px;
+    height:30px
+  }
+  .wl-watched,.wl-unwatch{
+    font-size:0.95rem
+  }
+}
+@media (min-width:1280px){
+  .container{
+    width:100%;
+    padding:0 40px 110px
+  }
+  .grid{
+    grid-template-columns:repeat(auto-fill,minmax(190px,1fr));
+    gap:22px
+  }
+  .hero-name{
+    font-size:1.85rem
+  }
+}
+@media (min-width:1600px){
+  .container{
+    width:100%
+  }
+  .grid{
+    grid-template-columns:repeat(auto-fill,minmax(200px,1fr));
+    gap:24px
+  }
+}
+.day{
+  margin-bottom:18px
+}
+.day-head{
+  display:flex;
+  align-items:center;
+  gap:12px;
+  margin-bottom:12px;
+  padding-left:2px
+}
+.day-num{
+  font-size:1.8rem;
+  font-weight:800;
+  color:#7d9dd4;
+  line-height:1;
+  letter-spacing:-1px
+}
+.day-mon{
+  font-size:0.75rem;
+  color:var(--text-dim)
+}
+.day-wd{
+  font-size:0.85rem;
+  font-weight:600;
+  color:var(--text)
+}
+.today{
+  background:var(--accent);
+  color:#fff;
+  font-size:0.68rem;
+  padding:3px 9px;
+  border-radius:999px;
+  font-weight:700;
+  margin-left:auto
+}
+.empty{
+  text-align:center;
+  padding:80px 20px;
+  color:var(--text-dim)
+}
+.empty p{
+  margin-top:14px;
+  font-size:0.92rem
+}
+@media (min-width:700px){
+  .empty{
+    padding:120px 20px
+  }
+}
+.modal{
+  position:fixed;
+  inset:0;
+  z-index:220;
+  display:none
+}
+.modal.open{
+  display:block
+}
+.modal-backdrop{
+  position:absolute;
+  inset:0;
+  background:var(--overlay-strong);
+  backdrop-filter:blur(12px) saturate(1.1);
+  -webkit-backdrop-filter:blur(12px) saturate(1.1);
+  animation:fadeIn 0.2s ease
+}
+.modal-panel{
+  position:absolute;
+  inset:0;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:12px;
+  padding-top:calc(12px + env(safe-area-inset-top));
+  padding-bottom:calc(12px + env(safe-area-inset-bottom));
+  pointer-events:none
+}
+.modal-shell{
+  pointer-events:auto;
+  position:relative;
+  display:flex;
+  flex-direction:column;
+  width:100%;
+  max-width:min(1120px,100%);
+  max-height:100%;
+  background:var(--modal-bg);
+  border:1px solid var(--border);
+  border-radius:18px;
+  box-shadow:0 40px 100px rgba(0,0,0,0.85);
+  animation:modalIn 0.28s cubic-bezier(0.2,0.9,0.3,1);
+  overflow:hidden
+}
+.modal-body{
+  position:relative;
+  width:100%;
+  flex:1 1 auto;
+  min-height:0;
+  overflow-y:auto;
+  overflow-x:hidden;
+  background:var(--modal-bg);
+  -webkit-overflow-scrolling:touch;
+  overscroll-behavior:contain
+}
+.modal-close{
+  position:absolute;
+  top:12px;
+  right:12px;
+  z-index:5;
+  width:40px;
+  height:40px;
+  border-radius:50%;
+  background:rgba(13,16,23,0.86);
+  border:1px solid rgba(255,255,255,0.18);
+  color:#fff;
+  cursor:pointer;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  backdrop-filter:blur(12px);
+  -webkit-backdrop-filter:blur(12px);
+  transition:background 0.15s,transform 0.15s,border-color 0.15s;
+  padding:0;
+  box-shadow:0 4px 16px rgba(0,0,0,0.55);
+  touch-action:manipulation;
+  -webkit-tap-highlight-color:transparent
+}
+.modal-close::before{
+  content:"";
+  position:absolute;
+  inset:-8px;
+  border-radius:50%
+}
+.modal-close:hover{
+  background:rgba(30,38,58,0.95);
+  transform:scale(1.05);
+  border-color:rgba(255,255,255,0.28)
+}
+.modal-close:active{
+  transform:scale(0.94);
+  background:rgba(50,60,88,0.95)
+}
+@media (max-width:599px){
+  .modal-panel{
+    padding:0;
+    align-items:stretch;
+    justify-content:flex-start
+  }
+  .modal-shell{
+    position:absolute;
+    left:0;
+    right:0;
+    top:calc(10px + env(safe-area-inset-top));
+    bottom:0;
+    max-width:100%;
+    max-height:none;
+    width:100%;
+    border-radius:16px 16px 0 0;
+    border:none;
+    border-top:1px solid var(--border)
+  }
+  .modal-body{
+    padding-bottom:env(safe-area-inset-bottom)
+  }
+  .detail-inner{
+    padding-top:24px
+  }
+  .detail-body{
+    padding-bottom:calc(28px + env(safe-area-inset-bottom))
+  }
+  .modal-close{
+    top:12px;
+    right:12px;
+    width:40px;
+    height:40px;
+    background:rgba(13,16,23,0.94);
+    border-color:rgba(255,255,255,0.24);
+    box-shadow:0 6px 22px rgba(0,0,0,0.65),inset 0 1px 0 rgba(255,255,255,0.08)
+  }
+  .modal-close::before{
+    inset:-12px
+  }
+  .modal-close:active{
+    transform:scale(0.9);
+    background:rgba(50,60,88,0.96)
+  }
+}
+@media (min-width:768px) and (max-width:1023px){
+  .modal-shell{
+    max-width:min(880px,92vw)
+  }
+}
+@media (min-width:700px){
+  .modal-panel{
+    padding:40px 24px
+  }
+}
+@keyframes modalIn{
+  from{
+    opacity:0;
+    transform:translateY(14px) scale(0.98)
+  }
+  to{
+    opacity:1;
+    transform:translateY(0) scale(1)
+  }
+}
+.modal-loading{
+  padding:100px 20px;
+  text-align:center
+}
+.modal-error{
+  padding:80px 20px;
+  text-align:center;
+  color:#9db5e0;
+  font-size:0.9rem
+}
+.detail-hero{
+  position:relative;
+  overflow:hidden;
+  background:var(--surface);
+  border-radius:18px 18px 0 0
+}
+.detail-bg{
+  position:absolute;
+  inset:0;
+  width:100%;
+  height:100%;
+  object-fit:cover;
+  filter:blur(30px) saturate(1.2) var(--detail-bg-filter,brightness(0.5));
+  transform:scale(1.15);
+  z-index:0
+}
+.detail-hero::after{
+  content:"";
+  position:absolute;
+  inset:0;
+  z-index:1;
+  background:var(--detail-hero-grad)
+}
+.detail-inner{
+  position:relative;
+  z-index:2;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  text-align:center;
+  gap:16px;
+  padding:24px 20px 24px
+}
+.detail-poster{
+  width:min(48vw,200px);
+  height:auto;
+  aspect-ratio:2/3;
+  border-radius:14px;
+  object-fit:cover;
+  flex-shrink:0;
+  box-shadow:0 16px 40px var(--shadow-login);
+  margin:0 auto
+}
+.detail-poster-ph{
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  background:var(--surface-2);
+  font-size:2.8rem;
+  color:var(--text-dim);
+  width:min(48vw,200px);
+  aspect-ratio:2/3
+}
+.detail-info{
+  flex:1;
+  min-width:0;
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+  align-items:center;
+  width:100%
+}
+.detail-title{
+  font-size:1.45rem;
+  font-weight:800;
+  letter-spacing:-0.4px;
+  line-height:1.25;
+  color:var(--text)
+}
+.detail-tagline{
+  font-size:0.85rem;
+  color:var(--text-dim);
+  font-style:italic
+}
+.detail-meta{
+  display:flex;
+  flex-wrap:wrap;
+  gap:10px;
+  font-size:0.85rem;
+  color:var(--text-dim);
+  justify-content:center
+}
+.detail-genres{
+  font-size:0.82rem;
+  color:var(--text-dim)
+}
+.detail-overview{
+  font-size:0.88rem;
+  color:var(--text-dim);
+  line-height:1.55;
+  margin-top:4px;
+  display:-webkit-box;
+  -webkit-line-clamp:5;
+  -webkit-box-orient:vertical;
+  overflow:hidden;
+  text-align:center;
+  cursor:pointer;
+  -webkit-tap-highlight-color:transparent;
+  transition:color 0.15s
+}
+.detail-overview:active{
+  color:var(--text)
+}
+.detail-overview.expanded{
+  display:block;
+  -webkit-line-clamp:unset;
+  overflow:visible;
+  cursor:pointer
+}
+.d-status{
+  display:flex;
+  gap:12px;
+  align-items:center;
+  background:var(--panel-grad);
+  border:1px solid var(--border);
+  border-radius:14px;
+  padding:12px 14px;
+  margin-top:8px;
+  width:100%;
+  justify-content:flex-start
+}
+.d-status.done{
+  border-color:rgba(74,222,128,0.3);
+  background:rgba(74,222,128,0.06)
+}
+.d-status-progress{
+  flex-direction:column;
+  align-items:stretch;
+  gap:10px
+}
+.d-status-row{
+  display:flex;
+  gap:12px;
+  align-items:center;
+  width:100%
+}
+.d-status-icon{
+  width:32px;
+  height:32px;
+  border-radius:50%;
+  background:var(--surface-2);
+  color:var(--text-dim);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-weight:700;
+  flex-shrink:0;
+  font-size:0.95rem
+}
+.d-status.done .d-status-icon{
+  background:rgba(74,222,128,0.15);
+  color:#4ade80
+}
+.d-status-body{
+  flex:1;
+  min-width:0;
+  text-align:left
+}
+.d-status-title{
+  font-size:0.88rem;
+  font-weight:600
+}
+.d-status-sub{
+  font-size:0.76rem;
+  color:var(--text-dim);
+  margin-top:2px
+}
+.d-action-bar{
+  display:inline-flex;
+  align-items:center;
+  gap:2px;
+  margin-top:16px;
+  padding:4px;
+  background:var(--pill-bg);
+  border:1px solid var(--pill-border);
+  border-radius:999px;
+  box-shadow:var(--pill-shadow);
+  backdrop-filter:blur(12px);
+  -webkit-backdrop-filter:blur(12px)
+}
+.d-act{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  width:44px;
+  height:44px;
+  border-radius:50%;
+  border:none;
+  background:transparent;
+  color:var(--pill-fg);
+  cursor:pointer;
+  padding:0;
+  font-family:inherit;
+  transition:background 0.18s ease,color 0.18s ease,transform 0.12s ease,box-shadow 0.18s ease;
+  -webkit-tap-highlight-color:transparent;
+  text-decoration:none;
+  flex-shrink:0;
+  position:relative
+}
+.d-act svg{
+  display:block;
+  pointer-events:none
+}
+.d-act:hover{
+  background:var(--pill-act-hover);
+  color:#fff
+}
+.d-act:active{
+  transform:scale(0.9)
+}
+.d-act:disabled{
+  opacity:0.5;
+  cursor:default;
+  pointer-events:none
+}
+.d-act-watched.active{
+  background:linear-gradient(145deg,#8b5cf6 0%,#a78bfa 55%,#c4b5fd 100%);
+  color:#fff;
+  box-shadow:0 4px 16px rgba(139,92,246,0.5),inset 0 1px 0 rgba(255,255,255,0.25)
+}
+.d-act-watched.active:hover{
+  filter:brightness(1.1);
+  color:#fff
+}
+.d-act-wl.active{
+  color:#c4b5fd;
+  background:rgba(167,139,250,0.12)
+}
+.d-act-wl.active:hover{
+  background:rgba(167,139,250,0.2);
+  color:var(--accent)
+}
+.d-act-play{
+  color:var(--pill-fg)
+}
+.d-act-play:hover{
+  background:rgba(167,139,250,0.15);
+  color:var(--accent)
+}
+.detail-body{
+  padding:20px 22px 24px
+}
+.d-section{
+  margin-top:8px;
+  margin-bottom:26px
+}
+.d-section:last-child{
+  margin-bottom:0
+}
+.d-section-title{
+  font-size:1rem;
+  font-weight:700;
+  letter-spacing:0.2px;
+  margin-bottom:14px;
+  color:var(--text);
+  display:flex;
+  align-items:center;
+  gap:8px
+}
+.d-section-title::before{
+  content:"";
+  width:3px;
+  height:16px;
+  border-radius:2px;
+  background:#7d9dd4
+}
+.cast-scroll{
+  display:flex;
+  gap:14px;
+  overflow-x:auto;
+  padding-bottom:8px;
+  scrollbar-width:none
+}
+.cast-scroll::-webkit-scrollbar{
+  display:none
+}
+.cast{
+  flex-shrink:0;
+  width:84px;
+  text-align:center
+}
+.cast-img{
+  width:84px;
+  height:84px;
+  border-radius:50%;
+  object-fit:cover;
+  background:var(--surface-2)
+}
+.cast-ph{
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  color:var(--text-dim);
+  font-size:1.6rem;
+  font-weight:600;
+  background:var(--soft-card-grad)
+}
+.cast-name{
+  font-size:0.75rem;
+  font-weight:600;
+  margin-top:8px;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap
+}
+.cast-role{
+  font-size:0.68rem;
+  color:var(--text-dim);
+  margin-top:1px;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap
+}
+.seasons{
+  display:flex;
+  flex-direction:column;
+  gap:8px
+}
+.season-item{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:12px;
+  overflow:hidden;
+  transition:border-color 0.15s
+}
+.season-item.open{
+  border-color:var(--scrollbar)
+}
+.season-head{
+  width:100%;
+  background:none;
+  border:none;
+  color:inherit;
+  display:flex;
+  align-items:center;
+  gap:10px;
+  padding:14px 16px;
+  cursor:pointer;
+  font-family:inherit;
+  text-align:left;
+  transition:background 0.15s
+}
+.season-head:hover{
+  background:var(--surface-2)
+}
+.season-title{
+  font-weight:600;
+  font-size:0.9rem;
+  flex:1
+}
+.season-meta{
+  font-size:0.76rem;
+  color:var(--text-dim)
+}
+.chev{
+  width:16px;
+  height:16px;
+  color:var(--text-dim);
+  transition:transform 0.2s ease;
+  flex-shrink:0
+}
+.season-item.open .chev{
+  transform:rotate(180deg)
+}
+.season-body{
+  display:none;
+  border-top:1px solid var(--border);
+  background:rgba(0,0,0,0.12)
+}
+.season-item.open .season-body{
+  display:block
+}
+.season-body .episode:first-child{
+  border-top:none
+}
+.ep-empty{
+  padding:20px;
+  text-align:center;
+  color:var(--text-dim);
+  font-size:0.85rem
+}
+.episode{
+  display:flex;
+  gap:14px;
+  padding:14px;
+  border-bottom:1px solid var(--border);
+  align-items:stretch;
+  transition:background 0.15s
+}
+.episode:last-child{
+  border-bottom:none
+}
+.episode.clickable{
+  cursor:pointer
+}
+.episode.clickable:hover{
+  background:var(--surface-2)
+}
+.episode.clickable:active{
+  background:var(--surface-3)
+}
+.episode.clickable:hover .ep-title{
+  color:#7d9dd4
+}
+.episode.watched .ep-title{
+  color:var(--text-dim)
+}
+.episode.watched.clickable:hover .ep-title{
+  color:#7d9dd4
+}
+.ep-still-wrap{
+  position:relative;
+  flex-shrink:0;
+  width:140px;
+  border-radius:10px;
+  overflow:hidden;
+  background:var(--surface-2);
+  aspect-ratio:16/9;
+  align-self:flex-start
+}
+.ep-still{
+  width:100%;
+  height:100%;
+  object-fit:cover;
+  display:block
+}
+.ep-still-ph{
+  width:100%;
+  height:100%;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:1.6rem;
+  color:var(--text-dim);
+  background:var(--soft-card-grad,var(--surface-2))
+}
+.ep-still-badge{
+  position:absolute;
+  top:6px;
+  left:6px;
+  font-size:0.65rem;
+  font-weight:700;
+  padding:2px 6px;
+  border-radius:6px;
+  background:rgba(52,211,153,0.9);
+  color:#052e1c
+}
+.ep-body{
+  flex:1;
+  min-width:0;
+  display:flex;
+  flex-direction:column;
+  gap:4px
+}
+.ep-head{
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:10px
+}
+.ep-title-line{
+  display:flex;
+  align-items:baseline;
+  gap:8px;
+  min-width:0;
+  flex:1
+}
+.ep-num{
+  font-family:ui-monospace,Menlo,monospace;
+  font-size:0.95rem;
+  color:var(--text-dim);
+  font-weight:800;
+  flex-shrink:0;
+  letter-spacing:0.3px
+}
+.ep-title{
+  font-size:0.95rem;
+  font-weight:700;
+  line-height:1.35;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap
+}
+.ep-meta{
+  display:flex;
+  flex-wrap:wrap;
+  align-items:center;
+  gap:6px;
+  font-size:0.75rem;
+  color:var(--text-dim);
+  margin-top:2px
+}
+.ep-vote{
+  display:inline-flex;
+  align-items:center;
+  gap:3px;
+  padding:1px 7px;
+  border-radius:999px;
+  background:rgba(167,139,250,0.14);
+  color:#c4b5fd;
+  font-weight:700;
+  font-size:0.72rem
+}
+.ep-dot{
+  opacity:0.45
+}
+.ep-overview{
+  font-size:0.8rem;
+  color:var(--text-dim);
+  margin-top:4px;
+  line-height:1.55;
+  display:-webkit-box;
+  -webkit-line-clamp:3;
+  -webkit-box-orient:vertical;
+  overflow:hidden
+}
+.ep-actions{
+  flex-shrink:0;
+  display:flex;
+  align-items:center;
+  gap:8px
+}
+.ep-play-btn{
+  width:30px;
+  height:30px;
+  border-radius:50%;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  flex-shrink:0;
+  background:rgba(167,139,250,0.16);
+  border:1px solid rgba(167,139,250,0.28);
+  color:#c4b5fd;
+  text-decoration:none;
+  transition:background 0.15s,transform 0.12s;
+  -webkit-tap-highlight-color:transparent
+}
+.ep-play-btn:hover{
+  background:rgba(167,139,250,0.28);
+  color:#ddd6fe
+}
+.ep-play-btn:active{
+  transform:scale(0.94)
+}
+.ep-status{
+  font-size:0.78rem;
+  font-weight:600;
+  white-space:nowrap;
+  line-height:1;
+  padding:0;
+  border:none;
+  background:none;
+  font-family:inherit
+}
+.ep-status.watched{
+  color:#4ade80;
+  cursor:default
+}
+.ep-status.unwatched{
+  color:var(--text-dim)
+}
+button.ep-status.unwatched{
+  cursor:pointer;
+  -webkit-tap-highlight-color:transparent
+}
+button.ep-status.unwatched:hover{
+  color:#6ee7b7
+}
+@media (max-width:520px){
+  .episode{
+    gap:10px;
+    padding:12px
+  }
+  .ep-still-wrap{
+    width:112px
+  }
+  .ep-title{
+    font-size:0.88rem;
+    white-space:normal;
+    display:-webkit-box;
+    -webkit-line-clamp:2;
+    -webkit-box-orient:vertical
+  }
+  .ep-overview{
+    -webkit-line-clamp:2;
+    font-size:0.76rem
+  }
+}
+.ep-watch-btn:disabled{
+  opacity:0.6;
+  cursor:wait
+}
+.ep-status.done,.ep-watch-btn.done{
+  color:#4ade80 !important;
+  cursor:default
+}
+.modal-body .grid{
+  grid-template-columns:repeat(auto-fill,minmax(150px,1fr));
+  gap:16px
+}
+@media (min-width:700px){
+  .detail-inner{
+    flex-direction:row;
+    align-items:flex-start;
+    text-align:left;
+    padding:34px;
+    gap:30px
+  }
+  .detail-poster{
+    width:220px;
+    height:auto;
+    aspect-ratio:2/3;
+    margin:0
+  }
+  .detail-info{
+    align-items:flex-start
+  }
+  .detail-meta{
+    justify-content:flex-start
+  }
+  .detail-overview{
+    text-align:left
+  }
+  .detail-title{
+    font-size:1.85rem
+  }
+  .detail-overview{
+    font-size:0.92rem;
+    -webkit-line-clamp:6
+  }
+  .detail-body{
+    padding:30px 34px 34px
+  }
+  .cast{
+    width:96px
+  }
+  .cast-img{
+    width:96px;
+    height:96px
+  }
+  .modal-body .grid{
+    grid-template-columns:repeat(auto-fill,minmax(160px,1fr));
+    gap:20px
+  }
+  .detail-ext-ratings{
+    justify-content:flex-start
+  }
+  .d-action-bar{
+    align-self:flex-start
+  }
+}
+.confirm-modal{
+  position:fixed;
+  inset:0;
+  z-index:620;
+  display:none
+}
+.confirm-modal.open{
+  display:block
+}
+.confirm-backdrop{
+  position:absolute;
+  inset:0;
+  background:var(--overlay);
+  backdrop-filter:blur(6px);
+  -webkit-backdrop-filter:blur(6px);
+  animation:fadeIn 0.18s ease
+}
+.confirm-panel{
+  position:absolute;
+  top:50%;
+  left:50%;
+  transform:translate(-50%,-50%);
+  width:min(88vw,340px);
+  background:var(--panel-grad);
+  border:1px solid var(--border-strong);
+  border-radius:18px;
+  padding:24px 22px 18px;
+  box-shadow:0 30px 80px rgba(0,0,0,0.8);
+  text-align:center;
+  animation:confirmIn 0.22s cubic-bezier(0.2,0.9,0.3,1)
+}
+@keyframes confirmIn{
+  from{
+    opacity:0;
+    transform:translate(-50%,-48%) scale(0.95)
+  }
+  to{
+    opacity:1;
+    transform:translate(-50%,-50%) scale(1)
+  }
+}
+.confirm-icon{
+  width:48px;
+  height:48px;
+  margin:0 auto 12px;
+  border-radius:50%;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:1.4rem;
+  background:var(--accent-soft);
+  color:var(--accent-2)
+}
+.confirm-icon.danger{
+  background:rgba(224,85,96,0.14);
+  color:#ff7b85
+}
+.confirm-icon.warn{
+  background:rgba(255,184,77,0.14);
+  color:#ffb84d
+}
+.confirm-icon.success{
+  background:rgba(52,211,153,0.14);
+  color:#34d399
+}
+.confirm-title{
+  font-size:1.02rem;
+  font-weight:700;
+  margin-bottom:6px;
+  color:var(--text)
+}
+.confirm-msg{
+  font-size:0.84rem;
+  color:var(--text-dim);
+  line-height:1.55;
+  word-break:break-word
+}
+.confirm-actions{
+  display:flex;
+  gap:10px;
+  margin-top:20px
+}
+.confirm-btn{
+  flex:1;
+  padding:11px 14px;
+  border-radius:12px;
+  font-size:0.88rem;
+  font-weight:700;
+  font-family:inherit;
+  cursor:pointer;
+  border:1px solid transparent;
+  transition:all 0.15s;
+  -webkit-tap-highlight-color:transparent
+}
+.confirm-cancel{
+  background:var(--chip-bg);
+  border-color:var(--chip-border);
+  color:var(--chip-fg)
+}
+.confirm-cancel:hover{
+  background:var(--chip-bg-hover);
+  color:var(--chip-fg-hover)
+}
+.confirm-ok{
+  background:var(--brand-grad);
+  color:#fff;
+  box-shadow:0 6px 20px rgba(167,139,250,0.3)
+}
+.confirm-ok:hover{
+  filter:brightness(1.08)
+}
+.confirm-ok.danger{
+  background:linear-gradient(135deg,#dc2626 0%,#f87171 100%);
+  box-shadow:0 6px 20px rgba(248,113,113,0.28)
+}
+.confirm-ok:disabled,.confirm-cancel:disabled{
+  opacity:0.6;
+  cursor:wait
+}
+.hero-avatar{
+  border:2px solid rgba(167,139,250,0.5);
+  padding:0;
+  cursor:pointer;
+  font:inherit;
+  color:inherit
+}
+.hero-avatar:hover{
+  box-shadow:0 0 0 3px rgba(167,139,250,0.28),0 4px 20px rgba(0,0,0,0.5);
+  transform:scale(1.03)
+}
+.hero-avatar:active{
+  transform:scale(0.97)
+}
+.summary-modal{
+  position:fixed;
+  inset:0;
+  z-index:160;
+  display:none
+}
+.summary-modal.open{
+  display:block
+}
+.summary-backdrop{
+  position:absolute;
+  inset:0;
+  background:var(--overlay);
+  backdrop-filter:blur(8px);
+  -webkit-backdrop-filter:blur(8px)
+}
+.summary-panel{
+  position:absolute;
+  top:50%;
+  left:50%;
+  transform:translate(-50%,-50%);
+  width:min(94vw,480px);
+  max-height:88vh;
+  display:flex;
+  flex-direction:column;
+  background:var(--panel-grad);
+  border:1px solid var(--border-strong);
+  border-radius:18px;
+  box-shadow:0 30px 80px rgba(0,0,0,0.85);
+  overflow:hidden
+}
+.summary-head{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  padding:16px 18px 10px;
+  border-bottom:1px solid var(--border);
+  flex-shrink:0
+}
+.summary-title{
+  font-size:1.05rem;
+  font-weight:700
+}
+.summary-close{
+  width:40px;
+  height:40px;
+  border-radius:50%;
+  border:1px solid var(--chip-border);
+  background:var(--chip-bg);
+  color:var(--chip-fg);
+  font-size:1.2rem;
+  cursor:pointer;
+  font-family:inherit;
+  line-height:1
+}
+.summary-close:hover{
+  color:#fff;
+  border-color:var(--border-strong)
+}
+.summary-body{
+  overflow-y:auto;
+  padding:12px 16px 20px;
+  -webkit-overflow-scrolling:touch
+}
+@media (max-width:599px){
+  .summary-panel{
+    top:auto;
+    bottom:0;
+    left:0;
+    right:0;
+    transform:none;
+    width:100%;
+    max-height:92vh;
+    border-radius:18px 18px 0 0
+  }
+}
+.sum-wrap{
+  padding:4px 0 24px
+}
+.sum-nav{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  margin-bottom:18px
+}
+.sum-nav-btn{
+  width:36px;
+  height:36px;
+  border-radius:10px;
+  border:1px solid var(--chip-border);
+  background:var(--chip-bg);
+  color:var(--text-dim);
+  font-size:1.2rem;
+  cursor:pointer;
+  font-family:inherit;
+  transition:all 0.15s
+}
+.sum-nav-btn:hover{
+  color:#fff;
+  border-color:var(--border-strong);
+  background:rgba(167,139,250,0.12)
+}
+.sum-nav-center{
+  flex:1;
+  text-align:center;
+  min-width:0
+}
+.sum-period-tabs{
+  display:inline-flex;
+  gap:4px;
+  background:var(--chip-bg);
+  border:1px solid var(--border);
+  border-radius:999px;
+  padding:3px;
+  margin-bottom:8px
+}
+.sum-period-btn{
+  border:none;
+  background:transparent;
+  color:var(--text-dim);
+  padding:6px 14px;
+  border-radius:999px;
+  font-size:0.8rem;
+  font-weight:600;
+  cursor:pointer;
+  font-family:inherit
+}
+.sum-period-btn.active{
+  background:var(--brand-grad);
+  color:#fff
+}
+.sum-label{
+  font-size:1.05rem;
+  font-weight:700;
+  letter-spacing:0.2px
+}
+.sum-stats{
+  display:grid;
+  grid-template-columns:repeat(4,1fr);
+  gap:8px;
+  margin-bottom:14px
+}
+.sum-stat{
+  text-align:center;
+  background:var(--panel-grad);
+  border:1px solid var(--border);
+  border-radius:14px;
+  padding:14px 6px
+}
+.sum-stat-num{
+  font-size:1.35rem;
+  font-weight:800;
+  letter-spacing:-0.5px;
+  background:var(--num-grad);
+  -webkit-background-clip:text;
+  background-clip:text;
+  -webkit-text-fill-color:transparent
+}
+.sum-stat-label{
+  font-size:0.7rem;
+  color:var(--text-mute);
+  margin-top:2px
+}
+.sum-chip{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  padding:8px 12px;
+  border-radius:10px;
+  background:rgba(167,139,250,0.1);
+  border:1px solid rgba(167,139,250,0.25);
+  color:var(--text-dim);
+  font-size:0.82rem;
+  margin-bottom:12px
+}
+.sum-chip strong{
+  color:var(--accent)
+}
+.sum-muted{
+  font-size:0.8rem;
+  color:var(--text-mute);
+  margin:6px 0 12px
+}
+.sum-block{
+  margin-top:18px
+}
+.sum-h3{
+  font-size:0.92rem;
+  font-weight:700;
+  margin-bottom:10px;
+  display:flex;
+  align-items:center;
+  gap:8px
+}
+.sum-h3::before{
+  content:"";
+  width:3px;
+  height:14px;
+  border-radius:2px;
+  background:linear-gradient(180deg,#a78bfa,#7c3aed)
+}
+.sum-heat{
+  display:flex;
+  flex-wrap:wrap;
+  gap:4px
+}
+.sum-heat-cell{
+  width:12px;
+  height:12px;
+  border-radius:3px;
+  background:rgba(255,255,255,0.06)
+}
+.sum-heat-cell.lv1{
+  background:rgba(167,139,250,0.25)
+}
+.sum-heat-cell.lv2{
+  background:rgba(167,139,250,0.45)
+}
+.sum-heat-cell.lv3{
+  background:rgba(167,139,250,0.7)
+}
+.sum-heat-cell.lv4{
+  background:#a78bfa
+}
+.sum-list{
+  display:flex;
+  flex-direction:column;
+  gap:8px
+}
+.sum-row{
+  display:flex;
+  align-items:center;
+  gap:12px;
+  padding:10px 12px;
+  background:var(--panel-grad);
+  border:1px solid var(--border);
+  border-radius:12px
+}
+.sum-rank{
+  width:22px;
+  height:22px;
+  border-radius:6px;
+  background:rgba(167,139,250,0.15);
+  color:#c4b5fd;
+  font-size:0.72rem;
+  font-weight:800;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  flex-shrink:0
+}
+.sum-row-body{
+  min-width:0;
+  flex:1
+}
+.sum-row-title{
+  font-size:0.9rem;
+  font-weight:600;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap
+}
+.sum-year{
+  font-weight:500;
+  color:var(--text-mute);
+  font-size:0.8rem
+}
+.sum-row-meta{
+  font-size:0.75rem;
+  color:var(--text-dim);
+  margin-top:2px
+}
+@media (max-width:420px){
+  .sum-stats{
+    gap:6px
+  }
+  .sum-stat{
+    padding:12px 4px
+  }
+  .sum-stat-num{
+    font-size:1.15rem
+  }
+}
+#toast-container{
+  position:fixed;
+  left:50%;
+  bottom:calc(28px + env(safe-area-inset-bottom));
+  transform:translateX(-50%);
+  z-index:99999;
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+  pointer-events:none;
+  max-width:min(92vw,440px);
+  width:max-content
+}
+.toast{
+  pointer-events:auto;
+  display:flex;
+  align-items:center;
+  gap:10px;
+  padding:11px 16px;
+  border-radius:12px;
+  font-size:0.86rem;
+  font-weight:500;
+  color:var(--toast-text);
+  background:var(--toast-bg);
+  border:1px solid rgba(255,255,255,0.1);
+  box-shadow:0 12px 32px rgba(0,0,0,0.55);
+  backdrop-filter:blur(14px);
+  -webkit-backdrop-filter:blur(14px);
+  opacity:0;
+  transform:translateY(12px) scale(0.96);
+  transition:opacity 0.22s ease,transform 0.22s ease;
+  cursor:pointer;
+  line-height:1.45;
+  word-break:break-word;
+  max-width:min(92vw,440px)
+}
+.toast.toast-in{
+  opacity:1;
+  transform:translateY(0) scale(1)
+}
+.toast.toast-out{
+  opacity:0;
+  transform:translateY(8px) scale(0.96)
+}
+.toast-icon{
+  flex-shrink:0;
+  width:20px;
+  height:20px;
+  border-radius:50%;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:0.72rem;
+  font-weight:800;
+  line-height:1
+}
+.toast-info .toast-icon{
+  background:rgba(125,157,212,0.22);
+  color:#a8c0e8
+}
+.toast-success .toast-icon{
+  background:rgba(52,211,153,0.22);
+  color:#6ee7b7
+}
+.toast-error .toast-icon{
+  background:rgba(224,85,96,0.24);
+  color:#ff8a8a
+}
+.toast-warn .toast-icon{
+  background:rgba(255,184,77,0.22);
+  color:#ffd693
+}
+.toast-success{
+  border-color:rgba(52,211,153,0.35)
+}
+.toast-error{
+  border-color:rgba(224,85,96,0.35)
+}
+.toast-warn{
+  border-color:rgba(255,184,77,0.35)
+}
+@media (max-width:420px){
+  .toast{
+    font-size:0.82rem;
+    padding:10px 14px
+  }
+}
+.cast.clickable{
+  cursor:pointer
+}
+.cast.clickable:hover .cast-img{
+  transform:translateY(-2px) scale(1.03);
+  box-shadow:0 8px 20px rgba(167,139,250,0.28)
+}
+.cast.clickable:hover .cast-name{
+  color:#c4b5fd
+}
+.cast-img{
+  transition:transform 0.2s ease,box-shadow 0.2s ease
+}
+.cast-name{
+  transition:color 0.15s ease
+}
+.trailer-grid{
+  display:grid;
+  grid-template-columns:1fr;
+  gap:14px
+}
+@media (min-width:600px){
+  .trailer-grid{
+    grid-template-columns:repeat(2,1fr)
+  }
+}
+.trailer-card{
+  position:relative;
+  aspect-ratio:16/9;
+  border-radius:12px;
+  overflow:hidden;
+  background:linear-gradient(135deg,#1a1528 0%,#0e0e10 100%);
+  cursor:pointer;
+  border:1px solid var(--border);
+  transition:border-color 0.15s,transform 0.15s
+}
+.trailer-card:hover{
+  border-color:rgba(167,139,250,0.4);
+  transform:translateY(-1px)
+}
+.trailer-thumb{
+  position:absolute;
+  inset:0;
+  width:100%;
+  height:100%;
+  object-fit:cover;
+  display:block;
+  z-index:1
+}
+.trailer-card.no-thumb .trailer-thumb{
+  display:none
+}
+.trailer-play{
+  position:absolute;
+  top:50%;
+  left:50%;
+  transform:translate(-50%,-50%);
+  width:52px;
+  height:52px;
+  border-radius:50%;
+  background:rgba(8,10,18,0.72);
+  border:1px solid rgba(255,255,255,0.28);
+  color:#fff;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  backdrop-filter:blur(8px);
+  -webkit-backdrop-filter:blur(8px);
+  transition:background 0.15s,transform 0.15s;
+  pointer-events:none;
+  z-index:3
+}
+.trailer-card:hover .trailer-play{
+  background:linear-gradient(145deg,#8b5cf6,#a78bfa);
+  transform:translate(-50%,-50%) scale(1.08)
+}
+.trailer-play svg{
+  display:block;
+  margin-left:2px
+}
+.trailer-name{
+  position:absolute;
+  left:0;
+  right:0;
+  bottom:0;
+  padding:22px 12px 9px;
+  font-size:0.8rem;
+  font-weight:600;
+  color:#fff;
+  background:linear-gradient(180deg,transparent,rgba(0,0,0,0.85));
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+  z-index:3
+}
+.trailer-card.playing .trailer-thumb,.trailer-card.playing .trailer-play,.trailer-card.playing .trailer-name{
+  display:none
+}
+.trailer-frame{
+  position:absolute;
+  inset:0;
+  width:100%;
+  height:100%;
+  background:var(--surface-2);
+  z-index:2
+}
+.trailer-frame:empty{
+  display:none
+}
+.trailer-frame iframe{
+  position:absolute;
+  inset:0;
+  width:100%;
+  height:100%;
+  border:0;
+  display:block
+}
+.trailer-card.playing .trailer-thumb,.trailer-card.playing .trailer-play{
+  opacity:0;
+  pointer-events:none
+}
+.trailer-yt-open{
+  position:absolute;
+  left:50%;
+  bottom:10px;
+  transform:translateX(-50%);
+  z-index:3;
+  padding:6px 12px;
+  border-radius:999px;
+  background:rgba(0,0,0,.72);
+  color:#fff;
+  font-size:.75rem;
+  text-decoration:none;
+  border:1px solid rgba(255,255,255,.18)
+}
+.person-modal{
+  position:fixed;
+  inset:0;
+  z-index:230;
+  display:none
+}
+.person-modal.open{
+  display:block
+}
+.person-backdrop{
+  position:absolute;
+  inset:0;
+  background:var(--overlay);
+  backdrop-filter:blur(8px);
+  -webkit-backdrop-filter:blur(8px);
+  animation:fadeIn 0.2s ease
+}
+.person-panel{
+  position:absolute;
+  top:50%;
+  left:50%;
+  transform:translate(-50%,-50%);
+  width:min(94vw,760px);
+  max-height:88vh;
+  display:flex;
+  flex-direction:column;
+  background:var(--panel-grad);
+  border:1px solid var(--border-strong);
+  border-radius:18px;
+  box-shadow:0 30px 80px rgba(0,0,0,0.85);
+  overflow:hidden;
+  animation:modalIn 0.25s cubic-bezier(0.2,0.9,0.3,1)
+}
+.person-panel-head{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  padding:14px 18px;
+  border-bottom:1px solid var(--border);
+  flex-shrink:0
+}
+.person-panel-name{
+  font-size:1rem;
+  font-weight:700;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+  flex:1;
+  min-width:0
+}
+.person-close{
+  width:40px;
+  height:40px;
+  flex-shrink:0;
+  border-radius:50%;
+  border:1px solid var(--chip-border);
+  background:var(--chip-bg);
+  color:var(--chip-fg);
+  font-size:1.2rem;
+  cursor:pointer;
+  font-family:inherit;
+  line-height:1;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  transition:all 0.15s
+}
+.person-close:hover{
+  color:#fff;
+  border-color:var(--border-strong)
+}
+.person-panel-body{
+  overflow-y:auto;
+  padding:18px 20px 24px;
+  -webkit-overflow-scrolling:touch;
+  overscroll-behavior:contain
+}
+@media (max-width:599px){
+  .person-panel{
+    top:auto;
+    bottom:0;
+    left:0;
+    right:0;
+    transform:none;
+    width:100%;
+    max-height:92vh;
+    border-radius:18px 18px 0 0
+  }
+}
+.person-head{
+  display:flex;
+  gap:18px;
+  margin-bottom:18px
+}
+.person-photo{
+  width:110px;
+  height:165px;
+  border-radius:12px;
+  object-fit:cover;
+  flex-shrink:0;
+  background:var(--surface-2);
+  box-shadow:0 8px 24px rgba(0,0,0,0.5)
+}
+.person-photo-ph{
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:2rem;
+  color:var(--text-dim);
+  background:var(--soft-card-grad)
+}
+.person-info{
+  flex:1;
+  min-width:0;
+  display:flex;
+  flex-direction:column;
+  gap:6px
+}
+.person-name{
+  font-size:1.3rem;
+  font-weight:800;
+  letter-spacing:-0.4px;
+  line-height:1.25
+}
+.person-sub{
+  font-size:0.82rem;
+  color:var(--text-dim)
+}
+.person-rows{
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+  margin-top:4px
+}
+.person-row{
+  font-size:0.78rem;
+  color:var(--text-dim);
+  line-height:1.5
+}
+.person-row b{
+  color:var(--text);
+  font-weight:600;
+  margin-right:6px
+}
+.person-bio{
+  font-size:0.86rem;
+  color:#c0c8d6;
+  line-height:1.65;
+  white-space:pre-line;
+  margin-bottom:22px;
+  padding-top:4px;
+  border-top:1px solid var(--border)
+}
+.person-credits-title{
+  font-size:0.95rem;
+  font-weight:700;
+  margin-bottom:14px;
+  display:flex;
+  align-items:center;
+  gap:8px
+}
+.person-credits-title::before{
+  content:"";
+  width:3px;
+  height:14px;
+  border-radius:2px;
+  background:linear-gradient(180deg,#a78bfa,#7c3aed)
+}
+@media (max-width:480px){
+  .person-head{
+    flex-direction:column;
+    align-items:center;
+    text-align:center;
+    gap:12px
+  }
+  .person-info{
+    align-items:center
+  }
+  .person-photo{
+    width:130px;
+    height:195px
+  }
+  .person-rows{
+    align-items:center
+  }
+}
+.btn-action.loading{
+  color:var(--accent-2);
+  border-color:rgba(167,139,250,0.45);
+  background:rgba(167,139,250,0.12);
+  pointer-events:none
+}
+.btn-action.loading svg{
+  transform-origin:50% 50%;
+  animation:btnSpin 0.7s linear infinite
+}
+@keyframes btnSpin{
+  to{
+    transform:rotate(360deg)
+  }
+}
+.btn-action.loading span::after{
+  content:"";
+  display:inline-block;
+  width:0;
+  overflow:hidden;
+  animation:btnDots 1.2s steps(4,end) infinite
+}
+@keyframes btnDots{
+  0%{
+    content:""
+  }
+  25%{
+    content:"."
+  }
+  50%{
+    content:".."
+  }
+  75%{
+    content:"..."
+  }
+}
+@media (max-width:767px){
+  .h-scroll .item.cw-card{
+    width:210px!important;
+    max-width:210px!important
+  }
+  .h-scroll .item.cw-card .cw-title{
+    font-size:0.86rem
+  }
+  .h-scroll .item.cw-card .cw-watching{
+    font-size:0.74rem
+  }
+  .h-scroll .item.cw-card .cw-meta{
+    font-size:0.7rem
+  }
+  .h-scroll .item.cw-card .cw-overlay{
+    font-size:0.72rem
+  }
+}
+@media (min-width:768px){
+  .h-scroll .item.cw-card{
+    width:300px!important;
+    max-width:300px!important
+  }
+  .h-scroll .item.cw-card .cw-title{
+    font-size:0.92rem
+  }
+  .h-scroll .item.cw-card .cw-watching{
+    font-size:0.8rem
+  }
+}
+.hist-day{
+  margin-top:28px
+}
+.hist-day:first-child{
+  margin-top:4px
+}
+.hist-day-head{
+  margin-top:0;
+  margin-bottom:14px
+}
+`;
   return __pageStylesCache;
 }
