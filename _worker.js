@@ -1,3 +1,16 @@
+/* ==================================================================
+ * MineTrakt —— 单文件 Cloudflare Worker
+ * Trakt 客户端（服务端渲染 + PWA），数据全部走 KV（env.TMDB_CACHE）。
+ * 目录：配置 → 通用工具 → Trakt 请求 → KV 缓存层 → cachedJSON
+ *      → PWA/静态 → 认证 → 缓存失效 → TMDB → 业务聚合 → 路由 → 渲染
+ *      → 内嵌前端脚本
+ * ================================================================== */
+
+/* ==================================================================
+ * 配置：对外地址与常量
+ * 站点地址、TTL、Cookie、主题色等所有可调参数集中在这里
+ * ================================================================== */
+
 const TRAKT_AUTH = "https://auth.trakt.tv",
   TRAKT_API = "https://api.trakt.tv",
   TMDB_API = "https://api.themoviedb.org/3",
@@ -45,6 +58,10 @@ const ASSET_ORIGINS = {
 };
 
 let __chromeMajorCached = 0;
+/**
+ * 推算一个"当下看起来合理"的 Chrome 主版本号。
+ * 按 2023-12 为 120 的锚点线性外推，避免 UA 里的版本号长期停在旧值被识别。
+ */
 function chromeMajorForUA() {
   if (__chromeMajorCached) return __chromeMajorCached;
   const ANCHOR_MAJOR = 120;
@@ -80,8 +97,9 @@ const PAGE_SIZE = 20,
   PLAYBACK_KV_TTL = 5400,
   STATS_KV_TTL = 604800,
   PROFILE_KV_TTL = 86400,
-  ENTITY_KV_TTL = 86400,
-  SEASON_KV_TTL = 86400,
+  ENTITY_KV_TTL = 86400 * 7,
+  SEASON_KV_TTL = 86400 * 7, // 已完结的季
+  SEASON_KV_TTL_LIVE = 86400, // 还在播的季：新集要当天就能看到
   DOUBAN_KV_TTL = 86400,
   THEATER_KV_TTL = 86400,
   GUDUO_KV_TTL = 86400,
@@ -91,12 +109,14 @@ const KV_STALE_RETENTION = 86400 * 7,
   LAST_GOOD_KV_TTL = 86400 * 7;
 
 const HOME_AUTO_REFRESH_MINUTES = 10;
+const PLAYBACK_FRESH_SEC = HOME_AUTO_REFRESH_MINUTES * 60;
 
-const APP_VERSION = "1.2.0";  //  版本号（更新代码需要跟随更新）
+const APP_VERSION = "1.3.0";  //  版本号（更新代码需要跟随更新）
 const APP_JS_VERSION = APP_VERSION;
 const APP_CSS_VERSION = APP_VERSION;
 
-const CC_API = "public, max-age=1800, stale-while-revalidate=600";
+// 所有响应一律不缓存：数据源就是 KV 里那一份，
+// 让浏览器再存一层只会带来"刷新了还是旧数据"。
 const CC_NO_STORE = "no-store";
 const CT_JSON = "application/json; charset=utf-8";
 const CT_HTML = "text/html; charset=utf-8";
@@ -105,36 +125,26 @@ const CACHE_USER_LONG = {
   missTtl: 60,
   swr: true,
   unwrap: true,
-  edgeTtl: 300,
   jitter: 300,
 };
 const CACHE_USER_META = {
   missTtl: 180,
   swr: true,
-  edgeTtl: 300,
   jitter: 300,
 };
 
+/**
+ * 用户态数据的默认缓存选项：短 TTL、允许 SWR、按账号隔离。
+ * 与公共数据的区别在于——它随时会变，所以不给长 TTL。
+ */
 function cacheUser(extra) {
   return Object.assign({}, CACHE_USER_LONG, extra || {});
 }
 
-function cacheUserMeta(extra) {
-  return Object.assign({}, CACHE_USER_META, extra || {});
-}
-
-function cachePublic(ttl, extra) {
-  return Object.assign(
-    {
-      ttl: ttl != null ? ttl : 86400,
-      missTtl: 600,
-      swr: true,
-      unwrap: true,
-      jitter: 300,
-    },
-    extra || {},
-  );
-}
+/* ==================================================================
+ * 通用响应工具
+ * 统一的 JSON 响应、边缘缓存开关、enrich 限流
+ * ================================================================== */
 
 function jsonResp(data, headers, status) {
   return new Response(JSON.stringify(data), {
@@ -146,55 +156,19 @@ function jsonResp(data, headers, status) {
   });
 }
 
+// 无边缘缓存：以前这里会把响应塞进 caches.default 存 1 天，
+// 于是豆瓣/影院/骨朵/平台这几个接口在不同 colo 上各存各的，
+// 设备之间看到的列表就不一样。现在直接放行到后端（后端本身走 KV）。
 async function edgeCached(request, ctx, ttlSec, fn) {
-  if (request.method !== "GET") return fn();
-  let cache = null;
-  try {
-    cache = caches.default;
-  } catch {
-    return fn();
-  }
-  if (!cache) return fn();
-
-  const url = new URL(request.url);
-  const bypass = url.searchParams.get("force") === "1";
-  const keyUrl = new URL(url.toString());
-  keyUrl.searchParams.delete("force");
-  const cacheKey = new Request(keyUrl.toString(), { method: "GET" });
-
-  if (!bypass) {
-    try {
-      const hit = await cache.match(cacheKey);
-      if (hit) return hit;
-    } catch {}
-  }
-
-  const resp = await fn();
-  if (
-    resp &&
-    resp.ok &&
-    ctx &&
-    typeof ctx.waitUntil === "function" &&
-    resp.status === 200
-  ) {
-    try {
-      const clone = resp.clone();
-      const h = new Headers(clone.headers);
-      h.set("Cache-Control", `public, max-age=${ttlSec}`);
-      ctx.waitUntil(
-        cache.put(
-          cacheKey,
-          new Response(clone.body, { status: 200, headers: h }),
-        ),
-      );
-    } catch {}
-  }
-  return resp;
+  return fn();
 }
 
 const __enrichHits = new Map();
-const __enrichBucketMem = new Map();
 
+/**
+ * enrich 接口的简易限流：同一 IP 每分钟最多 60 次。
+ * 详情页会批量触发 enrich，这层是防止被刷爆 TMDB 配额。
+ */
 function allowEnrich(request) {
   const ip =
     request.headers.get("CF-Connecting-IP") ||
@@ -218,7 +192,8 @@ function allowEnrich(request) {
 }
 
 const CK = {
-  playback: (u) => `pb:${u}`,
+  // v2：缓存内容改为原始 { paused, upNext }，合并/过滤每次现算
+  playback: (u) => `pb:v2:${u}`,
   stats: (u) => `stats:${u}`,
   profile: (u) => `prof:${u}:me`,
   history: (u, p = 1) => `hist:${u}:p${p}`,
@@ -226,6 +201,8 @@ const CK = {
   watchProgress: (u, id) => `tpr:${u}:${id}`,
   movieHistory: (u, id) => `tmh:${u}:${id}`,
   showPlayback: (u, id) => `spb:${u}:${id}`,
+  // 全量暂停列表按用户缓存一次，各剧详情页本地筛选（原按 show 存，导致每部剧都重拉全量）
+  playbackList: (u) => `pbl:${u}`,
   watchedEpisodes: (u) => `we:v2:${u}`,
   cwHide: (u) => `cwh:${u}`,
   entity: (t, id) => `te:${t}:${id}`,
@@ -251,6 +228,8 @@ const CK = {
   uidAt: (at) => `uid:at:${at}`,
   moreHistory: (u, p) => `more:hist:${u}:p${p}`,
   morePlayback: (u, p, l) => `more:pb:v4:${u}:p${p}:l${l}`,
+  // 播放同步状态：{ at: 上次成功 live 校验时间, sig: 活动签名基线 }
+  syncState: (u) => `sync:${u || "anon"}`,
   lastGood: {
     playback: (u) => `lg:pb:${u}`,
     history: (u, p = 1) => `lg:hist:${u}:p${p}`,
@@ -259,14 +238,46 @@ const CK = {
   },
 };
 
+/**
+ * 这一季是否已经播完。
+ * Trakt 的 season 响应里每集都带 first_aired：只要还有一集没播（或没定档），
+ * 就当成"正在播"，缓存只留 1 天；全部播完才给 7 天。
+ * 已完结的季再打开详情页就不必反复打 Trakt。
+ */
+function seasonIsDone(data) {
+  const eps = data && Array.isArray(data.episodes) ? data.episodes : null;
+  if (!eps || !eps.length) return false;
+  const now = Date.now();
+  for (const ep of eps) {
+    if (!ep) continue;
+    const air = ep.first_aired ? Date.parse(ep.first_aired) : NaN;
+    if (!Number.isFinite(air) || air > now) return false;
+  }
+  return true;
+}
+
+const seasonTtl = (data) =>
+  seasonIsDone(data) ? SEASON_KV_TTL : SEASON_KV_TTL_LIVE;
+
+/* ==================================================================
+ * Trakt 请求与限流
+ * UA、令牌桶、用户串行通道、429 冷却与重试
+ * ================================================================== */
+
+/**
+ * 裸 fetch 封装：统一超时、统一走 Trakt 限流闸门、统一错误形状。
+ * 返回 Response 本身（不解析），失败时返回 { __error } 对象而不是抛异常。
+ */
 async function fetchT(url, opts = {}, ms = 8000, userKey) {
-  if (TRAKT_HOST_RE.test(url)) await traktGate(userKey);
+  const release =
+    TRAKT_HOST_RE.test(url) && (await traktGate(userKey, opts.method));
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), ms);
   try {
     return await fetch(url, { ...opts, signal: ctrl.signal });
   } finally {
     clearTimeout(t);
+    if (release) release();
   }
 }
 
@@ -275,55 +286,171 @@ const backoff = (i, base = 500, jitter = 500) =>
   sleep(base * (i + 1) + Math.random() * jitter);
 const TRAKT_HOST_RE = /^https?:\/\/api\.trakt\.tv\//i;
 
+// 高压通道（写请求 / 额度吃紧时）的串行间隔
 const TRAKT_MIN_GAP_MS = 800;
 const TRAKT_USER_GAP_MS = 1000;
 const TRAKT_GAP_MAX_WAIT_MS = 20000;
+// 普通写请求（标记已看、加待看等）不需要 800ms 那么保守，
+// 太大会让一次"标记已看 + 清暂停记录"白等 1.6s
+const TRAKT_WRITE_GAP_MS = 300;
+const TRAKT_WRITE_USER_GAP_MS = 400;
+
+// 令牌桶：Trakt 官方额度 1000 次 / 5 分钟 / 用户
+const TRAKT_WINDOW_MS = 300000;
+const TRAKT_WINDOW_LIMIT = 1000;
+// 用量超过该比例就退化成串行限速，避免真的撞 429
+const TRAKT_SOFT_RATIO = 0.8;
+// 低压时允许的读请求并发（原来恒为 1，把 1000/5min 的额度只用掉 ~20%）
+const TRAKT_READ_CONCURRENCY = 3;
+// 同一用户并发请求之间的最小抖动，避免同一瞬间齐发
+const TRAKT_USER_JITTER_MS = 120;
 
 let __traktTail = Promise.resolve(),
   __traktLast = 0;
-const __traktUserTails = new Map();
 const __traktUserLast = new Map();
+const __traktWin = [];
+let __traktReadActive = 0;
+const __traktReadQueue = [];
 
-function traktGate(userKey) {
+/**
+ * 统计最近 5 分钟内已经发出的 Trakt 请求数（滑动窗口）。
+ */
+function traktWindowCount(nowMs) {
+  const cut = (nowMs || Date.now()) - TRAKT_WINDOW_MS;
+  while (__traktWin.length && __traktWin[0] <= cut) __traktWin.shift();
+  return __traktWin.length;
+}
+
+/**
+ * 当前压力：已用请求数 / 窗口上限。用来决定要不要降并发。
+ */
+function traktWindowPressure() {
+  return traktWindowCount() / TRAKT_WINDOW_LIMIT;
+}
+
+/**
+ * 申请一个读并发名额。满了就排队，避免把 Trakt 打限流。
+ */
+function __acquireTraktRead() {
+  if (__traktReadActive < TRAKT_READ_CONCURRENCY) {
+    __traktReadActive++;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => __traktReadQueue.push(resolve));
+}
+
+/**
+ * 归还读并发名额，并唤醒排队中的请求。
+ */
+function __releaseTraktRead() {
+  const next = __traktReadQueue.shift();
+  if (next) next();
+  else __traktReadActive = Math.max(0, __traktReadActive - 1);
+}
+
+/**
+ * 用户串行表超过上限时，清掉最久没活动的那批，防止内存无限增长。
+ */
+function __traktTrimUsers(uk) {
+  if (__traktUserLast.size > 300) {
+    const keys = [...__traktUserLast.keys()];
+    for (let i = 0; i < keys.length - 150; i++) {
+      if (keys[i] !== uk) __traktUserLast.delete(keys[i]);
+    }
+  }
+}
+
+/**
+ * 记录某用户最近一次请求时间，供上面的清理逻辑使用。
+ */
+function __traktMarkUsed(uk) {
+  const t = Date.now();
+  __traktLast = t;
+  __traktUserLast.set(uk, t);
+  __traktWin.push(t);
+  __traktTrimUsers(uk);
+  return t;
+}
+
+// 串行通道：写请求、或额度进入警戒区时使用
+function __traktSerial(uk, minGap, userGap) {
+  const gap = minGap != null ? minGap : TRAKT_MIN_GAP_MS;
+  const uGap = userGap != null ? userGap : TRAKT_USER_GAP_MS;
+  const prev = __traktTail;
+  let release;
+  __traktTail = new Promise((r) => (release = r));
+  return prev.then(async () => {
+    try {
+      const now = Date.now();
+      const wait = Math.max(
+        __traktLast + gap - now,
+        (__traktUserLast.get(uk) || 0) + uGap - now,
+        0,
+      );
+      if (wait > 0) await sleep(Math.min(wait, TRAKT_GAP_MAX_WAIT_MS));
+    } finally {
+      __traktMarkUsed(uk);
+      release();
+    }
+  });
+}
+
+// 并发通道：低压读请求，只做同用户抖动
+async function __traktParallel(uk) {
+  const wait =
+    (__traktUserLast.get(uk) || 0) + TRAKT_USER_JITTER_MS - Date.now();
+  if (wait > 0) await sleep(Math.min(wait, 2000));
+  __traktMarkUsed(uk);
+}
+
+/**
+ * 返回释放函数（读通道需在 fetch 结束后释放并发名额）；
+ * 写通道 / 高压通道返回 null，名额在 gate 内部即已归还。
+ */
+/**
+ * 所有 Trakt 请求的统一闸门。
+ * 全局层面用 5 分钟滑动窗口控制总量，同一用户层面强制串行 + 抖动，
+ * 避免多设备同时刷新把 Trakt 的 1000 次/5 分钟额度打满。
+ */
+async function traktGate(userKey, method) {
   const uk = userKey || "__anon__";
-  const prevGlobal = __traktTail;
-  let releaseGlobal;
-  __traktTail = new Promise((r) => (releaseGlobal = r));
+  const isWrite = !!method && String(method).toUpperCase() !== "GET";
+  const pressure = traktWindowPressure();
 
-  const prevUser = __traktUserTails.get(uk) || Promise.resolve();
-  let releaseUser;
-  const userP = new Promise((r) => (releaseUser = r));
-  __traktUserTails.set(uk, userP);
+  if (!isWrite && pressure < TRAKT_SOFT_RATIO) {
+    await __acquireTraktRead();
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      __releaseTraktRead();
+    };
+    try {
+      await __traktParallel(uk);
+    } catch (e) {
+      release();
+      throw e;
+    }
+    return release;
+  }
 
-  return prevGlobal
-    .then(() => prevUser)
-    .then(async () => {
-      try {
-        const now = Date.now();
-        const waitG = __traktLast + TRAKT_MIN_GAP_MS - now;
-        const waitU = (__traktUserLast.get(uk) || 0) + TRAKT_USER_GAP_MS - now;
-        const wait = Math.max(waitG, waitU, 0);
-        if (wait > 0) await sleep(Math.min(wait, TRAKT_GAP_MAX_WAIT_MS));
-      } finally {
-        const t = Date.now();
-        __traktLast = t;
-        __traktUserLast.set(uk, t);
-        releaseUser();
-        releaseGlobal();
-        if (__traktUserTails.size > 200) {
-          const keys = [...__traktUserTails.keys()];
-          for (let i = 0; i < keys.length - 100; i++) {
-            if (keys[i] !== uk) __traktUserTails.delete(keys[i]);
-          }
-        }
-        if (__traktUserLast.size > 300) {
-          const keys = [...__traktUserLast.keys()];
-          for (let i = 0; i < keys.length - 150; i++) {
-            if (keys[i] !== uk) __traktUserLast.delete(keys[i]);
-          }
-        }
-      }
-    });
+  // 窗口已吃满：等最老的一次调用滑出窗口，最多等 TRAKT_GAP_MAX_WAIT_MS
+  if (pressure >= 1) {
+    const now = Date.now();
+    const oldest = __traktWin[0] || now;
+    const wait = Math.min(
+      TRAKT_GAP_MAX_WAIT_MS,
+      Math.max(0, TRAKT_WINDOW_MS - (now - oldest)) + 50,
+    );
+    if (wait > 0) await sleep(wait);
+  }
+
+  await __traktSerial(
+    uk,
+    isWrite ? TRAKT_WRITE_GAP_MS : TRAKT_MIN_GAP_MS,
+    isWrite ? TRAKT_WRITE_USER_GAP_MS : TRAKT_USER_GAP_MS,
+  );
+  return null;
 }
 
 const TRAKT_RATE_LIMIT_COOLDOWN = 60000;
@@ -332,18 +459,28 @@ const TRAKT_RATE_LIMIT_MAX_COOLDOWN = 300000;
 const __traktRateLimitByUser = new Map();
 const __traktStrikes = new Map();
 
+/**
+ * 该用户是否还在 429 冷却期内。冷却期内跳过请求，直接返回降级数据，
+ * 否则越重试锁得越久。
+ */
 function isTraktRateLimited(userKey) {
   const k = userKey || "__anon__";
   const until = __traktRateLimitByUser.get(k) || 0;
   return Date.now() < until;
 }
 
+/**
+ * 冷却还剩多少秒（给前端显示"请稍后再试"用）。
+ */
 function traktRateLimitedRemaining(userKey) {
   const k = userKey || "__anon__";
   const until = __traktRateLimitByUser.get(k) || 0;
   return Math.max(0, Math.ceil((until - Date.now()) / 1000));
 }
 
+/**
+ * 标记某用户进入冷却期。连续命中会递增冷却时长，上限 5 分钟。
+ */
 function markTraktRateLimited(ms, userKey) {
   const k = userKey || "__anon__";
   const strikes = (__traktStrikes.get(k) || 0) + 1;
@@ -374,11 +511,18 @@ function markTraktRateLimited(ms, userKey) {
   return wait;
 }
 
+/**
+ * 请求成功后清零连续命中次数（冷却档位回退）。
+ */
 function clearTraktStrikes(userKey) {
   const k = userKey || "__anon__";
   if (__traktStrikes.size && __traktStrikes.has(k)) __traktStrikes.delete(k);
 }
 
+/**
+ * 从响应头读 Retry-After，换算成冷却截止时间。
+ * 没有该头时按连续命中次数递增（60s 起，最长 5 分钟）。
+ */
 function consumeRetryAfter(r, userKey) {
   const ra = parseInt(r.headers.get("Retry-After") || "", 10);
   const waitMs =
@@ -388,6 +532,13 @@ function consumeRetryAfter(r, userKey) {
   return markTraktRateLimited(waitMs, userKey);
 }
 
+/**
+ * 调 Trakt API 并按状态码决策：
+ *   401 → 交给上层刷新 token 后重试
+ *   429 → 记冷却时间，期间直接短路
+ *   5xx / 网络错误 → 指数退避重试
+ * 永远返回对象，错误以 { __error, __cooling } 表示，调用方不必 try/catch。
+ */
 async function traktFetch(
   url,
   headers,
@@ -462,57 +613,76 @@ async function traktFetch(
 const traktGet = (url, headers, retries = 2, userKey) =>
   traktFetch(url, headers, { retries, timeout: 12000, userKey });
 
-const KV_MEM_TTL = 1800000,
-  KV_EDGE_TTL = 1800,
-  KV_MISS = Symbol("kv-miss"),
+const KV_MISS = Symbol("kv-miss"),
   KV_ERR = Symbol("kv-err"),
   KV_MIN_PUT_TTL = 30,
   KV_DOWN_COOLDOWN_MS = 30000;
 
-const KV_MIN_PUT_INTERVAL_MS = 3600000;
-const KV_HOT_PUT_INTERVAL_MS = 120000;
-const KV_FORCE_PUT_INTERVAL_MS = 3600000;
 const LAST_GOOD_MIN_PUT_INTERVAL_MS = 7 * 24 * 3600000;
+// KV 写入最小间隔的应急阀。0 = 不节流（默认，多设备立即一致）。
+const KV_WRITE_MIN_GAP_MS = 0;
 
-function isHotKvKey(key) {
-  if (!key) return false;
-  const k = String(key);
-  return (
-    k.startsWith("pb:") ||
-    k.startsWith("hist:") ||
-    k.startsWith("lg:pb:") ||
-    k.startsWith("lg:hist:") ||
-    k.startsWith("lg:cal:") ||
-    k.startsWith("act:") ||
-    k.startsWith("more:pb:") ||
-    k.startsWith("more:hist:") ||
-    k.startsWith("spb:") ||
-    k.startsWith("tpr:") ||
-    k.startsWith("we:") ||
-    k.startsWith("cwh:") ||
-    k.startsWith("stats:") ||
-    k.startsWith("wlv:") ||
-    k.startsWith("cal:")
-  );
+/* ------------------------------------------------------------------
+ * 数据读取策略：缓存全部关闭，只认 KV
+ *
+ * 原来是一套四层缓存叠在一起：
+ *   isolate 内存副本（用户态 8s / 公共数据 30min）
+ *   + colo 边缘缓存（cacheTtl）
+ *   + 浏览器 Cache-Control
+ *   + KV 写入节流（1 小时）
+ * 任何一层没过期，同一账号的两台设备就会各看到一份数据：
+ * A 刚标记完已看，B 还抱着半小时前的副本。
+ *
+ * 现在只留一层：
+ *   - 读：一律直接 env.TMDB_CACHE.get，不带 cacheTtl，不读内存副本；
+ *   - 写：拿到新数据就落 KV，没有"最小写入间隔"；
+ *   - 同一请求内的重复读用 ctx 上的 memo 去重，请求结束即失效。
+ *
+ * 代价是每请求 KV 读次数上升（首屏 20~40 次），换来的是
+ * 任何设备、任何 colo 读到的都是 KV 里同一份数据。
+ * ------------------------------------------------------------------ */
+// 一律不传 cacheTtl：最小 60 秒的 colo 缓存会让同一个 key 在不同区域
+// 存在不同快照。现在所有 key 都直接读 KV，只有 KV 里那一份数据。
+/* ==================================================================
+ * KV 缓存层
+ * 读写封装、故障降级兜底、请求内去重、写入节流应急阀
+ * ================================================================== */
+
+/**
+ * 判断是不是"用户态"的 key。
+ * 这类数据的写入需要保证落盘（另一台设备会立刻读），
+ * 公共数据则允许后台慢写，避免拖慢首屏。
+ */
+const USER_STATE_KEY_RE =
+  /^(?:pb|hist|more:hist|more:pb|lg|we|us|cwh|sync|act|dropped|cal|pbl|wl|wlids|wlv|tpr|tmh|spb|prof|stats|sum2|pbc|uid|lg:put|cwmeta):/;
+
+function isUserStateKey(key) {
+  return !!key && USER_STATE_KEY_RE.test(String(key));
 }
+
+function kvReadOpts() {
+  return { type: "json" };
+}
+
 const ENRICH_BUCKETS = 4;
 const ENRICH_BUCKET_TTL = 86400 * 30;
 const ENRICH_BUCKET_MAX = 500;
 const ENRICH_BATCH_MAX = 20;
-const ENRICH_BUCKET_MEM_TTL = 120000;
+// 0 = 不跨请求复用：enrich 走 KV，各设备读同一份
 const DEFAULT_JITTER_SEC = 600;
 const __KV_LASTPUT_MAX = 5000;
 
 const __kvLastPut = new Map();
 
-const __cwTimeMem = new Map();
-
-const __kvMem = new Map(),
-  __kvMemExp = new Map(),
-  __kvInflight = new Map();
+const __kvInflight = new Map();
 const __kvMemStale = new Map();
 const STALE_MAX_AGE = 3600000;
 
+/**
+ * 记录一份内存兜底副本。
+ * 它不是缓存——正常情况下永远不会被读到，只在 KV 读失败（KV_ERR / kvIsDown）
+ * 时用来降级，避免页面直接空白。超过 STALE_MAX_AGE 自动失效。
+ */
 function kvMemStaleSet(key, data, dataTs) {
   __kvMemStale.set(key, {
     data,
@@ -528,6 +698,9 @@ function kvMemStaleSet(key, data, dataTs) {
   }
 }
 
+/**
+ * 取内存兜底副本，超过 STALE_MAX_AGE（1 小时）就当不存在。
+ */
 function kvMemStaleGet(key) {
   const e = __kvMemStale.get(key);
   if (!e) return undefined;
@@ -540,54 +713,62 @@ function kvMemStaleGet(key) {
 
 let __kvDownUntil = 0;
 
+/**
+ * KV 是否处于故障冷却期。冷却期内不再尝试读，直接走降级。
+ */
 function kvIsDown() {
   return Date.now() < __kvDownUntil;
 }
 
+/**
+ * 标记 KV 故障：30 秒内不再重试，避免每个请求都白等一次超时。
+ */
 function kvMarkDown() {
   __kvDownUntil = Date.now() + KV_DOWN_COOLDOWN_MS;
 }
 
+/**
+ * 标记 KV 恢复正常。
+ */
 function kvMarkUp() {
   __kvDownUntil = 0;
 }
 
-function kvMemGet(key) {
-  const exp = __kvMemExp.get(key);
-  if (exp === undefined) return undefined;
-  if (exp < Date.now()) {
-    __kvMem.delete(key);
-    __kvMemExp.delete(key);
-    return undefined;
-  }
-  return __kvMem.get(key);
+/* ------------------------------------------------------------------
+ * 内存只留一份"兜底副本"（__kvMemStale）
+ *
+ * 读取路径不再看内存：每次都直接回源 KV，KV 里只有一份数据，
+ * 谁读都是它，跨设备自然一致。
+ *
+ * 写入时顺手记一份到 __kvMemStale，仅在 KV 读失败（KV_ERR / kvIsDown）
+ * 时用来降级，正常路径永远走不到它，不影响一致性。
+ * ------------------------------------------------------------------ */
+function kvRemember(key, val) {
+  if (val === undefined || val === null || val === KV_MISS) return;
+  const data = typeof val === "object" && val.data !== undefined ? val.data : val;
+  if (!__isErrorPayload(data)) kvMemStaleSet(key, data, val && val._ts);
 }
 
-function kvMemSet(key, val, ttlMs) {
-  __kvMem.set(key, val);
-  __kvMemExp.set(key, Date.now() + (ttlMs || KV_MEM_TTL));
-  if (__kvMem.size > 4000) {
-    const now = Date.now();
-    for (const [k, t] of __kvMemExp) {
-      if (t < now) {
-        __kvMem.delete(k);
-        __kvMemExp.delete(k);
-      }
-    }
-    if (__kvMem.size > 4000) {
-      const entries = [];
-      for (const [k, t] of __kvMemExp) entries.push([k, t]);
-      entries.sort((a, b) => a[1] - b[1]);
-      const drop = Math.min(800, entries.length);
-      for (let i = 0; i < drop; i++) {
-        const k = entries[i][0];
-        __kvMem.delete(k);
-        __kvMemExp.delete(k);
-      }
-    }
+/**
+ * 作废某个 key 上正在进行的读取。
+ * singleFlight 会把 promise 在内存里多留 200ms，写操作之后如果不清掉，
+ * 紧接着的读（标记已看 → 立刻刷新首页）会拿到写之前那次请求的结果。
+ */
+function dropInflight(key) {
+  if (!key) return;
+  __kvInflight.delete(key);
+  __kvInflight.delete("swr:" + key);
+  const fp = "force:" + key + ":";
+  for (const k of [...__kvInflight.keys()]) {
+    if (typeof k === "string" && k.startsWith(fp)) __kvInflight.delete(k);
   }
 }
 
+/**
+ * 同一个 key 的并发读取合并成一次。
+ * promise 会多留 200ms 再清理，让几乎同时到达的请求复用同一份结果。
+ * 注意：写操作之后必须调 dropInflight() 作废，否则会读到写之前的值。
+ */
 function singleFlight(key, fn) {
   const existing = __kvInflight.get(key);
   if (existing) return existing;
@@ -602,14 +783,18 @@ function singleFlight(key, fn) {
   return p;
 }
 
-async function kvGetJSON(env, key, memOnly, edgeTtl, missTtl) {
+/**
+ * 读 KV，三态返回：
+ *   KV_MISS —— key 不存在（需要回源）
+ *   KV_ERR  —— KV 不可用（走降级，不要回源打爆上游）
+ *   其他    —— 实际数据
+ * memOnly 的 key（如用户状态 bundle）根本不落 KV，这里直接返回 undefined。
+ */
+async function kvGetJSON(env, key, memOnly) {
   if (memOnly) return undefined;
   if (!env.TMDB_CACHE || kvIsDown()) return KV_ERR;
   try {
-    const v = await env.TMDB_CACHE.get(key, {
-      type: "json",
-      cacheTtl: edgeTtl || KV_EDGE_TTL,
-    });
+    const v = await env.TMDB_CACHE.get(key, kvReadOpts());
     kvMarkUp();
     return v === null || v === undefined ? KV_MISS : v;
   } catch {
@@ -618,6 +803,14 @@ async function kvGetJSON(env, key, memOnly, edgeTtl, missTtl) {
   }
 }
 
+/**
+ * 写 KV。返回 promise，写操作的关键路径可以 await 它，
+ * 保证响应发出前数据已经落地（另一台设备立刻能读到）。
+ *
+ * memOnly      —— 只记内存兜底副本，不落 KV
+ * force        —— 无视应急阀强制写
+ * unchanged    —— 内容和 KV 里一致，跳过这次写，省额度
+ */
 function kvPutJSON(
   env,
   ctx,
@@ -631,13 +824,6 @@ function kvPutJSON(
 ) {
   if (unchanged) return;
 
-  const memMs =
-    payload && payload.miss
-      ? 30000
-      : ttl
-        ? Math.min(KV_MEM_TTL, Math.max(5000, ttl * 1000))
-        : KV_MEM_TTL;
-
   if (
     payload &&
     typeof payload === "object" &&
@@ -646,20 +832,22 @@ function kvPutJSON(
   )
     payload._ts = Date.now();
 
-  kvMemSet(key, payload, memMs);
+  kvRemember(key, payload);
   if (memOnly) return;
   if (!env.TMDB_CACHE || kvIsDown()) return;
   if (ttl != null && ttl < KV_MIN_PUT_TTL) return;
 
-  const now = Date.now();
-  const lastPut = __kvLastPut.get(key) || 0;
-  const minGap = force
-    ? KV_FORCE_PUT_INTERVAL_MS
-    : isHotKvKey(key)
-      ? KV_HOT_PUT_INTERVAL_MS
-      : KV_MIN_PUT_INTERVAL_MS;
-  if (lastPut && now - lastPut < minGap) return;
-  __kvLastPut.set(key, now);
+  // 去掉写入节流：以前同一个 key 在 1 小时（热点 2 分钟）内只允许写一次，
+  // 结果是 A 设备刚标记完已看，B 设备还得等节流窗口过去才读得到。
+  // 现在只要有新数据就落 KV，保证各设备读到的都是最新那份。
+  //
+  // 应急阀：万一 KV 每日写入额度吃紧，把 KV_WRITE_MIN_GAP_MS 调成 30000
+  // 这类值即可降频（代价是设备间最多差这么久）。默认 0 = 完全不节流。
+  if (KV_WRITE_MIN_GAP_MS > 0) {
+    const last = __kvLastPut.get(key) || 0;
+    if (last && Date.now() - last < KV_WRITE_MIN_GAP_MS) return;
+  }
+  __kvLastPut.set(key, Date.now());
 
   if (__kvLastPut.size > __KV_LASTPUT_MAX) {
     const it = __kvLastPut.keys();
@@ -685,8 +873,15 @@ function kvPutJSON(
     });
 
   if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
+  // 返回 promise：写操作的关键路径（标记已看 / 隐藏 / 丢弃）需要等它落地，
+  // 否则响应已经回到客户端、KV 里还是旧值。
+  return p;
 }
 
+/**
+ * 判断这是"错误数据"而不是业务数据。
+ * 缓存层靠它决定要不要把结果写回去——一次失败不能把错误锁进缓存。
+ */
 function __isErrorPayload(d) {
   if (d === null || d === undefined || d === false) return true;
   if (typeof d === "object" && d) {
@@ -697,6 +892,10 @@ function __isErrorPayload(d) {
   return false;
 }
 
+/**
+ * 由 key 算出一个稳定的抖动秒数，加到 TTL 上。
+ * 目的是让同批写入的 key 不要在同一秒集体过期，避免瞬时回源风暴。
+ */
 function stableJitter(key, maxSec) {
   const m = Math.floor(Number(maxSec) || 0);
   if (m <= 0) return 0;
@@ -707,6 +906,46 @@ function stableJitter(key, maxSec) {
     h = Math.imul(h, 16777619) >>> 0;
   }
   return h % m;
+}
+
+/* 请求级去重。
+ *
+ * 内存副本停用后，同一个 key 在一次请求里被读好几遍（bundle 会连带读
+ * dropped + watched + hideMap，首页还会再取一次 bundle），每次都打 KV 纯属浪费。
+ * 这里把结果挂在 ctx 上，只活到本次请求结束：
+ *   - 不跨请求、不跨 isolate、不跨设备 —— 想读到旧版本都没机会；
+ *   - 同一请求内两次读同一 key，KV 的值本来就是同一份，去重完全等价。
+ * bypass（强制拉新）不读它，写完照样更新它。
+ */
+function reqMemoMap(ctx) {
+  if (!ctx || typeof ctx !== "object") return null;
+  try {
+    if (!ctx.__mtMemo) ctx.__mtMemo = new Map();
+    // 上限只是防止单次请求把整份日历 + 播放列表都揣在内存里；
+    // 超了就不再记新的，宁可多读一次 KV
+    if (ctx.__mtMemo.size > 120) return null;
+    return ctx.__mtMemo;
+  } catch {
+    return null;
+  }
+}
+
+/* ==================================================================
+ * cachedJSON 核心
+ * 所有缓存的唯一入口：读 KV → 回源 → 写回 → 降级
+ * ================================================================== */
+
+/**
+ * 请求级 KV 调用统计。
+ * 平时只是几次整数自增（可忽略），带上 ?debug=1 时会随响应返回，
+ * 用来回答"这一趟到底读了几次、命中几次"。
+ */
+function reqKvStat(ctx) {
+  if (!ctx || typeof ctx !== "object") return null;
+  if (!ctx.__kvStat) {
+    ctx.__kvStat = { read: 0, hit: 0, miss: 0, write: 0, err: 0, dedup: 0 };
+  }
+  return ctx.__kvStat;
 }
 
 async function cachedJSON(
@@ -720,28 +959,37 @@ async function cachedJSON(
     memOnly = false,
     unwrap = true,
     swr = false,
-    edgeTtl,
     jitter,
     userKey,
     bypass = false,
-    preserveTs = false,
     sourceTracker = null,
     lastGoodKey = null,
     revalidate = true,
     staleRetention = null,
-    memOnlyOnBypass = false,
-    minWriteGapMs = null,
   } = {},
 ) {
+  const memoMap = reqMemoMap(ctx);
+  const kvStat = reqKvStat(ctx);
   const jitterSec = stableJitter(
     key,
     jitter != null ? jitter : DEFAULT_JITTER_SEC,
   );
-  const effectiveTtl = ttl + jitterSec;
-  const softAge =
-    swr === true ? Math.floor(ttl * 0.5) : typeof swr === "number" ? swr : 0;
-  const effectiveMinWriteGap =
-    minWriteGapMs != null ? minWriteGapMs : KV_FORCE_PUT_INTERVAL_MS;
+  // ttl 既可以是数字，也可以是一个按数据内容返回秒数的函数
+  // （季/集列表用它区分"正在播 → 1 天"和"已完结 → 7 天"）。
+  const ttlBase = (payload) => {
+    const v =
+      typeof ttl === "function"
+        ? ttl(payload && payload.data !== undefined ? payload.data : payload)
+        : ttl;
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? n : 3600;
+  };
+  const ttlSecOf = (payload) => ttlBase(payload) + jitterSec;
+  const softAgeOf = (payload) => {
+    if (typeof swr === "number") return swr;
+    if (swr !== true) return 0;
+    return Math.floor(ttlBase(payload) * 0.5);
+  };
 
   function unwrapVal(cached) {
     if (cached === KV_MISS || cached == null) return null;
@@ -829,12 +1077,10 @@ async function cachedJSON(
     );
   }
 
-  async function prevRawForTs(prevHint) {
-    if (prevHint && typeof prevHint === "object" && prevHint._ts)
-      return prevHint;
-    const mem = kvMemGet(key);
-    if (mem !== undefined && mem !== KV_MISS && mem && mem._ts) return mem;
-    return null;
+  function prevRawForTs(prevHint) {
+    return prevHint && typeof prevHint === "object" && prevHint._ts
+      ? prevHint
+      : null;
   }
 
   async function writeFresh(
@@ -854,35 +1100,36 @@ async function cachedJSON(
         : (prev && prev._ts) || 0;
     const nowMs = Date.now();
 
-    const memMs = effectiveTtl
-      ? Math.min(KV_MEM_TTL, Math.max(5000, effectiveTtl * 1000))
-      : KV_MEM_TTL;
-    if (!unchanged && prevWts && nowMs - prevWts < effectiveMinWriteGap) {
-      kvMemSet(
-        key,
-        { data, _ts: (prev && prev._ts) || nowMs, _wts: prevWts },
-        memMs,
-      );
-      kvMemStaleSet(key, data, (prev && prev._ts) || undefined);
-      return 0;
-    }
-
+    // 不再做"最小写入间隔"节流：拿到的就是最新数据，直接落 KV。
+    // 节流会让 KV 里长期停留旧版本，多设备之间就会对不上。
     const nowWts = unchanged ? prevWts || wts : nowMs;
-    kvPutJSON(
+    if (kvStat) kvStat.write++;
+    const putP = kvPutJSON(
       env,
       ctx,
       key,
       { data, _ts: wts, _wts: nowWts },
-      effectiveTtl,
+      ttlSecOf(data),
       memOnlyOverride != null ? memOnlyOverride : memOnly,
       force,
       null,
       unchanged,
     );
+    // 用户态数据（已看集 / 播放进度 / 统计…）等写入落地再往下走：
+    // 客户端拿到响应后往往立刻发起下一次请求，同 colo 的读要能看到新值。
+    // 公共数据（TMDB 详情、榜单）保持后台写，不拖慢响应。
+    if (isUserStateKey(key) && putP && typeof putP.then === "function") {
+      await putP;
+    }
     kvMemStaleSet(key, data, wts);
+    if (memoMap)
+      memoMap.set(key, {
+        payload: { data, _ts: wts, _wts: nowWts },
+        live: true,
+      });
 
     if (unchanged) {
-      kvMemSet(key, { data, _ts: wts, _wts: nowWts }, memMs);
+      kvRemember(key, { data, _ts: wts, _wts: nowWts });
     } else {
       writeLastGood(data);
     }
@@ -891,14 +1138,6 @@ async function cachedJSON(
   }
 
   function tryOldNormal() {
-    const mem = kvMemGet(key);
-    if (mem !== undefined && mem !== KV_MISS && !mem.miss) {
-      const v = unwrapVal(mem);
-      if (!__isErrorPayload(v)) {
-        markSource(true, mem);
-        return { found: true, val: v, raw: mem };
-      }
-    }
     const st = kvMemStaleGet(key);
     if (st && st.data !== undefined && !__isErrorPayload(st.data)) {
       markSource(true, { _ts: st._ts });
@@ -932,14 +1171,7 @@ async function cachedJSON(
 
   async function fallbackChain() {
     const old = tryOldNormal();
-    if (old.found) {
-      if (old.raw && old.raw !== KV_MISS) kvMemSet(key, old.raw, KV_MEM_TTL);
-      else if (old.val != null) {
-        kvMemSet(key, { data: old.val, _ts: old.ts || Date.now() }, KV_MEM_TTL);
-        kvMemStaleSet(key, old.val, old.ts);
-      }
-      return { found: true, val: old.val };
-    }
+    if (old.found) return { found: true, val: old.val };
 
     if (env && env.TMDB_CACHE && !kvIsDown()) {
       try {
@@ -951,7 +1183,7 @@ async function cachedJSON(
               typeof kvStale === "object" && kvStale.data !== undefined
                 ? kvStale
                 : { data: v, _ts: (kvStale && kvStale._ts) || Date.now() };
-            kvMemSet(key, memPayload, KV_MEM_TTL);
+            kvRemember(key, memPayload);
             kvMemStaleSet(key, v, (kvStale && kvStale._ts) || undefined);
             markSource(true, kvStale);
             return { found: true, val: v };
@@ -966,7 +1198,7 @@ async function cachedJSON(
         lg.raw && typeof lg.raw === "object" && lg.raw.data !== undefined
           ? lg.raw
           : { data: lg.val, _ts: (lg.raw && lg.raw._ts) || Date.now() };
-      kvMemSet(key, memPayload, KV_MEM_TTL);
+      kvRemember(key, memPayload);
       kvMemStaleSet(key, lg.val, (lg.raw && lg.raw._ts) || undefined);
       markSource(true, lg.raw || null);
       return { found: true, val: lg.val };
@@ -975,7 +1207,12 @@ async function cachedJSON(
   }
 
   if (bypass) {
-    return singleFlight("force:" + key, async () => {
+    // 加秒级时间桶：同一瞬间的并发强制刷新仍会合并成一次请求，
+    // 但不会因为 singleFlight 的 200ms 清理窗口而复用"上一次"的结果
+    // （复用会让调用方的 playbackSource 等 sourceTracker 停留在旧值，误报 stale）。
+    return singleFlight(
+      "force:" + key + ":" + Math.floor(Date.now() / 1000),
+      async () => {
       let data = null;
       try {
         data = await fetcher();
@@ -986,18 +1223,9 @@ async function cachedJSON(
 
       if (!__isErrorPayload(data)) {
         let prevHint = null;
-        if (
-          !memOnly &&
-          !memOnlyOnBypass &&
-          env &&
-          env.TMDB_CACHE &&
-          !kvIsDown()
-        ) {
+        if (!memOnly && env && env.TMDB_CACHE && !kvIsDown()) {
           try {
-            const raw = await env.TMDB_CACHE.get(key, {
-              type: "json",
-              cacheTtl: 60,
-            });
+            const raw = await env.TMDB_CACHE.get(key, kvReadOpts());
             kvMarkUp();
             if (raw && typeof raw === "object" && !raw.miss) {
               prevHint = raw;
@@ -1008,8 +1236,8 @@ async function cachedJSON(
         }
 
         const liveAge = await writeFresh(data, {
-          force: !memOnlyOnBypass,
-          memOnlyOverride: memOnlyOnBypass ? true : null,
+          force: true,
+          memOnlyOverride: memOnly ? true : null,
           prevHint,
         });
         markSource(false, null, liveAge);
@@ -1027,8 +1255,9 @@ async function cachedJSON(
     if (!cached || cached === KV_MISS || cached.miss || !cached._ts)
       return false;
     const age = ageSec(cached);
-    if (age > effectiveTtl) return true;
-    if (softAge > 0 && age > softAge) return true;
+    if (age > ttlSecOf(cached)) return true;
+    const soft = softAgeOf(cached);
+    if (soft > 0 && age > soft) return true;
     return false;
   }
 
@@ -1056,16 +1285,13 @@ async function cachedJSON(
     );
   }
 
-  const mem = kvMemGet(key);
+  const memoHit = memoMap ? memoMap.get(key) : undefined;
+  const mem = memoHit ? memoHit.payload : undefined;
   if (mem !== undefined) {
     if (mem === KV_MISS) {
       const lg = await tryLastGood();
       if (lg.found) {
-        kvMemSet(
-          key,
-          { data: lg.val, _ts: (lg.raw && lg.raw._ts) || Date.now() },
-          KV_MEM_TTL,
-        );
+        kvRemember(key, { data: lg.val, _ts: (lg.raw && lg.raw._ts) || Date.now() });
         kvMemStaleSet(key, lg.val, (lg.raw && lg.raw._ts) || undefined);
         markSource(true, lg.raw || null);
         return unwrap ? lg.val : { data: lg.val };
@@ -1073,14 +1299,24 @@ async function cachedJSON(
       markSource(null, null);
       return null;
     }
+    if (kvStat) kvStat.dedup++;
     if (revalidate && needRefresh(mem)) scheduleRefresh(mem);
-    markSource(true, mem);
+    // 本次请求刚拉到的新数据，第二次读要沿用 live 标记，
+    // 否则 playbackSource 会被误判成 "cache"，进而触发多余的 live 重试。
+    if (memoHit.live) markSource(false, null, 0);
+    else markSource(true, mem);
     if (unwrap) return unwrapVal(mem);
     return mem;
   }
 
   return singleFlight(key, async () => {
-    const cached = await kvGetJSON(env, key, memOnly, edgeTtl, missTtl);
+    const cached = await kvGetJSON(env, key, memOnly);
+    if (kvStat) {
+      kvStat.read++;
+      if (cached === KV_MISS) kvStat.miss++;
+      else if (cached === KV_ERR) kvStat.err++;
+      else kvStat.hit++;
+    }
     if (cached !== undefined && cached !== KV_MISS && cached !== KV_ERR) {
       if (!__isErrorPayload(unwrapVal(cached))) {
         kvMemStaleSet(
@@ -1092,6 +1328,7 @@ async function cachedJSON(
       if (revalidate && needRefresh(cached)) {
         scheduleRefresh(cached);
       }
+      if (memoMap) memoMap.set(key, { payload: cached, live: false });
       markSource(true, cached);
       if (unwrap) return unwrapVal(cached);
       return cached;
@@ -1194,11 +1431,20 @@ self.addEventListener("fetch", function (event) {
 
 var __cachePs = {};
 
+/* ==================================================================
+ * Service Worker 与 PWA
+ * 离线缓存策略：静态资源 SWR、导航网络优先
+ * ================================================================== */
+
 function getCache(name) {
   if (!__cachePs[name]) __cachePs[name] = caches.open(name);
   return __cachePs[name];
 }
 
+/**
+ * Service Worker：首页（启动页）用"先给缓存、后台更新"。
+ * 用户点开 App 能立刻看到骨架，不会对着白屏等网络。
+ */
 async function navigateLaunchSwr(req) {
   var cache = await getCache(NAV_CACHE);
   var cached = await cache.match(req);
@@ -1215,6 +1461,10 @@ async function navigateLaunchSwr(req) {
   return r;
 }
 
+/**
+ * Service Worker：非首页的导航走"网络优先"，5 秒超时后回退到缓存。
+ * 数据都在接口里，缓存旧的整页反而会显示过期内容。
+ */
 async function navigateNetworkFirst(req) {
   var ctrl = new AbortController();
   var timer = setTimeout(function () {
@@ -1265,6 +1515,9 @@ async function navigateNetworkFirst(req) {
   }
 }
 
+/**
+ * Service Worker：静态资源（CSS/JS/图片）先给缓存，同时后台拉新版。
+ */
 async function staleWhileRevalidate(req) {
   var cacheP = getCache(RUNTIME_CACHE);
   var networkP = fetch(req).then(function (r) {
@@ -1374,6 +1627,11 @@ export default {
   },
 };
 
+/* ==================================================================
+ * 静态资源与路由入口
+ * 图标、favicon、头像代理，以及 export default 的分发
+ * ================================================================== */
+
 async function handleAvatar(request, ctx) {
   const raw = new URL(request.url).searchParams.get("u") || "";
   let target;
@@ -1424,6 +1682,9 @@ async function handleAvatar(request, ctx) {
   return resp;
 }
 
+/**
+ * /assets/* —— 图标类静态资源，走边缘缓存，源站挂了也能出图。
+ */
 async function handleAsset(path, ctx) {
   const entry = ASSET_ORIGINS[path];
   if (!entry) return new Response("Not Found", { status: 404 });
@@ -1450,6 +1711,9 @@ async function handleAsset(path, ctx) {
   }
 }
 
+/**
+ * /app.css —— 内联样式表，强缓存一年（换版本靠 URL 上的 ?v= 刷新）。
+ */
 function handleAppCss() {
   return new Response(pageStyles(), {
     headers: {
@@ -1460,6 +1724,9 @@ function handleAppCss() {
   });
 }
 
+/**
+ * /app.js —— 内联前端脚本，同上。
+ */
 function handleAppJs(request) {
   const etag = `"js-v${APP_JS_VERSION}"`;
   const cacheHeaders = {
@@ -1477,6 +1744,9 @@ function handleAppJs(request) {
   });
 }
 
+/**
+ * PWA manifest：应用名、图标、主题色、启动方式。
+ */
 function handleManifest() {
   return new Response(
     JSON.stringify({
@@ -1510,6 +1780,9 @@ function handleManifest() {
   );
 }
 
+/**
+ * /api/version —— 给前端判断"要不要强制刷新"用的版本号。
+ */
 function handleAppVersion() {
   return new Response(
     JSON.stringify({ js: APP_JS_VERSION, css: APP_CSS_VERSION }),
@@ -1522,6 +1795,9 @@ function handleAppVersion() {
   );
 }
 
+/**
+ * /sw.js —— 下发 Service Worker 脚本本身，必须 no-store。
+ */
 function handleServiceWorker() {
   return new Response(SW_JS_CONTENT, {
     headers: {
@@ -1532,6 +1808,15 @@ function handleServiceWorker() {
   });
 }
 
+/* ==================================================================
+ * 认证与会话
+ * Cookie 校验、令牌刷新、Stable 用户 ID
+ * ================================================================== */
+
+/**
+ * 从 Cookie 取出登录态，token 快过期就先刷新。
+ * 只负责"有没登录"，不负责业务权限。
+ */
 async function requireAuth(request, env) {
   const cookieAuth = readAuth(request);
   if (!cookieAuth) return { ok: false };
@@ -1547,6 +1832,11 @@ async function requireAuth(request, env) {
   };
 }
 
+/**
+ * 认证 + 用户标识二合一，所有需要登录的接口都从这里进。
+ * 失败时直接返回可用的 Response（HTML 或 JSON 由 html 参数决定）。
+ * strict 模式下拿不到 userKey 也视为未登录。
+ */
 async function authed(
   request,
   env,
@@ -1599,6 +1889,10 @@ async function authed(
   };
 }
 
+/**
+ * 把 Trakt 的错误码 / 英文错误翻成给用户看的中文。
+ * 已经是中文的直接透传，未知错误给一句兜底提示。
+ */
 function humanizeApiError(codeOrMsg, extra) {
   const s = String(codeOrMsg || "").trim();
   const cooling = extra && extra.cooling != null ? Number(extra.cooling) : null;
@@ -1642,6 +1936,9 @@ function humanizeApiError(codeOrMsg, extra) {
   return s || "操作失败，请稍后重试";
 }
 
+/**
+ * 未登录的 JSON 响应（401 + 清 Cookie）。
+ */
 function unauthorizedJson() {
   return Response.json(
     { error: humanizeApiError("unauthorized") },
@@ -1652,6 +1949,9 @@ function unauthorizedJson() {
   );
 }
 
+/**
+ * 未登录的 HTML 响应（页面类接口用）。
+ */
 function unauthorizedHtml() {
   return new Response(humanizeApiError("unauthorized"), {
     status: 401,
@@ -1659,8 +1959,14 @@ function unauthorizedHtml() {
   });
 }
 
+/**
+ * 带登录态的 JSON 响应：需要时顺手刷新 Cookie。
+ * 默认 no-store——这些接口几乎都含用户态，不能让浏览器留副本。
+ */
 function authJson(auth, needsCookieUpdate, data, status = 200) {
-  const headers = { "Content-Type": CT_JSON };
+  // 默认 no-store：这些接口几乎都带用户态（已看/进度/追剧），
+  // 一旦让浏览器或中间层缓存住，换台设备打开就是旧画面。
+  const headers = { "Content-Type": CT_JSON, "Cache-Control": CC_NO_STORE };
   if (needsCookieUpdate && auth)
     headers["Set-Cookie"] = buildCookie(auth, auth.trakt_id);
   if (data && typeof data === "object" && data.error != null) {
@@ -1672,18 +1978,29 @@ function authJson(auth, needsCookieUpdate, data, status = 200) {
   return new Response(JSON.stringify(data), { status, headers });
 }
 
+/**
+ * 带登录态的 HTML / 自定义响应体，语义同上。
+ */
 function authResp(
   auth,
   needsCookieUpdate,
   body,
   { status = 200, contentType = "text/html; charset=utf-8", extra = {} } = {},
 ) {
-  const h = { "Content-Type": contentType, ...extra };
+  // 默认 no-store，显式传入的 Cache-Control 仍会覆盖这里。
+  const h = {
+    "Content-Type": contentType,
+    "Cache-Control": CC_NO_STORE,
+    ...extra,
+  };
   if (needsCookieUpdate && auth)
     h["Set-Cookie"] = buildCookie(auth, auth.trakt_id);
   return new Response(body, { status, headers: h });
 }
 
+/**
+ * 解析请求体 JSON，失败时返回可直接返回的错误响应。
+ */
 async function parseJsonBody(request) {
   try {
     return { ok: true, body: await request.json() };
@@ -1695,6 +2012,11 @@ async function parseJsonBody(request) {
   }
 }
 
+/**
+ * 所有"写 Trakt"接口的公共外壳：
+ * 校验参数 → 调 Trakt → 成功后执行 afterOk（通常是缓存失效）。
+ * 各接口只需提供 endpoint 和 payload 构造方式。
+ */
 async function traktSyncAction(
   request,
   env,
@@ -1792,6 +2114,11 @@ async function traktSyncAction(
   return authJson(auth, needsCookieUpdate, { ok: true, result });
 }
 
+/* ==================================================================
+ * 设备码登录
+ * TV/手机端 OAuth 设备码轮询
+ * ================================================================== */
+
 async function handleDevice(env) {
   const codeVerifier = randomString(64),
     codeChallenge = await pkceChallenge(codeVerifier);
@@ -1867,6 +2194,10 @@ async function handleDevice(env) {
   });
 }
 
+/**
+ * 设备码登录的轮询接口。
+ * 前端每隔几秒问一次"用户授权了没"，授权成功后写 Cookie 并返回跳转地址。
+ */
 async function handlePoll(request, env, ctx) {
   let body;
   try {
@@ -1992,11 +2323,7 @@ async function handlePoll(request, env, ctx) {
             },
           ).catch(() => {}),
         );
-        kvMemSet(
-          CK.profile(userKey),
-          { data: meProfile, _ts: nowTs },
-          KV_MEM_TTL,
-        );
+        kvRemember(CK.profile(userKey), { data: meProfile, _ts: nowTs });
       }
       if (meStats) {
         puts.push(
@@ -2009,17 +2336,11 @@ async function handlePoll(request, env, ctx) {
             },
           ).catch(() => {}),
         );
-        kvMemSet(CK.stats(userKey), { data: meStats, _ts: nowTs }, KV_MEM_TTL);
+        kvRemember(CK.stats(userKey), { data: meStats, _ts: nowTs });
       }
     }
-    if (rt) kvMemSet(CK.uidRt(rt.slice(0, 32)), traktId, KV_MEM_TTL);
-    if (at) kvMemSet(CK.uidAt(at.slice(0, 24)), traktId, KV_MEM_TTL);
-
-    try {
-      const pbKey = CK.playback(userKey);
-      __kvMem.delete(pbKey);
-      __kvMemExp.delete(pbKey);
-    } catch {}
+    if (rt) kvRemember(CK.uidRt(rt.slice(0, 32)), traktId);
+    if (at) kvRemember(CK.uidAt(at.slice(0, 24)), traktId);
 
     if (ctx && typeof ctx.waitUntil === "function")
       ctx.waitUntil(Promise.all(puts));
@@ -2084,6 +2405,9 @@ async function handlePoll(request, env, ctx) {
   );
 }
 
+/**
+ * 退出登录：作废缓存、清 Cookie、回登录页。
+ */
 async function handleLogout(request, env, ctx) {
   try {
     const cookieAuth = readAuth(request);
@@ -2120,6 +2444,11 @@ async function handleLogout(request, env, ctx) {
   });
 }
 
+/* ==================================================================
+ * Cookie 与身份
+ * 登录态序列化、profile 提示、头像挑选
+ * ================================================================== */
+
 function buildCookie(auth, traktId) {
   const payload = {
     access_token: auth.access_token,
@@ -2135,6 +2464,9 @@ function buildCookie(auth, traktId) {
   return `${COOKIE_NAME}=${b64urlEncode(JSON.stringify(payload))}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${COOKIE_MAX_AGE}`;
 }
 
+/**
+ * 从 Cookie 解出登录态。解析失败按未登录处理。
+ */
 function readAuth(request) {
   const cookie = request.headers.get("Cookie") || "";
   const m = cookie.match(new RegExp(`(?:^|;\\s*)${COOKIE_NAME}=([^;]+)`));
@@ -2148,6 +2480,10 @@ function readAuth(request) {
   }
 }
 
+/**
+ * access_token 剩余不足 30 分钟就刷新一次。
+ * 刷新失败返回原 auth（宁可继续用旧的，也不要把用户踢下线）。
+ */
 async function refreshIfNeeded(auth, env) {
   if (auth.expires_at - Date.now() > 30 * 60_000) return auth;
 
@@ -2183,6 +2519,9 @@ async function refreshIfNeeded(auth, env) {
   };
 }
 
+/**
+ * 构造 Trakt API 需要的请求头（client_id + token + UA）。
+ */
 function makeTraktHeaders(env, auth) {
   return {
     "Content-Type": "application/json",
@@ -2193,6 +2532,11 @@ function makeTraktHeaders(env, auth) {
   };
 }
 
+/**
+ * 取一个稳定的用户标识作为所有缓存 key 的后缀。
+ * 优先 Trakt 数字 id；拿不到时退回 token 前缀（会出现"同一个人两个 key"，
+ * 但至少不会串号）。
+ */
 async function getStableUserId(
   auth,
   headers,
@@ -2209,17 +2553,14 @@ async function getStableUserId(
 
   if (env && env.TMDB_CACHE) {
     try {
-      const raw = await env.TMDB_CACHE.get(memKey, {
-        type: "json",
-        cacheTtl: 600,
-      });
+      const raw = await env.TMDB_CACHE.get(memKey, kvReadOpts());
       kvMarkUp();
       if (raw != null) {
         const uid = String(
           typeof raw === "object" && raw.data != null ? raw.data : raw,
         );
         if (uid && uid !== "null" && uid !== "undefined") {
-          kvMemSet(memKey, uid, KV_MEM_TTL);
+          kvRemember(memKey, uid);
           return uid;
         }
       }
@@ -2242,7 +2583,7 @@ async function getStableUserId(
       else if (ids.slug) uid = "s:" + String(ids.slug);
 
       if (uid) {
-        kvMemSet(memKey, uid, KV_MEM_TTL);
+        kvRemember(memKey, uid);
         return uid;
       }
     } else if (r.status === 429) {
@@ -2260,23 +2601,33 @@ async function getStableUserId(
     : at
       ? "a" + at.slice(0, 16)
       : "anon";
-  kvMemSet(memKey, userId, KV_MEM_TTL);
+  kvRemember(memKey, userId);
   return userId;
 }
 
+/**
+ * 把 token 前缀 → 用户 id 的对照记一份，下次不用再请求 /users/me。
+ */
 function rememberTraktUserId(auth, traktId) {
   if (!auth || !traktId) return;
   const id = String(traktId);
   const rt = auth.refresh_token ? String(auth.refresh_token) : "";
   const at = auth.access_token ? String(auth.access_token) : "";
-  if (rt) kvMemSet(CK.uidRt(rt.slice(0, 32)), id, KV_MEM_TTL);
-  if (at) kvMemSet(CK.uidAt(at.slice(0, 24)), id, KV_MEM_TTL);
+  if (rt) kvRemember(CK.uidRt(rt.slice(0, 32)), id);
+  if (at) kvRemember(CK.uidAt(at.slice(0, 24)), id);
 }
 
+/**
+ * 生成清除登录 Cookie 的 Set-Cookie 值。
+ */
 function clearCookieHeader() {
   return `${COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`;
 }
 
+/**
+ * 从 profile Cookie 读出昵称/头像，用于首屏骨架先渲染出人名，
+ * 不必等接口返回。
+ */
 function readProfileHint(request) {
   const cookie = request.headers.get("Cookie") || "";
   const m = cookie.match(new RegExp(`(?:^|;\\s*)${PROFILE_COOKIE}=([^;]+)`));
@@ -2288,6 +2639,10 @@ function readProfileHint(request) {
   }
 }
 
+/**
+ * 从 Trakt profile 里挑头像：优先 full，其次 medium / thumb，
+ * 顺带收集备选地址，主地址加载失败时前端可以依次重试。
+ */
 function pickAvatar(profile) {
   const out = { url: "", alts: [] };
   if (!profile || typeof profile !== "object") return out;
@@ -2318,20 +2673,25 @@ function pickAvatar(profile) {
   return out;
 }
 
+/**
+ * 把昵称和头像压进一个轻量 Cookie，同上，只为首屏。
+ */
 function buildProfileCookie(profile) {
   const data = { name: profile.name || "", avatar: profile.avatar || "" };
   return `${PROFILE_COOKIE}=${b64urlEncode(JSON.stringify(data))}; Secure; SameSite=Lax; Path=/; Max-Age=${COOKIE_MAX_AGE}`;
 }
+
+/* ==================================================================
+ * 缓存失效
+ * 追剧版本号、用户键清单、写操作后作废哪些 key
+ * ================================================================== */
 
 async function getWatchlistVersion(env, ctx, userKey) {
   if (!userKey) return "0";
   const key = CK.watchlistVersion(userKey);
   if (!env || !env.TMDB_CACHE || kvIsDown()) return "0";
   try {
-    const raw = await env.TMDB_CACHE.get(key, {
-      type: "json",
-      cacheTtl: KV_EDGE_TTL,
-    });
+    const raw = await env.TMDB_CACHE.get(key, kvReadOpts());
     kvMarkUp();
     if (raw == null) return "0";
     const v = String(
@@ -2344,31 +2704,12 @@ async function getWatchlistVersion(env, ctx, userKey) {
   }
 }
 
+/**
+ * 待看列表失效：把版本号 +1。
+ * 所有 wl: 前缀的 key 都带版本号，所以一次写入就让整批失效，
+ * 不用逐个删（这是最省额度的一种失效方式）。
+ */
 function invalidateWatchlistCache(env, ctx, userKey) {
-  if (userKey) {
-    const verKey = CK.watchlistVersion(userKey);
-    __kvMem.delete(verKey);
-    __kvMemExp.delete(verKey);
-    const base = `wl:${userKey}:`;
-    for (const k of [...__kvMem.keys()]) {
-      if (k.startsWith(base) || k.startsWith(`wlids:${userKey}:`)) {
-        __kvMem.delete(k);
-        __kvMemExp.delete(k);
-      }
-    }
-  } else {
-    for (const k of [...__kvMem.keys()]) {
-      if (
-        k.startsWith("wl:") ||
-        k.startsWith("wlids:") ||
-        k.startsWith("wlv:")
-      ) {
-        __kvMem.delete(k);
-        __kvMemExp.delete(k);
-      }
-    }
-  }
-
   if (env && env.TMDB_CACHE && userKey) {
     const verKey = CK.watchlistVersion(userKey);
     const bump = (async () => {
@@ -2388,9 +2729,12 @@ function invalidateWatchlistCache(env, ctx, userKey) {
           kvMarkDown();
         }
       }
-      const next = String(cur + 1);
+      // 用"当前 + 1"和"当前毫秒时间戳"取大者：
+      // 两个请求并发读到同一个旧值时，各自写回的时间戳仍然不同，
+      // 不会出现"只 +1 一次、后到的请求白读旧值"的情况。
+      const next = String(Math.max(cur + 1, Date.now()));
       const payload = { data: next, _ts: Date.now(), _ttl: 86400 * 30 };
-      kvMemSet(verKey, payload, KV_MEM_TTL);
+      kvRemember(verKey, payload);
       if (!kvIsDown()) {
         try {
           await env.TMDB_CACHE.put(verKey, JSON.stringify(payload), {
@@ -2403,10 +2747,15 @@ function invalidateWatchlistCache(env, ctx, userKey) {
       }
     })();
     if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(bump);
-    else bump.catch(() => {});
+    return bump;
   }
+  return Promise.resolve();
 }
 
+/**
+ * 列出某个用户所有用户态缓存的 key（精确 + 前缀两类）。
+ * 写操作后由 bustHomeUserCaches 按这份清单做失效。
+ */
 function userCacheKeys(userKey) {
   return {
     exact: [
@@ -2418,6 +2767,8 @@ function userCacheKeys(userKey) {
       CK.pbImages(userKey),
       CK.watchedEpisodes(userKey),
       CK.cwHide(userKey),
+      CK.playbackList(userKey),
+      CK.syncState(userKey),
     ],
     prefix: [
       `hist:${userKey}:`,
@@ -2438,18 +2789,32 @@ function userCacheKeys(userKey) {
   };
 }
 
+/**
+ * 写操作（标记已看 / 隐藏 / 丢弃 / 追剧增删）后作废首屏相关缓存。
+ *
+ * 只删 4 个"不删就会看到错数据"的 key，其余靠 TTL 自然过期——
+ * KV 删除是独立计费的（免费额度 1000 次/天），能省则省。
+ * 返回 promise，关键写路径会 await 它，保证另一台设备立刻读到新状态。
+ */
 function bustHomeUserCaches(userKey, env, ctx) {
-  if (!userKey) return;
+  if (!userKey) return Promise.resolve();
+
+  // 写操作后把请求级 memo 一并作废，避免同一次请求里后半个流程
+  // 又读到写之前那份数据（比如标记已看后紧接着渲染首页）。
+  try {
+    if (ctx && ctx.__mtMemo) ctx.__mtMemo.clear();
+  } catch {}
+
+  // 12 小时内存副本也要作废：刚标记完已看，小结和累计数字都变了
+  const sumPrefix = `sum2:${userKey}:`;
+  const statsKey = CK.stats(userKey);
+  for (const k of [...__summaryMem.keys()]) {
+    if (k.startsWith(sumPrefix) || k === statsKey) __summaryMem.delete(k);
+  }
 
   const { exact, prefix } = userCacheKeys(userKey);
   const exact2 = [...exact, userStateCacheKey(userKey)];
 
-  for (const k of [...__kvMem.keys()]) {
-    if (exact2.includes(k) || prefix.some((p) => k.startsWith(p))) {
-      __kvMem.delete(k);
-      __kvMemExp.delete(k);
-    }
-  }
   for (const k of [...__kvLastPut.keys()]) {
     if (exact2.includes(k) || prefix.some((p) => k.startsWith(p))) {
       __kvLastPut.delete(k);
@@ -2460,26 +2825,51 @@ function bustHomeUserCaches(userKey, env, ctx) {
     __kvLastPut.delete("lgput:" + k);
   }
 
-  if (env && env.TMDB_CACHE) {
-    const fixedKeys = [
-      CK.playback(userKey),
-      CK.stats(userKey),
-      CK.history(userKey, 1),
-      CK.lastGood.history(userKey, 1),
-      CK.lastGood.playback(userKey),
-      CK.moreHistory(userKey, 1),
-      CK.moreHistory(userKey, 2),
-      CK.moreHistory(userKey, 3),
-      CK.morePlayback(userKey, 1, 20),
-      CK.morePlayback(userKey, 1, 30),
-      CK.watchedEpisodes(userKey),
-      CK.cwHide(userKey),
-      userStateCacheKey(userKey),
-    ];
-    safeDeleteKvKeys(env, ctx, fixedKeys);
+  // 进行中的读取也要作废，否则 200ms 内紧接着的读会复用到写之前的 promise
+  for (const k of [...__kvInflight.keys()]) {
+    if (typeof k !== "string") continue;
+    const bases = [k];
+    if (k.startsWith("swr:")) bases.push(k.slice(4));
+    if (k.startsWith("force:")) bases.push(k.slice(6).replace(/:\d+$/, ""));
+    if (
+      bases.some(
+        (b) => exact2.includes(b) || prefix.some((p) => b.startsWith(p)),
+      )
+    ) {
+      __kvInflight.delete(k);
+    }
   }
+
+  if (env && env.TMDB_CACHE) {
+    // 每次写操作都删一批 key，删除是独立计费的（免费额度 1000 次/天），
+    // 所以这里只留"不删就会让首屏读到错数据"的四个：
+    //   pb:v2  继续观看首屏的直接数据源
+    //   hist   记录页第一页（用户标记完常会立刻去看）
+    //   we     已看集集合，决定 isStalePause 过滤，不删会让刚标记的剧被藏掉
+    //   stats  首页那四个累计数字
+    // 其余靠 TTL 自然过期：
+    //   pbl  全量暂停列表 → 600s，详情页进度提示最多晚 10 分钟
+    //   cal  当天日历      → 8 小时，标记已看对"今天播什么"影响很小
+    //   sync 同步状态      → 不用删：pb 已经删了，下次读必然 miss 重拉
+    //   more:hist / more:pb → 300s
+    //   lg:*  内容本就是旧快照，留着当兜底更有价值
+    //   pbi / cwh → 与观看状态无关（图片映射、手动隐藏）
+    // 注意：userStateCacheKey 不在这里 —— bundle 只活在请求级 memo 里，KV 没有它
+    const hardKeys = [
+      CK.playback(userKey),
+      CK.history(userKey, 1),
+      CK.watchedEpisodes(userKey),
+      CK.stats(userKey),
+    ];
+    return safeDeleteKvKeys(env, ctx, hardKeys);
+  }
+  return Promise.resolve();
 }
 
+/**
+ * 限并发地跑一组任务，任务之间留一点间隔。
+ * 用来替代 Promise.all——后者会同一瞬间把 Trakt 的并发额度吃光。
+ */
 async function runLimited(taskFns, concurrency = 2, delayMs = 150) {
   let idx = 0;
   async function worker() {
@@ -2497,6 +2887,11 @@ async function runLimited(taskFns, concurrency = 2, delayMs = 150) {
   await Promise.all(workers);
 }
 
+/* ==================================================================
+ * TMDB 接入
+ * 详情缓存、海报地址、剧照/背景图/中文标题
+ * ================================================================== */
+
 async function tmdbGet(url) {
   try {
     const r = await fetchT(url, {}, 8000);
@@ -2507,6 +2902,9 @@ async function tmdbGet(url) {
   }
 }
 
+/**
+ * 拼 TMDB 请求地址，自动带上 zh-CN 和 api_key。
+ */
 function tmdbUrl(path, env, extra = {}) {
   const sep = path.includes("?") ? "&" : "?";
   const q = new URLSearchParams({
@@ -2517,7 +2915,12 @@ function tmdbUrl(path, env, extra = {}) {
   return `${TMDB_API}${path}${sep}${q}`;
 }
 
-async function tmdbDetailCached(path, env, ctx, ttl = 86400) {
+/**
+ * TMDB 详情缓存（td: 前缀）。
+ * ttl 支持传函数，按数据内容决定寿命——季/集列表用它区分
+ * "正在播 1 天"和"已完结 7 天"。
+ */
+async function tmdbDetailCached(path, env, ctx, ttl = TMDB_KV_TTL) {
   if (!env.TMDB_API_KEY) return null;
   return cachedJSON(
     env,
@@ -2528,17 +2931,21 @@ async function tmdbDetailCached(path, env, ctx, ttl = 86400) {
       ttl,
       missTtl: MISS_KV_TTL,
       swr: Math.min(86400, Math.floor(ttl * 0.25)),
-      edgeTtl: 900,
       jitter: 200,
-      minWriteGapMs: 7 * 24 * 3600 * 1000,
     },
   );
 }
 
+/**
+ * 拼 TMDB 图片地址。KV 里只存 path，不存图；图片由浏览器直连 image.tmdb.org。
+ */
 function tmdbPoster(path, size = "w185") {
   return path ? `${TMDB_IMG}/${size}${path}` : null;
 }
 
+/**
+ * 某一季的"集号 → 剧照 URL"映射，用于继续观看的卡片封面。
+ */
 async function tmdbSeasonStillMap(tmdbId, season, env, ctx) {
   if (!env || !env.TMDB_API_KEY) return null;
   const sid = Number(tmdbId),
@@ -2549,7 +2956,7 @@ async function tmdbSeasonStillMap(tmdbId, season, env, ctx) {
     `/tv/${sid}/season/${sn}`,
     env,
     ctx,
-    86400 * 14,
+    TMDB_KV_TTL,
   );
   if (!data || !Array.isArray(data.episodes)) return null;
   const map = new Map();
@@ -2561,6 +2968,9 @@ async function tmdbSeasonStillMap(tmdbId, season, env, ctx) {
   return map;
 }
 
+/**
+ * 单集剧照。先查整季映射，没有再单独请求该集。
+ */
 async function tmdbEpisodeStill(tmdbId, season, episode, env, ctx) {
   if (!env || !env.TMDB_API_KEY) return null;
   const sid = Number(tmdbId),
@@ -2575,12 +2985,16 @@ async function tmdbEpisodeStill(tmdbId, season, episode, env, ctx) {
     `/tv/${sid}/season/${sn}/episode/${en}`,
     env,
     ctx,
-    86400 * 14,
+    TMDB_KV_TTL,
   );
   if (data && data.still_path) return tmdbPoster(data.still_path, "w500");
   return null;
 }
 
+/**
+ * 取某部剧/电影的横版背景图，找不到时换另一种类型再试一次
+ * （TMDB 上偶尔 tv/movie 两条记录只有一条有图）。
+ */
 async function tmdbShowBackdrop(tmdbId, env, ctx, kind) {
   if (!env || !env.TMDB_API_KEY) return null;
   const sid = Number(tmdbId);
@@ -2594,15 +3008,18 @@ async function tmdbShowBackdrop(tmdbId, env, ctx, kind) {
     86400 * 7,
   );
   if (data && data.backdrop_path) return tmdbPoster(data.backdrop_path, "w780");
-  const alt = await tmdbDetailCached(`/${other}/${sid}`, env, ctx, 86400 * 7);
+  const alt = await tmdbDetailCached(`/${other}/${sid}`, env, ctx, TMDB_KV_TTL);
   if (alt && alt.backdrop_path) return tmdbPoster(alt.backdrop_path, "w780");
   return null;
 }
 
+/**
+ * 取 TMDB 的中文标题，用于把英文剧名替换成中文。
+ */
 async function tmdbZhTitle(kind, tmdbId, env, ctx) {
   if (!env || !env.TMDB_API_KEY || !tmdbId) return null;
   const path = kind === "movie" ? `/movie/${tmdbId}` : `/tv/${tmdbId}`;
-  const data = await tmdbDetailCached(path, env, ctx, 86400 * 7);
+  const data = await tmdbDetailCached(path, env, ctx, TMDB_KV_TTL);
   if (!data) return null;
   return (data.name || data.title || "").trim() || null;
 }
@@ -2611,44 +3028,35 @@ const IMG_MAP_KV_TTL = 86400 * 30;
 const IMG_MAP_MIN_PUT_INTERVAL_MS = 10 * 60 * 1000;
 const __IMG_MAP_LAST_PUT = new Map();
 
+/* ==================================================================
+ * 图片映射
+ * 继续观看 / 待看 / 日历的剧照与中文名映射表
+ * ================================================================== */
+
 async function loadImageMap(env, key) {
   if (!key) return {};
 
-  const mem = kvMemGet(key);
-  if (mem !== undefined) {
-    if (mem === KV_MISS) return {};
-    const v = mem && mem.data !== undefined ? mem.data : mem;
-    return v && typeof v === "object" && !Array.isArray(v) ? v : {};
-  }
-
-  if (!env || !env.TMDB_CACHE || kvIsDown()) {
-    const out = {};
-    kvMemSet(key, { data: out, _ts: Date.now() }, KV_MEM_TTL);
-    return out;
-  }
+  if (!env || !env.TMDB_CACHE || kvIsDown()) return {};
 
   try {
-    const raw = await env.TMDB_CACHE.get(key, {
-      type: "json",
-      cacheTtl: 600,
-    });
+    const raw = await env.TMDB_CACHE.get(key, kvReadOpts());
     kvMarkUp();
     const v = raw && raw.data !== undefined ? raw.data : raw;
     const out = v && typeof v === "object" && !Array.isArray(v) ? v : {};
-    kvMemSet(
-      key,
-      { data: out, _ts: (raw && raw._ts) || Date.now() },
-      KV_MEM_TTL,
-    );
+    kvRemember(key, { data: out, _ts: (raw && raw._ts) || Date.now() });
     return out;
   } catch {
     kvMarkDown();
     const out = {};
-    kvMemSet(key, { data: out, _ts: Date.now() }, KV_MEM_TTL);
+    kvRemember(key, { data: out, _ts: Date.now() });
     return out;
   }
 }
 
+/**
+ * 保存图片映射表。写入有 10 分钟节流——这张表是增量补全的，
+ * 没必要每加一条就写一次 KV。
+ */
 function saveImageMap(env, ctx, key, map) {
   if (!key || !map || typeof map !== "object") return;
 
@@ -2659,7 +3067,7 @@ function saveImageMap(env, ctx, key, map) {
 
   const now = Date.now();
   const payload = { data: map, _ts: now, _ttl: IMG_MAP_KV_TTL };
-  kvMemSet(key, payload, KV_MEM_TTL);
+  kvRemember(key, payload);
 
   if (!env || !env.TMDB_CACHE || kvIsDown()) return;
 
@@ -2687,6 +3095,12 @@ function saveImageMap(env, ctx, key, map) {
   else p.catch(() => {});
 }
 
+/**
+ * 给继续观看的条目生成图片映射键：
+ *   电影 → m:{traktId}
+ *   剧集 → s:{traktId}:{季}:{集}
+ * 同一部剧不同集的剧照不同，所以集号必须进 key。
+ */
 function pbImageKey(entry) {
   if (!entry) return null;
   if (entry.movie && entry.movie.ids && entry.movie.ids.trakt != null)
@@ -2700,6 +3114,10 @@ function pbImageKey(entry) {
   return "s:" + show.ids.trakt + ":" + s + ":" + n;
 }
 
+/**
+ * 把图片映射里的剧照 / 背景图 / 中文名贴到条目上。
+ * 返回是否命中，未命中时调用方会发起补全。
+ */
 function applyPbImage(j, imgMap) {
   const rec = j.k ? imgMap[j.k] : null;
   if (!rec) return false;
@@ -2714,6 +3132,10 @@ function applyPbImage(j, imgMap) {
   return true;
 }
 
+/**
+ * 把"今天播出且已过播出时间"的日历条目，转成本地生成的继续观看卡片。
+ * 用途：用户在别处看完了但 Trakt 还没同步时，首页不至于空一块。
+ */
 function calendarToLocalContinue(
   calendar,
   nowMs,
@@ -2783,10 +3205,16 @@ function calendarToLocalContinue(
   return out;
 }
 
+/**
+ * 判断这条日历记录是不是"本地补丁"（而非 Trakt 真实进度）。
+ */
 function isLocalAirEntry(entry) {
   return !!(entry && (entry.__localUpcoming || entry.__localAired));
 }
 
+/**
+ * 算一张卡片的进度条百分比（已看集 / 总集数）。
+ */
 function entryProgressPercent(entry) {
   if (!entry) return null;
   if (typeof entry.progress === "number") return entry.progress;
@@ -2795,6 +3223,24 @@ function entryProgressPercent(entry) {
   return null;
 }
 
+// "暂停已过期"判定的宽限期。
+// 原来只要该剧有任何一条观看记录晚于暂停时间就隐藏卡片，
+// 这让"刚暂停 → 看了下一集"和"暂停记录比 watched 缓存新"两种情况难以区分，
+// 两台设备命中不同版本的 watched 缓存时，同一份播放列表会被过滤出不同结果。
+const STALE_PAUSE_GRACE_MS = 30 * 60 * 1000;
+
+/* ==================================================================
+ * 继续观看：合并与过滤
+ * 把日历、播放进度、已看集合并成一张卡片列表
+ * ================================================================== */
+
+/**
+ * 判断一条暂停记录是不是"过期"了。
+ *
+ * 场景：用户在 A 设备看到第 5 集暂停，然后在 B 设备把第 6 集看完了。
+ * 此时 Trakt 的 playback 里还留着第 5 集的暂停记录，但它已经没意义了。
+ * 用"已看集集合"能识别出来——暂停的集已经看过了，就不该再出现在继续观看里。
+ */
 function isStalePause(entry, watchedSet) {
   if (!entry || !entry.paused_at || isLocalAirEntry(entry)) return false;
   const showLastMap = watchedSet && watchedSet.__showLastAt;
@@ -2808,9 +3254,22 @@ function isStalePause(entry, watchedSet) {
   const sid = Number(entry.show.ids.trakt);
   const lastMs = Number(showLastMap[sid] || showLastMap[String(sid)] || 0);
   const pausedMs = Date.parse(entry.paused_at);
-  return lastMs > 0 && Number.isFinite(pausedMs) && pausedMs < lastMs;
+  if (!Number.isFinite(pausedMs)) return false;
+
+  // 关键：这份 watched 是 T 时刻的快照。晚于 T 的暂停，它不可能知道，
+  // 拿它反过来判"暂停已过期"就是错的——以前没这一步，会让刚暂停的剧
+  // 在列表里一会儿出现一会儿消失（取决于当时拿到的是哪一版 watched）。
+  const dataTs = Number(watchedSet.__dataTs) || 0;
+  if (dataTs && pausedMs > dataTs) return false;
+
+  return lastMs > 0 && pausedMs + STALE_PAUSE_GRACE_MS < lastMs;
 }
 
+/**
+ * 把不该出现在"继续观看"里的条目剔除：
+ * 已标记看过的、已隐藏的、已丢弃的。
+ * 合并完再过滤，避免过滤结果被缓存冻结（这正是两台设备列表不一致的老原因）。
+ */
 function filterContinueEntries(list, watchedSet) {
   if (!Array.isArray(list)) return [];
   if (!watchedSet) return list.filter(Boolean);
@@ -2830,12 +3289,22 @@ function filterContinueEntries(list, watchedSet) {
   });
 }
 
+/**
+ * 更新某部剧的"最后观看时间"，用于列表排序。
+ */
 function bumpShowLastAt(map, sid, atMs) {
   if (sid == null || !Number.isFinite(atMs)) return;
   const k = Number(sid);
   if (!map[k] || atMs > map[k]) map[k] = atMs;
 }
 
+/**
+ * 把 Trakt 的播放进度和本地日历补丁合并成一张统一的继续观看列表。
+ *
+ * 合并规则：同一部剧只留一条，优先 Trakt 的实时进度；
+ * Trakt 没有时用日历补丁顶上。合并完再过滤（已看/隐藏/丢弃），
+ * 这样过滤结果不会被缓存冻结——两台设备列表不一致的老问题就出在这。
+ */
 function mergeContinueLists(
   playbackList,
   upNextList,
@@ -2907,10 +3376,27 @@ function mergeContinueLists(
     return completed >= aired;
   }
 
+  // 过滤原因计数：出问题时可以直接看出"是被过滤掉了"还是"根本没拉到"，
+  // 这是排查"两台设备列表不一致"的关键证据。
+  const skipStats = {
+    error: 0,
+    dropped: 0,
+    hidden: 0,
+    finished: 0,
+    caughtUp: 0,
+    notStarted: 0,
+    watched: 0,
+    stale: 0,
+  };
+  function markSkip(why) {
+    skipStats[why] = (skipStats[why] || 0) + 1;
+    return true;
+  }
+
   function shouldSkip(entry) {
-    if (!entry || entry.__error) return true;
-    if (isDropped(entry)) return true;
-    if (hideMap && isCwHiddenEntry(entry, hideMap)) return true;
+    if (!entry || entry.__error) return markSkip("error");
+    if (isDropped(entry)) return markSkip("dropped");
+    if (hideMap && isCwHiddenEntry(entry, hideMap)) return markSkip("hidden");
     if (hideMap) {
       const show = entry && entry.show;
       const sid = show && show.ids && show.ids.trakt;
@@ -2922,11 +3408,22 @@ function mergeContinueLists(
       }
     }
     if (typeof entry.progress === "number" && isFinishedPlayback(entry))
-      return true;
+      return markSkip("finished");
     if (entry.progress && typeof entry.progress === "object") {
-      if (isCaughtUp(entry)) return true;
-      const completed = entry.progress.completed;
-      if (typeof completed === "number" && completed <= 0) return true;
+      if (isCaughtUp(entry)) return markSkip("caughtUp");
+      const completed = Number(entry.progress.completed);
+      const aired = Number(entry.progress.aired);
+      const hasAiredEpisodes = Number.isFinite(aired) && aired > 0;
+      // completed 是"看完的集数"：看到 79% 也还是 0，并不代表"没开始看"。
+      // 以前把它一律当"未开始"跳过，结果是——一旦 Trakt 清掉某部剧的 playback
+      // 记录、同一条目转到 upNext 里，这张卡就凭空消失（下次又冒出来）。
+      // 只有"一集都还没播出"时，这条才真的没有继续观看的意义。
+      if (
+        !hasAiredEpisodes &&
+        (!Number.isFinite(completed) || completed <= 0)
+      ) {
+        return markSkip("notStarted");
+      }
     }
 
     if (
@@ -2938,10 +3435,10 @@ function mergeContinueLists(
       const epId = Number(entry.episode.ids.trakt);
       if (watched.has(epId)) {
         const p = entryProgressPercent(entry);
-        if (typeof p !== "number" || p <= 0) return true;
+        if (typeof p !== "number" || p <= 0) return markSkip("watched");
       }
     }
-    if (isStalePause(entry, watched)) return true;
+    if (isStalePause(entry, watched)) return markSkip("stale");
 
     return false;
   }
@@ -2999,9 +3496,17 @@ function mergeContinueLists(
       enumerable: false,
     });
   }
+  Object.defineProperty(result, "__skipStats", {
+    value: skipStats,
+    enumerable: false,
+  });
   return result;
 }
 
+/**
+ * 给条目打上"重看"标记：已看集里包含当前进度之前的集，说明用户在看第二遍。
+ * 前端据此显示不同的角标。
+ */
 function applyRewatchFlags(list, watchedEpIds) {
   if (!Array.isArray(list)) return list;
   const set =
@@ -3023,6 +3528,11 @@ function applyRewatchFlags(list, watchedEpIds) {
   }
   return list;
 }
+
+/* ==================================================================
+ * 图片补全
+ * 给条目补剧照、背景图、中文名，缺图时回源 TMDB
+ * ================================================================== */
 
 async function attachContinueStillsForPlayback(
   list,
@@ -3198,6 +3708,10 @@ async function attachContinueStillsForPlayback(
   return list;
 }
 
+/**
+ * 给一批条目补海报。缺失的按每批 6 个并发去 TMDB 拿，
+ * 拿到的结果既写回条目，也存进图片映射供下次直接用。
+ */
 async function attachEntityPosters(list, env, ctx, imgKey, maxFetch = 30) {
   if (!env || !Array.isArray(list) || !list.length) return list;
   if (!env.TMDB_API_KEY) return list;
@@ -3238,7 +3752,7 @@ async function attachEntityPosters(list, env, ctx, imgKey, maxFetch = 30) {
             `/${j.kind}/${j.tmdbId}`,
             env,
             ctx,
-            86400 * 14,
+            TMDB_KV_TTL,
           );
           if (data && data.poster_path) {
             const url = tmdbPoster(data.poster_path, "w342");
@@ -3260,6 +3774,9 @@ async function attachEntityPosters(list, env, ctx, imgKey, maxFetch = 30) {
   return list;
 }
 
+/**
+ * 给待看列表补剧照 / 背景图 / 中文名，逻辑同上，用的是 wli: 这张映射表。
+ */
 async function attachWatchlistStills(list, env, ctx, userKey, opts = {}) {
   if (!env || !Array.isArray(list) || !list.length) return list;
 
@@ -3307,7 +3824,7 @@ async function attachWatchlistStills(list, env, ctx, userKey, opts = {}) {
               `/${j.kind}/${j.tmdbId}`,
               env,
               ctx,
-              86400 * 14,
+              TMDB_KV_TTL,
             );
             if (data && data.poster_path) {
               const url = tmdbPoster(data.poster_path, "w342");
@@ -3386,6 +3903,9 @@ async function attachWatchlistStills(list, env, ctx, userKey, opts = {}) {
   return list;
 }
 
+/**
+ * 把 TMDB 的搜索结果转成页面统一的卡片结构（标题、年份、海报、简介、id）。
+ */
 function mapTmdbItem(r, typeHint) {
   if (!r || !r.id) return null;
   const mt = typeHint || r.media_type;
@@ -3406,6 +3926,10 @@ function mapTmdbItem(r, typeHint) {
   };
 }
 
+/**
+ * 榜单数据可用性判断：至少要有一个非空数组/对象。
+ * 上游偶尔会返回空壳 JSON，这种不能写进 KV，否则 12 小时都显示空白。
+ */
 function isUsableBoardPayload(data) {
   if (data == null) return false;
   if (Array.isArray(data)) return data.length > 0;
@@ -3436,11 +3960,65 @@ function isUsableBoardPayload(data) {
   }
 }
 
+/* ------------------------------------------------------------------
+ * 12 小时内存缓存（热榜 + 观看小结）
+ *
+ * 这些内容都是"一天变不了几次、但每次进页面都要过一次 KV"的类型：
+ *   __hotListMem —— 豆瓣 / 骨朵 / 平台剧场，纯公共榜单
+ *   __summaryMem —— 观看小结、全站统计，按用户和周期分开存
+ * 命中就直接返回，连 KV 都不读。
+ *
+ * 代价是两台设备最多差 12 小时。榜单和累计统计本身就是这个粒度，
+ * 可以接受；真正的用户态数据（已看 / 进度 / 追剧）仍然一律读 KV。
+ * 带 force=1 会绕过并刷新；标记已看之类的写操作会顺带清掉相关条目。
+ * ------------------------------------------------------------------ */
+const MEM_CACHE_TTL = 12 * 3600 * 1000;
+
+const __hotListMem = new Map();
+const __summaryMem = new Map();
+
+function memCacheGet(map, key) {
+  const e = map.get(key);
+  if (!e) return undefined;
+  if (Date.now() - e.ts > MEM_CACHE_TTL) {
+    map.delete(key);
+    return undefined;
+  }
+  return e.data;
+}
+
+/**
+ * 写 12 小时内存缓存。cap 是容量上限，超了按插入顺序淘汰最早的一批。
+ * 只用在热榜和观看小结这类"一天变不了几次"的数据上。
+ */
+function memCacheSet(map, key, data, cap) {
+  if (data === undefined || data === null) return;
+  map.set(key, { data, ts: Date.now() });
+  const limit = cap || 32;
+  if (map.size > limit) {
+    const drop = Math.max(1, Math.ceil(limit / 4));
+    const it = map.keys();
+    for (let i = 0; i < drop; i++) {
+      const k = it.next().value;
+      if (k) map.delete(k);
+    }
+  }
+}
+
+/**
+ * 豆瓣热播原始数据（12 小时内存缓存 → KV → 上游）。
+ * 只缓存"能用的数据"，一次拉取失败不会把空白锁 12 小时。
+ */
 async function getDoubanRaw(env, ctx, force) {
-  return cachedJSON(
+  const memKey = CK.douban;
+  if (!force) {
+    const hit = memCacheGet(__hotListMem, memKey);
+    if (hit !== undefined) return hit;
+  }
+  const data = await cachedJSON(
     env,
     ctx,
-    CK.douban,
+    memKey,
     async () => {
       try {
         const r = await fetchT(DOUBAN_API, {}, 10000);
@@ -3463,6 +4041,9 @@ async function getDoubanRaw(env, ctx, force) {
       revalidate: !!force,
     },
   );
+  // 只缓存能用的数据，别把一次失败锁死 12 小时
+  if (isUsableBoardPayload(data)) memCacheSet(__hotListMem, memKey, data, 8);
+  return data;
 }
 
 function isHkTw(region) {
@@ -3470,6 +4051,9 @@ function isHkTw(region) {
   return region.indexOf("香港") >= 0 || region.indexOf("台湾") >= 0;
 }
 
+/**
+ * 豆瓣条目 → 卡片结构。豆瓣给的是 TMDB 的 tmdbId + 中文简介。
+ */
 function mapDoubanItem(x) {
   if (!x || !x.tmdbId) return null;
   return {
@@ -3487,6 +4071,10 @@ function mapDoubanItem(x) {
   };
 }
 
+/**
+ * 把豆瓣 JSON 里所有层级的列表摊平收集起来（上游结构不固定，
+ * 有时分组、有时直接数组）。
+ */
 function collectDoubanLists(data, keys) {
   const out = [];
   if (!data) return out;
@@ -3497,6 +4085,10 @@ function collectDoubanLists(data, keys) {
   return out;
 }
 
+/**
+ * 按地区/类型从原始数据里挑一组：国产、港台、日韩、欧美。
+ * filter 还可以再按"全部 / 剧集 / 电影"细分。
+ */
 function pickDoubanSection(data, section, filter) {
   if (!data) return [];
 
@@ -3555,6 +4147,9 @@ function pickDoubanSection(data, section, filter) {
   return out;
 }
 
+/**
+ * 把豆瓣条目渲染成网格卡片。
+ */
 function renderDoubanItems(items) {
   if (!Array.isArray(items) || !items.length) return "";
   return items
@@ -3576,6 +4171,11 @@ function renderDoubanItems(items) {
     .join("");
 }
 
+/* ==================================================================
+ * 榜单：豆瓣热播
+ * 按地区分组的热播剧列表
+ * ================================================================== */
+
 async function handleDoubanList(request, env, ctx) {
   const url = new URL(request.url);
   const section = url.searchParams.get("section") || "domestic";
@@ -3589,16 +4189,24 @@ async function handleDoubanList(request, env, ctx) {
 
   const outHeaders = {
     "Content-Type": CT_HTML,
-    "Cache-Control": CC_API,
+    "Cache-Control": CC_NO_STORE,
   };
   return listResp(html, mode, outHeaders);
 }
 
+/**
+ * 平台剧场原始数据（各平台正在播的内容），12 小时内存缓存 → KV。
+ */
 async function getTheaterRaw(env, ctx, force) {
-  return cachedJSON(
+  const memKey = CK.theater;
+  if (!force) {
+    const hit = memCacheGet(__hotListMem, memKey);
+    if (hit !== undefined) return hit;
+  }
+  const data = await cachedJSON(
     env,
     ctx,
-    CK.theater,
+    memKey,
     async () => {
       try {
         const r = await fetchT(THEATER_API, {}, 10000);
@@ -3617,6 +4225,9 @@ async function getTheaterRaw(env, ctx, force) {
       revalidate: !!force,
     },
   );
+  // 只缓存能用的数据，别把一次失败锁死 12 小时
+  if (isUsableBoardPayload(data)) memCacheSet(__hotListMem, memKey, data, 8);
+  return data;
 }
 
 function collectTheaterItems(data) {
@@ -3631,6 +4242,10 @@ function collectTheaterItems(data) {
   return out;
 }
 
+/**
+ * 递归遍历平台剧场的 JSON 树，把叶子节点里的条目收集出来。
+ * 上游结构是"平台 → 分类 → 列表"多层嵌套，且层数不固定。
+ */
 function walkNode(node, platform, out) {
   if (!node) return;
   if (Array.isArray(node)) {
@@ -3648,6 +4263,9 @@ function walkNode(node, platform, out) {
   }
 }
 
+/**
+ * 平台名归一化：上游可能写"爱奇艺"/"iQIYI"/"爱奇艺视频"，统一成一个 id。
+ */
 function normalizeTheaterPlatformName(name) {
   if (!name) return "";
   const s = String(name).trim();
@@ -3655,6 +4273,9 @@ function normalizeTheaterPlatformName(name) {
   return s;
 }
 
+/**
+ * 判断某个条目的所属平台，用于分组展示。
+ */
 function theaterPlatformOf(x) {
   if (!x) return "";
   if (x.__platform) return normalizeTheaterPlatformName(x.__platform);
@@ -3680,6 +4301,9 @@ function theaterPlatformOf(x) {
   return "";
 }
 
+/**
+ * 列出当前数据里出现过的平台，供前端生成筛选 tab。
+ */
 function getTheaterPlatforms(data) {
   const list = collectTheaterItems(data);
   const seen = new Set(),
@@ -3698,6 +4322,9 @@ function getTheaterPlatforms(data) {
   return out;
 }
 
+/**
+ * 取某个平台（或全部）的条目列表。
+ */
 function pickTheaterSection(data, platform) {
   const list = collectTheaterItems(data);
   const filtered =
@@ -3738,6 +4365,9 @@ function pickTheaterSection(data, platform) {
   return out;
 }
 
+/**
+ * 渲染平台剧场的卡片网格。
+ */
 function renderTheaterItems(items) {
   if (!Array.isArray(items) || !items.length) return "";
   return items
@@ -3759,6 +4389,10 @@ function renderTheaterItems(items) {
     .join("");
 }
 
+/**
+ * 榜单列表的统一响应：grid（网格）和 hscroll（横向滑动）两种形态，
+ * 前端按 mode 决定怎么塞进页面。
+ */
 function listResp(html, mode, headers) {
   if (mode !== "hscroll") return new Response(html, { headers });
   if (!html)
@@ -3771,6 +4405,11 @@ function listResp(html, mode, headers) {
   return new Response(`<div class="h-scroll">${html}</div>`, { headers });
 }
 
+/* ==================================================================
+ * 榜单：平台剧场
+ * 各平台在播内容聚合
+ * ================================================================== */
+
 async function handleTheaterList(request, env, ctx) {
   const url = new URL(request.url);
   const mode = url.searchParams.get("mode") || "grid";
@@ -3780,7 +4419,7 @@ async function handleTheaterList(request, env, ctx) {
   const data = await getTheaterRaw(env, ctx, force);
   const outHeaders = {
     "Content-Type": CT_HTML,
-    "Cache-Control": CC_API,
+    "Cache-Control": CC_NO_STORE,
   };
 
   if (mode === "debug") {
@@ -3815,7 +4454,7 @@ async function handleTheaterList(request, env, ctx) {
       {
         headers: {
           "Content-Type": CT_JSON,
-          "Cache-Control": CC_API,
+          "Cache-Control": CC_NO_STORE,
         },
       },
     );
@@ -3839,7 +4478,7 @@ async function handleTheaterList(request, env, ctx) {
     return new Response(JSON.stringify({ previews }), {
       headers: {
         "Content-Type": CT_JSON,
-        "Cache-Control": CC_API,
+        "Cache-Control": CC_NO_STORE,
       },
     });
   }
@@ -3848,11 +4487,19 @@ async function handleTheaterList(request, env, ctx) {
   return listResp(html, mode, outHeaders);
 }
 
+/**
+ * 骨朵热度榜原始数据（剧集/电影/动漫/综艺），12 小时内存缓存 → KV。
+ */
 async function getGuduoRaw(env, ctx, force) {
-  return cachedJSON(
+  const memKey = CK.guduo;
+  if (!force) {
+    const hit = memCacheGet(__hotListMem, memKey);
+    if (hit !== undefined) return hit;
+  }
+  const data = await cachedJSON(
     env,
     ctx,
-    CK.guduo,
+    memKey,
     async () => {
       try {
         const r = await fetchT(GUDUO_API, {}, 10000);
@@ -3873,10 +4520,16 @@ async function getGuduoRaw(env, ctx, force) {
       revalidate: !!force,
     },
   );
+  // 只缓存能用的数据，别把一次失败锁死 12 小时
+  if (isUsableBoardPayload(data)) memCacheSet(__hotListMem, memKey, data, 8);
+  return data;
 }
 
 const GUDUO_CATEGORIES = ["剧集", "电影", "动漫", "综艺"];
 
+/**
+ * 骨朵条目 → 卡片结构。骨朵额外带"热度值"和"排名"。
+ */
 function mapGuduoItem(x) {
   if (!x || !x.tmdbId) return null;
   const isMovie =
@@ -3899,6 +4552,9 @@ function mapGuduoItem(x) {
   };
 }
 
+/**
+ * 按分类挑一组骨朵榜单数据。
+ */
 function pickGuduoSection(data, category) {
   if (!data || typeof data !== "object") return [];
   const cats = data.categories || data;
@@ -3934,6 +4590,9 @@ function pickGuduoSection(data, category) {
   return out;
 }
 
+/**
+ * 渲染骨朵榜单卡片，带排名角标。
+ */
 function renderGuduoItems(items) {
   if (!Array.isArray(items) || !items.length) return "";
   return items
@@ -3959,6 +4618,11 @@ function renderGuduoItems(items) {
     .join("");
 }
 
+/* ==================================================================
+ * 榜单：骨朵热榜
+ * 剧集/电影/动漫/综艺四类热度榜
+ * ================================================================== */
+
 async function handleGuduoList(request, env, ctx) {
   const url = new URL(request.url);
   const mode = url.searchParams.get("mode") || "grid";
@@ -3968,7 +4632,7 @@ async function handleGuduoList(request, env, ctx) {
   const data = await getGuduoRaw(env, ctx, force);
   const outHeaders = {
     "Content-Type": CT_HTML,
-    "Cache-Control": CC_API,
+    "Cache-Control": CC_NO_STORE,
   };
 
   if (mode === "debug") {
@@ -4000,7 +4664,7 @@ async function handleGuduoList(request, env, ctx) {
     return new Response(JSON.stringify({ categories: list }), {
       headers: {
         "Content-Type": CT_JSON,
-        "Cache-Control": CC_API,
+        "Cache-Control": CC_NO_STORE,
       },
     });
   }
@@ -4118,6 +4782,10 @@ function renderPlatformItems(items) {
     .join("");
 }
 
+/**
+ * 抓某个流媒体平台的"发现页"内容，按电影/剧集和分页取。
+ * 结果是平台官方页面里解析出来的，所以要处理各种缺字段的情况。
+ */
 async function fetchPlatformDiscover(plat, media, page, env) {
   if (!env.TMDB_API_KEY || !plat) return { items: [], totalPages: 1 };
 
@@ -4231,19 +4899,18 @@ async function fetchPlatformDiscover(plat, media, page, env) {
   return { items: out, totalPages: Math.min(5, maxPages) };
 }
 
+/**
+ * 首页"流媒体平台"每张卡片后面那 5 张海报。
+ * 按平台并发抓一次首页内容，缓存一天。
+ */
 async function loadPlatformPreviews(env, ctx, force) {
   const cacheKey = CK.platformPreviews;
 
   if (!force) {
-    const mem = kvMemGet(cacheKey);
-    if (mem && mem.items && typeof mem.items === "object") return mem.items;
-    const raw = await kvGetJSON(env, cacheKey, false, 900, 600);
+    const raw = await kvGetJSON(env, cacheKey, false);
     if (raw && raw !== KV_MISS && raw !== KV_ERR) {
       const v = raw.data !== undefined ? raw.data : raw;
-      if (v && v.items && typeof v.items === "object") {
-        kvMemSet(cacheKey, v, KV_MEM_TTL);
-        return v.items;
-      }
+      if (v && v.items && typeof v.items === "object") return v.items;
     }
   }
 
@@ -4266,10 +4933,15 @@ async function loadPlatformPreviews(env, ctx, force) {
   await Promise.all([worker(), worker(), worker(), worker(), worker()]);
 
   const payload = { items };
-  kvMemSet(cacheKey, payload, KV_MEM_TTL);
+  kvRemember(cacheKey, payload);
   kvPutJSON(env, ctx, cacheKey, payload, PLATFORM_KV_TTL, false, !!force);
   return items;
 }
+
+/* ==================================================================
+ * 榜单：流媒体平台
+ * 平台发现页内容的抓取与缓存
+ * ================================================================== */
 
 async function handlePlatformList(request, env, ctx) {
   const url = new URL(request.url);
@@ -4285,11 +4957,11 @@ async function handlePlatformList(request, env, ctx) {
 
   const outHeadersHtml = {
     "Content-Type": CT_HTML,
-    "Cache-Control": CC_API,
+    "Cache-Control": CC_NO_STORE,
   };
   const outHeadersJson = {
     "Content-Type": CT_JSON,
-    "Cache-Control": CC_API,
+    "Cache-Control": CC_NO_STORE,
   };
 
   if (mode === "previews") {
@@ -4343,7 +5015,6 @@ async function handlePlatformList(request, env, ctx) {
       missTtl: 600,
       swr: force ? false : 57600,
       jitter: 300,
-      edgeTtl: 900,
       bypass: !!force,
       revalidate: !!force,
     },
@@ -4381,6 +5052,9 @@ async function handlePlatformList(request, env, ctx) {
   );
 }
 
+/**
+ * 构造 Trakt 同步接口（标记已看/追剧）需要的请求体。
+ */
 function traktSyncPayload(kind, id) {
   const entry = { ids: { trakt: id } };
   if (kind === "movie") return { movies: [entry] };
@@ -4390,6 +5064,10 @@ function traktSyncPayload(kind, id) {
   return null;
 }
 
+/**
+ * TMDB id → Trakt id。详情页只有 TMDB id 时用它换出 Trakt id，
+ * 结果缓存在 tsp: 前缀下。
+ */
 async function resolveTraktIdFromTmdb(tmdbId, type, headers, userKey) {
   if (!tmdbId) return null;
   const id = String(tmdbId).trim();
@@ -4432,6 +5110,11 @@ async function resolveTraktIdFromTmdb(tmdbId, type, headers, userKey) {
 
   return await tryOnce(null);
 }
+
+/* ==================================================================
+ * 外部评分与预告
+ * OMDb 评分、TMDB 预告片
+ * ================================================================== */
 
 async function fetchOmdbRatings(imdbId, env, ctx) {
   if (!imdbId || !env.OMDB_API_KEY) return null;
@@ -4480,6 +5163,9 @@ async function fetchOmdbRatings(imdbId, env, ctx) {
   );
 }
 
+/**
+ * 取预告片：优先中文可播放的，没有再退回英文。
+ */
 async function fetchTmdbVideos(type, id, env, ctx) {
   if (!env.TMDB_API_KEY) return null;
 
@@ -4513,12 +5199,14 @@ async function fetchTmdbVideos(type, id, env, ctx) {
       ttl: TMDB_KV_TTL,
       missTtl: MISS_KV_TTL,
       swr: 3600,
-      edgeTtl: 900,
       jitter: 200,
     },
   );
 }
 
+/**
+ * 评分对应的颜色（红→黄→绿），前端用它给分数上色。
+ */
 function mcColor(n) {
   if (n >= 61) return "#66cc33";
   if (n >= 40) return "#ffcc33";
@@ -4534,6 +5222,9 @@ const RATING_LOGOS = {
   douban: `<svg class="ext-logo" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="#2D963D" d="M.51 3.06h22.98V.755H.51V3.06Zm20.976 2.537v9.608h-2.137l-1.669 5.76H24v2.28H0v-2.28h6.32l-1.67-5.76H2.515V5.597h18.972Zm-5.066 9.608H7.58l1.67 5.76h5.501l1.67-5.76ZM18.367 7.9H5.634v5.025h12.733V7.9Z"/></svg>`,
 };
 
+/**
+ * 渲染外部评分块（豆瓣 / IMDb / TMDB 三列）。
+ */
 function renderExtRatings(r, opts = {}) {
   const out = [];
 
@@ -4570,6 +5261,9 @@ function renderExtRatings(r, opts = {}) {
   return out.join("");
 }
 
+/**
+ * 拉待看列表原始数据。列表 key 带版本号，版本一变整批失效。
+ */
 async function fetchWatchlistRaw(headers, sort, userKey, debug) {
   const qs = `extended=full&images=poster`;
   const [movies, shows, seasons, episodes] = await Promise.all([
@@ -4638,6 +5332,9 @@ async function fetchWatchlistRaw(headers, sort, userKey, debug) {
   return merged;
 }
 
+/**
+ * 待看列表（带排序、分页、兜底）。
+ */
 async function getWatchlist(
   headers,
   sort = "added",
@@ -4662,7 +5359,6 @@ async function getWatchlist(
       ttl: WATCHLIST_KV_TTL,
       missTtl: 180,
       swr: force ? true : false,
-      edgeTtl: 3600,
       jitter: 300,
       bypass: !!force,
       revalidate: !!force,
@@ -4677,10 +5373,7 @@ async function getWatchlist(
   if (env.TMDB_CACHE && !kvIsDown()) {
     try {
       const lgKey = CK.lastGood.watchlist(prefix, sort);
-      const raw = await env.TMDB_CACHE.get(lgKey, {
-        type: "json",
-        cacheTtl: KV_EDGE_TTL,
-      });
+      const raw = await env.TMDB_CACHE.get(lgKey, kvReadOpts());
       kvMarkUp();
       if (raw != null) {
         const v =
@@ -4702,6 +5395,9 @@ async function getWatchlist(
   return null;
 }
 
+/**
+ * 待看里所有条目的 TMDB id 集合，用于在详情页显示"已在待看"。
+ */
 async function getWatchlistTmdbIds(headers, env, ctx, userKey, type) {
   const merged = await getWatchlist(headers, "added", env, ctx, userKey);
   if (!Array.isArray(merged)) return [];
@@ -4716,6 +5412,14 @@ async function getWatchlistTmdbIds(headers, env, ctx, userKey, type) {
   return ids;
 }
 
+/* ==================================================================
+ * 搜索与趋势
+ * Trakt 搜索、TMDB 趋势、追剧增删
+ * ================================================================== */
+
+/**
+ * GET /api/search —— 搜索。先查 Trakt，命中不足时补 TMDB 的结果。
+ */
 async function handleSearch(request, env, ctx) {
   const url = new URL(request.url),
     q = (url.searchParams.get("q") || "").trim(),
@@ -4770,6 +5474,9 @@ async function handleSearch(request, env, ctx) {
   return jsonResp({ items: merged.slice(0, 30) }, outHeaders);
 }
 
+/**
+ * GET /api/trending —— TMDB 当日趋势榜，纯公共数据。
+ */
 async function handleTrending(request, env, ctx) {
   const A = await authed(request, env, ctx);
   if (!A.ok) return A.response;
@@ -4790,7 +5497,6 @@ async function handleTrending(request, env, ctx) {
       ttl: TREND_KV_TTL,
       missTtl: 600,
       swr: 3600,
-      edgeTtl: 3600,
       jitter: 600,
     },
   );
@@ -4805,11 +5511,15 @@ async function handleTrending(request, env, ctx) {
   return new Response(JSON.stringify({ items }), {
     headers: {
       "Content-Type": CT_JSON,
-      "Cache-Control": "public, max-age=3600",
+      "Cache-Control": CC_NO_STORE,
     },
   });
 }
 
+/**
+ * POST /api/watchlist/add —— 加入待看。
+ * 成功后把待看版本号 +1，让所有 wl: 缓存一次性失效。
+ */
 async function handleWatchlistAdd(request, env, ctx) {
   const A = await authed(request, env, ctx);
   if (!A.ok) return A.response;
@@ -4873,11 +5583,14 @@ async function handleWatchlistAdd(request, env, ctx) {
     );
   }
 
-  invalidateWatchlistCache(env, ctx, userKey);
+  await invalidateWatchlistCache(env, ctx, userKey);
   const result = await r.json().catch(() => null);
   return authJson(auth, needsCookieUpdate, { ok: true, traktId, result });
 }
 
+/**
+ * POST /api/watchlist/remove —— 移出待看，失效逻辑同上。
+ */
 async function handleWatchlistRemove(request, env, ctx) {
   return traktSyncAction(request, env, ctx, {
     allowedTypes: ["movie", "show", "season", "episode"],
@@ -4885,10 +5598,15 @@ async function handleWatchlistRemove(request, env, ctx) {
     buildPayload: (type, id) => traktSyncPayload(type, id),
     afterOk: async (auth, headers, env, ctx) => {
       const userKey = await getStableUserId(auth, headers, env, ctx);
-      invalidateWatchlistCache(env, ctx, userKey);
+      await invalidateWatchlistCache(env, ctx, userKey);
     },
   });
 }
+
+/* ==================================================================
+ * 写操作：标记与隐藏
+ * 标记已看、取消、整季标记、隐藏继续观看、丢弃剧集
+ * ================================================================== */
 
 async function handleMarkWatched(request, env, ctx) {
   return traktSyncAction(request, env, ctx, {
@@ -4897,6 +5615,8 @@ async function handleMarkWatched(request, env, ctx) {
     buildPayload: (type, id) => traktSyncPayload(type, id),
     afterOk: async (auth, headers, env, ctx, body) => {
       const userKey = await getStableUserId(auth, headers, env, ctx);
+      // DELETE 必须早于缓存失效，否则"标记已看 → 立刻刷新"会读到还没删掉的暂停记录。
+      // 这里只把串行间隔降下来（写通道 300ms），不再整体塞进 waitUntil 换速度。
       try {
         const type = body && body.type;
         const id = body && (body.id != null ? body.id : body.traktId);
@@ -4913,31 +5633,11 @@ async function handleMarkWatched(request, env, ctx) {
         }
       } catch {}
 
-      const today = new Date(Date.now() + 8 * 3600 * 1000)
-        .toISOString()
-        .slice(0, 10);
-      const keysToBust = [
-        CK.playback(userKey),
-        CK.watchedEpisodes(userKey),
-        CK.calendar(userKey, today),
-        CK.stats(userKey),
-        CK.history(userKey, 1),
-      ];
-
-      for (const k of keysToBust) {
-        __kvMem.delete(k);
-        __kvMemExp.delete(k);
-        __kvMemStale.delete(k);
-        __kvLastPut.delete(k);
-      }
-
-      safeDeleteKvKeys(
-        env,
-        ctx,
-        keysToBust.concat([userStateCacheKey(userKey)]),
-      );
-
-      bustHomeUserCaches(userKey, env, ctx);
+      // 统一交给 bustHomeUserCaches 处理（4 个 key）。
+      // cal / sync 不再单独删：cal 靠 8 小时 TTL；sync 不删也不会读到旧数据，
+      // 因为 pb 那个 key 已经删了，下次读必然 miss 去重拉。
+      // await：等 KV 失效真正落地再回响应，另一台设备紧接着刷新才读得到新状态
+      await bustHomeUserCaches(userKey, env, ctx);
     },
   });
 }
@@ -4949,11 +5649,16 @@ async function handleUnmarkWatched(request, env, ctx) {
     buildPayload: (type, id) => traktSyncPayload(type, id),
     afterOk: async (auth, headers, env, ctx) => {
       const userKey = await getStableUserId(auth, headers, env, ctx);
-      bustHomeUserCaches(userKey, env, ctx);
+      await bustHomeUserCaches(userKey, env, ctx);
     },
   });
 }
 
+/**
+ * POST /api/mark-season-watched —— 整季标记已看。
+ * 先查这一季有哪些已播出的集，再一次性提交给 Trakt；
+ * 同时删掉该季的集列表缓存，让详情页立刻显示新状态。
+ */
 async function handleMarkSeasonWatched(request, env, ctx) {
   const A = await authed(request, env, ctx);
   if (!A.ok) return A.response;
@@ -4982,7 +5687,7 @@ async function handleMarkSeasonWatched(request, env, ctx) {
       );
       return r && !r.__error ? r : null;
     },
-    { ttl: SEASON_KV_TTL, missTtl: 60, swr: 3600, edgeTtl: 1800, jitter: 300 },
+    { ttl: seasonTtl, missTtl: 60, swr: 3600, jitter: 300 },
   );
 
   if (!seasonData || !Array.isArray(seasonData.episodes)) {
@@ -4999,7 +5704,7 @@ async function handleMarkSeasonWatched(request, env, ctx) {
           ctx,
           CK.season(showId, season),
           { data: r, _ts: Date.now() },
-          SEASON_KV_TTL,
+          seasonTtl(r),
           false,
           false,
         );
@@ -5023,7 +5728,7 @@ async function handleMarkSeasonWatched(request, env, ctx) {
             ctx,
             CK.season(showId, season),
             { data: found },
-            SEASON_KV_TTL,
+            seasonTtl(found),
             false,
           );
         }
@@ -5109,15 +5814,13 @@ async function handleMarkSeasonWatched(request, env, ctx) {
   }
 
   const result = await r.json().catch(() => null);
-  bustHomeUserCaches(userKey, env, ctx);
+  await bustHomeUserCaches(userKey, env, ctx);
 
   const seasonKey = CK.season(showId, season);
-  __kvMem.delete(seasonKey);
-  __kvMemExp.delete(seasonKey);
   if (env && env.TMDB_CACHE) {
     const p = env.TMDB_CACHE.delete(seasonKey).catch(() => {});
     if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
-    else p.catch(() => {});
+    await p;
   }
 
   return authJson(auth, needsCookieUpdate, {
@@ -5127,6 +5830,12 @@ async function handleMarkSeasonWatched(request, env, ctx) {
   });
 }
 
+/**
+ * POST /api/hide-continue —— 从继续观看里移除一部剧。
+ *
+ * 做三件事：删掉 Trakt 上的播放进度、把该剧记进隐藏表（cwh:）、
+ * 作废首页播放缓存。隐藏表记了集号——用户之后看了更新的集，它会重新出现。
+ */
 async function handleHideContinue(request, env, ctx) {
   const A = await authed(request, env, ctx);
   if (!A.ok) return A.response;
@@ -5175,28 +5884,16 @@ async function handleHideContinue(request, env, ctx) {
   if (!map || typeof map !== "object") map = {};
   const hideAt = Date.now();
   map[String(showId)] = { s, e, at: hideAt };
-  kvMemSet(CK.cwHide(userKey), { data: map, _ts: hideAt }, 86400 * 30 * 1000);
-  putCwHideMap(env, ctx, userKey, map);
+  kvRemember(CK.cwHide(userKey), { data: map, _ts: hideAt });
+  // 等隐藏表写进 KV 再回响应，另一台设备紧接着打开首页就能看到隐藏已生效
+  await putCwHideMap(env, ctx, userKey, map);
   bustUserStateBundle(userKey, env, ctx);
 
   if (userKey) {
-    for (const k of [...__kvMem.keys()]) {
-      if (
-        k === CK.playback(userKey) ||
-        k.startsWith(`pb:${userKey}`) ||
-        k.startsWith(`more:pb:${userKey}`) ||
-        k.startsWith(`spb:${userKey}`)
-      ) {
-        __kvMem.delete(k);
-        __kvMemExp.delete(k);
-      }
-    }
-    safeDeleteKvKeys(env, ctx, [
-      CK.playback(userKey),
-      CK.morePlayback(userKey, 1, 20),
-      CK.morePlayback(userKey, 1, 30),
-      userStateCacheKey(userKey),
-    ]);
+    // 只删 playback：more:pb 的两个 key 是 300s TTL，翻"更多"才会用到，
+    // 单独删它们等于每次隐藏多付两次删除额度。
+    await safeDeleteKvKeys(env, ctx, [CK.playback(userKey)]);
+    bustUserStateBundle(userKey, env, ctx);
   }
 
   return authJson(auth, needsCookieUpdate, {
@@ -5208,6 +5905,10 @@ async function handleHideContinue(request, env, ctx) {
   });
 }
 
+/**
+ * POST /api/drop-show —— 丢弃一部剧。
+ * 除了告诉 Trakt，还要在本地维护一份 drop 列表（供没同步时过滤用）。
+ */
 async function handleDropShow(request, env, ctx) {
   const A = await authed(request, env, ctx);
   if (!A.ok) return A.response;
@@ -5264,53 +5965,54 @@ async function handleDropShow(request, env, ctx) {
     );
   } catch {}
 
-  const today = new Date(Date.now() + 8 * 3600 * 1000)
-    .toISOString()
-    .slice(0, 10);
-
   if (userKey) {
     const dropKey = `dropped:${userKey}`;
-    const calKey = CK.calendar(userKey, today);
     let nextIds = [showId];
     try {
-      const prev = kvMemGet(dropKey);
+      // prev 从 KV 取：内存副本已经不参与读取了，这里再读内存只会拿到空值，
+      // 增量列表就变成"只有刚 drop 的这一部"，其余已 drop 的剧会重新冒出来。
+      const prevRaw =
+        env && env.TMDB_CACHE && !kvIsDown()
+          ? await env.TMDB_CACHE.get(dropKey, { type: "json" })
+          : null;
       const prevData =
-        prev && prev !== KV_MISS && prev.data !== undefined ? prev.data : prev;
+        prevRaw && prevRaw.data !== undefined ? prevRaw.data : prevRaw;
       if (prevData && Array.isArray(prevData.ids)) {
         nextIds = [...new Set(prevData.ids.map(Number).concat(showId))];
       }
     } catch {}
 
-    for (const k of [...__kvMem.keys()]) {
-      if (
-        k === calKey ||
-        k.startsWith(`cal:${userKey}:`) ||
-        k.startsWith(`pb:${userKey}`) ||
-        k.startsWith(`act:${userKey}`)
-      ) {
-        __kvMem.delete(k);
-        __kvMemExp.delete(k);
-      }
-    }
-
     __droppedShowIdsMem.set(dropKey, { ids: nextIds, ts: Date.now() });
+    // 增量列表必须落 KV：内存副本不再参与读取，不写 KV 的话
+    // getDroppedShowIds 在 TTL 内还会读到"没 drop 过这部剧"的旧快照。
+    await kvPutJSON(
+      env,
+      ctx,
+      dropKey,
+      { data: { ids: nextIds }, _ts: Date.now() },
+      1800,
+      false,
+      true,
+    );
 
     if (env && env.TMDB_CACHE) {
-      safeDeleteKvKeys(env, ctx, [
-        calKey,
-        CK.playback(userKey),
-        `act:${userKey}`,
-        userStateCacheKey(userKey),
-      ]);
+      // 只删 playback：cal 靠 8 小时 TTL，act 不用删（pb 没了必然重拉）
+      await safeDeleteKvKeys(env, ctx, [CK.playback(userKey)]);
+      bustUserStateBundle(userKey, env, ctx);
     }
   }
 
-  bustHomeUserCaches(userKey, env, ctx);
+  await bustHomeUserCaches(userKey, env, ctx);
 
   const added =
     result && result.added && result.added.shows ? result.added.shows : 0;
   return authJson(auth, needsCookieUpdate, { ok: true, added, result, showId });
 }
+
+/* ==================================================================
+ * 播出日历与观看小结
+ * 单剧播出日历、月度/年度统计
+ * ================================================================== */
 
 async function handleShowCalendar(request, env, ctx) {
   const url = new URL(request.url),
@@ -5390,12 +6092,17 @@ async function handleShowCalendar(request, env, ctx) {
     needsCookieUpdate,
     JSON.stringify({ episodes, title: zhShowTitle }),
     {
-      extra: { "Cache-Control": "public, max-age=600" },
+      extra: { "Cache-Control": CC_NO_STORE },
       contentType: "application/json; charset=utf-8",
     },
   );
 }
 
+/**
+ * GET /api/summary —— 观看小结。
+ * 先查 12 小时内存缓存（同一台设备连开面板不重复算），
+ * 再走 KV / 实时聚合；出错的响应不写缓存。
+ */
 async function handleSummary(request, env, ctx) {
   const A = await authed(request, env, ctx, { strict: true });
   if (!A.ok) return A.response;
@@ -5413,6 +6120,14 @@ async function handleSummary(request, env, ctx) {
   }
 
   const cacheKey = `sum2:${userKey}:${period}:${ref}`;
+  const force = url.searchParams.get("force") === "1";
+
+  // 观看小结是按月/年聚合的累计数字，12 小时内不会变，
+  // 放内存里连 KV 都不用读。force=1 可以强制重算。
+  if (!force) {
+    const hit = memCacheGet(__summaryMem, cacheKey);
+    if (hit !== undefined) return authJson(auth, needsCookieUpdate, hit);
+  }
 
   const data = await cachedJSON(
     env,
@@ -5426,6 +6141,7 @@ async function handleSummary(request, env, ctx) {
       unwrap: true,
       jitter: 600,
       lastGoodKey: "lg:" + cacheKey,
+      ...(force ? { bypass: true, revalidate: true } : {}),
     },
   );
 
@@ -5434,9 +6150,14 @@ async function handleSummary(request, env, ctx) {
       error: (data && data.__error) || "empty",
     });
   }
+  memCacheSet(__summaryMem, cacheKey, data, 240);
   return authJson(auth, needsCookieUpdate, data);
 }
 
+/**
+ * 算出小结统计的时间范围。按月（YYYY-MM）或按年（YYYY），
+ * 边界按北京时间对齐。
+ */
 function summaryRange(period, ref) {
   if (period === "year") {
     const y = ref;
@@ -5456,6 +6177,10 @@ function summaryRange(period, ref) {
   };
 }
 
+/**
+ * 拉某个时间段内的观看记录，用于小结统计。
+ * 按 Trakt 的分页协议翻页，直到超出范围或达到上限。
+ */
 async function fetchHistoryRange(headers, start, end, userKey) {
   const out = [];
   const limit = 100;
@@ -5491,6 +6216,11 @@ async function fetchHistoryRange(headers, start, end, userKey) {
   return out;
 }
 
+/**
+ * 观看小结的计算核心：拉指定时间段的观看记录，聚合成
+ * 电影/剧集/集数/小时四个数字、观看热力、最忙一天、电影与剧集 TOP。
+ * 数据量过大时只统计前 N 条并打 truncated 标记。
+ */
 async function buildSummary(headers, period, ref, env, ctx, userKey) {
   const { start, end, label } = summaryRange(period, ref);
   const items = await fetchHistoryRange(headers, start, end, userKey);
@@ -5696,6 +6426,10 @@ async function buildSummary(headers, period, ref, env, ctx, userKey) {
   };
 }
 
+/**
+ * GET / —— 首页。返回骨架 HTML（先渲染出人名/头像），
+ * 具体数据由前端再请求 /api/home 填充。
+ */
 async function handleHome(request, env, ctx) {
   const url = new URL(request.url);
   let initialDetail = url.searchParams.get("d");
@@ -5711,6 +6445,9 @@ async function handleHome(request, env, ctx) {
   return streamHomeShell(initialDetail, profileHint);
 }
 
+/**
+ * 给启动页加 preconnect 提示，提前把 DNS/TLS 握好手。
+ */
 function launchLinkHeader(request) {
   const parts = [
     "<https://api.trakt.tv>; rel=preconnect; crossorigin",
@@ -5726,6 +6463,9 @@ function launchLinkHeader(request) {
   return parts.join(", ");
 }
 
+/**
+ * /launch —— 启动画面（PWA 冷启动时先看到它）。
+ */
 function handleLaunch(request) {
   return new Response(renderLaunchPage(request), {
     headers: {
@@ -5738,12 +6478,18 @@ function handleLaunch(request) {
   });
 }
 
+/**
+ * /auth/login —— 发起 OAuth：生成 state + PKCE，跳转 Trakt 授权页。
+ */
 function handleLogin(request) {
   const url = new URL(request.url);
   if (readAuth(request)) return Response.redirect(new URL("/home", url), 302);
   return html(renderLoginPage());
 }
 
+/**
+ * /auth/status —— 前端轮询"授权完成了没"。
+ */
 function handleAuthStatus(request) {
   const authed = !!readAuth(request);
   return new Response(JSON.stringify({ loggedIn: authed }), {
@@ -5754,6 +6500,11 @@ function handleAuthStatus(request) {
     },
   });
 }
+
+/* ==================================================================
+ * 页面外壳与启动页
+ * 首页骨架的流式输出、启动图、登录页
+ * ================================================================== */
 
 function streamHomeShell(initialDetail, profileHint) {
   const cfg = {
@@ -5805,17 +6556,13 @@ function streamHomeShell(initialDetail, profileHint) {
   });
 }
 
-const __actSigMemCache = new Map();
-const ACT_SIG_MEM_TTL = 180000;
+/* ==================================================================
+ * 用户状态聚合
+ * 活动签名、drop 列表、已看集、隐藏表、状态 bundle
+ * ================================================================== */
 
 async function getUserActivitySig(headers, env, ctx, userKey, force = false) {
   if (!userKey || userKey === "anon") return null;
-
-  const now = Date.now();
-  if (!force) {
-    const mem = __actSigMemCache.get(userKey);
-    if (mem && now - mem.ts < ACT_SIG_MEM_TTL) return mem.val;
-  }
 
   const result = await cachedJSON(
     env,
@@ -5861,50 +6608,40 @@ async function getUserActivitySig(headers, env, ctx, userKey, force = false) {
     },
   );
 
-  if (result && result.sig) {
-    __actSigMemCache.set(userKey, { val: result, ts: now });
-    if (__actSigMemCache.size > 500) {
-      const it = __actSigMemCache.keys();
-      for (let i = 0; i < 100; i++) {
-        const k = it.next().value;
-        if (k) __actSigMemCache.delete(k);
-      }
-    }
-  }
   return result;
 }
 
+/**
+ * 判断"活动签名"和上次记录的是否不同，即别的设备是不是刚看过什么。
+ */
 async function __activityDiffers(headers, env, ctx, userKey) {
   if (!userKey) return false;
   try {
     const cur = await getUserActivitySig(headers, env, ctx, userKey);
     if (!cur || !cur.sig) return false;
-    let last = kvMemGet(`act:${userKey}:last`);
-    if (typeof last !== "string") last = null;
-    if (last === null && env && env.TMDB_CACHE && !kvIsDown()) {
-      try {
-        const raw = await env.TMDB_CACHE.get(`act:${userKey}:last`, {
-          type: "json",
-          cacheTtl: 600,
-        });
-        kvMarkUp();
-        if (raw && typeof raw === "object" && typeof raw.data === "string")
-          last = raw.data;
-      } catch {
-        kvMarkDown();
-      }
-    }
+    const syncState = await readSyncState(env, userKey);
+    const last =
+      syncState && typeof syncState.sig === "string" ? syncState.sig : null;
     return !!(last && last !== cur.sig);
   } catch {
     return false;
   }
 }
 
+// 最近一次成功聚合的用户状态（含 watched）。某个子请求失败时用它兜底：
+// 空集合会让 isStalePause 全部放行，"继续观看"里的卡片就会闪一下再消失。
+const __lastUserState = new Map();
+
 const __droppedShowIdsMem = new Map();
-const DROPPED_MEM_TTL = 120000;
+// 0 = 不跨请求复用，drop 列表每次都从 KV 读，保证多设备一致
+const DROPPED_MEM_TTL = 0;
 const __droppedShowIdsNegative = new Map();
 const DROPPED_NEGATIVE_TTL = 5 * 60 * 1000;
 
+/**
+ * 用户在 Trakt 上"丢弃"的剧集 id 集合。
+ * 继续观看里要排除它们；拉取失败时短暂缓存空结果，避免每次请求都重试。
+ */
 async function getDroppedShowIds(headers, env, ctx, userKey) {
   const key = `dropped:${userKey || "anon"}`;
   const now = Date.now();
@@ -5963,7 +6700,6 @@ async function getDroppedShowIds(headers, env, ctx, userKey) {
       missTtl: 120,
       swr: true,
       memOnly: false,
-      edgeTtl: 300,
       jitter: 60,
       unwrap: true,
     },
@@ -5999,15 +6735,80 @@ async function getDroppedShowIds(headers, env, ctx, userKey) {
 
 const USER_STATE_KV_TTL = 300;
 
+/**
+ * 播放同步状态：把原来的 pbc:{u}（上次成功 live 校验时间）和 act:{u}:last（活动签名基线）
+ * 合并成一个 key。两者总是一起更新（拿到 live 数据时），拆成两个 key 意味着
+ * 冷启要读 2 次、写 2 次 KV。合并后 1 读 1 写。
+ */
+/**
+ * 读取同步状态 { at, sig }：
+ *   at  —— 上次成功拉到 live 播放数据的时间（10 分钟内不再重复校验）
+ *   sig —— 当时的活动签名基线，用来判断"别的设备是不是刚看过什么"
+ * 判断逻辑在 handleHomeData 里：签名变了就强制 bypass 重拉。
+ */
+async function readSyncState(env, userKey) {
+  const key = CK.syncState(userKey);
+  if (env && env.TMDB_CACHE && !kvIsDown()) {
+    try {
+      const raw = await env.TMDB_CACHE.get(key, kvReadOpts());
+      kvMarkUp();
+      if (raw && !raw.miss) {
+        const v = raw.data !== undefined ? raw.data : raw;
+        if (v && typeof v === "object" && !Array.isArray(v)) {
+          kvRemember(key, { data: v, _ts: (raw && raw._ts) || Date.now() });
+          return v;
+        }
+      }
+    } catch {
+      kvMarkDown();
+    }
+  }
+  return null;
+}
+
+// 内存副本不再参与读取，prev 必须从 KV 取，否则 patch 会把另一个字段覆盖掉
+// （比如只更新 sig 时把 at 抹掉，判定就退化成"从没校验过"）。
+async function writeSyncState(env, ctx, userKey, patch, persist = true) {
+  // persist=false 表示这一轮没拿到 live 数据、要保持旧基线。
+  // 那就什么都不用做：原来照样读一次 KV 再合并，纯属白读
+  //（读到的结果也不会写回去，内存副本又不参与读取）。
+  if (!persist) return;
+  const key = CK.syncState(userKey);
+  let prev = {};
+  if (env && env.TMDB_CACHE && !kvIsDown()) {
+    try {
+      const raw = await env.TMDB_CACHE.get(key, kvReadOpts());
+      kvMarkUp();
+      const v = raw && raw.data !== undefined ? raw.data : raw;
+      if (v && typeof v === "object" && !Array.isArray(v)) prev = v;
+    } catch {
+      kvMarkDown();
+    }
+  }
+  const next = { ...prev, ...(patch || {}) };
+  kvRemember(key, { data: next, _ts: Date.now() });
+  kvPutJSON(env, ctx, key, { data: next }, 86400 * 7, false);
+}
+
+/**
+ * 用户状态 bundle 的 key（us: 前缀）。它只在请求级 memo 里活，
+ * 不落 KV——否则会变成一层独立缓存，watched 变了它还是旧的。
+ */
 function userStateCacheKey(userKey) {
   return `us:v1:${userKey || "anon"}`;
 }
 
+/**
+ * bundle 里的 drop 列表 → Set，方便判定。
+ */
 function droppedStateToSet(state) {
   const arr = state && Array.isArray(state.droppedIds) ? state.droppedIds : [];
   return new Set(arr.map(Number).filter(Number.isFinite));
 }
 
+/**
+ * bundle 里的已看集 → Set，并把 showLastAt / dataTs 挂成属性带出来。
+ */
 function watchedStateToSet(watched) {
   const ids =
     watched && Array.isArray(watched.ids)
@@ -6019,9 +6820,17 @@ function watchedStateToSet(watched) {
   if (watched && watched.showLastAt && typeof watched.showLastAt === "object") {
     set.__showLastAt = watched.showLastAt;
   }
+  if (watched && watched.dataTs) set.__dataTs = Number(watched.dataTs) || 0;
   return set;
 }
 
+/**
+ * 把继续观看过滤所需的三种状态一次取齐：
+ *   丢弃的剧（dropped）+ 已看集（watched）+ 手动隐藏（hideMap）
+ *
+ * 首页会调用两次（渲染前和写同步状态前），所以有请求级 memo 去重；
+ * 跨请求一律重新聚合——否则 bundle 就成了绕过下层最新数据的第三层缓存。
+ */
 async function getUserStateBundle(headers, env, ctx, userKey, force = false) {
   const key = userStateCacheKey(userKey);
 
@@ -6036,22 +6845,29 @@ async function getUserStateBundle(headers, env, ctx, userKey, force = false) {
         getCwHideMap(env, ctx, userKey).catch(() => ({})),
       ]);
 
-      let watched = { ids: [], showLastAt: {} };
+      let watched = { ids: [], showLastAt: {}, dataTs: 0 };
       if (watchedRaw instanceof Set) {
         watched = {
           ids: [...watchedRaw].map(Number),
           showLastAt: watchedRaw.__showLastAt || {},
+          dataTs: Number(watchedRaw.__dataTs) || 0,
         };
       } else if (watchedRaw && Array.isArray(watchedRaw.ids)) {
         watched = {
           ids: watchedRaw.ids.map(Number),
           showLastAt: watchedRaw.showLastAt || {},
+          dataTs: Number(watchedRaw.dataTs) || 0,
         };
       } else if (Array.isArray(watchedRaw)) {
-        watched = { ids: watchedRaw.map(Number), showLastAt: {} };
+        watched = { ids: watchedRaw.map(Number), showLastAt: {}, dataTs: 0 };
+      } else {
+        // watched 拉不到时不要凭空造一个"空的已看集"：
+        // 空集合会让 isStalePause 全部放行，列表里的卡片就会突然冒出来再消失。
+        const prev = __lastUserState.get(userKey);
+        if (prev && prev.watched) watched = prev.watched;
       }
 
-      return {
+      const bundle = {
         droppedIds: droppedSet ? [...droppedSet].map(Number) : [],
         watched,
         hideMap:
@@ -6061,17 +6877,33 @@ async function getUserStateBundle(headers, env, ctx, userKey, force = false) {
             ? hideMapRaw
             : {},
       };
+      // 只在 watched 这次真的拿到了，才记成"上一次好快照"，
+      // 供拉取失败时兜底（避免空集合让卡片闪一下）
+      if (watchedRaw) {
+        __lastUserState.set(userKey, bundle);
+        if (__lastUserState.size > 500) {
+          const it = __lastUserState.keys();
+          for (let i = 0; i < 100; i++) {
+            const k = it.next().value;
+            if (k) __lastUserState.delete(k);
+          }
+        }
+      }
+      return bundle;
     },
     {
       ttl: USER_STATE_KV_TTL,
       missTtl: 60,
       swr: true,
-      edgeTtl: 120,
       jitter: 60,
       unwrap: true,
       bypass: !!force,
       revalidate: !!force,
-      minWriteGapMs: 5 * 60 * 1000,
+      // bundle 只是 dropped + watched + hideMap 的快照。落 KV 会让它变成
+      // 一层独立缓存：watched 明明已经变了，bundle 还揣着旧快照，
+      // 两台设备就各拿一份不同的 watched。所以只在请求级 memo 里留，
+      // 每次跨请求都回下层 key 重新聚合。
+      memOnly: true,
     },
   );
 
@@ -6085,29 +6917,36 @@ async function getUserStateBundle(headers, env, ctx, userKey, force = false) {
   return data;
 }
 
+/**
+ * 作废 bundle：清兜底副本 + 作废进行中的读取。
+ * 它不落 KV，所以不需要删 KV。
+ */
 function bustUserStateBundle(userKey, env, ctx) {
   if (!userKey) return;
   const key = userStateCacheKey(userKey);
-  __kvMem.delete(key);
-  __kvMemExp.delete(key);
   __kvMemStale.delete(key);
+  dropInflight(key);
   __kvLastPut.delete(key);
-
-  safeDeleteKvKeys(env, ctx, [seasonKey, userStateCacheKey(userKey)]);
+  // bundle 现在只存在于内存（memOnly），不需要删 KV；
+  // 原来这里还有一次 safeDeleteKvKeys(..., [seasonKey, ...])，
+  // 而 seasonKey 在这个作用域里并不存在，一调用就抛 ReferenceError。
 }
 
+/**
+ * 删 KV 里的失效 key。返回 promise：写操作（标记已看 / 隐藏 / 丢弃 / 追剧增删）
+ * 需要等它落地再回响应，否则另一台设备在这个窗口里读到的还是旧数据。
+ */
 function safeDeleteKvKeys(env, ctx, keys) {
   const list = [...new Set((keys || []).filter(Boolean))];
-  if (!list.length) return;
+  if (!list.length) return Promise.resolve();
 
   for (const k of list) {
-    __kvMem.delete(k);
-    __kvMemExp.delete(k);
     __kvMemStale.delete(k);
     __kvLastPut.delete(k);
+    dropInflight(k);
   }
 
-  if (!env || !env.TMDB_CACHE) return;
+  if (!env || !env.TMDB_CACHE) return Promise.resolve();
 
   const p = Promise.allSettled(list.map((k) => env.TMDB_CACHE.delete(k)))
     .then(() => kvMarkUp())
@@ -6116,10 +6955,18 @@ function safeDeleteKvKeys(env, ctx, keys) {
     });
 
   if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
-  else p.catch(() => {});
+  return p;
 }
 
+/**
+ * 拉取"已看集"集合（we: 前缀）。
+ * 它是 isStalePause 判定的依据，也是详情页给每集打勾的数据源。
+ * 同时会记下这份数据的抓取时间，供暂停过期判定使用。
+ */
 async function getWatchedEpisodeIds(headers, env, ctx, userKey) {
+  // 记下这份"已看集"是什么时候的数据：晚于这个时刻的暂停记录，
+  // 它根本没机会知道，不能拿来判定"暂停已过期"。
+  const src = { fromCache: null, age: 0 };
   const raw = await cachedJSON(
     env,
     ctx,
@@ -6127,19 +6974,18 @@ async function getWatchedEpisodeIds(headers, env, ctx, userKey) {
     async () => {
       if (isTraktRateLimited(userKey)) return null;
       try {
-        const [epRes, showRes] = await Promise.all([
-          fetchT(`${TRAKT_API}/sync/watched/episodes`, { headers }, 15000),
-          fetchT(
-            `${TRAKT_API}/sync/watched/shows?page=1&limit=100`,
-            { headers },
-            15000,
-          ),
-        ]);
+        // 原先这里并行拉 /sync/watched/episodes + /sync/watched/shows?limit=100：
+        // episodes 每一项本身就带 show.ids + last_watched_at，showLastAt 可完全由它推导，
+        // watched/shows 属于纯冗余调用（还带 limit=100 截断风险），已移除。
+        const epRes = await fetchT(
+          `${TRAKT_API}/sync/watched/episodes`,
+          { headers },
+          15000,
+        );
         if (epRes.status === 429) {
           consumeRetryAfter(epRes, userKey);
           return null;
         }
-        if (showRes.status === 429) consumeRetryAfter(showRes, userKey);
         if (!epRes.ok) return null;
 
         const arr = await epRes.json();
@@ -6155,54 +7001,81 @@ async function getWatchedEpisodeIds(headers, env, ctx, userKey) {
             w && w.last_watched_at ? Date.parse(w.last_watched_at) : NaN;
           bumpShowLastAt(showLastAt, sid, at);
         }
-        if (showRes.ok) {
-          try {
-            const shows = await showRes.json();
-            if (Array.isArray(shows)) {
-              for (const s of shows) {
-                const sid = s && s.show && s.show.ids && s.show.ids.trakt;
-                const at =
-                  s && s.last_watched_at ? Date.parse(s.last_watched_at) : NaN;
-                bumpShowLastAt(showLastAt, sid, at);
-              }
-            }
-          } catch {}
-        }
         return { ids: out, showLastAt };
       } catch {
         return null;
       }
     },
-    { ttl: 3600, missTtl: 300, swr: true, edgeTtl: 600, jitter: 300 },
+    // TTL 原来 3600s，而播放记录是 5400s、首页判定新鲜度是 600s，
+    // 三者错开导致"新的暂停记录"经常配到"旧的已看集"，两台设备各过滤掉不同的剧。
+    // 压到 900s，把错配窗口从 1 小时收窄到 15 分钟。
+    {
+      ttl: 900,
+      missTtl: 300,
+      swr: true,
+      jitter: 180,
+      sourceTracker: src,
+    },
   );
   if (!raw) return null;
 
-  if (Array.isArray(raw)) return new Set(raw.map(Number));
+  const dataTs =
+    src.fromCache === null
+      ? 0
+      : src.fromCache === false
+        ? Date.now()
+        : Date.now() - Math.max(0, Number(src.age) || 0) * 1000;
+
+  if (Array.isArray(raw)) {
+    const s = new Set(raw.map(Number));
+    s.__dataTs = dataTs;
+    return s;
+  }
   const set = new Set((Array.isArray(raw.ids) ? raw.ids : []).map(Number));
   if (raw.showLastAt && typeof raw.showLastAt === "object")
     set.__showLastAt = raw.showLastAt;
+  set.__dataTs = dataTs;
   return set;
 }
 
+/**
+ * 手动隐藏的继续观看条目（cwh: 前缀），形如 { showId: { s, e, at } }。
+ * 记了集号是为了——用户隐藏后又看了更新的集，应该重新出现。
+ */
 async function getCwHideMap(env, ctx, userKey) {
   if (!userKey) return {};
   const raw = await cachedJSON(env, ctx, CK.cwHide(userKey), async () => ({}), {
     ttl: 86400 * 30,
     missTtl: 60,
     swr: false,
-    edgeTtl: 300,
     jitter: 120,
   });
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   return raw;
 }
 
+/**
+ * 写隐藏表。返回 promise，隐藏操作会等它落地再回响应。
+ */
 function putCwHideMap(env, ctx, userKey, map) {
-  if (!userKey) return;
+  if (!userKey) return Promise.resolve();
   const data = map && typeof map === "object" ? map : {};
-  kvPutJSON(env, ctx, CK.cwHide(userKey), { data }, 86400 * 30, false, true);
+  return kvPutJSON(
+    env,
+    ctx,
+    CK.cwHide(userKey),
+    { data },
+    86400 * 30,
+    false,
+    true,
+  );
 }
 
+/**
+ * 判断某条继续观看记录是否被用户隐藏过。
+ * 关键细节：如果记录的暂停时间晚于隐藏时间，说明用户隐藏之后又看了，
+ * 这时不该继续隐藏（否则剧永远回不来）。
+ */
 function isCwHiddenEntry(entry, hideMap) {
   if (!entry || !hideMap || typeof hideMap !== "object") return false;
   const show = entry.show;
@@ -6246,6 +7119,9 @@ function isCwHiddenEntry(entry, hideMap) {
   return true;
 }
 
+/**
+ * 按隐藏表过滤一整个列表。
+ */
 function filterCwHiddenList(list, hideMap) {
   if (!Array.isArray(list) || !list.length) return list || [];
   if (!hideMap || typeof hideMap !== "object" || !Object.keys(hideMap).length)
@@ -6280,6 +7156,10 @@ function filterCwHiddenList(list, hideMap) {
   return out;
 }
 
+/**
+ * 某一天的播出日历（cal: 前缀），带缓存。
+ * 首页"继续观看"里的本地待播补丁也读它。
+ */
 async function getCalendarCached(
   today,
   headers,
@@ -6329,7 +7209,6 @@ async function getCalendarCached(
       missTtl: 120,
 
       swr: force ? true : Math.floor(CALENDAR_KV_TTL * 0.45),
-      edgeTtl: 3600,
       jitter: 120,
       bypass: !!force,
       revalidate: true,
@@ -6340,6 +7219,42 @@ async function getCalendarCached(
   );
 }
 
+/**
+ * 只读版日历缓存：内存 → KV，绝不发起 Trakt 请求。
+ * 首页"继续观看"里的本地待播补丁只需要现有数据，不该为此在首屏关键路径上
+ * 拉一整份 30 天日历（extended=full&images=poster）。
+ */
+/**
+ * 只读版日历：只查内存兜底副本与 KV，绝不发起 Trakt 请求。
+ * 首屏关键路径上用它，避免为了一点点补丁数据多打一次 Trakt。
+ */
+async function peekCalendarCached(today, env, userKey) {
+  const key = CK.calendar(userKey || "anon", today);
+  // 只读版：内存兜底副本 -> KV，绝不发起 Trakt 请求
+  const st = kvMemStaleGet(key);
+  if (st && Array.isArray(st.data)) return st.data;
+  if (env && env.TMDB_CACHE && !kvIsDown()) {
+    try {
+      const raw = await env.TMDB_CACHE.get(key, kvReadOpts());
+      kvMarkUp();
+      if (raw && !raw.miss) {
+        const v = raw.data !== undefined ? raw.data : raw;
+        if (Array.isArray(v)) {
+          kvRemember(key, { data: v, _ts: (raw && raw._ts) || Date.now() });
+          kvMemStaleSet(key, v, raw && raw._ts);
+          return v;
+        }
+      }
+    } catch {
+      kvMarkDown();
+    }
+  }
+  return null;
+}
+
+/**
+ * GET /api/activity-sig —— 只返回活动签名，前端用来判断要不要强制刷新。
+ */
 async function handleActivitySig(request, env, ctx) {
   const A = await authed(request, env, ctx, { strict: true });
   if (!A.ok) return A.response;
@@ -6350,18 +7265,9 @@ async function handleActivitySig(request, env, ctx) {
   const cur = await getUserActivitySig(headers, env, ctx, userKey, force);
 
   let last = null;
-  if (userKey && env && env.TMDB_CACHE && !kvIsDown()) {
-    try {
-      const raw = await env.TMDB_CACHE.get(`act:${userKey}:last`, {
-        type: "json",
-        cacheTtl: 600,
-      });
-      kvMarkUp();
-      if (raw && typeof raw === "object" && typeof raw.data === "string")
-        last = raw.data;
-    } catch {
-      kvMarkDown();
-    }
+  if (userKey) {
+    const syncState = await readSyncState(env, userKey);
+    if (syncState && typeof syncState.sig === "string") last = syncState.sig;
   }
 
   return authJson(auth, needsCookieUpdate, {
@@ -6373,6 +7279,11 @@ async function handleActivitySig(request, env, ctx) {
     hint: "changed=true 表示检测到新的观看/暂停活动，下一次 home-data 刷新会自动绕过缓存拉新数据；noBaseline=true 表示还没有基线记录，首次拉取新数据后会自动建立。",
   });
 }
+
+/* ==================================================================
+ * 首页数据聚合
+ * 一次请求取齐继续观看 / 待看 / 日历 / 记录 / 统计
+ * ================================================================== */
 
 async function handleHomeData(request, env, ctx) {
   const A = await authed(request, env, ctx, { strict: true });
@@ -6419,42 +7330,59 @@ async function handleHomeData(request, env, ctx) {
   const wantCalendar = part === "calendar" || part === "all";
   const wantHistory = part === "history" || part === "all";
 
+  // ================= 阶段 1：先看活动签名，决定要不要 bypass 打 Trakt =================
   const actSigP = wantPlayback
     ? getUserActivitySig(headers, env, ctx, userKey, liveSig)
     : Promise.resolve(null);
   let pbBypass = force;
   let sigBaselineNeeded = false;
   let activityUnchanged = false;
+  let pbLastCheckAt = null;
+  let pbWantLive = !!force;
+
+  // pbc + 活动基线一次读出（原来分两个 key 各读一次）
+  const syncState = wantPlayback ? await readSyncState(env, userKey) : null;
+
   if (wantPlayback && !force) {
+    if (syncState && Number.isFinite(Number(syncState.at))) {
+      pbLastCheckAt = Number(syncState.at);
+    }
+    const checkAgeSec =
+      pbLastCheckAt != null
+        ? Math.max(0, (Date.now() - pbLastCheckAt) / 1000)
+        : Infinity;
+
+    let sigChanged = false;
     try {
       const sigEarly = await actSigP;
       if (sigEarly && sigEarly.sig) {
-        let last = kvMemGet(`act:${userKey}:last`);
-        if (typeof last !== "string") last = null;
-        if (last === null && env && env.TMDB_CACHE && !kvIsDown()) {
-          try {
-            const raw = await env.TMDB_CACHE.get(`act:${userKey}:last`, {
-              type: "json",
-              cacheTtl: 600,
-            });
-            kvMarkUp();
-            if (raw && typeof raw === "object" && typeof raw.data === "string")
-              last = raw.data;
-          } catch {
-            kvMarkDown();
-          }
-        }
+        const last =
+          syncState && typeof syncState.sig === "string" ? syncState.sig : null;
         if (last === null) {
           sigBaselineNeeded = true;
         } else if (last !== sigEarly.sig) {
-          pbBypass = true;
-        } else {
-          activityUnchanged = true;
+          sigChanged = true;
         }
       }
     } catch {}
+
+    // 活动变化 → 立刻重拉；10 分钟内用 KV；超时再校验
+    if (sigChanged) {
+      pbBypass = true;
+      pbWantLive = true;
+      activityUnchanged = false;
+    } else if (checkAgeSec < PLAYBACK_FRESH_SEC) {
+      pbBypass = false;
+      pbWantLive = false;
+      activityUnchanged = true;
+    } else {
+      pbBypass = true;
+      pbWantLive = true;
+      activityUnchanged = false;
+    }
   }
 
+  // ================= 阶段 2：并发抓取各分片 =================
   const result = { part };
   if (wantPlayback) result.activityUnchanged = activityUnchanged;
   const taskFns = [];
@@ -6471,19 +7399,34 @@ async function handleHomeData(request, env, ctx) {
   const calendarSrc = { fromCache: true, age: 0 };
   const historySrc = { fromCache: true, age: 0 };
 
-  const opts = (o) =>
+  // 手动刷新时：只有"用户当场要看到"的部分走硬 bypass，
+  // 个人资料/统计这类变化慢的走 SWR（返回缓存 + 后台刷），少打 2 个 Trakt 调用。
+  const opts = (o, hard = true) =>
     force
-      ? { ...o, bypass: true, revalidate: true }
+      ? hard
+        ? { ...o, bypass: true, revalidate: true }
+        : { ...o, bypass: false, revalidate: true, swr: true }
       : { ...o, revalidate: false, swr: false };
 
   if (wantPlayback) {
     taskFns.push(async () => {
-      playback = await cachedJSON(
+      // 先建好诊断容器：即使本轮命中缓存、fetcher 不执行，也要能看到过滤明细
+      if (!playbackSrc.debug) playbackSrc.debug = {};
+      // 用户状态与播放数据并行发起（冷启时这是 2~3 次 Trakt 调用）
+      const userStateP = getUserStateBundle(headers, env, ctx, userKey).catch(
+        () => null,
+      );
+
+      // 只缓存"原始"的暂停 / 下一集数据，合并与过滤放到缓存外面每次现算。
+      // 原来缓存的是合并后的结果，等于把 isStalePause 之类的判定结果冻结整个
+      // TTL（90 分钟）—— 另一台设备刚产生的观看进度要等缓存过期才会在这台
+      // 设备上生效，这就是"两台设备继续观看列表不一样"的直接原因。
+      const rawPb = await cachedJSON(
         env,
         ctx,
         CK.playback(userKey),
         async () => {
-          const dbg = (playbackSrc.debug = {});
+          const dbg = playbackSrc.debug || (playbackSrc.debug = {});
           if (isTraktRateLimited(userKey)) {
             dbg.rateLimited = true;
             dbg.cooling = traktRateLimitedRemaining(userKey);
@@ -6529,118 +7472,124 @@ async function handleHomeData(request, env, ctx) {
             };
           }
 
-          const userState = await getUserStateBundle(headers, env, ctx, userKey);
-          const droppedSet = droppedStateToSet(userState);
-          const watchedEpIds = watchedStateToSet(userState.watched);
-          const hideMapRaw = userState.hideMap || {};
-          const hideMap =
-            hideMapRaw &&
-            typeof hideMapRaw === "object" &&
-            !Array.isArray(hideMapRaw)
-              ? hideMapRaw
-              : {};
-
-          const merged = mergeContinueLists(
-            pausedOk || [],
-            upNextOk || [],
-            20,
-            droppedSet,
-            watchedEpIds,
-            hideMap,
-            null,
-          );
-          if (
-            merged &&
-            merged.__autoUnhide &&
-            merged.__autoUnhide.length &&
-            hideMap
-          ) {
-            let changed = false;
-            for (const sid of merged.__autoUnhide) {
-              const k = String(sid);
-              if (hideMap[k] || hideMap[sid]) {
-                delete hideMap[k];
-                delete hideMap[sid];
-                changed = true;
-              }
-            }
-            if (changed) putCwHideMap(env, ctx, userKey, hideMap);
-          }
-          applyRewatchFlags(merged, watchedEpIds);
-          dbg.items = merged.length;
-          dbg.dropped = droppedSet ? droppedSet.size : 0;
-          {
-            const nowTs = Date.now();
-            const meta = {
-              pauseUpdatedAt: nowTs,
-              continueUpdatedAt: nowTs,
-            };
-            try {
-              __cwTimeMem.set(userKey, meta);
-            } catch {}
-            try {
-              kvMemSet("cwmeta:" + userKey, { data: meta }, 86400 * 14 * 1000);
-            } catch {}
-            try {
-              kvPutJSON(
-                env,
-                ctx,
-                "cwmeta:" + userKey,
-                { data: meta },
-                86400 * 14,
-                false,
-                true,
-              );
-            } catch {}
-            Object.defineProperty(merged, "__cwMeta", {
-              value: meta,
-              enumerable: false,
-            });
-          }
-          return merged;
+          return { paused: pausedOk, upNext: upNextOk };
         },
         cacheUser({
           ...(pbBypass
-            ? { bypass: true, revalidate: true, memOnlyOnBypass: !force }
+            ? // 自动刷新也要落 KV：只写内存的话每次刷新都白拉一遍，其它设备也读不到。
+              { bypass: true, revalidate: true }
             : { revalidate: false, swr: false }),
           ttl: PLAYBACK_KV_TTL,
           sourceTracker: playbackSrc,
           lastGoodKey: CK.lastGood.playback(userKey),
         }),
       );
+
       try {
-        if (!Array.isArray(playback)) playback = [];
-        playback = playback.filter(
-          (e) => !(e && (e.__localUpcoming || e.__localAired)),
-        );
+        const rawPaused =
+          rawPb && Array.isArray(rawPb.paused) ? rawPb.paused : [];
+        const rawUpNext =
+          rawPb && Array.isArray(rawPb.upNext) ? rawPb.upNext : [];
 
-        const todayBJ = new Date(Date.now() + 8 * 3600 * 1000)
-          .toISOString()
-          .slice(0, 10);
-
-        const userState2 = await getUserStateBundle(headers, env, ctx, userKey);
+        const userState2 = (await userStateP) || {
+          droppedIds: [],
+          watched: { ids: [], showLastAt: {} },
+          hideMap: {},
+        };
         const droppedSet = droppedStateToSet(userState2);
         const freshWatched = watchedStateToSet(userState2.watched);
         const hideMapRaw = userState2.hideMap || {};
-        const cal = await getCalendarCached(
-          todayBJ,
-          headers,
-          env,
-          ctx,
-          userKey,
-          false,
-          null,
-        ).catch(() => null);
-
         const hideMap =
           hideMapRaw &&
           typeof hideMapRaw === "object" &&
           !Array.isArray(hideMapRaw)
             ? hideMapRaw
             : {};
-        applyRewatchFlags(playback, freshWatched);
-        let localUpcoming = [];
 
+        // 每次请求都用当前最新的 watched / dropped / hideMap 重新合并
+        playback = mergeContinueLists(
+          rawPaused,
+          rawUpNext,
+          20,
+          droppedSet,
+          freshWatched,
+          hideMap,
+          null,
+        );
+
+        const dbgPb = playbackSrc.debug || (playbackSrc.debug = {});
+        dbgPb.rawPaused = rawPaused.length;
+        dbgPb.rawUpNext = rawUpNext.length;
+        dbgPb.merged = playback ? playback.length : 0;
+        dbgPb.watchedCount = freshWatched ? freshWatched.size : null;
+        dbgPb.watchedDataTs = (freshWatched && freshWatched.__dataTs) || null;
+        dbgPb.droppedCount = droppedSet ? droppedSet.size : 0;
+        dbgPb.hideCount = hideMap ? Object.keys(hideMap).length : 0;
+        if (playback && playback.__skipStats) {
+          dbgPb.skipStats = playback.__skipStats;
+        }
+        if (playback && playback.__autoUnhide && playback.__autoUnhide.length) {
+          let changed = false;
+          for (const sid of playback.__autoUnhide) {
+            const k = String(sid);
+            if (hideMap[k] || hideMap[sid]) {
+              delete hideMap[k];
+              delete hideMap[sid];
+              changed = true;
+            }
+          }
+          if (changed) putCwHideMap(env, ctx, userKey, hideMap);
+        }
+        applyRewatchFlags(playback, freshWatched);
+        dbgPb.items = playback.length;
+        dbgPb.dropped = droppedSet ? droppedSet.size : 0;
+
+        // 继续观看的时间戳（客户端用来显示"x 分钟前更新"）
+        try {
+          const nowTs = Date.now();
+          const meta = { pauseUpdatedAt: nowTs, continueUpdatedAt: nowTs };
+          kvRemember("cwmeta:" + userKey, { data: meta });
+          // 只在本轮真的重新拉过数据时才更新时间戳。
+          // 纯命中缓存时这份数据没变，每个请求都写一次纯属浪费写入额度。
+          if (!activityUnchanged) {
+            kvPutJSON(
+              env,
+              ctx,
+              "cwmeta:" + userKey,
+              { data: meta },
+              86400 * 14,
+              false,
+              true,
+            );
+          }
+          Object.defineProperty(playback, "__cwMeta", {
+            value: meta,
+            enumerable: false,
+          });
+        } catch {}
+
+        const todayBJ = new Date(Date.now() + 8 * 3600 * 1000)
+          .toISOString()
+          .slice(0, 10);
+
+        // 关键路径优化：只读现有日历缓存，不再为"本地待播补丁"在这里拉 30 天日历。
+        // 缓存缺失时本轮跳过补丁（继续观看主体已完整），改为后台预热供下一轮使用。
+        let cal = await peekCalendarCached(todayBJ, env, userKey);
+        if (!cal && ctx && typeof ctx.waitUntil === "function") {
+          ctx.waitUntil(
+            getCalendarCached(
+              todayBJ,
+              headers,
+              env,
+              ctx,
+              userKey,
+              false,
+              null,
+            ).catch(() => null),
+          );
+        }
+
+        let localUpcoming = [];
         try {
           if (freshWatched !== null) {
             localUpcoming = calendarToLocalContinue(
@@ -6691,12 +7640,19 @@ async function handleHomeData(request, env, ctx) {
         }
 
         if (Array.isArray(playback) && freshWatched) {
+          const before = playback.length;
           playback = filterContinueEntries(playback, freshWatched);
+          // 二次过滤（缓存命中的旧数据也会被这一步裁掉），单独记一笔便于排查
+          if (playback.length !== before && playbackSrc.debug) {
+            playbackSrc.debug.postFilter = {
+              before,
+              after: playback.length,
+            };
+          }
         }
       } catch (e) {}
     });
   }
-
   if (wantHistory) {
     taskFns.push(async () => {
       history = await cachedJSON(
@@ -6785,43 +7741,75 @@ async function handleHomeData(request, env, ctx) {
           return p && !p.__error ? p : null;
         },
         {
-          ...opts({
-            ...CACHE_USER_META,
-            ttl: PROFILE_KV_TTL,
-          }),
+          ...opts(
+            {
+              ...CACHE_USER_META,
+              ttl: PROFILE_KV_TTL,
+            },
+            false,
+          ),
           sourceTracker: metaSrc,
         },
       );
     });
     taskFns.push(async () => {
+      // 首页那四个累计数字（电影/剧集/集数/小时）12 小时内不会变，
+      // 命中内存就不再过 KV；force 刷新时绕过。
+      const statsKey = CK.stats(userKey);
+      if (!force) {
+        const hit = memCacheGet(__summaryMem, statsKey);
+        if (hit !== undefined) {
+          stats = hit;
+          return;
+        }
+      }
       stats = await cachedJSON(
         env,
         ctx,
-        CK.stats(userKey),
+        statsKey,
         async () => {
           const s = await fetchJson(`${TRAKT_API}/users/me/stats`);
           return s && !s.__error ? s : null;
         },
-        opts({
-          ...CACHE_USER_META,
-          ttl: STATS_KV_TTL,
-          lastGoodKey: CK.lastGood.stats ? CK.lastGood.stats(userKey) : "lg:stats:" + userKey,
-        }),
+        opts(
+          {
+            ...CACHE_USER_META,
+            ttl: STATS_KV_TTL,
+            lastGoodKey: CK.lastGood.stats
+              ? CK.lastGood.stats(userKey)
+              : "lg:stats:" + userKey,
+          },
+          false,
+        ),
       );
+      if (stats && !stats.__error) memCacheSet(__summaryMem, statsKey, stats, 240);
     });
   }
 
-  const concurrency = force ? 1 : Math.min(2, Math.max(1, taskFns.length));
-  const gapMs = force ? 1000 : 40;
+  // ================= 阶段 3：统一限并发执行 =================
+  // 限速交给 traktGate（令牌桶 / 串行通道）统一管，这里不再叠加"并发1 + 1s 间隔"，
+  // 否则 force 刷新每个 part 要白等 2 秒。
+  const concurrency = force ? 2 : Math.min(3, Math.max(1, taskFns.length));
+  const gapMs = force ? 0 : 40;
   await runLimited(taskFns, concurrency, gapMs);
 
   const actSig = await actSigP.catch(() => null);
 
-  if (actSig && actSig.sig) {
-    kvMemSet(`act:${userKey}:last`, actSig.sig, KV_MEM_TTL);
-    try {
-      kvMemSet(`act:${userKey}:last`, actSig.sig, KV_MEM_TTL);
-    } catch {}
+  // 同步状态一次写盘：{ at: 上次 live 校验时间, sig: 活动基线 }。
+  // 原来这里是两次 KV put（pbc 一次、act 一次），现在合成一次。
+  // 只有本轮真的拿到 live 播放数据才落盘，否则保持旧基线，下次仍会主动重拉。
+  if (wantPlayback) {
+    const liveOk = playbackSrc.fromCache === false;
+    const patch = {};
+    // at 必须在这里取当前时间：下面 playback 结果块里的 pbLastCheckAt 赋值发生得更晚
+    if (liveOk) patch.at = Date.now();
+    if (actSig && actSig.sig) patch.sig = actSig.sig;
+    if (Object.keys(patch).length) {
+      try {
+        const p = writeSyncState(env, ctx, userKey, patch, liveOk);
+        if (p && typeof p.catch === "function") p.catch(() => {});
+      } catch {}
+    }
   }
 
   if (isTraktRateLimited(userKey)) {
@@ -6832,6 +7820,7 @@ async function handleHomeData(request, env, ctx) {
     result.cooling = 0;
   }
 
+  // ================= 阶段 4：组装结果并渲染 HTML =================
   const liveSources = [
     playbackSrc,
     metaSrc,
@@ -6845,13 +7834,31 @@ async function handleHomeData(request, env, ctx) {
 
   if (wantPlayback) {
     const pbList = Array.isArray(playback) ? playback : [];
+    let pbHtml = "";
     try {
-      await attachContinueStillsForPlayback(pbList, env, ctx, userKey, { maxFetch: 20 });
-      result.playbackHScrollHtml = renderContinueItems(pbList, "hscroll");
-    } catch {
-      result.playbackHScrollHtml =
-        '<div class="empty" style="padding:50px 20px"><p style="margin:0;font-size:.92rem">继续观看加载失败，稍后重试</p></div>';
-    }
+      if (pbList.length) {
+        await attachContinueStillsForPlayback(pbList, env, ctx, userKey, {
+          maxFetch: 20,
+        });
+        pbHtml = renderContinueItems(pbList, "hscroll");
+      }
+    } catch {}
+
+    // 空列表也必须给一段 HTML。
+    // 之前这里列表为空时直接返回空串，前端 applyPlayback 里 if(html) 不成立，
+    // 骨架里的 spinner 就永远留在"继续观看"下面——这就是一直转圈的直接原因。
+    const pbEmptyHint = isTraktRateLimited(userKey)
+      ? 'Trakt 限流中，稍后会自动同步'
+      : '';
+    result.playbackHScrollHtml =
+      pbHtml ||
+      '<div class="empty" style="padding:50px 20px"><p style="margin:0;font-size:.92rem">' +
+      (playback == null ? '继续观看加载失败，稍后重试' : '暂无继续观看') +
+      '</p>' +
+      (pbEmptyHint
+        ? '<p style="margin:6px 0 0;font-size:.8rem;opacity:.6">' + pbEmptyHint + '</p>'
+        : '<p style="margin:6px 0 0;font-size:.8rem;opacity:.6">在 Trakt 上标记看过之后会出现在这里</p>') +
+      '</div>';
     result.playbackSource =
       playbackSrc.fromCache === true
         ? "cache"
@@ -6863,16 +7870,7 @@ async function handleHomeData(request, env, ctx) {
     let playbackDataTs = 0;
     let playbackTsSource = null;
 
-    try {
-      const mem = kvMemGet(CK.playback(userKey));
-      if (mem && mem._ts) {
-        playbackDataTs = mem._ts;
-        playbackAgeSec = Math.max(0, Math.round((Date.now() - playbackDataTs) / 1000));
-        playbackTsSource = "mem-ts";
-      }
-    } catch {}
-
-    if (!playbackDataTs && typeof playbackSrc.age === "number") {
+    if (typeof playbackSrc.age === "number") {
       playbackAgeSec = playbackSrc.age || 0;
       playbackDataTs = Date.now() - playbackAgeSec * 1000;
       playbackTsSource = "age";
@@ -6894,16 +7892,40 @@ async function handleHomeData(request, env, ctx) {
     result.playbackDataTs = playbackDataTs || null;
     result.playbackTsSource = playbackTsSource;
 
-    const lastSyncAt = playbackDataTs || userUpdatedAt || null;
+    // 本想 live 拉新却仍落到缓存 → 视为本次同步失败，返回旧数据但打标，且不刷新 pbc（下次仍会重试）
+    const gotLive = playbackSrc.fromCache === false;
+    const refreshFailed =
+      !!(pbWantLive || force) && !gotLive && !!(playbackSrc.fromCache === true);
+    if (gotLive) {
+      // 只记时间戳，落盘统一在函数尾部跟活动基线合并成一次写
+      pbLastCheckAt = Date.now();
+    }
+
+    const lastSyncAt =
+      pbLastCheckAt || playbackDataTs || userUpdatedAt || null;
 
     result.pauseUpdatedAt = lastSyncAt;
     result.continueUpdatedAt = lastSyncAt;
     result.lastSyncAt = lastSyncAt;
+    result.playbackDataTs = playbackDataTs || lastSyncAt || null;
+    result.stale = refreshFailed;
+    result.refreshFailed = refreshFailed;
+    if (refreshFailed) {
+      result.refreshError =
+        (playbackSrc.debug &&
+          (playbackSrc.debug.rateLimited
+            ? "rate_limited"
+            : playbackSrc.debug.error || playbackSrc.debug.paused || null)) ||
+        "upstream_failed";
+    }
 
     result.syncMeta = {
       lastSyncAt: lastSyncAt,
       dataTs: playbackDataTs || null,
+      checkedAt: pbLastCheckAt || null,
       source: result.playbackSource || null,
+      stale: refreshFailed,
+      freshSec: PLAYBACK_FRESH_SEC,
     };
 
     if (url.searchParams.get("debug") === "1") {
@@ -6917,6 +7939,8 @@ async function handleHomeData(request, env, ctx) {
         userUpdatedAt: userUpdatedAt || null,
         items: Array.isArray(playback) ? playback.length : null,
         lastActivity: actSig && actSig.playbackTs ? actSig.playbackTs : null,
+        // 每条播放记录被丢弃的原因计数（来自 playbackSrc.debug.skipStats）；
+        // 没有该字段说明本轮数据来自缓存、未重新计算
         ...(playbackSrc.debug || {}),
       };
     }
@@ -7113,6 +8137,10 @@ async function handleHomeData(request, env, ctx) {
     };
   }
 
+  // ?debug=1 时把这趟跑了多少次 KV 调用一起返回，方便对比优化前后
+  if (url.searchParams.get("debug") === "1") {
+    result.kvStats = ctx && ctx.__kvStat ? ctx.__kvStat : null;
+  }
   return jsonResp(result, outHeaders);
 }
 
@@ -7202,23 +8230,38 @@ const THEATER_PLATFORMS = [
   },
 ];
 
+/* ==================================================================
+ * 首页骨架渲染
+ * 平台卡片、平台行、整页骨架
+ * ================================================================== */
+
 function renderPlatformCard(p, extraAttr) {
   const attr = extraAttr || `data-platform-id="${esc(p.id)}"`;
   return `<button type="button" class="platform-card" ${attr} title="${esc(p.name)}"><div class="platform-card-left"><img class="platform-card-logo" src="${esc(p.logo)}" alt="" loading="lazy"><span class="platform-card-name">${esc(p.name)}</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="${esc(p.id)}"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button>`;
 }
 
+/**
+ * 首页"流媒体平台"那一行的骨卡（海报由前端异步填）。
+ */
 function renderPlatformRows() {
   const cards = HOME_PLATFORM_IDS.map((id) => PLATFORMS[id]).filter(Boolean);
 
   return `<div class="platform-rows"><div class="platform-row"><div class="platform-cards">${cards.map((p) => renderPlatformCard(p)).join("")}</div></div></div>`;
 }
 
+/**
+ * 首页"平台剧场"那一行的骨卡。
+ */
 function renderTheaterPlatformRows() {
   return `<div class="platform-rows theater-platform-rows"><div class="platform-row"><div class="platform-cards">${THEATER_PLATFORMS.map(
     (p) => renderPlatformCard(p, `data-theater-platform="${esc(p.id)}"`),
   ).join("")}</div></div></div>`;
 }
 
+/**
+ * 整页骨架：头部（头像/昵称/统计）、tab、各区块占位、
+ * 以及所有弹窗的容器。数据由前端拉接口后填入。
+ */
 function renderHomeSkeleton(initialDetail, profileHint) {
   const boot = initialDetail
     ? `<script>window.addEventListener('load',()=>{const s=${jsStr(initialDetail)},idx=s.indexOf('/');if(idx>0)openDetail(s.slice(0,idx),s.slice(idx+1),false);});<\/script>`
@@ -7236,6 +8279,11 @@ function renderHomeSkeleton(initialDetail, profileHint) {
 
   return `<div class="container"><div class="top-sticky"><header class="hero"><div class="hero-left"><button type="button" class="hero-avatar" id="hero-avatar" title="观看小结" aria-label="打开观看小结">${heroAvatarHtml}</button><div class="hero-text"><h1 class="hero-name" id="hero-name">${heroName}</h1><p class="updated-at" id="updated-at" title="最近一次有数据变化的更新"></p></div></div><div class="hero-actions"><button class="btn-action" id="btn-refresh" onclick="forceRefresh()" title="刷新观看数据（豆瓣/热榜/平台等按日缓存，到期自动更新）"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg><span>刷新</span></button><button class="btn-action" id="btn-theme" onclick="cycleTheme()" title="主题：深色" aria-label="切换主题：深色"><span class="theme-icon" id="theme-icon"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></span><span>主题</span></button><button class="btn-action" id="btn-logout" onclick="logout()" title="退出登录"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg><span>退出</span></button></div></header><div class="stats" id="stats-box">${renderStatsHtml(null)}</div><nav class="tabs"><button class="tab active" data-tab="playback"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9.5 21v-6h5v6"/></svg><span>首页</span></button><button class="tab" data-tab="watchlist"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg><span>待看</span></button><button class="tab" data-tab="calendar"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg><span>日历</span></button><button class="tab" data-tab="history"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/></svg><span>记录</span></button><button class="tab" data-tab="search"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg><span>搜索</span></button></nav></div><section id="playback" class="pane active">${section("playback", "继续观看")}<div class="home-section platform-section"><div class="home-section-head"><h2 class="home-section-title">流媒体平台</h2></div>${renderPlatformRows()}<div class="home-section theater-platform-section"><div class="home-section-head"><h2 class="home-section-title">平台剧场</h2></div>${renderTheaterPlatformRows()}</div>${section("guduo", "骨朵热榜", '<div class="theater-home-tabs" id="guduo-home-tabs" style="display:none"></div>')}${section("douban-domestic", "豆瓣热播国产剧")}${section("douban-hktw", "豆瓣热播港台剧")}${section("douban-jpkr", "豆瓣热播日韩剧")}${section("douban-western", "豆瓣热播欧美剧")}</section><section id="watchlist" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="calendar" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="history" class="pane"><div class="grid"></div><div id="history-more"></div></section><section id="search" class="pane"><div class="search-bar"><input id="search-input" class="search-input" type="search" placeholder="搜索电影 / 剧集" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></div><div id="search-results" class="grid"></div></section><div class="app-version">MineTrakt v${APP_JS_VERSION}</div></div><div id="list-modal" class="list-modal"><div class="list-modal-backdrop" onclick="closeListModal()"></div><div class="list-modal-panel"><div class="list-modal-head"><h3 class="list-modal-title" id="list-modal-title"></h3><button type="button" class="list-modal-close" onclick="closeListModal()" aria-label="关闭">×</button></div><div class="list-modal-body" id="list-modal-body"></div></div></div><div id="summary-modal" class="summary-modal" style="display:none" role="dialog" aria-modal="true" aria-label="观看小结"><div class="summary-backdrop" onclick="window.__closeSummary()"></div><div class="summary-panel"><div class="summary-head"><h2 class="summary-title">观看小结</h2><button type="button" class="summary-close" onclick="window.__closeSummary()" aria-label="关闭">×</button></div><div id="summary-modal-body" class="summary-body"><div class="pane-loading"><div class="spinner"></div></div></div></div></div><div id="person-modal" class="person-modal"><div class="person-backdrop" onclick="closePerson()"></div><div class="person-panel"><div class="person-panel-head"><div class="person-panel-name" id="person-modal-name"></div><button class="person-close" onclick="closePerson()" aria-label="关闭">×</button></div><div class="person-panel-body" id="person-modal-body"></div></div></div><div id="confirm-modal" class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title" style="display:none"><div class="confirm-backdrop"></div><div class="confirm-panel"><div class="confirm-icon" id="confirm-icon">?</div><div class="confirm-title" id="confirm-title"></div><div class="confirm-msg" id="confirm-msg"></div><div class="confirm-actions"><button class="confirm-btn confirm-cancel" id="confirm-cancel" type="button">取消</button><button class="confirm-btn confirm-ok" id="confirm-ok" type="button">确定</button></div></div></div><div id="modal" class="modal"><div class="modal-backdrop" onclick="closeDetail()"></div><div class="modal-panel"><div class="modal-shell"><button class="modal-close" onclick="closeDetail()" aria-label="关闭"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button><div class="modal-body" id="modal-body"></div></div></div></div><div id="show-cal-modal" class="show-cal-modal"><div class="show-cal-backdrop" onclick="closeShowCal()"></div><div class="show-cal-panel"><div class="show-cal-head"><div class="show-cal-name" id="show-cal-name"></div><button class="show-cal-close" onclick="closeShowCal()" aria-label="关闭">×</button></div><div class="show-cal-info" id="show-cal-info"></div><div class="show-cal-nav"><button onclick="calShiftMonth(-1)" aria-label="上个月">‹</button><div id="show-cal-month">—</div><button onclick="calShiftMonth(1)" aria-label="下个月">›</button></div><div class="show-cal-weekdays"><span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span></div><div class="show-cal-grid" id="show-cal-grid"></div><div class="show-cal-legend"><span class="legend-item"><i class="legend-dot legend-past"></i>已播出</span><span class="legend-item"><i class="legend-dot legend-today"></i>今天</span><span class="legend-item"><i class="legend-dot legend-future"></i>待播出</span></div><div class="show-cal-detail" id="show-cal-detail"></div></div></div><script src="/app.js?v=${APP_JS_VERSION}" defer><\/script>${boot}`;
 }
+
+/* ==================================================================
+ * 详情页增强
+ * 演员表、推荐、评分、预告片
+ * ================================================================== */
 
 async function handleDetailExtras(request, env, ctx) {
   const url = new URL(request.url);
@@ -7378,12 +8426,16 @@ async function handleDetailExtras(request, env, ctx) {
     {
       contentType: "application/json; charset=utf-8",
       extra: {
-        "Cache-Control": "private, max-age=600, stale-while-revalidate=1200",
+        // 详情页增强块含用户观看状态，禁止浏览器缓存，否则换设备/刷新看到的还是旧的
+        "Cache-Control": CC_NO_STORE,
       },
     },
   );
 }
 
+/**
+ * GET /api/person —— 演职人员详情：简介、参演作品。
+ */
 async function handlePerson(request, env, ctx) {
   const url = new URL(request.url);
   const id = url.searchParams.get("id");
@@ -7488,7 +8540,8 @@ async function handlePerson(request, env, ctx) {
   const html = `<div class="person-head">${photo ? `<img class="person-photo" src="${photo}" alt="">` : `<div class="person-photo person-photo-ph">${esc(initial)}</div>`}<div class="person-info"><div class="person-name">${esc(name)}</div>${rows.length ? `<div class="person-rows">${rows.join("")}</div>` : ""}</div></div>${bio ? `<div class="person-bio">${esc(bio)}</div>` : ""}${creditsHtml ? `<div class="person-credits-title">参演作品</div><div class="grid">${creditsHtml}</div>` : '<p class="person-sub">暂无参演作品信息</p>'}`;
 
   return authResp(auth, needsCookieUpdate, html, {
-    extra: { "Cache-Control": "private, max-age=3600" },
+    // 人物页会带上"已看/在追"标记，同样不缓存
+    extra: { "Cache-Control": CC_NO_STORE },
   });
 }
 
@@ -7508,34 +8561,37 @@ async function handleSeason(request, env, ctx) {
 
   const validShowId = showId && /^\d+$/.test(showId);
 
-  const freshProgress = validShowId
-    ? await __activityDiffers(headers, env, ctx, userKey)
-    : false;
+  // 活动校验与季/集数据并行，不要挡在 Promise.all 前面
+  const freshProgressP = validShowId
+    ? __activityDiffers(headers, env, ctx, userKey).catch(() => false)
+    : Promise.resolve(false);
 
   const [progress, traktSeason, tmdbSeason] = await Promise.all([
     validShowId
-      ? cachedJSON(
-          env,
-          ctx,
-          CK.watchProgress(userKey, showId),
-          async () => {
-            const r = await traktGet(
-              `${TRAKT_API}/shows/${showId}/progress/watched?hidden=false&specials=false`,
-              headers,
-              2,
-              userKey,
-            );
-            return r && !r.__error ? r : null;
-          },
-          {
-            ttl: 1800,
-            missTtl: 60,
-            swr: true,
-            edgeTtl: 300,
-            jitter: 180,
-            ...(freshProgress ? { bypass: true } : {}),
-          },
-        )
+      ? (async () => {
+          const freshProgress = await freshProgressP;
+          return cachedJSON(
+            env,
+            ctx,
+            CK.watchProgress(userKey, showId),
+            async () => {
+              const r = await traktGet(
+                `${TRAKT_API}/shows/${showId}/progress/watched?hidden=false&specials=false`,
+                headers,
+                2,
+                userKey,
+              );
+              return r && !r.__error ? r : null;
+            },
+            {
+              ttl: 1800,
+              missTtl: 60,
+              swr: true,
+              jitter: 180,
+              ...(freshProgress ? { bypass: true } : {}),
+            },
+          );
+        })()
       : Promise.resolve(null),
     validShowId
       ? cachedJSON(
@@ -7552,10 +8608,9 @@ async function handleSeason(request, env, ctx) {
             return r && !r.__error ? r : null;
           },
           {
-            ttl: SEASON_KV_TTL,
+            ttl: seasonTtl,
             missTtl: 60,
             swr: 3600,
-            edgeTtl: 1800,
             jitter: 300,
           },
         )
@@ -7588,6 +8643,11 @@ async function handleSeason(request, env, ctx) {
   );
 }
 
+/* ==================================================================
+ * 详情页主接口
+ * 服务端渲染整页详情，含季集列表与观看状态
+ * ================================================================== */
+
 async function handleApiDetail(request, env, ctx) {
   try {
     const url = new URL(request.url),
@@ -7614,6 +8674,13 @@ async function handleApiDetail(request, env, ctx) {
 
     const t = type === "movie" ? "movie" : "tv";
 
+    // 与 entity 抓取并行开始。原来它被 await 在 cachedJSON 的参数位置，
+    // 会把后面的 pausedListP / movieHistoryP 全堵在它后面（多一次 Trakt 往返）。
+    const actDiffP =
+      type === "show" && traktId
+        ? __activityDiffers(headers, env, ctx, userKey).catch(() => false)
+        : Promise.resolve(false);
+
     const entityP = traktId
       ? cachedJSON(
           env,
@@ -7632,7 +8699,6 @@ async function handleApiDetail(request, env, ctx) {
             ttl: ENTITY_KV_TTL,
             missTtl: 60,
             swr: 3600,
-            edgeTtl: 1800,
             jitter: 300,
           },
         )
@@ -7658,7 +8724,7 @@ async function handleApiDetail(request, env, ctx) {
                 null
               );
             },
-            { ttl: 86400 * 7, missTtl: 120, swr: 3600, edgeTtl: 3600 },
+            { ttl: 86400 * 7, missTtl: 120, swr: 3600 },
           )
         : Promise.resolve(null);
 
@@ -7679,68 +8745,51 @@ async function handleApiDetail(request, env, ctx) {
 
     const userProgressP =
       type === "show" && traktId
-        ? cachedJSON(
-            env,
-            ctx,
-            CK.watchProgress(userKey, traktId),
-            async () => {
-              const r = await traktGet(
-                `${TRAKT_API}/shows/${traktId}/progress/watched?hidden=false&specials=false`,
-                headers,
-                2,
-                userKey,
-              );
-              return r && !r.__error ? r : null;
-            },
-            {
-              ttl: 1800,
-              missTtl: 60,
-              swr: true,
-              edgeTtl: 300,
-              jitter: 180,
-              ...((await __activityDiffers(headers, env, ctx, userKey))
-                ? { bypass: true }
-                : {}),
-            },
-          )
+        ? (async () =>
+            cachedJSON(
+              env,
+              ctx,
+              CK.watchProgress(userKey, traktId),
+              async () => {
+                const r = await traktGet(
+                  `${TRAKT_API}/shows/${traktId}/progress/watched?hidden=false&specials=false`,
+                  headers,
+                  2,
+                  userKey,
+                );
+                return r && !r.__error ? r : null;
+              },
+              {
+                ttl: 1800,
+                missTtl: 60,
+                swr: true,
+                jitter: 180,
+                ...((await actDiffP) ? { bypass: true } : {}),
+              },
+            ))()
         : Promise.resolve(null);
 
-    const pausedEntryP =
+    // 全量暂停列表按用户缓存一次（原来按 show 存，导致每看一部剧都要重拉全量列表）。
+    const pausedListP =
       type === "show" && traktId
         ? cachedJSON(
             env,
             ctx,
-            CK.showPlayback(userKey, traktId),
+            CK.playbackList(userKey),
             async () => {
               if (isTraktRateLimited(userKey)) return null;
               const r = await traktGet(
-                `${TRAKT_API}/sync/playback/episodes?extended=full&limit=100`,
+                // 详情页只用 season / number / ids / progress / paused_at，
+                // 不需要 extended=full —— 去掉后这份"全量暂停列表"的体积降一个数量级，
+                // 而它现在按用户全局缓存（pbl:），体积直接影响 KV 读写成本。
+                `${TRAKT_API}/sync/playback/episodes?limit=100`,
                 headers,
                 2,
                 userKey,
               );
-              if (!Array.isArray(r) || !r.length) return null;
-              const mine = r.filter(
-                (p) =>
-                  p &&
-                  p.show &&
-                  p.show.ids &&
-                  p.show.ids.trakt != null &&
-                  String(p.show.ids.trakt) === String(traktId),
-              );
-              if (!mine.length) return null;
-              mine.sort((a, b) =>
-                String(b.paused_at || "").localeCompare(
-                  String(a.paused_at || ""),
-                ),
-              );
-              const top = mine[0];
-              const pct =
-                typeof top.progress === "number" ? top.progress : null;
-              if (pct == null || pct <= 0 || pct >= 90) return null;
-              return top;
+              return Array.isArray(r) ? r : null;
             },
-            { ttl: 600, missTtl: 120, swr: true, edgeTtl: 300, jitter: 120 },
+            { ttl: 600, missTtl: 120, swr: true, jitter: 120 },
           )
         : Promise.resolve(null);
 
@@ -7759,18 +8808,34 @@ async function handleApiDetail(request, env, ctx) {
               );
               return r && !r.__error ? r : null;
             },
-            { ttl: 1800, missTtl: 60, swr: true, edgeTtl: 300, jitter: 180 },
+            { ttl: 1800, missTtl: 60, swr: true, jitter: 180 },
           )
         : Promise.resolve(null);
 
-    const [tmdbBasic, userProgress, movieHistory, pausedEntry, watchedEpIds] =
+    // 待看列表判定提前发起，与上面几路并行（原先是渲染前才串行 await，最坏白等 4 个往返）
+    const wlHint =
+      (entity && entity.ids && entity.ids.tmdb) || tmdbIdHint || null;
+    const wlIdsP =
+      wlHint != null
+        ? getWatchlistTmdbIds(
+            headers,
+            env,
+            ctx,
+            userKey,
+            type === "movie" ? "movies" : "shows",
+          ).catch(() => [])
+        : Promise.resolve(null);
+
+    const [tmdbBasic, userProgress, movieHistory, pausedList, watchedEpIds] =
       await Promise.all([
         tmdbBasicP,
         userProgressP,
         movieHistoryP,
-        pausedEntryP,
+        pausedListP,
         getWatchedEpisodeIds(headers, env, ctx, userKey).catch(() => null),
       ]);
+
+    const pausedEntry = pickPausedShowEntry(pausedList, traktId);
 
     let pausedIsRewatch = false;
     if (
@@ -7837,14 +8902,7 @@ async function handleApiDetail(request, env, ctx) {
 
     if (wlTmdbId != null) {
       try {
-        const wlType = type === "movie" ? "movies" : "shows";
-        const ids = await getWatchlistTmdbIds(
-          headers,
-          env,
-          ctx,
-          userKey,
-          wlType,
-        );
+        const ids = await wlIdsP;
         const want = Number(wlTmdbId);
         inWatchlist = Array.isArray(ids) && ids.some((x) => Number(x) === want);
       } catch {}
@@ -7925,7 +8983,8 @@ async function handleApiDetail(request, env, ctx) {
 
     return authResp(auth, needsCookieUpdate, bodyHtml, {
       extra: {
-        "Cache-Control": "private, max-age=120, stale-while-revalidate=300",
+        // 详情页 HTML 含用户态，直接不缓存
+        "Cache-Control": CC_NO_STORE,
       },
     });
   } catch (e) {
@@ -7936,6 +8995,33 @@ async function handleApiDetail(request, env, ctx) {
   }
 }
 
+/**
+ * 从全量暂停列表里挑出某部剧"正在看且进度合理"的那一条。
+ * 列表本身按用户全局缓存（CK.playbackList），各剧详情只做本地筛选。
+ */
+function pickPausedShowEntry(list, traktId) {
+  if (!Array.isArray(list) || !list.length || traktId == null) return null;
+  const mine = list.filter(
+    (p) =>
+      p &&
+      p.show &&
+      p.show.ids &&
+      p.show.ids.trakt != null &&
+      String(p.show.ids.trakt) === String(traktId),
+  );
+  if (!mine.length) return null;
+  mine.sort((a, b) =>
+    String(b.paused_at || "").localeCompare(String(a.paused_at || "")),
+  );
+  const top = mine[0];
+  const pct = typeof top.progress === "number" ? top.progress : null;
+  if (pct == null || pct <= 0 || pct >= 90) return null;
+  return top;
+}
+
+/**
+ * 从 Trakt 条目自带的 images 里取海报。
+ */
 function posterOfTrakt(obj) {
   if (!obj || !obj.images) return null;
   const pick = (arr) => {
@@ -7954,6 +9040,9 @@ function posterOfTrakt(obj) {
   );
 }
 
+/**
+ * 从图片映射里取继续观看条目的剧照，取不到时退回 Trakt 自带图。
+ */
 function continueImageOf(item) {
   if (!item) return null;
   return (
@@ -7964,6 +9053,9 @@ function continueImageOf(item) {
   );
 }
 
+/**
+ * 构造列表卡片的基础字段（标题、年份、海报、进详情页的参数）。
+ */
 function buildBaseItem(traktItem) {
   const base = {
     tag: "",
@@ -8081,6 +9173,9 @@ function buildBaseItem(traktItem) {
   return base;
 }
 
+/**
+ * 解析 enrich key：movie:tmdb:123 / tv:imdb:tt456 这类。
+ */
 function parseEnrichKey(key) {
   if (!key) return null;
   const i1 = key.indexOf(":");
@@ -8117,6 +9212,9 @@ const ENRICH_KEY_RE =
 
 const ENRICH_MISS_TTL = 600000;
 
+/**
+ * 真正去 TMDB 取一条 enrich 数据（标题/简介/海报）。
+ */
 async function fetchEnrichData(key, env) {
   if (!env.TMDB_API_KEY) return null;
   const parsed = parseEnrichKey(key);
@@ -8159,6 +9257,11 @@ async function fetchEnrichData(key, env) {
     : null;
 }
 
+/**
+ * 从 enrich 分桶里取一条结果。
+ * 区分三种情况：没查过（undefined，需要去查）、查过但没有（null）、有数据。
+ * 后者靠 rec.m 标记，10 分钟内不再重复查同一个缺失项。
+ */
 function __bucketGet(items, key) {
   const rec = items[key];
   if (!rec) return undefined;
@@ -8168,6 +9271,16 @@ function __bucketGet(items, key) {
   return { title: rec.t || "", overview: rec.o || "", poster: rec.p || null };
 }
 
+/* ==================================================================
+ * enrich 批量补全
+ * 按 4 个分桶缓存标题/简介/海报，供列表页异步填充
+ * ================================================================== */
+
+/**
+ * 批量补全条目的标题 / 简介 / 海报。
+ * 结果按 4 个分桶存 KV（eb: 前缀），一个分桶一次读写，
+ * 避免每条内容一个 key 把 KV 操作数打爆。
+ */
 async function enrichBatch(keys, env, ctx) {
   const out = {};
   if (!env || !env.TMDB_API_KEY) {
@@ -8179,12 +9292,6 @@ async function enrichBatch(keys, env, ctx) {
   const keyBucket = new Map();
 
   for (const key of keys) {
-    const mem = kvMemGet(CK.enrich(key));
-    if (mem !== undefined && mem !== KV_MISS) {
-      out[key] =
-        mem && mem.miss ? null : mem && mem.data !== undefined ? mem.data : mem;
-      continue;
-    }
     keyBucket.set(key, stableJitter(key, ENRICH_BUCKETS));
     pending.push(key);
   }
@@ -8192,27 +9299,17 @@ async function enrichBatch(keys, env, ctx) {
 
   const bucketData = new Map();
   const bucketIds = [...new Set(keyBucket.values())];
-  const nowB = Date.now();
-  for (const b of bucketIds) {
-    const mem = __enrichBucketMem.get(b);
-    if (mem && mem.exp > nowB) bucketData.set(b, mem.items);
-  }
-  const missBuckets = bucketIds.filter((b) => !bucketData.has(b));
+  const missBuckets = bucketIds;
   if (missBuckets.length && env.TMDB_CACHE && !kvIsDown()) {
     await Promise.all(
       missBuckets.map(async (b) => {
         try {
           const raw = await env.TMDB_CACHE.get(CK.enrichBucket(b), {
             type: "json",
-            cacheTtl: 600,
           });
           const items =
             raw && raw.items && typeof raw.items === "object" ? raw.items : {};
           bucketData.set(b, items);
-          __enrichBucketMem.set(b, {
-            items,
-            exp: Date.now() + ENRICH_BUCKET_MEM_TTL,
-          });
           kvMarkUp();
         } catch {
           bucketData.set(b, {});
@@ -8228,7 +9325,7 @@ async function enrichBatch(keys, env, ctx) {
     const hit = __bucketGet(bucketData.get(keyBucket.get(key)), key);
     if (hit !== undefined) {
       out[key] = hit;
-      kvMemSet(CK.enrich(key), hit, KV_MEM_TTL);
+      kvRemember(CK.enrich(key), hit);
       continue;
     }
 
@@ -8304,27 +9401,30 @@ async function enrichBatch(keys, env, ctx) {
     bucketData.set(b, items);
     dirty.add(b);
     out[key] = val;
-    kvMemSet(CK.enrich(key), val || { miss: 1 }, val ? KV_MEM_TTL : 30000);
+    kvRemember(CK.enrich(key), val || { miss: 1 });
   }
 
+  // enrich 结果必须落 KV：原来只写进程内存，内存一关就等于每次开详情页
+  // 都要重新向 TMDB 批量请求。写回同一个分桶，各设备读到的也是同一份。
   for (const b of dirty) {
     const items = bucketData.get(b);
+    if (!items) continue;
     const ks = Object.keys(items);
     if (ks.length > ENRICH_BUCKET_MAX) {
       ks.sort((x, y) => (items[x].ts || 0) - (items[y].ts || 0));
       for (let i = 0; i < ks.length - ENRICH_BUCKET_MAX; i++)
         delete items[ks[i]];
     }
-
-    __enrichBucketMem.set(b, {
-      items,
-      exp: Date.now() + ENRICH_BUCKET_MEM_TTL,
-    });
+    kvPutJSON(env, ctx, CK.enrichBucket(b), { items }, ENRICH_BUCKET_TTL, false, false);
   }
 
   return out;
 }
 
+/**
+ * POST /api/enrich —— 批量补全列表卡片的标题/简介/海报。
+ * 前端在列表渲染后异步调用，把占位图换成真图。
+ */
 async function handleEnrich(request, env, ctx) {
   let body;
   try {
@@ -8354,7 +9454,8 @@ async function handleEnrich(request, env, ctx) {
   return new Response(JSON.stringify(out), {
     headers: {
       "Content-Type": CT_JSON,
-      "Cache-Control": "private, max-age=300",
+      // enrich 批量结果含用户态标记，不缓存
+      "Cache-Control": CC_NO_STORE,
     },
   });
 }
@@ -8427,6 +9528,11 @@ function mediaItem(opts) {
     opts.lockPoster || opts.hasPoster ? ` data-lock-poster="1"` : "";
   return `<div class="item${clickable}"${dataAttrs}${enrichAttrs}${lockPosterAttr}${opts.itemAttrs || ""}${style}>${removeHtml}${watchedHtml}${unwatchHtml}<div class="poster">${opts.poster ? `<img src="${opts.poster}" loading="lazy" alt="" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"><div class="poster-ph" style="display:none"><span>${opts.tagClass === "movie" ? "🎬" : "📺"}</span></div>` : `<div class="poster-ph"><span>${opts.tagClass === "movie" ? "🎬" : "📺"}</span></div>`}${playHtml}${dropHtml}</div><div class="info"><div class="name-row"><span class="name">${esc(opts.title)}</span>${rewatchBadge}${tagHtml}</div>${opts.line1 ? `<div class="meta">${esc(opts.line1)}</div>` : ""}${opts.overview ? `<div class="overview">${esc(opts.overview)}</div>` : ""}${opts.line2 ? `<div class="meta dim">${esc(opts.line2)}</div>` : ""}${bar}${cwActionsHtml}${calendarBtnHtml}</div></div>`;
 }
+
+/* ==================================================================
+ * 页面渲染
+ * 记录、待看、日历、详情片段、季集列表
+ * ================================================================== */
 
 function renderHistoryPage(items, env, isFragment) {
   if (isFragment === undefined) isFragment = false;
@@ -8535,10 +9641,16 @@ function renderHistoryPage(items, env, isFragment) {
   return `<div class="hist-days">${sections.join("")}</div>`;
 }
 
+/**
+ * 待看为空时的占位内容。
+ */
 function emptyWatchlistHtml() {
   return `<div class="empty"><svg viewBox="0 0 24 24" width="56" height="56" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.25"><circle cx="12" cy="12" r="10"/><path d="M12 8v8M8 12h8"/></svg><p>待看列表是空的</p><p style="font-size:0.82rem;color:#5a6474;margin-top:10px;line-height:1.6;text-align:center">去 Trakt 上把想看的电影 / 剧集加入 watchlist，这里就会显示</p></div>`;
 }
 
+/**
+ * 渲染待看列表（含年份、评分、已在待看标记）。
+ */
 function renderWatchlistItems(items, env) {
   if (!Array.isArray(items) || !items.length) return "";
   return items
@@ -8595,6 +9707,10 @@ function renderWatchlistItems(items, env) {
     .join("");
 }
 
+/**
+ * 生成 Infuse 的播放链接（infuse://x-callback-url/play?…），
+ * 点卡片可以直接在播放器里打开对应剧集。
+ */
 function buildInfuseHrefForContinue(item) {
   if (!item) return null;
 
@@ -8765,15 +9881,17 @@ function renderContinueItems(upNext, mode = "grid") {
       isMovie = !!(item.movie && !item.episode),
       playPct =
         typeof item.progress === "number" ? Math.round(item.progress) : null,
-      e = buildBaseItem(item),
-      coverImg =
-        it.stillUrl ||
-        item.__stillUrl ||
-        (item.episode && item.episode.__stillUrl) ||
-        it.backdropUrl ||
-        item.__backdropUrl ||
-        posterOfTrakt(item.episode) ||
-        null;
+      e = buildBaseItem(item);
+
+    // 原来是 const 链里的 coverImg，下面又赋值一次 → 没剧照的条目直接 TypeError
+    let coverImg =
+      it.stillUrl ||
+      item.__stillUrl ||
+      (item.episode && item.episode.__stillUrl) ||
+      it.backdropUrl ||
+      item.__backdropUrl ||
+      posterOfTrakt(item.episode) ||
+      null;
 
     if (!coverImg) {
       coverImg =
@@ -9027,10 +10145,12 @@ function renderContinueItems(upNext, mode = "grid") {
     });
   });
 
-  if (mode === "hscroll") return parts.join("");
   return parts.join("");
 }
 
+/**
+ * 渲染日历页：按天分组，标出已播/今天/待播。
+ */
 function renderCalendarPage(calendar, env, zhTitles) {
   if (!Array.isArray(calendar)) return emptyPaneHtml("暂时无法加载追剧日历");
   if (!calendar.length) return emptyView("未来 30 天没有待播剧集");
@@ -9102,6 +10222,9 @@ function renderCalendarPage(calendar, env, zhTitles) {
   return out.join("");
 }
 
+/**
+ * 找出一季里第一个还没看的集，用于详情页定位"看到哪了"。
+ */
 function firstUnwatchedEpisode(userProgress) {
   if (!userProgress || userProgress.__error) return null;
 
@@ -9121,6 +10244,9 @@ function firstUnwatchedEpisode(userProgress) {
   return null;
 }
 
+/**
+ * 渲染详情页主体：海报区、简介、评分、演职员、季集列表、操作按钮。
+ */
 function renderDetailFragment(d) {
   const type = d.type,
     entity = d.entity,
@@ -9443,6 +10569,9 @@ function renderDetailFragment(d) {
   return `<div class="detail-wrap"${rootAttrs}><div class="detail-hero">${backdrop ? `<img class="detail-bg" src="${backdrop}" alt="">` : ""}<div class="detail-inner">${poster ? `<img class="detail-poster" src="${poster}" alt="">` : `<div class="detail-poster detail-poster-ph">${isMovie ? "🎬" : "📺"}</div>`}<div class="detail-info"><h1 class="detail-title">${esc(title)}</h1>${tagline ? `<div class="detail-tagline">${esc(tagline)}</div>` : ""}<div class="detail-meta">${year ? `<span>${esc(year)}</span>` : ""}${runtimeStr ? `<span>${esc(runtimeStr)}</span>` : ""}</div>${ratingsSectionHtml}${genres ? `<div class="detail-genres">${esc(genres)}</div>` : ""}${overview ? `<p class="detail-overview" role="button" tabindex="0" title="点击展开/收起全文" onclick="this.classList.toggle('expanded')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.classList.toggle('expanded')}">${esc(overview)}</p>` : ""}${statusHtml}${actionsHtml}</div></div></div><div class="detail-body">${castSectionHtml}${trailersSectionHtml}${seasonsHtml}${recsSectionHtml}</div></div>`;
 }
 
+/**
+ * 渲染某一季的集列表，带已看勾选与单集标记按钮。
+ */
 function renderSeasonEpisodes(
   seasonProgress,
   tmdbSeason,
@@ -9552,6 +10681,9 @@ function renderSeasonEpisodes(
     .join("");
 }
 
+/**
+ * 空状态占位块（列表为空、加载失败时用）。
+ */
 function emptyView(opts) {
   if (typeof opts === "string") opts = { text: opts };
   const text = opts.text || "";
@@ -9560,10 +10692,16 @@ function emptyView(opts) {
   return `<div class="empty"><svg viewBox="0 0 24 24" width="56" height="56" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.25"><circle cx="12" cy="12" r="10"/><path d="M8 12h8M12 8v8"/></svg><p>${text}</p></div>`;
 }
 
+/**
+ * 空面板占位。
+ */
 function emptyPaneHtml(text) {
   return `<div class="empty" style="padding:70px 20px"><p style="margin:0;font-size:.95rem">${esc(text)}</p><p style="font-size:.82rem;color:#7a8394;margin-top:10px">稍后重试即可恢复</p></div>`;
 }
 
+/**
+ * 生成指定长度的随机串，用于 OAuth 的 state / code_verifier。
+ */
 function randomString(len) {
   const cs =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~",
@@ -9574,12 +10712,19 @@ function randomString(len) {
   return s;
 }
 
+/**
+ * PKCE 的 code_challenge：S256(verifier) 再 base64url。
+ */
 async function pkceChallenge(verifier) {
   const data = new TextEncoder().encode(verifier),
     digest = await crypto.subtle.digest("SHA-256", data);
   return b64urlEncode(String.fromCharCode(...new Uint8Array(digest)), true);
 }
 
+/**
+ * base64url 编码（去掉 = 填充，+ / 换成 - _）。
+ * Cookie 里的登录态就靠它塞进单个字符串。
+ */
 function b64urlEncode(str, isBinary) {
   let bytes;
   if (isBinary) {
@@ -9593,6 +10738,9 @@ function b64urlEncode(str, isBinary) {
   return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
+/**
+ * base64url 解码，兼容缺失的 = 填充。
+ */
 function b64urlDecode(str) {
   let b64 = str.replace(/-/g, "+").replace(/_/g, "/");
   const pad = b64.length % 4;
@@ -9603,6 +10751,10 @@ function b64urlDecode(str) {
   return new TextDecoder().decode(bytes);
 }
 
+/**
+ * HTML 转义。所有拼进页面的用户数据都必须过一遍，
+ * 否则剧名里的引号/尖括号会破坏标签结构。
+ */
 function esc(s) {
   return String(s == null ? "" : s)
     .replace(/&/g, "&amp;")
@@ -9612,6 +10764,10 @@ function esc(s) {
     .replace(/'/g, "&#39;");
 }
 
+/**
+ * 把任意值序列化成可安全塞进 <script> 的字符串字面量。
+ * 关键是转义 </script> 与换行，避免提前闭合脚本标签。
+ */
 function jsStr(s) {
   return JSON.stringify(String(s == null ? "" : s))
     .replace(/</g, "\\u003c")
@@ -9619,10 +10775,16 @@ function jsStr(s) {
     .replace(/\u2029/g, "\\u2029");
 }
 
+/**
+ * 数字补零（9 → "09"）。
+ */
 function pad(n) {
   return String(n == null ? 0 : n).padStart(2, "0");
 }
 
+/**
+ * 把时间戳格式化成"3 分钟前 / 昨天 / 10-11"这种相对时间。
+ */
 function fmtRelative(iso) {
   if (!iso) return "";
   const d = new Date(iso),
@@ -9639,6 +10801,9 @@ function fmtRelative(iso) {
   return d.toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" });
 }
 
+/**
+ * 简易 HTML 模板：把参数按位置插入，同时做转义。
+ */
 function html(body) {
   return new Response(body, {
     headers: {
@@ -9650,6 +10815,10 @@ function html(body) {
   });
 }
 
+/**
+ * 把"今天已播出但 Trakt 还没记录"的剧，本地补进继续观看。
+ * 避免用户明明看了、首页却空着。
+ */
 async function injectLocalUpcomingIntoContinue(
   list,
   headers,
@@ -9717,6 +10886,11 @@ async function injectLocalUpcomingIntoContinue(
   return Array.isArray(list) ? list : [];
 }
 
+/* ==================================================================
+ * 分页列表
+ * 继续观看 / 记录的翻页接口
+ * ================================================================== */
+
 async function handleMore(request, env, ctx) {
   const url = new URL(request.url),
     type = url.searchParams.get("type"),
@@ -9755,7 +10929,7 @@ async function handleMore(request, env, ctx) {
             parseInt(r.headers.get("X-Pagination-Page-Count") || "1") || 1,
         };
       },
-      { ttl: 300, missTtl: 60, swr: true, edgeTtl: 120, jitter: 120 },
+      { ttl: 300, missTtl: 60, swr: true, jitter: 120 },
     );
 
     if (!data || !Array.isArray(data.items))
@@ -9786,25 +10960,35 @@ async function handleMore(request, env, ctx) {
 
     const limit = limitParam > 0 ? Math.min(limitParam, 40) : 20;
 
+    // 缓存里可能是旧的合并结果（数组），也可能是 v2 的原始 { paused, upNext }
+    function asHomePlaybackList(v) {
+      if (Array.isArray(v)) return v.length ? v : null;
+      if (v && (Array.isArray(v.paused) || Array.isArray(v.upNext))) {
+        const merged = mergeContinueLists(
+          Array.isArray(v.paused) ? v.paused : [],
+          Array.isArray(v.upNext) ? v.upNext : [],
+          20,
+          null,
+          null,
+          null,
+          null,
+        );
+        return merged && merged.length ? merged : null;
+      }
+      return null;
+    }
+
     async function readHomePlaybackList() {
       const tryKeys = [CK.playback(userKey), CK.lastGood.playback(userKey)];
       for (const key of tryKeys) {
-        try {
-          const mem = kvMemGet(key);
-          if (mem && !mem.miss) {
-            const v = mem.data !== undefined ? mem.data : mem;
-            if (Array.isArray(v) && v.length) return v;
-          }
-        } catch {}
         if (env && env.TMDB_CACHE && !kvIsDown()) {
           try {
-            const raw = await env.TMDB_CACHE.get(key, {
-              type: "json",
-              cacheTtl: 60,
-            });
+            const raw = await env.TMDB_CACHE.get(key, kvReadOpts());
             if (raw && !raw.miss) {
-              const v = raw.data !== undefined ? raw.data : raw;
-              if (Array.isArray(v) && v.length) return v;
+              const hit = asHomePlaybackList(
+                raw.data !== undefined ? raw.data : raw,
+              );
+              if (hit) return hit;
             }
           } catch {}
         }
@@ -9924,7 +11108,7 @@ async function handleMore(request, env, ctx) {
           pageCount: pageCountInner,
         };
       },
-      { ttl: 300, missTtl: 60, swr: true, edgeTtl: 120, jitter: 150 },
+      { ttl: 300, missTtl: 60, swr: true, jitter: 150 },
     );
 
     let list = data && Array.isArray(data.items) ? data.items : null;
@@ -10004,6 +11188,11 @@ async function handleMore(request, env, ctx) {
 
   return new Response("", { status: 400 });
 }
+
+/* ==================================================================
+ * 启动页与页面外壳
+ * 登录页、启动图、公共 head/tail
+ * ================================================================== */
 
 function renderLoginPage() {
   return pageShell(
@@ -10289,6 +11478,7 @@ function __setUpdatedAt(source,ageSec,dataTs){
 function applyPlayback(d,isCache){
   if(!d)return;
   if(d.playbackHScrollHtml){window.__lastPbHtml=d.playbackHScrollHtml;setHTML('#playback-hscroll',d.playbackHScrollHtml);}
+  else{setHTML('#playback-hscroll','<div class="empty" style="padding:50px 20px"><p style="margin:0;font-size:.92rem">暂无继续观看</p></div>');}
   try{__rememberCwTimes(d);}catch(e){}
   var src=isCache?'cache':(d.playbackSource||'');
   var age=null;
@@ -10319,7 +11509,15 @@ try{
   else __setUpdatedAt('boot');
 }catch(e){}
 function applyMeta(d,isCache){if(!d)return;var n=document.getElementById('hero-name');if(n&&d.name)n.textContent=d.name;applyAvatar(d.avatar,d.avatarAlt);if(d.statsHtml)setHTML('#stats-box',d.statsHtml);if(!isCache)try{lsSet('mt:meta',d,604800);}catch(e){}}window.__applyMeta=applyMeta;var __homeDataLoading=false;
-function fetchPart(part,force,live){return fetch('/api/home-data?part='+encodeURIComponent(part)+(force?'&force=1':'')+(live?'&live=1':''),{credentials:'same-origin',cache:'no-store'}).then(function(r){if(r.status===401){return r.json().catch(function(){return{};}).then(function(d){var msg=(d&&d.error)||'登录已失效，请重新登录';try{sessionStorage.setItem('mt:relogin',msg);}catch(e){}if(window.__toast)window.__toast(msg,{type:'warn',duration:2200});setTimeout(function(){location.href='/login';},1000);return null;});}if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){if(!d)return null;if(d.login){location.href='/login';return null;}return d;});}window.__fetchPart=fetchPart;var __loadedParts={};function loadPartOnce(part){if(__loadedParts[part])return Promise.resolve(__loadedParts[part]);return fetchPart(part).then(function(d){__loadedParts[part]=d;return d;});}window.__loadPartOnce=loadPartOnce;window.__loadedParts=__loadedParts;function loadHomeData(opts){
+/* 带超时的 fetch：后端如果卡在 Trakt 限流排队上，不能让前端无限转圈 */
+function __fetchWithTimeout(url,opts,ms){
+  var ctrl=(typeof AbortController!=='undefined')?new AbortController():null;
+  var timer=null;
+  if(ctrl){timer=setTimeout(function(){try{ctrl.abort();}catch(e){}},ms||30000);opts=opts||{};opts.signal=ctrl.signal;}
+  return fetch(url,opts).then(function(r){if(timer)clearTimeout(timer);return r;},function(e){if(timer)clearTimeout(timer);throw e;});
+}
+
+function fetchPart(part,force,live){return __fetchWithTimeout('/api/home-data?part='+encodeURIComponent(part)+(force?'&force=1':'')+(live?'&live=1':''),{credentials:'same-origin',cache:'no-store'},30000).then(function(r){if(r.status===401){return r.json().catch(function(){return{};}).then(function(d){var msg=(d&&d.error)||'登录已失效，请重新登录';try{sessionStorage.setItem('mt:relogin',msg);}catch(e){}if(window.__toast)window.__toast(msg,{type:'warn',duration:2200});setTimeout(function(){location.href='/login';},1000);return null;});}if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){if(!d)return null;if(d.login){location.href='/login';return null;}return d;});}window.__fetchPart=fetchPart;var __loadedParts={};function loadPartOnce(part){if(__loadedParts[part])return Promise.resolve(__loadedParts[part]);return fetchPart(part).then(function(d){__loadedParts[part]=d;return d;});}window.__loadPartOnce=loadPartOnce;window.__loadedParts=__loadedParts;function loadHomeData(opts){
   opts=opts||{};
   var silent=!!opts.silent;
   if(__homeDataLoading&&!silent)return;
@@ -10379,10 +11577,15 @@ function fetchPart(part,force,live){return fetch('/api/home-data?part='+encodeUR
     if(window.requestIdleCallback)requestIdleCallback(runMeta,{timeout:1500});
     else setTimeout(runMeta,200);
   });
-}var __refreshTick=0,__lastUserAct=Date.now(),__lastBoardReload=Date.now();['scroll','click','touchstart','keydown'].forEach(function(t){window.addEventListener(t,function(){__lastUserAct=Date.now();},{passive:true});});function silentRefresh(){if(document.hidden)return;var __m=document.getElementById('modal');if(__m&&__m.classList.contains('open'))return;if(window.__forceRefreshing||window.__homeDataLoading)return;__refreshTick++;__lastRefreshAt=Date.now();fetchPart('playback',false,true).then(function(d){if(!d)return;if(d.activityUnchanged)return;var prevHtml=window.__lastPbHtml||null;var newHtml=(d&&d.playbackHScrollHtml)||null;if(newHtml&&prevHtml&&prevHtml===newHtml)return;applyPlayback(d);try{lsSet('mt:pb',d,900);}catch(e){}if(newHtml&&prevHtml&&prevHtml!==newHtml&&window.__toast)window.__toast('已自动更新观看进度',{type:'success',duration:2000});}).catch(function(){});}window.__refreshStats=silentRefresh;
-window.forceRefresh=async function(){if(window.__forceRefreshing)return;window.__forceRefreshing=true;window.__manualRefreshPending=true;try{localStorage.removeItem('mt:pb');localStorage.removeItem('mt:meta');try{window.__cwMoreCache=null;}catch(e){}}catch(e){}var btn=document.getElementById('btn-refresh');var span=btn&&btn.querySelector('span');var oldText=span?span.textContent:'刷新';if(btn)btn.classList.add('loading');if(span)span.textContent='刷新中';var okCount=0,cacheCount=0,failCount=0,cooling=0,hitLimit=false;var GAP_OK=600,GAP_LIMIT=1400;try{var wanted=['playback','meta','calendar'];var loaded=window.__loadedParts||{};['history','watchlist'].forEach(function(p){if(loaded[p]&&wanted.indexOf(p)<0)wanted.push(p);});for(var i=0;i<wanted.length;i++){if(hitLimit)break;var part=wanted[i];if(i>0){var gap=cooling>0?GAP_LIMIT:GAP_OK;await new Promise(function(r){setTimeout(r,gap);});}var d=null;try{d=await __enqueueTrakt(function(){return fetchPart(part,true);});}catch(e){d=null;}if(!d){failCount++;continue;}var isCache=false;if(part==='playback'&&d.playbackSource==='cache')isCache=true;if(part==='meta'&&d.metaSource==='cache')isCache=true;if(part==='calendar'&&d.calendarSource==='cache')isCache=true;if(isCache)cacheCount++;else okCount++;if(part==='playback'){applyPlayback(d);try{lsSet('mt:pb',d,900);}catch(e){}}else if(part==='meta'){applyMeta(d,false);}else if(part==='watchlist'||part==='calendar'||part==='history'){__applyPart(part,d);__savePartSnap(part,d);}window.__loadedParts[part]=d;if(__partFailed(d)){try{delete window.__loadedParts[part];}catch(e){}}if(d.rateLimited||(d.cooling&&d.cooling>0)){hitLimit=true;cooling=Math.max(cooling,Number(d.cooling)||0);}else if(isCache&&(part==='playback'||part==='meta')){hitLimit=true;}}if(failCount&&!okCount&&!cacheCount){__errToast('刷新失败',new Error('无法连接，请检查网络后重试'));}else if(hitLimit){var msg=cooling>0?('刷新失败，Trakt 限流约 '+cooling+' 秒，已显示缓存'):'刷新失败，已显示缓存';__toast(msg,{type:'warn',duration:4200});}else if(failCount||cacheCount){__toast('已刷新观看数据（部分仍为缓存）',{type:'warn',duration:2800});}else{__toast('已刷新观看数据',{type:'success',duration:1800});}if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){__errToast('刷新失败',e);}finally{if(btn)btn.classList.remove('loading');if(span)span.textContent=oldText;window.__forceRefreshing=false;}};
-function startHomeData(){loadHomeData({silent:false});}if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',startHomeData);}else{startHomeData();}var REFRESH_MS=${HOME_AUTO_REFRESH_MINUTES}*60*1000;var __lastRefreshAt=Date.now();if(REFRESH_MS>0){setInterval(function(){if(Date.now()-__lastUserAct<60000)return;silentRefresh();},REFRESH_MS);document.addEventListener('visibilitychange',function(){if(document.hidden)return;silentRefresh();});}})();`;
+}var __refreshTick=0,__lastUserAct=Date.now(),__lastBoardReload=Date.now();['scroll','click','touchstart','keydown'].forEach(function(t){window.addEventListener(t,function(){__lastUserAct=Date.now();},{passive:true});});function silentRefresh(){if(document.hidden)return;var __m=document.getElementById('modal');if(__m&&__m.classList.contains('open'))return;if(window.__forceRefreshing||window.__homeDataLoading)return;if(window.__silentRefreshing)return;window.__silentRefreshing=true;__refreshTick++;__lastRefreshAt=Date.now();function __applySilent(d,fromRetry){if(!d)return false;var dataTs=d.lastSyncAt||d.continueUpdatedAt||d.pauseUpdatedAt||d.playbackDataTs||null;if(dataTs){try{var n=Number(dataTs);if(isFinite(n)&&n>0)__setUpdatedAt(d.stale||d.refreshFailed?'cache':(d.playbackSource||'live'),null,n);}catch(e){}}if(d.stale||d.refreshFailed){if(window.__toast&&(!window.__staleToastAt||Date.now()-(window.__staleToastAt||0)>120000)){window.__staleToastAt=Date.now();window.__toast(d.cooling?'同步失败（限流），仍显示缓存':'同步失败，仍显示缓存',{type:'warn',duration:2800});}try{lsSet('mt:pb',d,600);}catch(e){}return true;}var prevHtml=window.__lastPbHtml||null;var newHtml=(d&&d.playbackHScrollHtml)||null;if(d.activityUnchanged&&newHtml&&prevHtml&&prevHtml===newHtml){try{lsSet('mt:pb',d,600);}catch(e){}return true;}if(newHtml){applyPlayback(d);try{lsSet('mt:pb',d,600);}catch(e){}if(prevHtml&&newHtml!==prevHtml&&window.__toast)window.__toast('已自动更新观看进度',{type:'success',duration:2000});return true;}return !!dataTs;}fetchPart('playback',false,true).then(function(d){if(__applySilent(d))return;return fetchPart('playback',false,true).then(function(d2){__applySilent(d2,true);});}).catch(function(){return new Promise(function(r){setTimeout(r,2000);}).then(function(){return fetchPart('playback',false,true).then(function(d){if(!__applySilent(d)&&window.__toast)window.__toast('自动同步失败，请稍后手动刷新',{type:'warn',duration:2800});}).catch(function(){if(window.__toast)window.__toast('自动同步失败，请稍后手动刷新',{type:'warn',duration:2800});});});}).finally(function(){window.__silentRefreshing=false;});}window.__refreshStats=silentRefresh;
+window.forceRefresh=async function(){if(window.__forceRefreshing)return;window.__forceRefreshing=true;window.__manualRefreshPending=true;try{localStorage.removeItem('mt:pb');localStorage.removeItem('mt:meta');try{window.__cwMoreCache=null;}catch(e){}}catch(e){}var btn=document.getElementById('btn-refresh');var span=btn&&btn.querySelector('span');var oldText=span?span.textContent:'刷新';if(btn)btn.classList.add('loading');if(span)span.textContent='刷新中';var okCount=0,cacheCount=0,failCount=0,cooling=0,hitLimit=false;var GAP_OK=0,GAP_LIMIT=600;try{var wanted=['playback','meta','calendar'];var loaded=window.__loadedParts||{};['history','watchlist'].forEach(function(p){if(loaded[p]&&wanted.indexOf(p)<0)wanted.push(p);});for(var i=0;i<wanted.length;i++){if(hitLimit)break;var part=wanted[i];if(i>0){var gap=cooling>0?GAP_LIMIT:GAP_OK;await new Promise(function(r){setTimeout(r,gap);});}var d=null;try{d=await __enqueueTrakt(function(){return fetchPart(part,true);});}catch(e){d=null;}if(!d){failCount++;continue;}var isCache=false;if(part==='playback'&&d.playbackSource==='cache')isCache=true;if(part==='meta'&&d.metaSource==='cache')isCache=true;if(part==='calendar'&&d.calendarSource==='cache')isCache=true;if(isCache)cacheCount++;else okCount++;if(part==='playback'){applyPlayback(d);try{lsSet('mt:pb',d,900);}catch(e){}}else if(part==='meta'){applyMeta(d,false);}else if(part==='watchlist'||part==='calendar'||part==='history'){__applyPart(part,d);__savePartSnap(part,d);}window.__loadedParts[part]=d;if(__partFailed(d)){try{delete window.__loadedParts[part];}catch(e){}}if(d.rateLimited||(d.cooling&&d.cooling>0)){hitLimit=true;cooling=Math.max(cooling,Number(d.cooling)||0);}else if(isCache&&(part==='playback'||part==='meta')){hitLimit=true;}}if(failCount&&!okCount&&!cacheCount){__errToast('刷新失败',new Error('无法连接，请检查网络后重试'));}else if(hitLimit){var msg=cooling>0?('刷新失败，Trakt 限流约 '+cooling+' 秒，已显示缓存'):'刷新失败，已显示缓存';__toast(msg,{type:'warn',duration:4200});}else if(failCount||cacheCount){__toast('已刷新观看数据（部分仍为缓存）',{type:'warn',duration:2800});}else{__toast('已刷新观看数据',{type:'success',duration:1800});}if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){__errToast('刷新失败',e);}finally{if(btn)btn.classList.remove('loading');if(span)span.textContent=oldText;window.__forceRefreshing=false;}};
+function startHomeData(){loadHomeData({silent:false});}if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',startHomeData);}else{startHomeData();}var REFRESH_MS=${HOME_AUTO_REFRESH_MINUTES}*60*1000;var __lastRefreshAt=Date.now();if(REFRESH_MS>0){setInterval(function(){if(Date.now()-__lastUserAct<60000)return;silentRefresh();},REFRESH_MS);document.addEventListener('visibilitychange',function(){if(document.hidden)return;if(Date.now()-__lastRefreshAt<60000)return;silentRefresh();});}})();`;
 }
+
+/* ==================================================================
+ * 内嵌前端脚本
+ * 以下全部是浏览器端代码，通过 /app.js 下发
+ * ================================================================== */
 
 function getClientSideScripts() {
   return (
@@ -11058,7 +12261,7 @@ async function __loadHScroll(elId,url,keepId){
   try{
     var r=await fetch(url);
     var html=r.ok?await r.text():'';
-    if(!html){el.innerHTML='<div class="h-scroll-empty"><span class="spinner"></span></div>';return;}
+    if(!html){el.innerHTML='<div class="h-scroll-empty"><p>暂无内容</p></div>';return;}
     if(keepId){
       el.outerHTML=html.replace('class="h-scroll"','class="h-scroll" id="'+elId+'"');
     }else{
