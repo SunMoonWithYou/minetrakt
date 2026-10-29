@@ -243,13 +243,13 @@ const KV_STALE_RETENTION = 86400 * 7;
 /** lastGood 兜底副本 TTL：7 天 */
 const LAST_GOOD_KV_TTL = 86400 * 7;
 
-/** 首页自动刷新间隔（分钟） */
-const HOME_AUTO_REFRESH_MINUTES = 10;
+/** 首页自动刷新间隔（分钟）；略拉长以降低后台打 Trakt 频率 */
+const HOME_AUTO_REFRESH_MINUTES = 15;
 /** 播放数据视为「新鲜」的秒数（= 自动刷新间隔） */
 const PLAYBACK_FRESH_SEC = HOME_AUTO_REFRESH_MINUTES * 60;
 
 /** 应用版本；发版时务必同步修改（影响 SW / 静态资源 ETag） */
-const APP_VERSION = "2.0.0";
+const APP_VERSION = "1.2.1";
 /** 前端 JS 资源版本（可与 APP_VERSION 解耦发版） */
 const APP_JS_VERSION = APP_VERSION;
 /** 前端 CSS 资源版本 */
@@ -508,26 +508,33 @@ const TRAKT_AUTH_HOST_RE = /^https?:\/\/auth\.trakt\.tv\//i;
 const TRAKT_HOST_RE = /^https?:\/\/(?:api|auth)\.trakt\.tv\//i;
 
 /** 高压/读串行时，全局两次 Trakt 请求最小间隔（毫秒） */
-const TRAKT_MIN_GAP_MS = 800;
+const TRAKT_MIN_GAP_MS = 1000;
 /** 同一用户两次请求最小间隔（毫秒） */
-const TRAKT_USER_GAP_MS = 1000;
+const TRAKT_USER_GAP_MS = 1200;
 /** 串行排队最多等待这么久，避免把请求拖死 */
 const TRAKT_GAP_MAX_WAIT_MS = 20000;
-/** 普通写请求（已看/待看）全局最小间隔，可比读更短 */
-const TRAKT_WRITE_GAP_MS = 300;
-/** 普通写请求的同用户最小间隔 */
-const TRAKT_WRITE_USER_GAP_MS = 400;
+/**
+ * 写请求全局最小间隔。官方 AUTHED_API_POST_LIMIT ≈ 1 次/秒，
+ * 必须 ≥1000，否则标记已看/待看连点极易 429。
+ */
+const TRAKT_WRITE_GAP_MS = 1000;
+/** 写请求同用户最小间隔（与全局写间隔对齐） */
+const TRAKT_WRITE_USER_GAP_MS = 1000;
 
 /** Trakt 官方额度窗口长度：5 分钟 */
 const TRAKT_WINDOW_MS = 300000;
-/** 窗口内允许的请求上限（官方约 1000/5min/用户） */
-const TRAKT_WINDOW_LIMIT = 1000;
-/** 用量超过该比例则退化为串行，避免撞 429 */
-const TRAKT_SOFT_RATIO = 0.8;
-/** 低压时允许的读并发数 */
-const TRAKT_READ_CONCURRENCY = 3;
-/** 同用户并发读之间的最小抖动，避免同一瞬间齐发 */
-const TRAKT_USER_JITTER_MS = 120;
+/**
+ * 窗口内允许的请求上限。
+ * Standard 文档：AUTHED GET ≈ 500 / 5min；这里用 450 留余量，
+ * 避免首页多接口齐发顶满官方桶。
+ */
+const TRAKT_WINDOW_LIMIT = 450;
+/** 用量超过该比例则退化为串行（更早降速，减少尖峰） */
+const TRAKT_SOFT_RATIO = 0.65;
+/** 低压时允许的读并发；1=最稳，2=稍快仍可控 */
+const TRAKT_READ_CONCURRENCY = 2;
+/** 同用户并发读之间的最小抖动，拉开齐发 */
+const TRAKT_USER_JITTER_MS = 300;
 
 /** api 域串行链尾 Promise */
 let __traktTail = Promise.resolve();
@@ -638,8 +645,8 @@ function __traktSerial(uk, minGap, userGap) {
  *   3. 会主动泄压。队列积压超过 MAX_WAIT 就不再等，直接放行 ——
  *      多人同时登录时宁可乱序，也不能让 poll 卡到超时、用户干等。
  * ------------------------------------------------------------------ */
-/** auth 域两次请求最小间隔（毫秒），比 api 更保守 */
-const TRAKT_AUTH_GAP_MS = 1200;
+/** auth 域两次请求最小间隔（毫秒），比 api 更保守，减轻 WAF */
+const TRAKT_AUTH_GAP_MS = 1500;
 /** auth 排队超过该等待则不再死等，优先放行避免 poll 超时 */
 const TRAKT_AUTH_MAX_WAIT_MS = 3000;
 
