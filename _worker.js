@@ -147,7 +147,7 @@ const TRAKT_UA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (
  * api.trakt.tv 使用的客户端 UA。官方要求第三方带上应用名与版本，勿伪装成浏览器。
  */
 function appUserAgent() {
-  return `MineTrakt/${APP_VERSION} (+https://trakt.real-mrtang.workers.dev; Cloudflare-Worker)`;
+  return `MineTrakt/${APP_VERSION} (+https://trakt.sunmoonyou.workers.dev; Cloudflare-Worker)`;
 }
 
 /* 浏览器一致性头组：只给 auth.trakt.tv 用。
@@ -243,13 +243,21 @@ const KV_STALE_RETENTION = 86400 * 7;
 /** lastGood 兜底副本 TTL：7 天 */
 const LAST_GOOD_KV_TTL = 86400 * 7;
 
-/** 首页自动刷新间隔（分钟）；略拉长以降低后台打 Trakt 频率 */
-const HOME_AUTO_REFRESH_MINUTES = 15;
-/** 播放数据视为「新鲜」的秒数（= 自动刷新间隔） */
-const PLAYBACK_FRESH_SEC = HOME_AUTO_REFRESH_MINUTES * 60;
+/**
+ * 定时检测活动签名的间隔（分钟）。
+ * 前端每这么久拉一次 last_activities 判断签名有没有变化：
+ *   - 签名变了  → 回源拉播放数据 + 强制重拉已看清单
+ *   - 签名没变  → 完全不动，直接用缓存
+ * 想调整检测频率，只改这一个数即可。
+ */
+const SIG_CHECK_INTERVAL_MINUTES = 15;
+/** 前端自动刷新间隔（跟随上面的签名检测间隔） */
+const HOME_AUTO_REFRESH_MINUTES = SIG_CHECK_INTERVAL_MINUTES;
+/** 播放数据视为「新鲜」的秒数（仅用于诊断输出） */
+const PLAYBACK_FRESH_SEC = SIG_CHECK_INTERVAL_MINUTES * 60;
 
 /** 应用版本；发版时务必同步修改（影响 SW / 静态资源 ETag） */
-const APP_VERSION = "1.5.0";
+const APP_VERSION = "1.6.5";
 /** 前端 JS 资源版本（可与 APP_VERSION 解耦发版） */
 const APP_JS_VERSION = APP_VERSION;
 /** 前端 CSS 资源版本 */
@@ -7334,7 +7342,10 @@ async function getUserStateBundle(headers, env, ctx, userKey, force = false) {
     async () => {
       const [droppedSet, watchedRaw, hideMapRaw] = await Promise.all([
         getDroppedShowIds(headers, env, ctx, userKey).catch(() => new Set()),
-        getWatchedEpisodeIds(headers, env, ctx, userKey).catch(() => null),
+        // force 一路传到已看清单：签名变了就让这份清单也 bypass 重拉
+        getWatchedEpisodeIds(headers, env, ctx, userKey, force).catch(
+          () => null,
+        ),
         getCwHideMap(env, ctx, userKey).catch(() => ({})),
       ]);
 
@@ -7456,7 +7467,7 @@ function safeDeleteKvKeys(env, ctx, keys) {
  * 它是 isStalePause 判定的依据，也是详情页给每集打勾的数据源。
  * 同时会记下这份数据的抓取时间，供暂停过期判定使用。
  */
-async function getWatchedEpisodeIds(headers, env, ctx, userKey) {
+async function getWatchedEpisodeIds(headers, env, ctx, userKey, force = false) {
   // 记下这份"已看集"是什么时候的数据：晚于这个时刻的暂停记录，
   // 它根本没机会知道，不能拿来判定"暂停已过期"。
   const src = { fromCache: null, age: 0 };
@@ -7467,9 +7478,8 @@ async function getWatchedEpisodeIds(headers, env, ctx, userKey) {
     async () => {
       if (isTraktRateLimited(userKey)) return null;
       try {
-        // 原先这里并行拉 /sync/watched/episodes + /sync/watched/shows?limit=100：
-        // episodes 每一项本身就带 show.ids + last_watched_at，showLastAt 可完全由它推导，
-        // watched/shows 属于纯冗余调用（还带 limit=100 截断风险），已移除。
+        // /sync/watched/episodes 每一项本身就带 show.ids + last_watched_at，
+        // showLastAt 可完全由它推导，不需要再拉 /sync/watched/shows。
         const epRes = await fetchT(
           `${TRAKT_API}/sync/watched/episodes`,
           { headers },
@@ -7499,15 +7509,16 @@ async function getWatchedEpisodeIds(headers, env, ctx, userKey) {
         return null;
       }
     },
-    // TTL 原来 3600s，而播放记录是 5400s、首页判定新鲜度是 600s，
-    // 三者错开导致"新的暂停记录"经常配到"旧的已看集"，两台设备各过滤掉不同的剧。
-    // 压到 900s，把错配窗口从 1 小时收窄到 15 分钟。
     {
       ttl: 900,
       missTtl: 300,
       swr: true,
       jitter: 180,
       sourceTracker: src,
+      // 签名变化 / 手动刷新 / 首次建基线时强制重拉：
+      // 删除 KV 是异步的，这一轮读可能还是旧清单，
+      // 刚看完的那一集剔不掉，播放记录就会一直挂在继续观看里。
+      ...(force ? { bypass: true, revalidate: true } : {}),
     },
   );
   if (!raw) return null;
@@ -7824,6 +7835,8 @@ async function handleHomeData(request, env, ctx) {
   const wantHistory = part === "history" || part === "all";
 
   // ================= 阶段 1：先看活动签名，决定要不要 bypass 打 Trakt =================
+// ================= 阶段 1：先看活动签名，决定要不要 bypass 打 Trakt =================
+  // 原则：签名变了才回源；签名没变就完全不动，直接用缓存。
   const actSigP = wantPlayback
     ? getUserActivitySig(headers, env, ctx, userKey, force || liveSig)
     : Promise.resolve(null);
@@ -7832,18 +7845,18 @@ async function handleHomeData(request, env, ctx) {
   let activityUnchanged = false;
   let pbLastCheckAt = null;
   let pbWantLive = !!force;
+  // 签名变了 / 手动刷新 / 首次建基线时，让"已看清单"也强制重拉。
+  // 只重拉 playback 不够：Trakt 不会因为别处标记 watched 就删掉播放记录，
+  // 那条旧记录要靠"已看清单"对照才剔得掉。清单不重拉 → 看完的剧仍挂在列表里。
+  let watchedBypass = false;
 
-  // pbc + 活动基线一次读出（原来分两个 key 各读一次）
+  // pbc + 活动基线一次读出
   const syncState = wantPlayback ? await readSyncState(env, userKey) : null;
 
   if (wantPlayback) {
     if (syncState && Number.isFinite(Number(syncState.at))) {
       pbLastCheckAt = Number(syncState.at);
     }
-    const checkAgeSec =
-      pbLastCheckAt != null
-        ? Math.max(0, (Date.now() - pbLastCheckAt) / 1000)
-        : Infinity;
 
     let sigChanged = false;
     let hasBaseline = false;
@@ -7868,12 +7881,15 @@ async function handleHomeData(request, env, ctx) {
       pbBypass = true;
       pbWantLive = true;
       activityUnchanged = hasBaseline && !sigChanged;
+      watchedBypass = true;
     } else if (sigChanged) {
-      // 活动变化 → 立刻重拉继续观看，并作废历史缓存
-      // （暂停/进度更新往往伴随新的 history 流水，官网有记录而本站没有就是这里漏了）
+      // 签名变了（暂停 / 看完 / 加待看 / 评分…）：
+      // 重拉播放数据 + 强制重拉已看清单，
+      // 这样"看完一集"也能和"暂停"一样立刻反映到继续观看。
       pbBypass = true;
       pbWantLive = true;
       activityUnchanged = false;
+      watchedBypass = true;
       try {
         if (userKey && env) {
           const histKeys = [
@@ -7889,7 +7905,10 @@ async function handleHomeData(request, env, ctx) {
               (async () => {
                 await p;
                 try {
-                  if (env.TMDB_CACHE && typeof env.TMDB_CACHE.list === "function") {
+                  if (
+                    env.TMDB_CACHE &&
+                    typeof env.TMDB_CACHE.list === "function"
+                  ) {
                     const toDel = [];
                     for (const prefix of [
                       `hist:${userKey}:`,
@@ -7919,17 +7938,19 @@ async function handleHomeData(request, env, ctx) {
           }
         }
       } catch {}
-    } else if (checkAgeSec < PLAYBACK_FRESH_SEC) {
-      pbBypass = false;
-      pbWantLive = false;
-      activityUnchanged = true;
-    } else {
+    } else if (sigBaselineNeeded) {
+      // 首次还没有基线：拉一次建立基线，之后才谈得上"比对"
       pbBypass = true;
       pbWantLive = true;
       activityUnchanged = false;
+      watchedBypass = true;
+    } else {
+      // 签名没变：完全不动，直接用缓存（不再有「到点就重拉」这一条）
+      pbBypass = false;
+      pbWantLive = false;
+      activityUnchanged = true;
     }
   }
-
   // ================= 阶段 2：并发抓取各分片 =================
   const result = { part };
   if (wantPlayback) result.activityUnchanged = activityUnchanged;
@@ -7961,9 +7982,15 @@ async function handleHomeData(request, env, ctx) {
       // 先建好诊断容器：即使本轮命中缓存、fetcher 不执行，也要能看到过滤明细
       if (!playbackSrc.debug) playbackSrc.debug = {};
       // 用户状态与播放数据并行发起（冷启时这是 2~3 次 Trakt 调用）
-      const userStateP = getUserStateBundle(headers, env, ctx, userKey).catch(
-        () => null,
-      );
+      // 传入 watchedBypass：签名变了 / 手动刷新 / 首次建基线时，
+      // 让已看清单也 bypass 重拉，保证"看完"能被正确剔除。
+      const userStateP = getUserStateBundle(
+        headers,
+        env,
+        ctx,
+        userKey,
+        watchedBypass,
+      ).catch(() => null);
 
       // 只缓存"原始"的暂停 / 下一集数据，合并与过滤放到缓存外面每次现算。
       // 原来缓存的是合并后的结果，等于把 isStalePause 之类的判定结果冻结整个
@@ -8847,7 +8874,7 @@ function renderHomeSkeleton(initialDetail, profileHint) {
   const section = (id, title, extraHtml) =>
     `<div class="home-section"><div class="home-section-head"><h2 class="home-section-title">${title}</h2><button class="home-more-btn" type="button" onclick="openListModal('${id}')"><span>查看更多</span><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg></button></div>${extraHtml || ""}<div class="h-scroll-wrap"><div class="h-scroll" id="${id}-hscroll"><div class="pane-loading"><div class="spinner"></div></div></div></div></div>`;
 
-  return `<div class="container"><div class="top-sticky"><header class="hero"><div class="hero-left"><button type="button" class="hero-avatar" id="hero-avatar" title="观看小结" aria-label="打开观看小结">${heroAvatarHtml}</button><div class="hero-text"><h1 class="hero-name" id="hero-name">${heroName}</h1><p class="updated-at" id="updated-at" title="最近一次有数据变化的更新"></p></div></div><div class="hero-actions"><button class="btn-action" id="btn-refresh" onclick="forceRefresh()" title="刷新观看数据（豆瓣/热榜/平台等按日缓存，到期自动更新）"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg><span>刷新</span></button><button class="btn-action" id="btn-theme" onclick="cycleTheme()" title="主题：深色" aria-label="切换主题：深色"><span class="theme-icon" id="theme-icon"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></span><span>主题</span></button><button class="btn-action" id="btn-logout" onclick="logout()" title="退出登录"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg><span>退出</span></button></div></header><div class="stats" id="stats-box">${renderStatsHtml(null)}</div><nav class="tabs"><button class="tab active" data-tab="playback"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9.5 21v-6h5v6"/></svg><span>首页</span></button><button class="tab" data-tab="watchlist"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg><span>待看</span></button><button class="tab" data-tab="calendar"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg><span>日历</span></button><button class="tab" data-tab="history"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/></svg><span>记录</span></button><button class="tab" data-tab="search"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg><span>搜索</span></button></nav></div><section id="playback" class="pane active">${section("playback", "继续观看")}<div class="home-section platform-section"><div class="home-section-head"><h2 class="home-section-title">流媒体平台</h2></div>${renderPlatformRows()}<div class="home-section theater-platform-section"><div class="home-section-head"><h2 class="home-section-title">平台剧场</h2></div>${renderTheaterPlatformRows()}</div>${section("guduo", "骨朵热榜", '<div class="theater-home-tabs" id="guduo-home-tabs" style="display:none"></div>')}${section("douban-domestic", "豆瓣热播国产剧")}${section("douban-hktw", "豆瓣热播港台剧")}${section("douban-jpkr", "豆瓣热播日韩剧")}${section("douban-western", "豆瓣热播欧美剧")}</section><section id="watchlist" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="calendar" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="history" class="pane"><div class="grid"></div><div id="history-more"></div></section><section id="search" class="pane"><div class="search-bar"><input id="search-input" class="search-input" type="search" placeholder="搜索电影 / 剧集" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></div><div id="search-results" class="grid"></div></section><div class="app-version">MineTrakt v${APP_JS_VERSION}</div></div><div id="list-modal" class="list-modal"><div class="list-modal-backdrop" onclick="closeListModal()"></div><div class="list-modal-panel"><div class="list-modal-head"><h3 class="list-modal-title" id="list-modal-title"></h3><button type="button" class="list-modal-close" onclick="closeListModal()" aria-label="关闭">×</button></div><div class="list-modal-body" id="list-modal-body"></div></div></div><div id="summary-modal" class="summary-modal" style="display:none" role="dialog" aria-modal="true" aria-label="观看小结"><div class="summary-backdrop" onclick="window.__closeSummary()"></div><div class="summary-panel"><div class="summary-head"><h2 class="summary-title">观看小结</h2><button type="button" class="summary-close" onclick="window.__closeSummary()" aria-label="关闭">×</button></div><div id="summary-modal-body" class="summary-body"><div class="pane-loading"><div class="spinner"></div></div></div></div></div><div id="person-modal" class="person-modal"><div class="person-backdrop" onclick="closePerson()"></div><div class="person-panel"><div class="person-panel-head"><div class="person-panel-name" id="person-modal-name"></div><button class="person-close" onclick="closePerson()" aria-label="关闭">×</button></div><div class="person-panel-body" id="person-modal-body"></div></div></div><div id="confirm-modal" class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title" style="display:none"><div class="confirm-backdrop"></div><div class="confirm-panel"><div class="confirm-icon" id="confirm-icon">?</div><div class="confirm-title" id="confirm-title"></div><div class="confirm-msg" id="confirm-msg"></div><div class="confirm-actions"><button class="confirm-btn confirm-cancel" id="confirm-cancel" type="button">取消</button><button class="confirm-btn confirm-ok" id="confirm-ok" type="button">确定</button></div></div></div><div id="modal" class="modal"><div class="modal-backdrop" onclick="closeDetail()"></div><div class="modal-panel"><div class="modal-shell"><button class="modal-close" onclick="closeDetail()" aria-label="关闭"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button><div class="modal-body" id="modal-body"></div></div></div></div><div id="show-cal-modal" class="show-cal-modal"><div class="show-cal-backdrop" onclick="closeShowCal()"></div><div class="show-cal-panel"><div class="show-cal-head"><div class="show-cal-name" id="show-cal-name"></div><button class="show-cal-close" onclick="closeShowCal()" aria-label="关闭">×</button></div><div class="show-cal-info" id="show-cal-info"></div><div class="show-cal-nav"><button onclick="calShiftMonth(-1)" aria-label="上个月">‹</button><div id="show-cal-month">—</div><button onclick="calShiftMonth(1)" aria-label="下个月">›</button></div><div class="show-cal-weekdays"><span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span></div><div class="show-cal-grid" id="show-cal-grid"></div><div class="show-cal-legend"><span class="legend-item"><i class="legend-dot legend-past"></i>已播出</span><span class="legend-item"><i class="legend-dot legend-today"></i>今天</span><span class="legend-item"><i class="legend-dot legend-future"></i>待播出</span></div><div class="show-cal-detail" id="show-cal-detail"></div></div></div><script src="/app.js?v=${APP_JS_VERSION}" defer><\/script>${boot}`;
+  return `<div class="container"><div class="top-sticky"><header class="hero"><div class="hero-left"><button type="button" class="hero-avatar" id="hero-avatar" title="观看小结" aria-label="打开观看小结">${heroAvatarHtml}</button><div class="hero-text"><h1 class="hero-name" id="hero-name">${heroName}</h1><p class="updated-at" id="updated-at" title="最近一次有数据变化的更新"></p></div></div><div class="hero-actions"><button class="btn-action" id="btn-refresh" onclick="forceRefresh()" title="刷新观看数据（豆瓣/热榜/平台等按日缓存，到期自动更新）"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg><span>刷新</span></button><button class="btn-action" id="btn-theme" onclick="cycleTheme()" title="主题：深色" aria-label="切换主题：深色"><span class="theme-icon" id="theme-icon"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></span><span>主题</span></button><button class="btn-action" id="btn-logout" onclick="logout()" title="退出登录"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg><span>退出</span></button></div></header><div class="stats" id="stats-box">${renderStatsHtml(null)}</div><nav class="tabs"><button class="tab active" data-tab="playback"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9.5 21v-6h5v6"/></svg><span>首页</span></button><button class="tab" data-tab="watchlist"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg><span>待看</span></button><button class="tab" data-tab="calendar"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg><span>日历</span></button><button class="tab" data-tab="history"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/></svg><span>记录</span></button><button class="tab" data-tab="search"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg><span>搜索</span></button></nav></div><section id="playback" class="pane active">${section("playback", "继续观看")}<div class="home-section platform-section"><div class="home-section-head"><h2 class="home-section-title">流媒体平台</h2></div>${renderPlatformRows()}<div class="home-section theater-platform-section"><div class="home-section-head"><h2 class="home-section-title">平台剧场</h2></div>${renderTheaterPlatformRows()}</div>${section("guduo", "骨朵热榜", '<div class="theater-home-tabs" id="guduo-home-tabs" style="display:none"></div>')}${section("douban-domestic", "豆瓣热播国产剧")}${section("douban-hktw", "豆瓣热播港台剧")}${section("douban-jpkr", "豆瓣热播日韩剧")}${section("douban-western", "豆瓣热播欧美剧")}</section><section id="watchlist" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="calendar" class="pane"><div class="pane-loading"><div class="spinner"></div></div></section><section id="history" class="pane"><div class="grid"></div><div id="history-more"></div></section><section id="search" class="pane"><div class="search-bar"><input id="search-input" class="search-input" type="search" placeholder="搜索电影 / 剧集" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></div><div id="search-results" class="grid"></div></section><div class="app-version">MineTrakt v${APP_JS_VERSION}</div></div><div id="list-modal" class="list-modal"><div class="list-modal-backdrop" onclick="closeListModal()"></div><div class="list-modal-panel"><div class="list-modal-head"><h3 class="list-modal-title" id="list-modal-title"></h3><button type="button" class="list-modal-close" onclick="closeListModal()" aria-label="关闭">×</button></div><div class="list-modal-body" id="list-modal-body"></div></div></div><div id="summary-modal" class="summary-modal" role="dialog" aria-modal="true" aria-label="观看小结"><div class="summary-backdrop" onclick="window.__closeSummary()"></div><div class="summary-panel"><div class="summary-head"><h2 class="summary-title">观看小结</h2><button type="button" class="summary-close" onclick="window.__closeSummary()" aria-label="关闭">×</button></div><div id="summary-modal-body" class="summary-body"><div class="pane-loading"><div class="spinner"></div></div></div></div></div><div id="person-modal" class="person-modal"><div class="person-backdrop" onclick="closePerson()"></div><div class="person-panel"><div class="person-panel-head"><div class="person-panel-name" id="person-modal-name"></div><button class="person-close" onclick="closePerson()" aria-label="关闭">×</button></div><div class="person-panel-body" id="person-modal-body"></div></div></div><div id="confirm-modal" class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title" style="display:none"><div class="confirm-backdrop"></div><div class="confirm-panel"><div class="confirm-icon" id="confirm-icon">?</div><div class="confirm-title" id="confirm-title"></div><div class="confirm-msg" id="confirm-msg"></div><div class="confirm-actions"><button class="confirm-btn confirm-cancel" id="confirm-cancel" type="button">取消</button><button class="confirm-btn confirm-ok" id="confirm-ok" type="button">确定</button></div></div></div><div id="modal" class="modal"><div class="modal-backdrop" onclick="closeDetail()"></div><div class="modal-panel"><div class="modal-shell"><button class="modal-close" onclick="closeDetail()" aria-label="关闭"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button><div class="modal-body" id="modal-body"></div></div></div></div><div id="show-cal-modal" class="show-cal-modal"><div class="show-cal-backdrop" onclick="closeShowCal()"></div><div class="show-cal-panel"><div class="show-cal-head"><div class="show-cal-name" id="show-cal-name"></div><button class="show-cal-close" onclick="closeShowCal()" aria-label="关闭">×</button></div><div class="show-cal-info" id="show-cal-info"></div><div class="show-cal-nav"><button onclick="calShiftMonth(-1)" aria-label="上个月">‹</button><div id="show-cal-month">—</div><button onclick="calShiftMonth(1)" aria-label="下个月">›</button></div><div class="show-cal-weekdays"><span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span></div><div class="show-cal-grid" id="show-cal-grid"></div><div class="show-cal-legend"><span class="legend-item"><i class="legend-dot legend-past"></i>已播出</span><span class="legend-item"><i class="legend-dot legend-today"></i>今天</span><span class="legend-item"><i class="legend-dot legend-future"></i>待播出</span></div><div class="show-cal-detail" id="show-cal-detail"></div></div></div><script src="/app.js?v=${APP_JS_VERSION}" defer><\/script>${boot}`;
 }
 
 /* ==================================================================
@@ -11810,7 +11837,172 @@ async function handleMore(request, env, ctx) {
 
 function renderLoginPage() {
   return pageShell(
-    `<div class="login-wrap"><div class="login-card"><div class="login-logo"><img src="${ICON_192}" alt="MineTrakt" width="64" height="64" style="display:block;margin:0 auto"></div><h1 class="login-title">MineTrakt</h1><p class="login-sub">首页 · 待看列表 · 追剧日历 · 观看记录</p><div id="login-area" class="login-area"><button class="btn-primary" onclick="startLogin()">使用 Trakt 登录</button></div></div></div><script>async function startLogin(){const area=document.getElementById('login-area');window.__loginGen=(window.__loginGen||0)+1;const gen=window.__loginGen;area.innerHTML='<div class="spinner"></div>';let r;try{r=await fetch('/auth/device');}catch(e){if(gen!==window.__loginGen)return;area.innerHTML='<div class="err-box"><p class="err-title">网络错误</p><p class="err">'+String(e)+'</p></div><button class="btn-primary" onclick="startLogin()">重试</button>';return;}if(gen!==window.__loginGen)return;if(!r.ok){const err=await r.json().catch(()=>({}));if(gen!==window.__loginGen)return;if(r.status===429||err.rateLimited){var wait=Number(err.retryAfter)||30;area.innerHTML='<div class="err-box" style="background:rgba(255,184,77,.10);border-color:rgba(255,184,77,.28)"><p class="err-title" style="color:#ffb84d">请求过于频繁</p><p class="err" style="color:#ffd693">Trakt 限流了，请 <span id="rl-count">'+wait+'</span> 秒后再试</p></div><button class="btn-primary" id="rl-btn" disabled style="opacity:.5;cursor:not-allowed">请稍候…</button>';var cnt=document.getElementById('rl-count'),btn=document.getElementById('rl-btn'),left=wait;var t=setInterval(function(){if(gen!==window.__loginGen){clearInterval(t);return;}left--;if(cnt)cnt.textContent=String(left);if(left<=0){clearInterval(t);if(btn){btn.disabled=false;btn.style.opacity='';btn.style.cursor='';btn.textContent='立即重试';btn.onclick=function(){startLogin();};}}},1000);return;}area.innerHTML='<div class="err-box"><p class="err-title">获取设备码失败</p><p class="err">'+(err.error||('HTTP '+r.status))+'</p>'+(err.hint?'<p class="hint">'+err.hint+'</p>':'')+'</div><button class="btn-primary" onclick="startLogin()">重试</button>';return;}const d=await r.json();if(gen!==window.__loginGen)return;const activateUrl='https://trakt.tv/activate',qr='https://api.qrserver.com/v1/create-qr-code/?size=220x220&color=4a6db8&bgcolor=ffffff&data='+encodeURIComponent(activateUrl);area.innerHTML='<div class="device-flow"><div class="steps"><div class="step"><span class="n">1</span><span>打开 <a href="'+activateUrl+'" target="_blank" rel="noopener">trakt.tv/activate</a></span></div><div class="step"><span class="n">2</span><span>输入下方代码</span></div></div><div class="code-box">'+d.user_code+'</div><button type="button" class="btn-ghost" id="refresh-code-btn" onclick="startLogin()" style="margin:4px 0 10px">换一个验证码</button><div class="step"><span class="n">3</span><span>在 Trakt 页面点击授权</span></div><div class="qr-box"><img src="'+qr+'" alt="QR"></div><p id="status" class="status" style="display:none"></p></div><details class="log-details"><summary>调试日志</summary><div id="log" class="log-box"></div></details>';let interval=(d.interval||5)*1000,attempt=0;const logEl=document.getElementById('log'),log=(s)=>{if(logEl)logEl.innerHTML+='<div>['+new Date().toLocaleTimeString()+'] '+s+'</div>';};const tick=async()=>{if(gen!==window.__loginGen)return;attempt++;let r2;try{r2=await fetch('/auth/poll',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({state:d.state})});}catch(e){if(gen!==window.__loginGen)return;log('网络错误');setTimeout(tick,interval);return;}if(gen!==window.__loginGen)return;if(r2.status===200){try{const st=document.getElementById('status');if(st){st.innerHTML='✓ 授权成功，正在进入…';st.className='status success';st.style.display='';}}catch(e){}setTimeout(()=>location.href='/home',400);return;}let text='';try{text=await r2.text();}catch{}let data={};try{data=JSON.parse(text);}catch{}log('HTTP '+r2.status+' · '+(data.status||data.message||'未知'));if(r2.status===202){if(data.status==='slow_down')interval+=2000;setTimeout(tick,interval);return;}if(r2.status===429){setTimeout(tick,Math.max(interval,5000));return;}if(r2.status===502||r2.status===503||r2.status===504){setTimeout(tick,Math.max(interval,3000));return;}if(r2.status===403){try{const st=document.getElementById('status');if(st){st.textContent=data.message||'你拒绝了授权，请换一个验证码重试';st.className='status error';st.style.display='';}const rb=document.getElementById('refresh-code-btn');if(rb){rb.style.borderColor='rgba(224,85,96,.45)';rb.style.color='#ff8a8a';}}catch(e){}return;}if(r2.status===410){try{const st=document.getElementById('status');if(st){st.textContent=data.message||'验证码无效或已过期，请换一个重试';st.className='status error';st.style.display='';}const rb=document.getElementById('refresh-code-btn');if(rb){rb.style.borderColor='rgba(224,85,96,.45)';rb.style.color='#ff8a8a';rb.focus();}}catch(e){}return;}setTimeout(tick,interval);};setTimeout(tick,1000);}<\/script><script>(function(){try{var msg=sessionStorage.getItem('mt:relogin');if(!msg)return;sessionStorage.removeItem('mt:relogin');var area=document.getElementById('login-area');if(!area)return;var p=document.createElement('p');p.className='err';p.style.cssText='margin-bottom:14px;text-align:center';p.textContent=msg;area.parentNode.insertBefore(p,area);}catch(e){}})();<\/script>`,
+    `<div class="login-wrap"><div class="login-card"><div class="login-logo"><img src="${ICON_192}" alt="MineTrakt" width="64" height="64" style="display:block;margin:0 auto"></div><h1 class="login-title">MineTrakt</h1><p class="login-sub">首页 · 待看列表 · 追剧日历 · 观看记录</p><div id="login-area" class="login-area"><button class="btn-primary" onclick="startLogin()">使用 Trakt 登录</button></div></div></div><script>
+async function startLogin(){
+  var area=document.getElementById('login-area');
+  window.__loginGen=(window.__loginGen||0)+1;
+  var gen=window.__loginGen;
+  area.innerHTML='<div class="spinner"></div>';
+  var r;
+  try{r=await fetch('/auth/device');}
+  catch(e){
+    if(gen!==window.__loginGen)return;
+    area.innerHTML='<div class="err-box"><p class="err-title">网络好像断了</p><p class="err">连不上服务器，请检查网络后再试</p></div><button class="btn-primary" onclick="startLogin()">重试</button>';
+    return;
+  }
+  if(gen!==window.__loginGen)return;
+  if(!r.ok){
+    var err={};
+    try{err=await r.json();}catch(e){err={};}
+    if(gen!==window.__loginGen)return;
+    if(r.status===429||err.rateLimited){
+      var wait=Number(err.retryAfter)||30;
+      area.innerHTML='<div class="err-box" style="background:rgba(255,184,77,.10);border-color:rgba(255,184,77,.28)"><p class="err-title" style="color:#ffb84d">请求过于频繁</p><p class="err" style="color:#ffd693">Trakt 限流了，请 <span id="rl-count">'+wait+'</span> 秒后再试</p></div><button class="btn-primary" id="rl-btn" disabled style="opacity:.5;cursor:not-allowed">请稍候…</button>';
+      var cnt=document.getElementById('rl-count'),btn=document.getElementById('rl-btn'),left=wait;
+      var timer=setInterval(function(){
+        if(gen!==window.__loginGen){clearInterval(timer);return;}
+        left--;
+        if(cnt)cnt.textContent=String(left);
+        if(left<=0){clearInterval(timer);if(btn){btn.disabled=false;btn.style.opacity='';btn.style.cursor='';btn.textContent='立即重试';btn.onclick=function(){startLogin();};}}
+      },1000);
+      return;
+    }
+    area.innerHTML='<div class="err-box"><p class="err-title">没拿到验证码</p><p class="err">'+((err.error&&String(err.error))||'服务器暂时没有响应，请稍后再试')+'</p>'+(err.hint?'<p class="hint">'+err.hint+'</p>':'')+'</div><button class="btn-primary" onclick="startLogin()">重试</button>';
+    return;
+  }
+  var d=await r.json();
+  if(gen!==window.__loginGen)return;
+  var activateUrl='https://trakt.tv/activate';
+  area.innerHTML='<div class="device-flow">'
+    +'<div class="steps">'
+    +'<div class="step"><span class="n">1</span><span>打开 <a href="'+activateUrl+'" target="_blank" rel="noopener">trakt.tv/activate</a></span></div>'
+    +'<div class="step"><span class="n">2</span><span>输入下方代码</span></div>'
+    +'</div>'
+    +'<div class="code-box">'+d.user_code+'</div>'
+    +'<button type="button" class="btn-ghost" id="refresh-code-btn" onclick="startLogin()" style="margin:4px 0 10px">换一个验证码</button>'
+    +'<div class="step"><span class="n">3</span><span>在 Trakt 页面点击授权，这里会自动继续</span></div>'
+    +'<p id="status" class="status" style="display:none"></p>'
+    +'<details class="log-details" open><summary>调试日志</summary><div id="log" class="log-box"></div></details>'
+    +'</div>';
+  var logEl=document.getElementById('log');
+  var waitRow=null,waitRender=null,waitDetail='',waitCls='';
+  var waitFrom=Date.now();
+  var interval=((d&&d.interval)||5)*1000;
+  function p2(n){return (n<10?'0':'')+n;}
+  function clock(){var t=new Date();return p2(t.getHours())+':'+p2(t.getMinutes())+':'+p2(t.getSeconds());}
+  function waitedSec(){return Math.max(0,Math.round((Date.now()-waitFrom)/1000));}
+  function logScroll(){if(!logEl)return;if(logEl.scrollHeight-logEl.scrollTop-logEl.clientHeight<24)logEl.scrollTop=logEl.scrollHeight;}
+  function paintWait(){
+    if(!waitRow)return;
+    waitRow.className='log-row log-wait'+(waitCls?' '+waitCls:'');
+    waitRow.title=waitDetail;
+    waitRow.innerHTML='<span class="log-t">'+clock()+'</span><span class="log-m">'+(waitRender?waitRender():'')+'</span>';
+    logScroll();
+  }
+  function logWait(render,detail,cls){
+    if(!logEl)return;
+    waitRender=(typeof render==='function')?render:function(){return String(render);};
+    waitDetail=detail||'';
+    waitCls=cls||'';
+    if(!waitRow){waitRow=document.createElement('div');waitRow.className='log-row log-wait';logEl.appendChild(waitRow);}
+    paintWait();
+  }
+  function logEvent(msg,cls,detail){
+    if(!logEl)return;
+    if(waitRow&&waitRow.parentNode){waitRow.parentNode.removeChild(waitRow);waitRow=null;waitRender=null;}
+    var row=document.createElement('div');
+    row.className='log-row'+(cls?' '+cls:'');
+    if(detail)row.title=detail;
+    row.innerHTML='<span class="log-t">'+clock()+'</span><span class="log-m">'+msg+'</span>';
+    logEl.appendChild(row);
+    logScroll();
+  }
+  function setStatus(msg,kind){
+    try{var st=document.getElementById('status');if(!st)return;st.textContent=msg;st.className='status '+(kind||'');st.style.display='';}catch(e){}
+  }
+  function pointToRefresh(){
+    try{var rb=document.getElementById('refresh-code-btn');if(rb){rb.style.borderColor='rgba(224,85,96,.45)';rb.style.color='#ff8a8a';rb.focus();}}catch(e){}
+  }
+  logEvent('验证码已生成：'+d.user_code,'log-ok','user_code='+d.user_code);
+  logWait(function(){return '等待你在 Trakt 页面完成授权…（已等待 '+waitedSec()+' 秒）';},'authorization_pending');
+  var ticker=setInterval(function(){
+    if(gen!==window.__loginGen){clearInterval(ticker);return;}
+    paintWait();
+  },1000);
+  function stopTicker(){try{clearInterval(ticker);}catch(e){}}
+  var tick=async function(){
+    if(gen!==window.__loginGen){stopTicker();return;}
+    var r2;
+    try{
+      r2=await fetch('/auth/poll',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({state:d.state})});
+    }catch(e){
+      if(gen!==window.__loginGen){stopTicker();return;}
+      logWait(function(){return '网络断了一下，正在重试…（已等待 '+waitedSec()+' 秒）';},String(e),'log-warn');
+      setTimeout(tick,interval);
+      return;
+    }
+    if(gen!==window.__loginGen){stopTicker();return;}
+    if(r2.status===200){
+      stopTicker();
+      logEvent('授权成功，正在进入首页…','log-ok','HTTP 200 · ok');
+      setStatus('✓ 授权成功，正在进入…','success');
+      setTimeout(function(){location.href='/home';},400);
+      return;
+    }
+    var data={},text='';
+    try{text=await r2.text();}catch(e){}
+    try{data=JSON.parse(text)||{};}catch(e){data={};}
+    var raw='HTTP '+r2.status+(data&&(data.status||data.message)?' · '+(data.status||data.message):'');
+    if(r2.status===202){
+      if(data.status==='slow_down'){
+        interval+=2000;
+        logWait(function(){return '还在等你授权…（Trakt 说我们问得太急，已自动放慢检查节奏 已等待 '+waitedSec()+' 秒）';},raw);
+      }else{
+        logWait(function(){return '等待你在 Trakt 页面完成授权…（已等待 '+waitedSec()+' 秒）';},raw);
+      }
+      setTimeout(tick,interval);
+      return;
+    }
+    if(r2.status===403){
+      stopTicker();
+      logEvent('授权没有完成 —— 你在 Trakt 页面点了「拒绝授权」。点下面的「换一个验证码」再来一次','log-err',raw);
+      setStatus(data.message||'你拒绝了授权，请换一个验证码重试','error');
+      pointToRefresh();
+      return;
+    }
+    if(r2.status===410){
+      stopTicker();
+      logEvent('验证码失效了 —— 等得太久（超过 10 分钟），点下面的「换一个验证码」重新开始','log-err',raw);
+      setStatus(data.message||'验证码无效或已过期，请换一个重试','error');
+      pointToRefresh();
+      return;
+    }
+    if(r2.status===400){
+      stopTicker();
+      logEvent('这个验证码已经不能用了（可能刷新过页面），点下面的「换一个验证码」重新开始','log-err',raw);
+      setStatus('验证码已失效，请换一个重试','error');
+      pointToRefresh();
+      return;
+    }
+    if(r2.status===429){
+      var ra=Number(data.retryAfter);
+      var ms=(isFinite(ra)&&ra>0)?Math.min(300,Math.max(5,ra))*1000:Math.max(interval,5000);
+      var until=Date.now()+ms;
+      logWait(function(){var s=Math.max(0,Math.ceil((until-Date.now())/1000));return 'Trakt 限流了，我们安静等 '+s+' 秒再自动重试…';},raw,'log-warn');
+      setTimeout(tick,ms);
+      return;
+    }
+    if(r2.status===502||r2.status===503||r2.status===504){
+      logWait(function(){return '暂时连不上 Trakt 服务器，正在自动重试…（已等待 '+waitedSec()+' 秒）';},raw,'log-warn');
+      setTimeout(tick,Math.max(interval,3000));
+      return;
+    }
+    logWait(function(){return '出了点小状况，正在自动重试…（已等待 '+waitedSec()+' 秒）';},raw,'log-warn');
+    setTimeout(tick,interval);
+  };
+  setTimeout(tick,1000);
+}
+<\/script><script>(function(){try{var msg=sessionStorage.getItem('mt:relogin');if(!msg)return;sessionStorage.removeItem('mt:relogin');var area=document.getElementById('login-area');if(!area)return;var p=document.createElement('p');p.className='err';p.style.cssText='margin-bottom:14px;text-align:center';p.textContent=msg;area.parentNode.insertBefore(p,area);}catch(e){}})<\/script>`,
   );
 }
 
@@ -12466,7 +12658,88 @@ function __fetchPartForTab(part, retry) {
 }
 
 window.__fetchPartForTab = __fetchPartForTab;
-document.querySelectorAll('.tab').forEach(t=>{t.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.pane').forEach(x=>x.classList.remove('active'));t.classList.add('active');var tabName=t.dataset.tab,pane=document.getElementById(tabName);if(pane)pane.classList.add('active');if(tabName==='search'){setTimeout(function(){var inp=document.getElementById('search-input');if(inp)inp.focus();if(inp&&!inp.value.trim()&&window.__loadTrending)window.__loadTrending();},60);return;}if(tabName==='playback')return;var partMap={watchlist:'watchlist',calendar:'calendar',history:'history'};var part=partMap[tabName];if(!part)return;var loaded=window.__loadedParts||{};if(loaded[part]&&!__partFailed(loaded[part])){__applyPart(part,loaded[part]);if(part==='calendar'){try{if(window.__scheduleCalAirTick)window.__scheduleCalAirTick();}catch(e){}var ts=Number(loaded[part].__fetchedAt||0);if(!ts||Date.now()-ts>12*60*1000){window.__fetchPartForTab(part).then(function(d){if(!d)return;d.__fetchedAt=Date.now();__applyPart(part,d);__savePartSnap(part,d);window.__loadedParts[part]=d;}).catch(function(){});}}return;}var snap=__loadPartSnap(part);if(snap)__applyPart(part,snap);window.__fetchPartForTab(part).then(function(d){if(d){__applyPart(part,d);return;}var lv=snap||__loadPartSnap(part);if(lv){__applyPart(part,lv);if(window.__toast)window.__toast('上游暂不可用，已显示上次数据',{type:'warn',duration:1800});return;}var p=document.getElementById(tabName);if(p)p.innerHTML='<div class="empty"><p>加载失败，请稍后重试</p></div>';});});});
+(function(){
+  var TAB_ORDER=['playback','watchlist','calendar','history','search'];
+  var lastTab='playback';
+  function tabIndex(name){
+    var i=TAB_ORDER.indexOf(name);
+    return i<0?0:i;
+  }
+  function switchPane(tabName,dir){
+    var panes=document.querySelectorAll('.pane');
+    var next=document.getElementById(tabName);
+    for(var i=0;i<panes.length;i++){
+      var p=panes[i];
+      p.classList.remove('active','pane-in-left','pane-in-right','pane-in-fade');
+    }
+    if(!next)return;
+    var anim=dir>0?'pane-in-left':(dir<0?'pane-in-right':'pane-in-fade');
+    next.classList.add('active',anim);
+    // 动画结束后清掉方向 class，避免再次切换时不触发
+    setTimeout(function(){
+      next.classList.remove('pane-in-left','pane-in-right','pane-in-fade');
+    },420);
+  }
+  document.querySelectorAll('.tab').forEach(function(t){
+    t.addEventListener('click',function(){
+      var tabName=t.dataset.tab;
+      if(!tabName)return;
+      var from=lastTab;
+      var dir=tabIndex(tabName)-tabIndex(from);
+      document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('active');});
+      t.classList.add('active');
+      switchPane(tabName,dir);
+      lastTab=tabName;
+      // 轻触反馈：标签轻微弹一下
+      t.classList.remove('tab-tap');
+      void t.offsetWidth;
+      t.classList.add('tab-tap');
+      if(tabName==='search'){
+        setTimeout(function(){
+          var inp=document.getElementById('search-input');
+          if(inp)inp.focus();
+          if(inp&&!inp.value.trim()&&window.__loadTrending)window.__loadTrending();
+        },60);
+        return;
+      }
+      if(tabName==='playback')return;
+      var partMap={watchlist:'watchlist',calendar:'calendar',history:'history'};
+      var part=partMap[tabName];
+      if(!part)return;
+      var loaded=window.__loadedParts||{};
+      if(loaded[part]&&!__partFailed(loaded[part])){
+        __applyPart(part,loaded[part]);
+        if(part==='calendar'){
+          try{if(window.__scheduleCalAirTick)window.__scheduleCalAirTick();}catch(e){}
+          var ts=Number(loaded[part].__fetchedAt||0);
+          if(!ts||Date.now()-ts>12*60*1000){
+            window.__fetchPartForTab(part).then(function(d){
+              if(!d)return;
+              d.__fetchedAt=Date.now();
+              __applyPart(part,d);
+              __savePartSnap(part,d);
+              window.__loadedParts[part]=d;
+            }).catch(function(){});
+          }
+        }
+        return;
+      }
+      var snap=__loadPartSnap(part);
+      if(snap)__applyPart(part,snap);
+      window.__fetchPartForTab(part).then(function(d){
+        if(d){__applyPart(part,d);return;}
+        var lv=snap||__loadPartSnap(part);
+        if(lv){
+          __applyPart(part,lv);
+          if(window.__toast)window.__toast('上游暂不可用，已显示上次数据',{type:'warn',duration:1800});
+          return;
+        }
+        var p=document.getElementById(tabName);
+        if(p)p.innerHTML='<div class="empty"><p>加载失败，请稍后重试</p></div>';
+      });
+    });
+  });
+})();
 (function(){var order=['watchlist','calendar','history'],GAP=4000;function warm(i){if(i>=order.length||document.hidden)return;var p=order[i];function next(){setTimeout(function(){warm(i+1);},GAP);}var loaded=window.__loadedParts||{};if(loaded[p]&&!__partFailed(loaded[p])){next();return;}__fetchPartForTab(p).then(function(d){if(d)__applyPart(p,d);next();});}function start(){setTimeout(function(){warm(0);},1500);}if(window.requestIdleCallback)window.requestIdleCallback(start,{timeout:3000});else start();})();
 /**
  * logout
@@ -13129,7 +13402,7 @@ async function __loadHScroll(elId,url,keepId){
  */
 async function loadGuduoHScroll(category,force){category=category||'剧集';return __loadHScroll('guduo-hscroll','/api/guduo-list?mode=hscroll&category='+encodeURIComponent(category)+(force?'&force=1':''));}async function loadGuduoHomeTabs(){var tabsBox=document.getElementById('guduo-home-tabs');if(!tabsBox||tabsBox.dataset.loaded==='1')return;try{var r=await fetch('/api/guduo-list?mode=categories');var d=r.ok?await r.json():{categories:[]};var cats=(d&&d.categories)||[];if(!cats.length){}cats=cats.length?cats:['剧集','电影','动漫','综艺'];var html='';for(var i=0;i<cats.length;i++){var p=cats[i];html+='<button class="theater-filter-tab'+(i===0?' active':'')+'" data-category="'+__esc(p)+'">'+__esc(p)+'</button>';}tabsBox.innerHTML=html;tabsBox.style.display='';tabsBox.dataset.loaded='1';tabsBox.addEventListener('click',function(e){var btn=e.target.closest('.theater-filter-tab');if(!btn)return;tabsBox.querySelectorAll('.theater-filter-tab').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');loadGuduoHScroll(btn.getAttribute('data-category')||'剧集');});}catch(e){}}
 (function(){var sections=[['douban-domestic','domestic'],['douban-hktw','hktw'],['douban-jpkr','jpkr'],['douban-western','western']];function loadOne(id,section,force){return __loadHScroll(id+'-hscroll','/api/douban-list?section='+section+'&mode=hscroll'+(force?'&force=1':''),true);}function start(force){sections.forEach(function(pair){loadOne(pair[0],pair[1],force);});var guduoTab=document.querySelector('#guduo-home-tabs .theater-filter-tab.active');var guduoCat=guduoTab?guduoTab.getAttribute('data-category')||'剧集':'剧集';loadGuduoHScroll(guduoCat,force);if(force){var gt=document.getElementById('guduo-home-tabs');if(gt)gt.dataset.loaded='0';}loadGuduoHomeTabs();if(window.__reloadPlatformPreviews)window.__reloadPlatformPreviews(false);if(window.__reloadTheaterPreviews)window.__reloadTheaterPreviews(!!force);}if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',function(){start(false);});else start(false);window.__reloadDoubanSections=start;})();
-let modalLoadingId=0;window.__lastDetailType=null;window.__lastDetailId=null;async function openDetail(type,id,push=true,force=false){const modal=document.getElementById('modal'),body=document.getElementById('modal-body');if(!modal||!body)return;if(window.__stopTrailers)window.__stopTrailers();window.__lastDetailType=type;window.__lastDetailId=id;modal.classList.add('open');document.body.style.overflow='hidden';if(push&&location.pathname!=='/detail/'+type+'/'+id)history.pushState({detail:true},'','/detail/'+type+'/'+id);const reqId=++modalLoadingId;body.innerHTML='<div class="modal-loading"><div class="spinner"></div></div>';body.scrollTop=0;try{const r=await fetch('/api/detail?type='+encodeURIComponent(type)+'&id='+encodeURIComponent(id)+(force?'&force=1':''));if(reqId!==modalLoadingId)return;if(!r.ok)throw new Error('HTTP '+r.status);body.innerHTML=await r.text();if(window.__detailDeferLoad)window.__detailDeferLoad(type);}catch(e){if(reqId!==modalLoadingId)return;body.innerHTML='<div class="modal-error"><p>加载失败，请稍后重试</p><button class="btn-ghost" type="button" style="margin-top:14px" onclick="window.__retryDetail&&window.__retryDetail()">重试</button></div>';}}window.openDetail=openDetail;
+let modalLoadingId=0;window.__lastDetailType=null;window.__lastDetailId=null;async function openDetail(type,id,push=true,force=false){const modal=document.getElementById('modal'),body=document.getElementById('modal-body');if(!modal||!body)return;if(window.__stopTrailers)window.__stopTrailers();window.__lastDetailType=type;window.__lastDetailId=id;modal.classList.add('open');document.body.style.overflow='hidden';/* 不压历史栈，避免 iPhone 系统右滑返回关掉弹窗；仍用 replaceState 保持可分享 URL */if(push&&location.pathname!=='/detail/'+type+'/'+id){try{history.replaceState({detail:true},'','/detail/'+type+'/'+id);}catch(e){}}const reqId=++modalLoadingId;body.innerHTML='<div class="modal-loading"><div class="spinner"></div></div>';body.scrollTop=0;try{const r=await fetch('/api/detail?type='+encodeURIComponent(type)+'&id='+encodeURIComponent(id)+(force?'&force=1':''));if(reqId!==modalLoadingId)return;if(!r.ok)throw new Error('HTTP '+r.status);body.innerHTML=await r.text();if(window.__detailDeferLoad)window.__detailDeferLoad(type);}catch(e){if(reqId!==modalLoadingId)return;body.innerHTML='<div class="modal-error"><p>加载失败，请稍后重试</p><button class="btn-ghost" type="button" style="margin-top:14px" onclick="window.__retryDetail&&window.__retryDetail()">重试</button></div>';}}window.openDetail=openDetail;
 window.__retryDetail=function(){if(window.__lastDetailType&&window.__lastDetailId)openDetail(window.__lastDetailType,window.__lastDetailId,false);};
 /** 展开季时懒加载集列表 */
 function __loadSeasonBody(body,head){if(!body||!head)return;if(body.dataset.loaded||body.dataset.loading)return;body.dataset.loading='1';body.innerHTML='<div class="modal-loading" style="padding:24px"><div class="spinner"></div></div>';fetch('/api/season?show='+encodeURIComponent(head.dataset.show||'')+'&season='+encodeURIComponent(head.dataset.season)+'&tmdb='+encodeURIComponent(head.dataset.tmdb)+'&slug='+encodeURIComponent(head.dataset.slug||'')).then(function(r){return r.ok?r.text():'';}).then(function(html){body.innerHTML=html;body.dataset.loaded='1';delete body.dataset.loading;}).catch(function(){body.innerHTML='<div class="modal-error" style="padding:20px">加载失败</div>';delete body.dataset.loading;});}
@@ -13140,7 +13413,7 @@ function __stopTrailers(){try{var root=document.getElementById('modal-body')||do
  * closeDetail
  */
 /** 关闭详情弹层 */
-function closeDetail(push=true){const modal=document.getElementById('modal');if(!modal)return;if(push&&location.pathname.startsWith('/detail/')){__stopTrailers();history.back();return;}__stopTrailers();modal.classList.remove('open');document.body.style.overflow='';}window.closeDetail=closeDetail;window.__stopTrailers=__stopTrailers;
+function closeDetail(push=true){const modal=document.getElementById('modal');if(!modal)return;__stopTrailers();modal.classList.remove('open');document.body.style.overflow='';if(push&&location.pathname.startsWith('/detail/')){try{history.replaceState(null,'','/');}catch(e){}}}window.closeDetail=closeDetail;window.__stopTrailers=__stopTrailers;
 document.addEventListener('visibilitychange',function(){if(document.hidden&&window.__stopTrailers)window.__stopTrailers();});
 document.addEventListener('click',(e)=>{const el=e.target.closest('[data-detail-type]');if(!el)return;const t=el.dataset.detailType,i=el.dataset.detailId;if(!t||!i)return;if(e.target.closest('button,a,.ep-watch-btn,.d-mark-btn,.d-watchlist-btn,.poster-play,.cal-open-btn,.cal-drop-btn'))return;e.preventDefault();openDetail(t,i);});
 document.addEventListener('click',(e)=>{const mb=document.getElementById('modal-body');if(!mb||!mb.contains(e.target))return;const inner=e.target.closest('.detail-hero');if(!inner)return;if(e.target.closest('button,a,.item,.episode,.season-head'))return;const rect=inner.getBoundingClientRect();const y=e.clientY-rect.top;if(y<70)closeDetail();},true);
@@ -13152,7 +13425,7 @@ document.addEventListener('click',(e)=>{const ep=e.target.closest('.episode');if
  */
 /** 展开/收起某一季 */
 async function toggleSeason(headEl){if(!headEl)return;const item=headEl.closest('.season-item');if(!item)return;const body=item.querySelector('.season-body');if(!body)return;if(item.classList.contains('open')){item.classList.remove('open');return;}item.classList.add('open');if(body.dataset.loaded)return;__loadSeasonBody(body,headEl);}
-window.addEventListener('popstate',()=>{const path=location.pathname;if(path.startsWith('/detail/')){const parts=path.split('/').filter(Boolean);if(parts.length===3)openDetail(parts[1],parts[2],false);}else{closeDetail(false);}});
+window.addEventListener('popstate',()=>{const path=location.pathname;if(path.startsWith('/detail/')){const parts=path.split('/').filter(Boolean);if(parts.length===3)openDetail(parts[1],parts[2],false);}else{const m=document.getElementById('modal');if(m&&m.classList.contains('open'))closeDetail(false);}});
 /** 已预取的详情 type/id，避免重复请求 */
 const __prefetched=new Set();
 /** 悬停/可见时预取详情，加快点开 */
@@ -13208,8 +13481,8 @@ function __sumRender(data){if(!data||data.error)return '<div class="empty"><p>�
 window.__summarySetPeriod=function(period){window.__summaryState.period=period;window.__summaryState.ref=__sumDefaultRef(period);window.__loadSummary(true);};
 window.__summaryNav=function(dir){var st=window.__summaryState;if(!st._prevRef&&!st._nextRef)return;if(dir<0&&st._prevRef)st.ref=st._prevRef;if(dir>0&&st._nextRef)st.ref=st._nextRef;window.__loadSummary(true);};
 document.addEventListener('click',function(e){var row=e.target&&e.target.closest&&e.target.closest('.sum-row-click');if(!row)return;var type=row.getAttribute('data-sum-type'),id=row.getAttribute('data-sum-id');if(!type||!id)return;e.preventDefault();if(typeof openDetail==='function')openDetail(type,id,true);});
-window.__openSummary=function(){var modal=document.getElementById('summary-modal');if(!modal)return;modal.classList.add('open');modal.style.display='block';document.body.style.overflow='hidden';window.__loadSummary(true);};
-window.__closeSummary=function(){var modal=document.getElementById('summary-modal');if(!modal)return;modal.classList.remove('open');modal.style.display='none';document.body.style.overflow='';};
+window.__openSummary=function(){var modal=document.getElementById('summary-modal');if(!modal)return;try{modal.style.removeProperty('display');}catch(e){modal.style.display='';}modal.classList.remove('closing');modal.classList.add('open');document.body.style.overflow='hidden';try{window.__loadSummary(true);}catch(err){console.error(err);}};
+window.__closeSummary=function(){var modal=document.getElementById('summary-modal');if(modal){modal.classList.remove('open');}document.body.style.overflow='';};
 window.__loadSummary=async function(force){var body=document.getElementById('summary-modal-body');if(!body)return;if(body.dataset.loaded==='1'&&!force)return;var st=window.__summaryState;if(!st.ref)st.ref=__sumDefaultRef(st.period);body.innerHTML='<div class="pane-loading"><div class="spinner"></div></div>';
   var lsKey='mt:sum:'+st.period+':'+st.ref;
   try{
@@ -13268,7 +13541,52 @@ document.addEventListener('click',async function(e){
   }
 },true);
 document.addEventListener('click',function(e){const card=e.target.closest('.trailer-card');if(!card||card.classList.contains('playing'))return;const key=card.getAttribute('data-yt-key');if(!key)return;card.classList.add('playing');const frame=card.querySelector('.trailer-frame');if(frame){var src='https://www.youtube.com/embed/'+encodeURIComponent(key)+'?autoplay=1&mute=1&playsinline=1&rel=0&modestbranding=1&enablejsapi=1';frame.innerHTML='<iframe src="'+src+'" allow="accelerometer;autoplay;clipboard-write;encrypted-media;gyroscope;picture-in-picture;web-share" allowfullscreen playsinline referrerpolicy="strict-origin-when-cross-origin"></iframe>'+'<a class="trailer-yt-open" href="https://www.youtube.com/watch?v='+encodeURIComponent(key)+'" target="_blank" rel="noopener" onclick="event.stopPropagation()">在 YouTube 打开</a>';}});
-window.addEventListener('load',()=>{setTimeout(__runEnrich,200);});`
+window.addEventListener('load',()=>{setTimeout(__runEnrich,200);});
+/* ==================================================================
+ * 动效：弹层退场收尾
+ * ----------------------------------------------------------------
+ * 这些弹层都是靠 .open 切换 display 的，直接移除 class 会瞬间消失，
+ * 一点退场都不给。这里用 MutationObserver 盯住 open 的移除，
+ * 补一个 .closing 让 CSS 把退场动画播完（200ms）再真正隐藏；
+ * 如果这期间又被重新打开，立刻撤掉 .closing，避免两套动画打架。
+ * ================================================================== */
+(function(){
+  if(typeof MutationObserver!=='function')return;
+  var overlays=['modal','list-modal','summary-modal','person-modal','confirm-modal','show-cal-modal','cw-sheet'];
+  var CLOSE_MS=200;
+  for(var i=0;i<overlays.length;i++){
+    (function(id){
+      var el=document.getElementById(id);
+      if(!el)return;
+      var wasOpen=el.classList.contains('open');
+      var timer=null;
+      var mo=new MutationObserver(function(){
+        var now=el.classList.contains('open');
+        if(now===wasOpen)return;
+        wasOpen=now;
+        if(now){
+          if(timer){clearTimeout(timer);timer=null;}
+          el.classList.remove('closing');
+          return;
+        }
+        el.classList.add('closing');
+        if(timer)clearTimeout(timer);
+        timer=setTimeout(function(){
+          el.classList.remove('closing');
+          timer=null;
+          // 所有弹层都关了才恢复滚动，避免小结打不开却把页面锁死
+          var any=false;
+          for(var j=0;j<overlays.length;j++){
+            var o=document.getElementById(overlays[j]);
+            if(o&&(o.classList.contains('open')||o.classList.contains('closing'))){any=true;break;}
+          }
+          if(!any)document.body.style.overflow='';
+        },CLOSE_MS);
+      });
+      mo.observe(el,{attributes:true,attributeFilter:['class','style']});
+    })(overlays[i]);
+  }
+})();`
   );
 }
 
@@ -13788,16 +14106,6 @@ img{
   user-select:all;
   text-align:center
 }
-.qr-box{
-  background:#fff;
-  border-radius:14px;
-  padding:10px;
-  display:inline-block;
-  margin:6px 0 14px
-}
-.qr-box img{
-  border-radius:8px
-}
 .status{
   display:inline-flex;
   align-items:center;
@@ -13851,17 +14159,46 @@ img{
   user-select:none
 }
 .log-box{
-  font-family:ui-monospace,Menlo,monospace;
-  font-size:0.7rem;
+  font-size:0.76rem;
   color:var(--text-dim);
   background:var(--surface-3);
   border:1px solid var(--border);
   border-radius:8px;
   padding:10px;
-  max-height:160px;
+  max-height:190px;
   overflow:auto;
   margin-top:6px;
-  line-height:1.6
+  line-height:1.65
+}
+.log-row{
+  display:flex;
+  gap:6px;
+  align-items:baseline;
+  padding:1px 0
+}
+.log-t{
+  font-family:ui-monospace,Menlo,monospace;
+  font-size:0.68rem;
+  color:var(--text-mute);
+  flex-shrink:0;
+  font-variant-numeric:tabular-nums
+}
+.log-m{
+  flex:1;
+  min-width:0;
+  word-break:break-word
+}
+.log-wait .log-m{
+  color:var(--text-dim)
+}
+.log-ok .log-m{
+  color:#4ade80
+}
+.log-warn .log-m{
+  color:#ffb84d
+}
+.log-err .log-m{
+  color:#e05560
 }
 .hero{
   display:flex;
@@ -14209,7 +14546,6 @@ img{
 }
 .pane.active{
   display:block;
-  animation:fadeIn 0.3s ease;
   padding-top:12px
 }
 @keyframes fadeIn{
@@ -17854,6 +18190,677 @@ button.ep-status.unwatched:hover{
 .hist-day-head{
   margin-top:0;
   margin-bottom:14px
+}
+/* ==================================================================
+ * 动效层 motion layer
+ * ----------------------------------------------------------------
+ * 令牌 → 关键帧 → 首屏/列表入场 → 微交互 → 弹层进出 → 登录页
+ * 放在样式表最末：靠后的同权重规则会覆盖前面零散的旧动效，
+ * 调参只改这一段即可；最末尾有 prefers-reduced-motion 兜底。
+ * ================================================================== */
+:root{
+  --mt-ease:cubic-bezier(.22,.68,.32,1);
+  --mt-spring:cubic-bezier(.34,1.3,.58,1);
+  --mt-t-fast:130ms;
+  --mt-t-base:220ms;
+  --mt-t-slow:360ms
+}
+
+/* ---------------- 关键帧 ---------------- */
+@keyframes mtFadeUp{
+  from{opacity:0;transform:translateY(14px)}
+  to{opacity:1;transform:translateY(0)}
+}
+@keyframes mtFadeDown{
+  from{opacity:0;transform:translateY(-10px)}
+  to{opacity:1;transform:translateY(0)}
+}
+@keyframes mtFadeIn{
+  from{opacity:0}
+  to{opacity:1}
+}
+@keyframes mtPop{
+  0%{opacity:0;transform:scale(.94)}
+  65%{opacity:1;transform:scale(1.012)}
+  100%{opacity:1;transform:scale(1)}
+}
+@keyframes mtShellIn{
+  from{opacity:0;transform:translateY(18px) scale(.965)}
+  to{opacity:1;transform:translateY(0) scale(1)}
+}
+@keyframes mtShellOut{
+  to{opacity:0;transform:translateY(10px) scale(.975)}
+}
+@keyframes mtPanelIn{
+  from{opacity:0;transform:translate(-50%,-50%) scale(.94)}
+  to{opacity:1;transform:translate(-50%,-50%) scale(1)}
+}
+@keyframes mtPanelOut{
+  to{opacity:0;transform:translate(-50%,-50%) scale(.96)}
+}
+@keyframes mtSheetIn{
+  from{opacity:0;transform:translateY(22px)}
+  to{opacity:1;transform:translateY(0)}
+}
+@keyframes mtSheetOut{
+  to{opacity:0;transform:translateY(16px)}
+}
+@keyframes mtBackdropIn{
+  from{opacity:0}
+  to{opacity:1}
+}
+@keyframes mtBackdropOut{
+  to{opacity:0}
+}
+@keyframes mtShimmer{
+  from{background-position:130% 0}
+  to{background-position:-130% 0}
+}
+@keyframes mtSeasonIn{
+  from{opacity:0;transform:translateY(-6px)}
+  to{opacity:1;transform:translateY(0)}
+}
+@keyframes mtTabPill{
+  0%{transform:scale(.92)}
+  60%{transform:scale(1.035)}
+  100%{transform:scale(1)}
+}
+@keyframes mtCodeGlow{
+  0%,100%{box-shadow:0 0 0 0 rgba(139,92,246,0)}
+  50%{box-shadow:0 0 0 3px rgba(139,92,246,.16)}
+}
+
+/* ---------------- 首屏骨架：顶栏 / 统计 / 标签依次落位 ---------------- */
+.hero{animation:mtFadeDown var(--mt-t-slow) var(--mt-ease) backwards}
+.stats{animation:mtFadeUp var(--mt-t-slow) var(--mt-ease) .05s backwards}
+.tabs{animation:mtFadeUp var(--mt-t-slow) var(--mt-ease) .1s backwards}
+.stat{animation:mtPop .4s var(--mt-ease) backwards}
+.stat:nth-child(2){animation-delay:.04s}
+.stat:nth-child(3){animation-delay:.08s}
+.stat:nth-child(4){animation-delay:.12s}
+.stat-num{transition:color var(--mt-t-base) var(--mt-ease)}
+.stat:hover .stat-num{color:var(--text)}
+
+/* ---------------- 列表 / 横滑卡片：交错入场 ---------------- */
+.item{animation:mtFadeUp .44s var(--mt-ease) backwards}
+/* 横滑卡片原本被 animation:none 关掉了入场，这里按更具体的选择器打开 */
+.h-scroll .item{animation:mtFadeUp .42s var(--mt-ease) backwards}
+.item:nth-child(2){animation-delay:.045s}
+.item:nth-child(3){animation-delay:.09s}
+.item:nth-child(4){animation-delay:.135s}
+.item:nth-child(5){animation-delay:.18s}
+.item:nth-child(6){animation-delay:.225s}
+.item:nth-child(7){animation-delay:.27s}
+.item:nth-child(8){animation-delay:.315s}
+.item:nth-child(n+9){animation-delay:.36s}
+.home-section{animation:mtFadeUp .5s var(--mt-ease) backwards}
+.home-section:nth-child(2){animation-delay:.05s}
+.home-section:nth-child(3){animation-delay:.1s}
+.home-section:nth-child(4){animation-delay:.15s}
+.home-section:nth-child(n+5){animation-delay:.2s}
+.platform-card{animation:mtFadeUp .44s var(--mt-ease) backwards}
+.platform-card:nth-child(2){animation-delay:.06s}
+.platform-card:nth-child(3){animation-delay:.12s}
+.platform-card:nth-child(n+4){animation-delay:.18s}
+/* 页切换动画改由 pane-in-* 控制 */.pane.active.pane-in-fade{animation:mtPaneInFade .34s var(--mt-ease)}
+/* 日历 / 观看记录：按天分组，逐组浮现 */
+.hist-days>.hist-day{animation:mtFadeUp .45s var(--mt-ease) backwards}
+.hist-days>.hist-day:nth-child(2){animation-delay:.05s}
+.hist-days>.hist-day:nth-child(3){animation-delay:.1s}
+.hist-days>.hist-day:nth-child(n+4){animation-delay:.15s}
+
+/* ---------------- 卡片微交互 ---------------- */
+.item.clickable{
+  transition:transform var(--mt-t-base) var(--mt-ease),border-color var(--mt-t-base),box-shadow var(--mt-t-base),background var(--mt-t-base)
+}
+.item.clickable:hover{
+  transform:translateY(-3px)
+}
+.item.clickable:active{
+  transform:scale(.985);
+  transition-duration:var(--mt-t-fast)
+}
+.poster img{
+  transition:transform .5s var(--mt-ease)
+}
+.item:hover .poster img{
+  transform:scale(1.045)
+}
+.platform-card{
+  transition:transform var(--mt-t-base) var(--mt-ease),border-color var(--mt-t-base),box-shadow var(--mt-t-base)
+}
+.platform-card:hover{
+  transform:translateY(-2px)
+}
+.platform-card:active{
+  transform:scale(.985);
+  transition-duration:var(--mt-t-fast)
+}
+.poster-play{
+  transition:opacity var(--mt-t-base) var(--mt-ease),transform var(--mt-t-base) var(--mt-spring),background var(--mt-t-fast),box-shadow var(--mt-t-base)
+}
+
+/* ---------------- 按钮 / 标签页 ---------------- */
+.btn-primary,.btn-ghost,.btn-action{
+  transition:transform var(--mt-t-fast) var(--mt-ease),background var(--mt-t-fast),border-color var(--mt-t-fast),color var(--mt-t-fast),box-shadow var(--mt-t-base),opacity var(--mt-t-fast)
+}
+.btn-primary:active,.btn-ghost:active,.btn-action:active{
+  transform:scale(.96)
+}
+.btn-primary:hover{
+  box-shadow:0 8px 26px rgba(139,92,246,.32)
+}
+.tab{
+  transition:color var(--mt-t-base),background var(--mt-t-base),transform var(--mt-t-fast) var(--mt-ease)
+}
+.tab:active{
+  transform:scale(.94)
+}
+.tab.active{
+  animation:mtTabPill .32s var(--mt-ease)
+}
+.douban-filter-tab,.theater-filter-tab,.cw-act-btn,.wl-remove,.wl-drop,.wl-watched,.wl-unwatch,.cal-open-btn,.cal-drop-btn{
+  transition:transform var(--mt-t-fast) var(--mt-ease),background var(--mt-t-fast),border-color var(--mt-t-fast),color var(--mt-t-fast),opacity var(--mt-t-fast)
+}
+.douban-filter-tab:active,.theater-filter-tab:active,.cw-act-btn:active,.wl-remove:active,.wl-drop:active,.wl-watched:active,.wl-unwatch:active,.cal-open-btn:active,.cal-drop-btn:active{
+  transform:scale(.94)
+}
+.hero-avatar{
+  transition:transform var(--mt-t-base) var(--mt-spring),border-color var(--mt-t-base)
+}
+.hero-avatar:hover{
+  transform:scale(1.04)
+}
+.hero-avatar img{
+  transition:transform .5s var(--mt-ease)
+}
+.hero-avatar:hover img{
+  transform:scale(1.07)
+}
+.search-input{
+  transition:border-color var(--mt-t-base),box-shadow var(--mt-t-base),background var(--mt-t-base)
+}
+.search-input:focus{
+  box-shadow:0 0 0 3px rgba(139,92,246,.14)
+}
+
+/* ---------------- 弹层：进场 + 退场 ---------------- */
+.modal.open .modal-backdrop{animation:mtBackdropIn .24s var(--mt-ease)}
+.modal.open .modal-shell{animation:mtShellIn .34s var(--mt-spring)}
+.list-modal.open .list-modal-backdrop{animation:mtBackdropIn .22s var(--mt-ease)}
+.list-modal.open .list-modal-panel{animation:mtPanelIn .3s var(--mt-spring)}
+.summary-modal.open .summary-backdrop{animation:mtBackdropIn .22s var(--mt-ease)}
+.summary-modal.open .summary-panel{animation:mtPanelIn .3s var(--mt-spring)}
+.person-modal.open .person-backdrop{animation:mtBackdropIn .22s var(--mt-ease)}
+.person-modal.open .person-panel{animation:mtPanelIn .3s var(--mt-spring)}
+.confirm-modal.open .confirm-backdrop{animation:mtBackdropIn .18s var(--mt-ease)}
+.confirm-modal.open .confirm-panel{animation:mtPanelIn .28s var(--mt-spring)}
+.show-cal-modal.open .show-cal-backdrop{animation:mtBackdropIn .2s var(--mt-ease)}
+.show-cal-modal.open .show-cal-panel{animation:mtPanelIn .28s var(--mt-spring)}
+.cw-sheet.open .cw-sheet-backdrop{animation:mtBackdropIn .18s var(--mt-ease)}
+.cw-sheet.open .cw-sheet-panel{animation:mtSheetIn .26s var(--mt-spring)}
+/* 手机底部抽屉：禁止用带 translate(-50%,-50%) 的居中动画，否则会像从左边飞出来 */
+@media (max-width:599px){
+  .list-modal.open .list-modal-panel,
+  .summary-modal.open .summary-panel,
+  .person-modal.open .person-panel{
+    animation:mtSheetIn .3s var(--mt-spring)
+  }
+  .list-modal.closing .list-modal-panel,
+  .summary-modal.closing .summary-panel,
+  .person-modal.closing .person-panel{
+    animation:mtSheetOut .19s var(--mt-ease) forwards
+  }
+}
+/* 退场：JS 捕捉到 open 被移除时补一个 .closing，播完再真正隐藏 */
+.modal.closing,.list-modal.closing,.summary-modal.closing,.person-modal.closing,.confirm-modal.closing,.show-cal-modal.closing,.cw-sheet.closing{
+  display:block!important
+}
+.modal.closing .modal-backdrop,.list-modal.closing .list-modal-backdrop,.summary-modal.closing .summary-backdrop,.person-modal.closing .person-backdrop,.confirm-modal.closing .confirm-backdrop,.show-cal-modal.closing .show-cal-backdrop,.cw-sheet.closing .cw-sheet-backdrop{
+  animation:mtBackdropOut .18s var(--mt-ease) forwards
+}
+.modal.closing .modal-shell{
+  animation:mtShellOut .19s var(--mt-ease) forwards
+}
+.list-modal.closing .list-modal-panel,.summary-modal.closing .summary-panel,.person-modal.closing .person-panel,.confirm-modal.closing .confirm-panel,.show-cal-modal.closing .show-cal-panel{
+  animation:mtPanelOut .19s var(--mt-ease) forwards
+}
+.cw-sheet.closing .cw-sheet-panel{
+  animation:mtSheetOut .19s var(--mt-ease) forwards
+}
+/* 关闭按钮：轻转一下 */
+.modal-close,.list-modal-close,.person-close,.show-cal-close,.summary-close{
+  transition:transform var(--mt-t-base) var(--mt-ease),background var(--mt-t-fast),color var(--mt-t-fast)
+}
+.modal-close:hover,.list-modal-close:hover,.person-close:hover,.show-cal-close:hover,.summary-close:hover{
+  transform:rotate(90deg)
+}
+
+/* ---------------- 详情弹层内容：分区依次浮现 ---------------- */
+.modal-body .detail-hero{animation:mtFadeIn .3s var(--mt-ease)}
+.modal-body .detail-body>*{animation:mtFadeUp .42s var(--mt-ease) backwards}
+.modal-body .detail-body>*:nth-child(2){animation-delay:.05s}
+.modal-body .detail-body>*:nth-child(3){animation-delay:.1s}
+.modal-body .detail-body>*:nth-child(4){animation-delay:.15s}
+.modal-body .detail-body>*:nth-child(n+5){animation-delay:.2s}
+.season-item.open .season-body{animation:mtSeasonIn .26s var(--mt-ease)}
+.episode{
+  transition:background var(--mt-t-fast)
+}
+.episode.clickable:active{
+  transform:scale(.997)
+}
+.cw-card:hover .cw-poster img{
+  transform:scale(1.04)
+}
+
+/* ---------------- 提示条 ---------------- */
+.toast.toast-in .toast-icon{animation:mtPop .42s var(--mt-spring)}
+
+/* ---------------- 登录页 ---------------- */
+.login-card{animation:mtPop .5s var(--mt-spring)}
+.steps .step:nth-child(1){animation:mtFadeUp .4s var(--mt-ease) backwards}
+.steps .step:nth-child(2){animation:mtFadeUp .4s var(--mt-ease) .06s backwards}
+.device-flow>.step{animation:mtFadeUp .4s var(--mt-ease) .14s backwards}
+.code-box{animation:mtCodeGlow 2.6s var(--mt-ease) .8s 2}
+.log-row{animation:mtFadeIn .26s var(--mt-ease)}
+
+/* ---------------- 加载占位：流光 ---------------- */
+.platform-card-poster-ph{
+  background:linear-gradient(100deg,#c9cdd5 32%,#e9ecf1 50%,#c9cdd5 68%);
+  background-size:230% 100%;
+  animation:mtShimmer 1.6s linear infinite
+}
+
+
+/* ==================================================================
+ * v1.6.0 页面美化层 polish layer
+ * ----------------------------------------------------------------
+ * 背景氛围、滚动条、标题装饰、卡片光泽、焦点环、空态、
+ * 粘性顶栏与标签栏微光、统计数字呼吸感、骨架流光等
+ * ================================================================== */
+
+
+/* 细滚动条 */
+*{
+  scrollbar-width:thin;
+  scrollbar-color:var(--scrollbar,rgba(255,255,255,0.12)) transparent
+}
+*::-webkit-scrollbar{
+  width:6px;
+  height:6px
+}
+*::-webkit-scrollbar-track{
+  background:transparent
+}
+*::-webkit-scrollbar-thumb{
+  background:var(--scrollbar,rgba(255,255,255,0.14));
+  border-radius:99px
+}
+*::-webkit-scrollbar-thumb:hover{
+  background:rgba(167,139,250,0.45)
+}
+
+/* 选中文字 */
+::selection{
+  background:rgba(167,139,250,0.35);
+  color:#fff
+}
+html[data-theme="light"] ::selection{
+  background:rgba(139,92,246,0.28);
+  color:#1a1a2e
+}
+
+/* 焦点环（键盘可达） */
+:focus-visible{
+  outline:2px solid rgba(167,139,250,0.7);
+  outline-offset:2px
+}
+button:focus:not(:focus-visible),
+a:focus:not(:focus-visible){
+  outline:none
+}
+
+/* 顶栏底部分割光（不额外加重 blur，避免浅色主题发糊） */
+.top-sticky::after{
+  content:"";
+  position:absolute;
+  left:8%;
+  right:8%;
+  bottom:0;
+  height:1px;
+  background:linear-gradient(90deg,transparent,rgba(167,139,250,0.35),transparent);
+  pointer-events:none;
+  opacity:0.85
+}
+
+/* 英雄区昵称微光 */
+.hero-name{
+  letter-spacing:-0.3px
+}
+.hero-avatar{
+  box-shadow:0 0 0 2px var(--avatar-ring,rgba(167,139,250,0.45)),0 6px 20px var(--shadow-avatar,rgba(0,0,0,0.35))
+}
+
+/* 统计卡片：悬浮抬起 + 数字渐变更清晰 */
+.stat{
+  transition:transform var(--mt-t-base) var(--mt-ease),border-color var(--mt-t-base),box-shadow var(--mt-t-base),background var(--mt-t-base)
+}
+.stat:hover{
+  transform:translateY(-2px);
+  border-color:rgba(167,139,250,0.28);
+  box-shadow:0 10px 28px rgba(0,0,0,0.28),0 0 0 1px rgba(167,139,250,0.08)
+}
+html[data-theme="light"] .stat:hover{
+  box-shadow:0 8px 20px rgba(0,0,0,0.06),0 0 0 1px rgba(139,92,246,0.12)
+}
+.stat-icon{
+  transition:transform var(--mt-t-base) var(--mt-spring),background var(--mt-t-base)
+}
+.stat:hover .stat-icon{
+  transform:scale(1.06)
+}
+
+/* 标签栏：底轨指示感 */
+.tabs{
+  position:relative;
+  gap:2px
+}
+.tab{
+  position:relative
+}
+.tab.active{
+  box-shadow:0 4px 16px rgba(139,92,246,0.28)
+}
+
+/* 分区标题竖条呼吸 */
+.home-section-title::before,
+.d-section-title::before,
+.trending-head::before,
+.sum-h3::before,
+.person-credits-title::before{
+  box-shadow:0 0 10px rgba(167,139,250,0.45)
+}
+.home-section-title::before{
+  background:linear-gradient(180deg,#c4b5fd,#7c3aed)
+}
+
+
+/* 海报卡：边框高光 */
+.h-scroll .item .poster,
+.grid .item .poster{
+  box-shadow:0 4px 16px rgba(0,0,0,0.45),inset 0 0 0 1px rgba(255,255,255,0.06)
+}
+html[data-theme="light"] .h-scroll .item .poster,
+html[data-theme="light"] .grid .item .poster{
+  box-shadow:0 4px 14px rgba(0,0,0,0.08),inset 0 0 0 1px rgba(0,0,0,0.04)
+}
+.poster img{
+  transition:transform .55s var(--mt-ease),filter .35s ease
+}
+.item:hover .poster img{
+  filter:brightness(1.04) saturate(1.06)
+}
+
+/* 进度条微光 */
+.bar-fill,.cw-bar-fill{
+  position:relative;
+  overflow:hidden
+}
+.bar-fill::after,.cw-bar-fill::after{
+  content:"";
+  position:absolute;
+  inset:0;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,0.35),transparent);
+  transform:translateX(-100%);
+  animation:mtBarShine 2.8s ease-in-out infinite
+}
+@keyframes mtBarShine{
+  0%,60%{transform:translateX(-100%)}
+  100%{transform:translateX(120%)}
+}
+
+/* 平台卡片光泽 */
+.platform-card::after{
+  content:"";
+  position:absolute;
+  inset:0;
+  border-radius:inherit;
+  pointer-events:none;
+  background:linear-gradient(135deg,rgba(255,255,255,0.08) 0%,transparent 42%,transparent 100%);
+  opacity:0.9
+}
+.platform-card:hover{
+  box-shadow:0 16px 36px var(--platform-shadow-hover,rgba(0,0,0,0.55)),0 0 0 1px rgba(167,139,250,0.2),inset 0 1px 0 var(--hover-bg-strong,rgba(255,255,255,0.08))
+}
+
+/* 空态 */
+.empty{
+  position:relative
+}
+.empty p{
+  opacity:0.9
+}
+.empty::before{
+  content:"";
+  display:block;
+  width:48px;
+  height:48px;
+  margin:0 auto 4px;
+  border-radius:50%;
+  background:radial-gradient(circle at 35% 30%,rgba(167,139,250,0.25),rgba(167,139,250,0.06) 60%,transparent 70%);
+  box-shadow:0 0 0 1px rgba(167,139,250,0.12)
+}
+
+/* 骨架 / 加载 spinner 更精致 */
+.spinner{
+  border-color:rgba(167,139,250,0.12);
+  border-top-color:#a78bfa;
+  box-shadow:0 0 12px rgba(167,139,250,0.2)
+}
+.pane-loading{
+  min-height:80px;
+  display:flex;
+  align-items:center;
+  justify-content:center
+}
+
+/* 操作按钮微光 */
+.btn-action:hover{
+  box-shadow:0 4px 16px rgba(167,139,250,0.16)
+}
+.btn-primary{
+  position:relative;
+  overflow:hidden
+}
+.btn-primary::after{
+  content:"";
+  position:absolute;
+  inset:0;
+  background:linear-gradient(120deg,transparent 30%,rgba(255,255,255,0.18) 50%,transparent 70%);
+  transform:translateX(-120%);
+  transition:transform .5s ease
+}
+.btn-primary:hover::after{
+  transform:translateX(120%)
+}
+
+/* 搜索框 */
+.search-input:focus{
+  border-color:rgba(167,139,250,0.55);
+  box-shadow:0 0 0 3px rgba(139,92,246,0.16),0 8px 24px rgba(0,0,0,0.2)
+}
+
+/* 详情动作胶囊 */
+.d-action-bar{
+  transition:box-shadow var(--mt-t-base),border-color var(--mt-t-base)
+}
+.d-action-bar:hover{
+  border-color:rgba(167,139,250,0.28);
+  box-shadow:var(--pill-shadow),0 0 0 1px rgba(167,139,250,0.1)
+}
+
+/* 日历日格 */
+.sc-day.sc-has{
+  transition:transform var(--mt-t-fast) var(--mt-ease),background var(--mt-t-fast),border-color var(--mt-t-fast)
+}
+.sc-day.sc-has:active{
+  transform:scale(0.92)
+}
+
+/* Toast 更立体 */
+.toast{
+  box-shadow:0 12px 36px rgba(0,0,0,0.55),0 0 0 1px rgba(255,255,255,0.06),inset 0 1px 0 rgba(255,255,255,0.06)
+}
+
+/* 版本号淡入 */
+.app-version{
+  letter-spacing:0.4px;
+  transition:opacity 0.2s
+}
+.app-version:hover{
+  opacity:1
+}
+
+/* 更新时间呼吸点 */
+.updated-at{
+  position:relative;
+  padding-left:10px
+}
+.updated-at:not(:empty)::before{
+  content:"";
+  position:absolute;
+  left:0;
+  top:50%;
+  width:5px;
+  height:5px;
+  margin-top:-2.5px;
+  border-radius:50%;
+  background:#4ade80;
+  box-shadow:0 0 0 0 rgba(74,222,128,0.45);
+  animation:mtLiveDot 2.2s ease-out infinite
+}
+@keyframes mtLiveDot{
+  0%{box-shadow:0 0 0 0 rgba(74,222,128,0.5)}
+  70%{box-shadow:0 0 0 6px rgba(74,222,128,0)}
+  100%{box-shadow:0 0 0 0 rgba(74,222,128,0)}
+}
+
+/* 继续观看卡片标题区 */
+.cw-poster{
+  transition:box-shadow var(--mt-t-base) var(--mt-ease),transform var(--mt-t-base)
+}
+.cw-card:hover .cw-poster{
+  box-shadow:0 10px 28px rgba(0,0,0,0.55),0 0 0 1px rgba(167,139,250,0.2)
+}
+.cw-poster img{
+  transition:transform .5s var(--mt-ease)
+}
+
+/* 登录码大号更醒目 */
+.code-box{
+  letter-spacing:0.12em
+}
+
+/* 列表模态头部细分割光 */
+.list-modal-head,.summary-head,.person-panel-head{
+  position:relative
+}
+.list-modal-head::after,.summary-head::after,.person-panel-head::after{
+  content:"";
+  position:absolute;
+  left:12%;
+  right:12%;
+  bottom:0;
+  height:1px;
+  background:linear-gradient(90deg,transparent,rgba(167,139,250,0.25),transparent);
+  pointer-events:none
+}
+
+
+/* ==================================================================
+ * v1.6.2 标签页切换特效
+ * 按左右方向滑入，内容错落入场
+ * ================================================================== */
+.pane{
+  display:none;
+  will-change:transform,opacity
+}
+.pane.active{
+  display:block;
+  padding-top:12px
+}
+@keyframes mtPaneInLeft{
+  from{opacity:0;transform:translateX(22px)}
+  to{opacity:1;transform:translateX(0)}
+}
+@keyframes mtPaneInRight{
+  from{opacity:0;transform:translateX(-22px)}
+  to{opacity:1;transform:translateX(0)}
+}
+@keyframes mtPaneInFade{
+  from{opacity:0;transform:translateY(10px)}
+  to{opacity:1;transform:translateY(0)}
+}
+.pane.active.pane-in-left{
+  animation:mtPaneInLeft .38s var(--mt-ease,cubic-bezier(.22,.68,.32,1)) both
+}
+.pane.active.pane-in-right{
+  animation:mtPaneInRight .38s var(--mt-ease,cubic-bezier(.22,.68,.32,1)) both
+}
+.pane.active.pane-in-fade{
+  animation:mtPaneInFade .34s var(--mt-ease,cubic-bezier(.22,.68,.32,1)) both
+}
+/* 切换后子元素轻微错落 */
+.pane.active.pane-in-left .home-section,
+.pane.active.pane-in-left .item,
+.pane.active.pane-in-left .day,
+.pane.active.pane-in-left .hist-day,
+.pane.active.pane-in-right .home-section,
+.pane.active.pane-in-right .item,
+.pane.active.pane-in-right .day,
+.pane.active.pane-in-right .hist-day{
+  animation:mtFadeUp .42s var(--mt-ease,cubic-bezier(.22,.68,.32,1)) backwards
+}
+.pane.active.pane-in-left .home-section:nth-child(2),
+.pane.active.pane-in-right .home-section:nth-child(2){animation-delay:.04s}
+.pane.active.pane-in-left .home-section:nth-child(3),
+.pane.active.pane-in-right .home-section:nth-child(3){animation-delay:.08s}
+.pane.active.pane-in-left .home-section:nth-child(4),
+.pane.active.pane-in-right .home-section:nth-child(4){animation-delay:.12s}
+.pane.active.pane-in-left .home-section:nth-child(n+5),
+.pane.active.pane-in-right .home-section:nth-child(n+5){animation-delay:.16s}
+
+/* 标签点击弹一下 */
+@keyframes mtTabTap{
+  0%{transform:scale(1)}
+  40%{transform:scale(.94)}
+  100%{transform:scale(1)}
+}
+.tab.tab-tap{
+  animation:mtTabTap .28s var(--mt-spring,cubic-bezier(.34,1.3,.58,1))
+}
+.tab.active.tab-tap{
+  animation:mtTabTap .28s var(--mt-spring,cubic-bezier(.34,1.3,.58,1)),mtTabPill .32s var(--mt-ease,cubic-bezier(.22,.68,.32,1))
+}
+
+/* 主题切换时整页柔和过渡 */
+html{
+  transition:background-color .35s ease,color .25s ease
+}
+body{
+  transition:background-color .35s ease,color .25s ease
+}
+
+/* ---------------- 减弱动效 ---------------- */
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{
+    animation-duration:.01ms!important;
+    animation-delay:0ms!important;
+    animation-iteration-count:1!important;
+    transition-duration:.01ms!important;
+    scroll-behavior:auto!important
+  }
 }
 `;
   return __pageStylesCache;
