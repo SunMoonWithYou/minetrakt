@@ -147,7 +147,7 @@ const TRAKT_UA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (
  * api.trakt.tv 使用的客户端 UA。官方要求第三方带上应用名与版本，勿伪装成浏览器。
  */
 function appUserAgent() {
-  return `MineTrakt/${APP_VERSION} (+https://trakt.sunmoonyou.workers.dev; Cloudflare-Worker)`;
+  return `MineTrakt/${APP_VERSION} (+; Cloudflare-Worker)`;
 }
 
 /* 浏览器一致性头组：只给 auth.trakt.tv 用。
