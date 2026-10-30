@@ -74,6 +74,10 @@ const THEME_COLOR_DARK = "#050505";
 /** 浅色模式 theme-color / 背景 */
 const THEME_COLOR_LIGHT = "#ffffff";
 
+/** 北京时间 = UTC+8。小结/日历的"一天"都按这个时区切分，
+ * 原来这个魔数在 12 处各自硬编码，改这里一处即可。 */
+const BJ_OFFSET_MS = 8 * 3600 * 1000;
+
 const THEME_BOOT_SCRIPT = `<script>(function(){try{var K=${JSON.stringify(THEME_STORAGE_KEY)};var t=localStorage.getItem(K);if(t!=='light'&&t!=='dark'&&t!=='system')t='dark';var d=document.documentElement;d.setAttribute('data-theme',t);var dark=(t==='dark')||(t==='system'&&(!window.matchMedia||matchMedia('(prefers-color-scheme: dark)').matches));var c=dark?${JSON.stringify(THEME_COLOR_DARK)}:${JSON.stringify(THEME_COLOR_LIGHT)};var tc=document.querySelector('meta[name="theme-color"]');if(tc)tc.setAttribute('content',c);var cs=document.querySelector('meta[name="color-scheme"]');if(cs)cs.setAttribute('content',dark?'dark':'light');var sb=document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]');if(sb)sb.setAttribute('content',dark?'black-translucent':'default');d.style.backgroundColor=c;}catch(e){}})();<\/script>`;
 
 /** favicon 路径 */
@@ -112,25 +116,31 @@ const ASSET_ORIGINS = {
 
 /** 缓存已算出的 Chrome 主版本，避免每次请求重算 */
 let __chromeMajorCached = 0;
+/** env.CHROME_UA_MAJOR 可钉死版本号；env.TRAKT_UA_OVERRIDE 可整体覆盖 UA */
+let __chromeMajorOverride = 0;
+let __uaOverride = "";
+
 /**
  * 推算一个"当下看起来合理"的 Chrome 主版本号。
  * 按 2023-12 为 120 的锚点线性外推，避免 UA 里的版本号长期停在旧值被识别。
+ * 外推封顶 175：Chrome 改发版节奏导致锚点漂移后不再无限增长产生失真。
  */
 function chromeMajorForUA() {
+  if (__chromeMajorOverride) return __chromeMajorOverride;
   if (__chromeMajorCached) return __chromeMajorCached;
   const ANCHOR_MAJOR = 120;
   const ANCHOR_MS = Date.UTC(2023, 11, 1);
   const weeks = Math.floor((Date.now() - ANCHOR_MS) / (7 * 86400 * 1000));
-  __chromeMajorCached = Math.max(
-    ANCHOR_MAJOR,
-    ANCHOR_MAJOR + Math.floor(weeks / 4) - 3,
+  __chromeMajorCached = Math.min(
+    175,
+    Math.max(ANCHOR_MAJOR, ANCHOR_MAJOR + Math.floor(weeks / 4) - 3),
   );
   return __chromeMajorCached;
 }
 
 /* 两套 UA，按目标域分开用 —— 这是"同 IP 请求多了被限"的第一个成因。
  *
- * 1) TRAKT_UA：给 auth.trakt.tv 用。它前面是 Cloudflare 的 WAF，
+ * 1) traktAuthUa()：给 auth.trakt.tv 用。它前面是 Cloudflare 的 WAF，
  *    只带 Content-Type + 浏览器 UA、别的头一个没有，是最典型的脚本特征；
  *    头指纹不自洽（有 Chrome UA 却没有 Accept-Language / sec-ch-ua），
  *    反而比老实报出自己是谁更容易被打分。
@@ -139,15 +149,19 @@ function chromeMajorForUA() {
  *    去打 API 才是爬虫的典型特征。
  */
 /**
- * 给 auth.trakt.tv 用的浏览器态 UA（配 BROWSER_FETCH_HEADERS）。
+ * 给 auth.trakt.tv 用的浏览器态 UA（配 browserFetchHeaders）。
+ * 可用绑定 env.TRAKT_UA_OVERRIDE 整体覆盖，或 env.CHROME_UA_MAJOR 钉版本。
  */
-const TRAKT_UA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeMajorForUA()}.0.0.0 Safari/537.36`;
+function traktAuthUa() {
+  if (__uaOverride) return __uaOverride;
+  return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeMajorForUA()}.0.0.0 Safari/537.36`;
+}
 
 /**
  * api.trakt.tv 使用的客户端 UA。官方要求第三方带上应用名与版本，勿伪装成浏览器。
  */
 function appUserAgent() {
-  return `MineTrakt/${APP_VERSION} (+; Cloudflare-Worker)`;
+  return `MineTrakt/${APP_VERSION} (+https://trakt.real-mrtang.workers.dev; Cloudflare-Worker)`;
 }
 
 /* 浏览器一致性头组：只给 auth.trakt.tv 用。
@@ -158,39 +172,229 @@ function appUserAgent() {
 /**
  * auth 域浏览器一致性头组，避免空壳 POST 被 WAF 打低分。
  */
-const BROWSER_FETCH_HEADERS = {
-  Accept: "application/json, text/plain, */*",
-  "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-  "Cache-Control": "no-cache",
-  Pragma: "no-cache",
-  Referer: "https://trakt.tv/",
-  "sec-ch-ua": `"Chromium";v="${chromeMajorForUA()}", "Not=A?Brand";v="24"`,
-  "sec-ch-ua-mobile": "?0",
-  "sec-ch-ua-platform": '"Windows"',
-  "Sec-Fetch-Dest": "empty",
-  "Sec-Fetch-Mode": "cors",
-  "Sec-Fetch-Site": "same-site",
-};
+function browserFetchHeaders() {
+  const v = chromeMajorForUA();
+  return {
+    Accept: "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
+    Pragma: "no-cache",
+    Referer: "https://trakt.tv/",
+    "sec-ch-ua": `"Chromium";v="${v}", "Not=A?Brand";v="24"`,
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
+  };
+}
 
 /**
- * 设备码/token 等 JSON POST 头。
+ * 设备码 / 换 token 等 JSON POST 头（每次现取，保证 env 覆盖生效）。
  */
-const JSON_HEADERS = {
-  "Content-Type": "application/json",
-  "User-Agent": TRAKT_UA,
-  ...BROWSER_FETCH_HEADERS,
-};
+function authJsonHeaders() {
+  return {
+    "Content-Type": "application/json",
+    "User-Agent": traktAuthUa(),
+    ...browserFetchHeaders(),
+  };
+}
 
 /* 外站数据源（douban / theater / guduo 的 widget 接口）也不要在裸奔。
  * 这几个站同样在 CDN 后面，无 UA 无 Accept 的请求会被当扫描器。 */
 /**
  * 外站 widget（豆瓣/院线/骨朵）请求头，避免无 UA 被当扫描器。
  */
-const SITE_HEADERS = {
-  "User-Agent": TRAKT_UA,
-  Accept: "application/json, text/plain, */*",
-  "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-};
+function siteHeaders() {
+  return {
+    "User-Agent": traktAuthUa(),
+    Accept: "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+  };
+}
+
+/* ==================================================================
+ * Cookie 完整性签名（HMAC-SHA256，纯同步实现）
+ * ----------------------------------------------------------------------
+ * 登录 Cookie 原来是无签名 base64 明文 JSON，任何能改 Cookie 的人都能
+ * 篡改 trakt_id / expires_at 等字段。这里引入 HMAC 签名：
+ *   - 密钥：绑定 env.COOKIE_SECRET（推荐 `wrangler secret put COOKIE_SECRET`）；
+ *     未设置时回退用 TRAKT_CLIENT_ID 派生 —— 仍优于裸奔，但建议显式配置。
+ *   - Cookie 值格式 v2：`v2.<b64payload>.<hex(hmac)>`；
+ *   - 旧版无签名 Cookie（v1）继续接受（平滑迁移），requireAuth 会标记
+ *     needsCookieUpdate，下一次任意响应自动换发成 v2 签名 Cookie；
+ *   - v2 验签失败 → 按未登录处理。
+ * 选纯 JS 实现而非 crypto.subtle：authJson/authResp/buildCookie 全链路
+ * 是同步的，async 化会波及几十个调用点；签名只在登录/刷新时计算，开销可忽略。
+ * ================================================================== */
+
+/** Cookie 签名密钥（首次请求时从 env 缓存到 isolate） */
+let __cookieSecret = "";
+
+/**
+ * 每个 isolate 首个请求调用一次：读入 env 运行时配置。
+ * 同时处理 UA 覆盖（TRAKT_UA_OVERRIDE / CHROME_UA_MAJOR）。
+ *
+ * Cookie 签名密钥的取值优先级（零配置友好，无需手动设 secret）：
+ *   1. env.COOKIE_SECRET —— 显式配置的专用密钥（生产环境仍最推荐）；
+ *   2. KV 里持久化的自生成随机密钥 —— 首次启动时用 crypto.getRandomValues
+ *      生成 256 位随机数写入 KV（sys:cookie_secret），之后所有 isolate 都读它。
+ *      全自动、跨 isolate 稳定一致；唯一的极小概率竞态是两个 isolate 同时
+ *      首启各生成一份（后写覆盖先写），期间签发的 Cookie 会失效、用户需
+ *      重新登录一次 —— 只发生在全新部署的第一秒，可接受；
+ *   3. 降级：TRAKT_CLIENT_ID 派生（KV 都没有时的最后兜底）。
+ */
+async function initEnvRuntime(env) {
+  if (__cookieSecret) return;
+  if (env && env.COOKIE_SECRET) {
+    __cookieSecret = env.COOKIE_SECRET;
+  } else if (env && env.TMDB_CACHE && typeof env.TMDB_CACHE.get === "function") {
+    const SECRET_KEY = "sys:cookie_secret";
+    try {
+      let s = await env.TMDB_CACHE.get(SECRET_KEY);
+      if (!s) {
+        // 256 位 CSPRNG 随机数 → hex
+        const buf = new Uint8Array(32);
+        crypto.getRandomValues(buf);
+        s = [...buf].map((b) => b.toString(16).padStart(2, "0")).join("");
+        await env.TMDB_CACHE.put(SECRET_KEY, s);
+      }
+      __cookieSecret = s;
+    } catch {
+      // KV 不可用（配额/故障）：退回 CLIENT_ID 派生，签名仍比裸奔强
+      __cookieSecret = env.TRAKT_CLIENT_ID || "minetrakt-dev-fallback";
+    }
+  } else {
+    __cookieSecret =
+      (env && env.TRAKT_CLIENT_ID) || "minetrakt-dev-fallback";
+  }
+  if (env && typeof env.TRAKT_UA_OVERRIDE === "string" && env.TRAKT_UA_OVERRIDE)
+    __uaOverride = env.TRAKT_UA_OVERRIDE;
+  const cm = Number(env && env.CHROME_UA_MAJOR);
+  if (Number.isFinite(cm) && cm >= 100) __chromeMajorOverride = Math.floor(cm);
+}
+
+/** UTF-8 编码为字节数组 */
+function __utf8Bytes(str) {
+  const out = [];
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    if (c < 128) out.push(c);
+    else if (c < 2048) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+    else if (c < 55296 || c >= 57344)
+      out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+    else {
+      i++;
+      const cp = 0x10000 + ((c & 1023) << 10) + (str.charCodeAt(i) & 1023);
+      out.push(
+        0xf0 | (cp >> 18),
+        0x80 | ((cp >> 12) & 63),
+        0x80 | ((cp >> 6) & 63),
+        0x80 | (cp & 63),
+      );
+    }
+  }
+  return out;
+}
+
+/** 纯 JS SHA-256（输入/输出均为字节数组），已与 Node crypto 对拍验证 */
+function __sha256Bytes(bytes) {
+  const rrot = (v, n) => (v >>> n) | (v << (32 - n));
+  const K = [
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2,
+  ];
+  let H = [
+    0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+    0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19,
+  ];
+  const msg = bytes.slice();
+  const bitLen = msg.length * 8;
+  msg.push(0x80);
+  while (msg.length % 64 !== 56) msg.push(0);
+  for (let i = 0; i < 8; i++)
+    msg.push(Math.floor(bitLen / Math.pow(2, (7 - i) * 8)) & 255);
+  const w = new Array(64);
+  for (let off = 0; off < msg.length; off += 64) {
+    for (let i = 0; i < 16; i++)
+      w[i] =
+        (msg[off + i * 4] << 24) |
+        (msg[off + i * 4 + 1] << 16) |
+        (msg[off + i * 4 + 2] << 8) |
+        msg[off + i * 4 + 3];
+    for (let i = 16; i < 64; i++) {
+      const s0 = rrot(w[i - 15], 7) ^ rrot(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+      const s1 = rrot(w[i - 2], 17) ^ rrot(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
+    }
+    let a = H[0], b = H[1], c = H[2], d = H[3],
+        e = H[4], f = H[5], g = H[6], h = H[7];
+    for (let i = 0; i < 64; i++) {
+      const S1 = rrot(e, 6) ^ rrot(e, 11) ^ rrot(e, 25);
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (h + S1 + ch + K[i] + w[i]) | 0;
+      const S0 = rrot(a, 2) ^ rrot(a, 13) ^ rrot(a, 22);
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (S0 + maj) | 0;
+      h = g; g = f; f = e; e = (d + t1) | 0;
+      d = c; c = b; b = a; a = (t1 + t2) | 0;
+    }
+    H = [
+      (H[0] + a) | 0, (H[1] + b) | 0, (H[2] + c) | 0, (H[3] + d) | 0,
+      (H[4] + e) | 0, (H[5] + f) | 0, (H[6] + g) | 0, (H[7] + h) | 0,
+    ];
+  }
+  const out = [];
+  for (const x of H) out.push((x >>> 24) & 255, (x >>> 16) & 255, (x >>> 8) & 255, x & 255);
+  return out;
+}
+
+/** HMAC-SHA256 → 小写 hex（key/msg 为 UTF-8 字符串） */
+function __hmacSha256Hex(key, msg) {
+  let k = __utf8Bytes(key);
+  if (k.length > 64) k = __sha256Bytes(k);
+  while (k.length < 64) k.push(0);
+  const oKey = k.map((b) => b ^ 0x5c);
+  const iKey = k.map((b) => b ^ 0x36);
+  const inner = __sha256Bytes(iKey.concat(__utf8Bytes(msg)));
+  const mac = __sha256Bytes(oKey.concat(inner));
+  return mac.map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Cookie 值签名（对 b64 payload 原文做 HMAC） */
+function cookieSigHex(payloadB64) {
+  return __hmacSha256Hex(__cookieSecret || "minetrakt-dev-fallback", payloadB64);
+}
+
+/**
+ * CSRF 防护：对浏览器发起的跨站 POST 直接 403。
+ *   - Sec-Fetch-Site（现代浏览器必带）：cross-site 一律拒绝；
+ *   - Origin（若带）：host 不匹配拒绝；
+ *   - 两者都没有（curl 等脚本客户端）放行 —— 这类请求本就无 CSRF 概念，
+ *     真正的鉴权由 HttpOnly Cookie 承担。
+ * 返回 null 表示放行，否则返回可直接响应的 403 Response。
+ */
+function sameOriginGuard(request) {
+  const site = request.headers.get("Sec-Fetch-Site");
+  if (site && site !== "same-origin" && site !== "same-site" && site !== "none")
+    return new Response("cross-site request blocked", { status: 403 });
+  const origin = request.headers.get("Origin");
+  if (origin) {
+    try {
+      if (new URL(origin).host !== new URL(request.url).host)
+        return new Response("cross-origin request blocked", { status: 403 });
+    } catch {
+      return new Response("bad origin", { status: 403 });
+    }
+  }
+  return null;
+}
 
 /** 登录态 Cookie 名（HttpOnly） */
 const COOKIE_NAME = "trakt_auth";
@@ -256,8 +460,9 @@ const HOME_AUTO_REFRESH_MINUTES = SIG_CHECK_INTERVAL_MINUTES;
 /** 播放数据视为「新鲜」的秒数（仅用于诊断输出） */
 const PLAYBACK_FRESH_SEC = SIG_CHECK_INTERVAL_MINUTES * 60;
 
-/** 应用版本；发版时务必同步修改（影响 SW / 静态资源 ETag） */
-const APP_VERSION = "1.6.5";
+/** 应用版本；发版时务必同步修改（影响 SW / 静态资源 ETag）。
+ * 1.6.10：修复延迟填充徽章间距不一致（defer 占位 span 改 display:contents） */
+const APP_VERSION = "1.8.0";
 /** 前端 JS 资源版本（可与 APP_VERSION 解耦发版） */
 const APP_JS_VERSION = APP_VERSION;
 /** 前端 CSS 资源版本 */
@@ -598,7 +803,11 @@ function __releaseTraktRead() {
  */
 function __traktTrimUsers(uk) {
   if (__traktUserLast.size > 300) {
-    const keys = [...__traktUserLast.keys()];
+    // Map 的插入序 ≠ 活动序（对已存在 key set 不会重排），
+    // 这里按记录的最近活动时间排序，删掉真正最久没活动的那批。
+    const keys = [...__traktUserLast.entries()]
+      .sort((a, b) => a[1] - b[1])
+      .map((e) => e[0]);
     for (let i = 0; i < keys.length - 150; i++) {
       if (keys[i] !== uk) __traktUserLast.delete(keys[i]);
     }
@@ -650,12 +859,13 @@ function __traktSerial(uk, minGap, userGap) {
  *   1. 不互相阻塞。换 token 卡住时不能把首页的 api 请求一起堵死；
  *   2. 间隔更长。设备码 / 授权轮询是低频动作，慢 1 秒无所谓，
  *      但短时间连打十几次就会触发 WAF 按 IP 封；
- *   3. 会主动泄压。队列积压超过 MAX_WAIT 就不再等，直接放行 ——
- *      多人同时登录时宁可乱序，也不能让 poll 卡到超时、用户干等。
+ *   3. 等待有上限。排队最多等 MAX_WAIT，既保住最小间隔的节流
+ *      （积压越深越不能连发，否则正是 WAF 最恨的突发），
+ *      也不会让 poll 卡到超时、用户干等。
  * ------------------------------------------------------------------ */
 /** auth 域两次请求最小间隔（毫秒），比 api 更保守，减轻 WAF */
 const TRAKT_AUTH_GAP_MS = 1500;
-/** auth 排队超过该等待则不再死等，优先放行避免 poll 超时 */
+/** auth 排队最多等待这么久，超时则放行避免 poll 卡死 */
 const TRAKT_AUTH_MAX_WAIT_MS = 3000;
 
 /** auth 域串行链尾 */
@@ -664,10 +874,7 @@ let __traktAuthTail = Promise.resolve();
 let __traktAuthLast = 0;
 
 /**
- * auth.trakt.tv 独立串行通道，与 api 互不阻塞。
- */
-/**
- * auth.trakt.tv 专用串行：间隔更长，积压超过 MAX_WAIT 则不再死等。
+ * auth.trakt.tv 专用串行：间隔更长，等待上限 MAX_WAIT（到点放行，不跳过节流）。
  */
 function __traktAuthSerial() {
   const prev = __traktAuthTail;
@@ -679,7 +886,9 @@ function __traktAuthSerial() {
         0,
         __traktAuthLast + TRAKT_AUTH_GAP_MS - Date.now(),
       );
-      if (wait > 0 && wait <= TRAKT_AUTH_MAX_WAIT_MS) await sleep(wait);
+      // 原来是 wait <= MAX_WAIT 才等、否则直接放行 —— 队列积压越深
+      // 放行越猛，恰好制造 WAF 最恨的连发。改为固定封顶等待。
+      if (wait > 0) await sleep(Math.min(wait, TRAKT_AUTH_MAX_WAIT_MS));
     } finally {
       __traktAuthLast = Date.now();
       release();
@@ -1400,17 +1609,30 @@ async function cachedJSON(
     }
   }
 
+  /** djb2 哈希 + 长度：把大对象压缩成短指纹，用于全量变更检测 */
+  function __hashStr(s) {
+    let h = 5381;
+    for (let i = 0; i < s.length; i++)
+      h = (((h << 5) + h) | 0) + s.charCodeAt(i);
+    return "h" + (h >>> 0).toString(36) + ":" + s.length;
+  }
+
   function __stableStr(v) {
     if (v === undefined) return "null";
     if (v === null || typeof v !== "object") return JSON.stringify(v);
     if (Array.isArray(v)) {
       if (v.length > 40) {
+        // 原来只取前 8 个元素的 id + 末元素：列表长度与首尾 id 不变、
+        // 中间内容变了（如观看状态）会被误判 unchanged，导致 force 刷新
+        // 的最新数据永远写不进 KV。改为全量 JSON 哈希；超大列表
+        // （>2000 项，哈希成本可控性兜底）才退回截断式指纹。
+        if (v.length <= 2000) return __hashStr(JSON.stringify(v));
         return (
           "[len:" +
           v.length +
           "|" +
           v
-            .slice(0, 8)
+            .slice(0, 500)
             .map((x) => {
               if (!x || typeof x !== "object") return JSON.stringify(x);
               const id =
@@ -1423,15 +1645,6 @@ async function cachedJSON(
               return String(id);
             })
             .join(",") +
-          "|" +
-          (v[v.length - 1] && typeof v[v.length - 1] === "object"
-            ? String(
-                (v[v.length - 1].ids && v[v.length - 1].ids.trakt) ||
-                  v[v.length - 1].paused_at ||
-                  v[v.length - 1].last_watched_at ||
-                  "",
-              )
-            : "") +
           "]"
         );
       }
@@ -1439,16 +1652,9 @@ async function cachedJSON(
     }
     const ks = Object.keys(v).sort();
     if (ks.length > 60) {
-      return (
-        "{keys:" +
-        ks.length +
-        "|" +
-        ks
-          .slice(0, 12)
-          .map((k) => JSON.stringify(k) + ":" + __stableStr(v[k]))
-          .join(",") +
-        "}"
-      );
+      // 同理：key 超多时用全量哈希，不再截断成前 12 个 key
+      //（截断会漏掉第 13 个 key 之后的值变化）
+      return __hashStr(JSON.stringify(v));
     }
     return (
       "{" +
@@ -1942,11 +2148,27 @@ export default {
     const url = new URL(request.url),
       path = url.pathname;
 
+    // isolate 级一次性初始化：Cookie 签名密钥（优先 KV 自生成，零配置）+ UA 覆盖
+    await initEnvRuntime(env);
+
+    // CSRF 防护：浏览器跨站 POST 一律 403（见 sameOriginGuard 注释）。
+    // 只拦会改数据的端点；读接口无 CSRF 风险。
+    if (
+      request.method === "POST" &&
+      (path.startsWith("/api/") ||
+        path === "/auth/poll" ||
+        path === "/auth/logout")
+    ) {
+      const blocked = sameOriginGuard(request);
+      if (blocked) return blocked;
+    }
+
     if (path.startsWith("/assets/")) return handleAsset(path, ctx);
-    if (path === "/app.css") return handleAppCss();
+    if (path === "/app.css") return handleAppCss(request);
     if (path === "/app.js") return handleAppJs(request);
     if (path === "/favicon.ico") return Response.redirect(FAVICON_URL, 302);
     if (path === "/avatar") return handleAvatar(request, ctx);
+    if (path === "/logo") return handleLogo(request, ctx);
     if (path === "/manifest.webmanifest") return handleManifest();
     if (path === "/sw.js") return handleServiceWorker();
 
@@ -2018,6 +2240,192 @@ export default {
  * 图标、favicon、头像代理，以及 export default 的分发
  * ================================================================== */
 
+/**
+ * GET /logo?u=<图床地址>&t=<平台名> —— 平台 Logo 边缘代理。
+ * 优先图床（picui.ogmua.cn），失败则回源 GitHub img/，再失败用内嵌/SVG。
+ *   - 图床白名单防 SSRF；GitHub 兜底只按平台名映射，不接受任意 URL；
+ *   - Cache API 边缘缓存 30 天；
+ *   - 全部挂了 → 内联品牌占位 SVG，UI 永不破图。
+ */
+const LOGO_PROXY_HOST_RE = /^https:\/\/picui\.ogmua\.cn\//i;
+const LOGO_CACHE_TTL = 30 * 86400;
+/** GitHub 仓库 img/ 目录（raw），图床挂了时的二级源 */
+const LOGO_GH_BASE =
+  "https://raw.githubusercontent.com/SunMoonWithYou/minetrakt/main/img/";
+/**
+ * 平台名 → GitHub img/ 文件名（与仓库一致，含空格与中文）。
+ * 键必须与 PLATFORMS.name / THEATER_PLATFORMS.name（以及 /logo?t=）对齐。
+ */
+const LOGO_GH_FILES = {
+  // 流媒体
+  Netflix: "Netflix.webp",
+  "Disney+": "Disney+.webp",
+  "HBO Max": "HBO Max.webp",
+  "Apple TV+": "Apple TV+.webp",
+  "Prime Video": "Prime Video.webp",
+  哔哩哔哩: "哔哩哔哩.webp",
+  爱奇艺: "爱奇艺.webp",
+  腾讯视频: "腾讯视频.webp",
+  优酷: "优酷.webp",
+  芒果TV: "芒果TV.webp",
+  // 平台剧场
+  X剧场: "X.png",
+  迷雾剧场: "Fog.png",
+  白夜剧场: "BaiYe.png",
+  正午阳光: "ZhengWu.png",
+  大家剧场: "DaJia.png",
+  微尘剧场: "WeiChen.png",
+  恋恋剧场: "LianLian.png",
+  生花剧场: "ShengHua.png",
+  板凳单元: "BanDeng.png",
+  小逗剧场: "XiaoDou.png",
+  十分剧场: "ShiFen.png",
+  横屏短剧: "DuanJu.png",
+  萤火单元: "YingHuo.png",
+  悬疑剧: "Xuanyi.png",
+};
+
+/* ==================================================================
+ * 内嵌 logo 兜底库
+ * 键 = 平台名（与 /logo?t= 参数一致），值 = { mime, b64 }（原始 base64）。
+ * 图床 + GitHub 都失败时从 Worker 内存出图；可由构建脚本填充。
+ * ================================================================== */
+const LOGO_ASSETS = {
+  /* __LOGO_ASSETS_PLACEHOLDER__ */
+};
+
+/** base64 → Uint8Array（流式构造 Response 用） */
+function __b64ToBytes(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+/** 查内嵌 logo：命中返回可直接响应的 Response，未命中返回 null */
+function logoAssetResponse(label) {
+  const asset = LOGO_ASSETS[String(label || "").trim()];
+  if (!asset || !asset.b64) return null;
+  return new Response(__b64ToBytes(asset.b64), {
+    headers: {
+      "Content-Type": asset.mime || "image/webp",
+      "Cache-Control": "public, max-age=604800",
+    },
+  });
+}
+
+/** 最终兜底：品牌占位 SVG，显示平台名，缓存 5 分钟可自愈 */
+function logoFallback(label) {
+  let text = String(label || "")
+    .replace(/[<>&"]/g, "")
+    .trim()
+    .slice(0, 6);
+  if (!text) text = "TV";
+  const fs =
+    text.length <= 2 ? 9 : text.length === 3 ? 8 : text.length === 4 ? 6.5 : 5.5;
+  const svg =
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 24">' +
+    '<rect width="48" height="24" rx="4" fill="rgba(127,127,127,0.15)"/>' +
+    '<text x="24" y="' +
+    (16 - (9 - fs) * 0.5) +
+    '" font-size="' +
+    fs +
+    '" text-anchor="middle" fill="rgba(127,127,127,0.6)" font-family="sans-serif">' +
+    text +
+    "</text></svg>";
+  return new Response(svg, {
+    headers: {
+      "Content-Type": "image/svg+xml",
+      "Cache-Control": "public, max-age=300",
+    },
+  });
+}
+
+/**
+ * 从任意图片 URL 拉图（带浏览器头 + 一次重试），成功则写入 Cache API。
+ * 返回 Response 或 null。
+ */
+async function fetchLogoImage(target, ctx) {
+  if (!target) return null;
+  try {
+    const cacheKey = new Request(target, { method: "GET" });
+    const cache = caches.default;
+    let resp = await cache.match(cacheKey);
+    if (resp) return resp;
+    const headers = {
+      "User-Agent": traktAuthUa(),
+      Accept:
+        "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      Referer: "https://github.com/",
+      "Sec-Fetch-Dest": "image",
+      "Sec-Fetch-Mode": "no-cors",
+      "Sec-Fetch-Site": "cross-site",
+    };
+    for (let i = 0; i < 2 && !resp; i++) {
+      try {
+        const upstream = await fetch(target, {
+          headers,
+          redirect: "follow",
+        });
+        if (
+          upstream.ok &&
+          (upstream.headers.get("Content-Type") || "").startsWith("image/")
+        ) {
+          resp = new Response(upstream.body, upstream);
+          resp.headers.delete("content-encoding");
+          resp.headers.delete("content-length");
+          resp.headers.set(
+            "Cache-Control",
+            `public, max-age=${LOGO_CACHE_TTL}`,
+          );
+          if (ctx && typeof ctx.waitUntil === "function")
+            ctx.waitUntil(cache.put(cacheKey, resp.clone()).catch(() => {}));
+          return resp;
+        } else if (i === 0) {
+          await new Promise((r) => setTimeout(r, 400));
+        }
+      } catch {}
+    }
+  } catch {}
+  return null;
+}
+
+/** 按平台名拼 GitHub raw 地址（文件名需 URL 编码） */
+function logoGithubUrl(label) {
+  const name = String(label || "").trim();
+  const file = LOGO_GH_FILES[name];
+  if (!file) return "";
+  return LOGO_GH_BASE + encodeURIComponent(file).replace(/%2F/gi, "/");
+}
+
+async function handleLogo(request, ctx) {
+  const url = new URL(request.url);
+  const target = url.searchParams.get("u") || "";
+  const label = url.searchParams.get("t") || "";
+
+  // 有 u 时必须是图床白名单，防止被当通用代理
+  if (target && !LOGO_PROXY_HOST_RE.test(target))
+    return new Response("bad url", { status: 400 });
+
+  let resp = null;
+
+  // 1) 优先图床
+  if (target) resp = await fetchLogoImage(target, ctx);
+
+  // 2) 图床失败 / 无 u → GitHub img/
+  if (!resp) {
+    const gh = logoGithubUrl(label);
+    if (gh) resp = await fetchLogoImage(gh, ctx);
+  }
+
+  // 3) 内嵌 base64
+  if (!resp) resp = logoAssetResponse(label);
+  // 4) 文本 SVG
+  if (!resp) resp = logoFallback(label);
+  return resp;
+}
+
 async function handleAvatar(request, ctx) {
   const raw = new URL(request.url).searchParams.get("u") || "";
   let target;
@@ -2048,7 +2456,7 @@ async function handleAvatar(request, ctx) {
   let r;
   try {
     r = await fetch(target.toString(), {
-      headers: { "User-Agent": TRAKT_UA, Referer: "https://trakt.tv/" },
+      headers: { "User-Agent": traktAuthUa(), Referer: "https://trakt.tv/" },
     });
   } catch {
     return new Response("bad gateway", { status: 502 });
@@ -2100,14 +2508,18 @@ async function handleAsset(path, ctx) {
 /**
  * /app.css —— 内联样式表，强缓存一年（换版本靠 URL 上的 ?v= 刷新）。
  */
-function handleAppCss() {
-  return new Response(pageStyles(), {
-    headers: {
-      "Content-Type": "text/css; charset=utf-8",
-      "Cache-Control": "public, max-age=31536000, immutable",
-      ETag: `"css-v${APP_CSS_VERSION}"`,
-    },
-  });
+function handleAppCss(request) {
+  const etag = `"css-v${APP_CSS_VERSION}"`;
+  const cacheHeaders = {
+    "Content-Type": "text/css; charset=utf-8",
+    "Cache-Control": "public, max-age=31536000, immutable",
+    ETag: etag,
+  };
+  // 与 handleAppJs 对齐：命中 If-None-Match 直接 304，省掉整包 CSS 传输
+  if (request && request.headers.get("If-None-Match") === etag) {
+    return new Response(null, { status: 304, headers: cacheHeaders });
+  }
+  return new Response(pageStyles(), { headers: cacheHeaders });
 }
 
 /**
@@ -2206,13 +2618,20 @@ function handleServiceWorker() {
 async function requireAuth(request, env) {
   const cookieAuth = readAuth(request);
   if (!cookieAuth) return { ok: false };
+  const ck = cookieAuth.__ck || { ver: 1, payload: null, sig: null };
+  if (ck.ver === 2) {
+    // v2：验签失败 = Cookie 被篡改或密钥已轮换，按未登录处理
+    if (cookieSigHex(ck.payload) !== ck.sig) return { ok: false };
+  }
   const auth = await refreshIfNeeded(cookieAuth, env);
   if (!auth) return { ok: false };
   return {
     ok: true,
     auth,
     headers: makeTraktHeaders(env, auth),
+    // v1 旧 Cookie 也要标记换发：下一次任意响应会把签名 v2 发下去
     needsCookieUpdate:
+      ck.ver === 1 ||
       auth.access_token !== cookieAuth.access_token ||
       auth.trakt_id !== (cookieAuth.trakt_id || null),
   };
@@ -2419,7 +2838,7 @@ async function traktSyncAction(
 ) {
   const A = await authed(request, env, ctx);
   if (!A.ok) return A.response;
-  const { auth, headers, needsCookieUpdate } = A;
+  const { auth, headers, needsCookieUpdate, userKey } = A;
 
   const parsed = await parseJsonBody(request);
   if (!parsed.ok) return parsed.error;
@@ -2450,9 +2869,17 @@ async function traktSyncAction(
         body: JSON.stringify(payload),
       },
       timeout,
+      // 写请求带上 userKey：同用户写间隔（TRAKT_WRITE_USER_GAP_MS）
+      // 才真正生效，否则所有写都归到 "__anon__" 桶里互相顶牛。
+      userKey,
     );
-  } catch (e) {
-    return authJson(auth, needsCookieUpdate, { error: String(e) }, 502);
+  } catch {
+    return authJson(
+      auth,
+      needsCookieUpdate,
+      { error: "请求 Trakt 失败，请稍后重试" },
+      502,
+    );
   }
 
   if (!r.ok) {
@@ -2529,7 +2956,7 @@ async function handleDevice(request, env, ctx) {
       `${TRAKT_AUTH}/oauth/device/code`,
       {
         method: "POST",
-        headers: JSON_HEADERS,
+        headers: authJsonHeaders(),
         body: JSON.stringify({
           client_id: env.TRAKT_CLIENT_ID,
           code_challenge: codeChallenge,
@@ -2636,7 +3063,7 @@ async function handlePoll(request, env, ctx) {
       `${TRAKT_AUTH}/oauth/device/token`,
       {
         method: "POST",
-        headers: JSON_HEADERS,
+        headers: authJsonHeaders(),
         body: JSON.stringify({
           code: decoded.device_code,
           client_id: env.TRAKT_CLIENT_ID,
@@ -2887,7 +3314,13 @@ function buildCookie(auth, traktId) {
         ? String(auth.trakt_id)
         : null,
   };
-  return `${COOKIE_NAME}=${b64urlEncode(JSON.stringify(payload))}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${COOKIE_MAX_AGE}`;
+  // v2：payload + HMAC-SHA256 签名，防止 Cookie 被篡改（见文件头部说明）。
+  // __cookieSecret 尚未初始化（极早调用）时退回 v1 无签名格式，保持兼容。
+  const body = b64urlEncode(JSON.stringify(payload));
+  const value = __cookieSecret
+    ? `v2.${body}.${cookieSigHex(body)}`
+    : body;
+  return `${COOKIE_NAME}=${value}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${COOKIE_MAX_AGE}`;
 }
 
 /**
@@ -2898,8 +3331,26 @@ function readAuth(request) {
   const m = cookie.match(new RegExp(`(?:^|;\\s*)${COOKIE_NAME}=([^;]+)`));
   if (!m) return null;
   try {
-    const auth = JSON.parse(b64urlDecode(m[1]));
+    let raw = m[1];
+    let ver = 1;
+    // v2 格式：v2.<b64payload>.<hex sig>；v1：纯 b64 payload
+    if (raw.startsWith("v2.")) {
+      ver = 2;
+      const parts = raw.split(".");
+      if (parts.length !== 3) return null;
+      raw = parts[1];
+    }
+    const auth = JSON.parse(b64urlDecode(raw));
     if (auth && !("trakt_id" in auth)) auth.trakt_id = null;
+    if (auth) {
+      // 附加不可枚举的校验元数据：payload 原文 / 签名 / 版本号。
+      // 不可枚举保证它不会被 JSON 序列化或 spread 进新的 auth 对象。
+      Object.defineProperty(auth, "__ck", {
+        value: { ver, payload: raw, sig: ver === 2 ? m[1].split(".")[2] : null },
+        enumerable: false,
+        configurable: true,
+      });
+    }
     return auth;
   } catch {
     return null;
@@ -2919,7 +3370,7 @@ async function refreshIfNeeded(auth, env) {
       `${TRAKT_AUTH}/oauth/token`,
       {
         method: "POST",
-        headers: JSON_HEADERS,
+        headers: authJsonHeaders(),
         body: JSON.stringify({
           refresh_token: auth.refresh_token,
           client_id: env.TRAKT_CLIENT_ID,
@@ -2931,9 +3382,11 @@ async function refreshIfNeeded(auth, env) {
       10000,
     );
   } catch {
-    return null;
+    // 刷新失败（网络抖动 / 上游 5xx）时保留旧 token，绝不把用户踢下线；
+    // 旧 token 在 expires_at 前仍然有效，下次请求会再次尝试刷新。
+    return auth;
   }
-  if (!res.ok) return null;
+  if (!res.ok) return auth;
 
   const data = await res.json();
   return {
@@ -3951,7 +4404,11 @@ function mergeContinueLists(
       b.last_watched_at ||
       (b.progress && b.progress.last_watched_at) ||
       "";
-    return String(tb).localeCompare(String(ta));
+    // 用时间戳数值比较：localeCompare 是 locale 感知排序，慢，
+    // 且字段混入非 ISO 格式时会错序
+    return (
+      (Date.parse(String(tb)) || 0) - (Date.parse(String(ta)) || 0)
+    );
   });
 
   const result = out.slice(0, Math.max(1, limit | 0));
@@ -4499,7 +4956,7 @@ async function getBoardRaw(
     key,
     async () => {
       try {
-        const r = await fetchT(url, { headers: SITE_HEADERS }, 10000);
+        const r = await fetchT(url, { headers: siteHeaders() }, 10000);
         if (!r.ok) return null;
         const data = await r.json();
         if (validateOnFetch && !isUsableBoardPayload(data)) return null;
@@ -4711,6 +5168,10 @@ function renderGuduoItems(items) {
  * ================================================================== */
 
 async function handleDoubanList(request, env, ctx) {
+  // 防刷：公开榜单接口按 IP 限流（enrich 同款 60 次/分钟），
+  // force=1 会击穿缓存直打上游，不能放给脚本无限刷。
+  if (!allowEnrich(request))
+    return new Response("too many requests", { status: 429 });
   const url = new URL(request.url);
   const section = url.searchParams.get("section") || "domestic";
   const mode = url.searchParams.get("mode") || "grid";
@@ -4906,6 +5367,10 @@ function listResp(html, mode, headers) {
  * ================================================================== */
 
 async function handleTheaterList(request, env, ctx) {
+  // 防刷：公开榜单接口按 IP 限流（enrich 同款 60 次/分钟），
+  // force=1 会击穿缓存直打上游，不能放给脚本无限刷。
+  if (!allowEnrich(request))
+    return new Response("too many requests", { status: 429 });
   const url = new URL(request.url);
   const mode = url.searchParams.get("mode") || "grid";
   const platform = url.searchParams.get("platform") || "all";
@@ -4918,11 +5383,15 @@ async function handleTheaterList(request, env, ctx) {
   };
 
   if (mode === "debug") {
+    // debug 会吐出上游数据的原始形状，仅限已登录用户排障使用
+    const Ad = await authed(request, env, ctx);
+    if (!Ad.ok) return Ad.response;
     const summary = { type: typeof data, keys: [], sample: null, itemCount: 0 };
     if (data && typeof data === "object") {
       summary.keys = Object.keys(data);
       summary.sample = data;
-      summary.itemCount = collectTheaterItems(data).length;
+      const theaterItems = collectTheaterItems(data);
+      summary.itemCount = theaterItems.length;
       summary.shape = {};
       for (const k of summary.keys) {
         const v = data[k];
@@ -4932,8 +5401,7 @@ async function handleTheaterList(request, env, ctx) {
             "object{" + Object.keys(v).slice(0, 5).join(",") + "}";
         else summary.shape[k] = typeof v;
       }
-      const first = collectTheaterItems(data)[0];
-      summary.firstItem = first || null;
+      summary.firstItem = theaterItems[0] || null;
     }
     return new Response(JSON.stringify(summary).slice(0, 8000), {
       headers: {
@@ -5072,6 +5540,10 @@ function pickGuduoSection(data, category) {
  * ================================================================== */
 
 async function handleGuduoList(request, env, ctx) {
+  // 防刷：公开榜单接口按 IP 限流（enrich 同款 60 次/分钟），
+  // force=1 会击穿缓存直打上游，不能放给脚本无限刷。
+  if (!allowEnrich(request))
+    return new Response("too many requests", { status: 429 });
   const url = new URL(request.url);
   const mode = url.searchParams.get("mode") || "grid";
   const category = url.searchParams.get("category") || "all";
@@ -5084,6 +5556,9 @@ async function handleGuduoList(request, env, ctx) {
   };
 
   if (mode === "debug") {
+    // debug 会吐出上游数据的原始形状，仅限已登录用户排障使用
+    const Ad = await authed(request, env, ctx);
+    if (!Ad.ok) return Ad.response;
     const cats = (data && data.categories) || {};
     const summary = {
       type: typeof data,
@@ -5130,7 +5605,8 @@ const PLATFORMS = {
     id: "hbomax",
     name: "HBO Max",
     region: "国外",
-    logo: "https://picui.ogmua.cn/s1/2026/10/14/6acf1d2eaeb73.webp",
+    // picui 曾 404；留空时走 /logo?t=HBO Max → GitHub 兜底
+    logo: "",
     kind: "watch",
     providers: [1899, 384],
     watchRegion: "US",
@@ -5371,6 +5847,7 @@ async function loadPlatformPreviews(env, ctx, force) {
 
   const items = {};
   const queue = HOME_PLATFORM_IDS.filter((pid) => PLATFORMS[pid]);
+  let failures = 0;
   const worker = async () => {
     while (queue.length) {
       const pid = queue.shift();
@@ -5381,7 +5858,10 @@ async function loadPlatformPreviews(env, ctx, force) {
           .slice(0, 5)
           .map((x) => x.poster.replace("/w185", "/w342"));
       } catch {
+        // 失败不进长期缓存：瞬时故障若落 KV 一天，
+        // 平台卡片会空白一整天。空数组仅存活本轮内存。
         items[pid] = [];
+        failures++;
       }
     }
   };
@@ -5389,7 +5869,9 @@ async function loadPlatformPreviews(env, ctx, force) {
 
   const payload = { items };
   kvRemember(cacheKey, payload);
-  kvPutJSON(env, ctx, cacheKey, payload, PLATFORM_KV_TTL, false, !!force);
+  // 有失败时只写内存兜底，不落 KV（下次请求重试回源）
+  if (failures === 0)
+    kvPutJSON(env, ctx, cacheKey, payload, PLATFORM_KV_TTL, false, !!force);
   return items;
 }
 
@@ -5399,6 +5881,10 @@ async function loadPlatformPreviews(env, ctx, force) {
  * ================================================================== */
 
 async function handlePlatformList(request, env, ctx) {
+  // 防刷：公开榜单接口按 IP 限流（enrich 同款 60 次/分钟），
+  // force=1 会击穿缓存直打上游，不能放给脚本无限刷。
+  if (!allowEnrich(request))
+    return new Response("too many requests", { status: 429 });
   const url = new URL(request.url);
   const id = (url.searchParams.get("id") || "").trim().toLowerCase();
   const mode = url.searchParams.get("mode") || "grid";
@@ -5627,7 +6113,8 @@ async function fetchTmdbVideos(type, id, env, ctx) {
   return cachedJSON(
     env,
     ctx,
-    `tv:${type}:${id}`,
+    // vid: 前缀避免与 enrich 的 tv:/movie: key 撞名，也便于按前缀审计
+    `vid:${type}:${id}`,
     async () => {
       const mk = (lang) =>
         `${TMDB_API}/${type}/${id}/videos?language=${lang}&api_key=${env.TMDB_API_KEY}`;
@@ -5662,10 +6149,12 @@ async function fetchTmdbVideos(type, id, env, ctx) {
 /**
  * 评分对应的颜色（红→黄→绿），前端用它给分数上色。
  */
-function mcColor(n) {
-  if (n >= 61) return "#66cc33";
-  if (n >= 40) return "#ffcc33";
-  return "#ff0000";
+/** Metacritic 分数档位 → CSS 类。颜色交给 CSS 定义（深浅主题各一套），
+ * 不能再用内联 style 硬编码：内联优先级高于任何主题覆盖，浅色下会看不清。 */
+function mcTier(n) {
+  if (n >= 61) return "high";
+  if (n >= 40) return "mid";
+  return "low";
 }
 
 const RATING_LOGOS = {
@@ -5689,7 +6178,7 @@ function renderExtRatings(r, opts = {}) {
     );
   if (r && r.metacritic != null)
     out.push(
-      `<span class="ext-rating ext-mc" title="Metacritic ${r.metacritic}/100">${RATING_LOGOS.mc}<span class="ext-score" style="color:${mcColor(r.metacritic)}">${r.metacritic}</span></span>`,
+      `<span class="ext-rating ext-mc" title="Metacritic ${r.metacritic}/100">${RATING_LOGOS.mc}<span class="ext-score mc-score-${mcTier(r.metacritic)}">${r.metacritic}</span></span>`,
     );
   if (r && r.rt != null)
     out.push(
@@ -5869,11 +6358,12 @@ async function getWatchlistTmdbIds(headers, env, ctx, userKey, type) {
 
 /* ==================================================================
  * 搜索与趋势
- * Trakt 搜索、TMDB 趋势、追剧增删
+ * TMDB 搜索（电影/剧集两路并发）、TMDB 趋势、追剧增删
  * ================================================================== */
 
 /**
- * GET /api/search —— 搜索。先查 Trakt，命中不足时补 TMDB 的结果。
+ * GET /api/search —— 搜索。实际查询 TMDB（电影 + 剧集两路并发），
+ * 按 type 过滤合并结果；不做 Trakt 调用，不走 KV 缓存。
  */
 async function handleSearch(request, env, ctx) {
   const url = new URL(request.url),
@@ -6029,8 +6519,13 @@ async function handleWatchlistAdd(request, env, ctx) {
       },
       10000,
     );
-  } catch (e) {
-    return authJson(auth, needsCookieUpdate, { error: String(e) }, 502);
+  } catch {
+    return authJson(
+      auth,
+      needsCookieUpdate,
+      { error: "请求 Trakt 失败，请稍后重试" },
+      502,
+    );
   }
 
   if (!r.ok) {
@@ -6175,11 +6670,12 @@ async function handleMarkSeasonWatched(request, env, ctx) {
       );
       if (r && !r.__error && Array.isArray(r.episodes)) {
         seasonData = r;
+        // _ts 由 kvPutJSON 统一补齐，无需手写
         kvPutJSON(
           env,
           ctx,
           CK.season(showId, season),
-          { data: r, _ts: Date.now() },
+          { data: r },
           seasonTtl(r),
           false,
           false,
@@ -6205,6 +6701,7 @@ async function handleMarkSeasonWatched(request, env, ctx) {
             CK.season(showId, season),
             { data: found },
             seasonTtl(found),
+            false,
             false,
           );
         }
@@ -6258,11 +6755,11 @@ async function handleMarkSeasonWatched(request, env, ctx) {
       },
       15000,
     );
-  } catch (e) {
+  } catch {
     return authJson(
       auth,
       needsCookieUpdate,
-      { error: "网络错误：" + String(e) },
+      { error: "网络错误，请稍后重试" },
       502,
     );
   }
@@ -6364,13 +6861,13 @@ async function handleHideContinue(request, env, ctx) {
   kvRemember(CK.cwHide(userKey), { data: map, _ts: hideAt });
   // 等隐藏表写进 KV 再回响应，另一台设备紧接着打开首页就能看到隐藏已生效
   await putCwHideMap(env, ctx, userKey, map);
-  bustUserStateBundle(userKey, env, ctx);
 
   if (userKey) {
+    // bundle 只与 userKey 相关（无 userKey 时 bustUserStateBundle 是空操作）
+    bustUserStateBundle(userKey, env, ctx);
     // 只删 playback：more:pb 的两个 key 是 300s TTL，翻"更多"才会用到，
     // 单独删它们等于每次隐藏多付两次删除额度。
     await safeDeleteKvKeys(env, ctx, [CK.playback(userKey)]);
-    bustUserStateBundle(userKey, env, ctx);
   }
 
   return authJson(auth, needsCookieUpdate, {
@@ -6429,8 +6926,13 @@ async function handleDropShow(request, env, ctx) {
     } catch {
       result = {};
     }
-  } catch (e) {
-    return authJson(auth, needsCookieUpdate, { error: String(e) }, 502);
+  } catch {
+    return authJson(
+      auth,
+      needsCookieUpdate,
+      { error: "请求 Trakt 失败，请稍后重试" },
+      502,
+    );
   }
 
   try {
@@ -6446,7 +6948,7 @@ async function handleDropShow(request, env, ctx) {
   } catch {}
 
   if (userKey) {
-    const dropKey = `dropped:${userKey}`;
+    const dropKey = `dropped:${userKey || "anon"}`;
     let nextIds = [showId];
     try {
       // prev 从 KV 取：内存副本已经不参与读取了，这里再读内存只会拿到空值，
@@ -6491,7 +6993,7 @@ async function handleDropShow(request, env, ctx) {
     added,
     showId,
     message:
-      added === false
+      added === 0
         ? "这部剧已经在弃看列表里了"
         : "已弃看，已从日历和继续观看移除",
     result,
@@ -6536,16 +7038,21 @@ async function handleShowCalendar(request, env, ctx) {
           const realSeasons = tmdbShow.seasons.filter(
             (s) => s.season_number > 0,
           );
+          // 原来逐季 await + sleep(30) 串行，20 季的老剧要串行 20 次往返；
+          // 改为每批 4 季并发（tmdbDetailCached 自带 KV 缓存，回源压力可控）。
           const seasonDatas = [];
-          for (const s of realSeasons) {
-            seasonDatas.push(
-              await tmdbDetailCached(
-                `/tv/${tmdbId}/season/${s.season_number}`,
-                env,
-                ctx,
+          for (let i = 0; i < realSeasons.length; i += 4) {
+            const batch = realSeasons.slice(i, i + 4);
+            const part = await Promise.all(
+              batch.map((s) =>
+                tmdbDetailCached(
+                  `/tv/${tmdbId}/season/${s.season_number}`,
+                  env,
+                  ctx,
+                ).catch(() => null),
               ),
             );
-            await sleep(30);
+            seasonDatas.push(...part);
           }
           for (const sd of seasonDatas) {
             if (!sd || !Array.isArray(sd.episodes)) continue;
@@ -6599,7 +7106,7 @@ async function handleSummary(request, env, ctx) {
 
   const url = new URL(request.url);
   const period = url.searchParams.get("period") === "year" ? "year" : "month";
-  const now = new Date(Date.now() + 8 * 3600 * 1000);
+  const now = new Date(Date.now() + BJ_OFFSET_MS);
   let ref = (url.searchParams.get("ref") || "").trim();
 
   if (period === "month") {
@@ -6729,7 +7236,7 @@ async function buildSummary(headers, period, ref, env, ctx, userKey) {
     if (watchedAt) {
       try {
         const d = new Date(watchedAt);
-        day = new Date(d.getTime() + 8 * 3600 * 1000)
+        day = new Date(d.getTime() + BJ_OFFSET_MS)
           .toISOString()
           .slice(0, 10);
       } catch {}
@@ -7804,7 +8311,7 @@ async function handleHomeData(request, env, ctx) {
   const { auth, headers, needsCookieUpdate, userKey } = A;
   const url = new URL(request.url);
 
-  const today = new Date(Date.now() + 8 * 3600 * 1000)
+  const today = new Date(Date.now() + BJ_OFFSET_MS)
     .toISOString()
     .slice(0, 10);
 
@@ -7834,7 +8341,6 @@ async function handleHomeData(request, env, ctx) {
   const wantCalendar = part === "calendar" || part === "all";
   const wantHistory = part === "history" || part === "all";
 
-  // ================= 阶段 1：先看活动签名，决定要不要 bypass 打 Trakt =================
 // ================= 阶段 1：先看活动签名，决定要不要 bypass 打 Trakt =================
   // 原则：签名变了才回源；签名没变就完全不动，直接用缓存。
   const actSigP = wantPlayback
@@ -8011,14 +8517,25 @@ async function handleHomeData(request, env, ctx) {
             };
           }
 
-          const [paused, upNext] = await Promise.all([
+          const [paused, upNextRaw] = await Promise.all([
             fetchJson(`${TRAKT_API}/sync/playback?extended=full`, 1, 12000),
+            // up_next_nitro 是 Trakt 未文档化的 beta 端点，上游一改即断：
+            // 404/410 时降级为空列表，继续观看仍由 paused 支撑，而非整体失败
             fetchJson(
               `${TRAKT_API}/sync/progress/up_next_nitro?extended=full&images=poster,screenshot,fanart&limit=30&intent=continuing`,
               1,
               15000,
-            ),
+            ).catch((e) => ({ __error: String(e) })),
           ]);
+          let upNext = upNextRaw;
+          if (
+            upNext &&
+            upNext.__error &&
+            /HTTP 40[4]\b|HTTP 410\b/.test(String(upNext.__error))
+          ) {
+            dbg.upNextDegraded = String(upNext.__error);
+            upNext = [];
+          }
 
           const pausedOk = Array.isArray(paused) ? paused : null;
           const upNextOk = Array.isArray(upNext) ? upNext : null;
@@ -8107,9 +8624,9 @@ async function handleHomeData(request, env, ctx) {
           let changed = false;
           for (const sid of playback.__autoUnhide) {
             const k = String(sid);
-            if (hideMap[k] || hideMap[sid]) {
+            if (hideMap[k]) {
+              // hideMap 一律以 String(sid) 为键，无需再按原始值删一遍
               delete hideMap[k];
-              delete hideMap[sid];
               changed = true;
             }
           }
@@ -8143,7 +8660,7 @@ async function handleHomeData(request, env, ctx) {
           });
         } catch {}
 
-        const todayBJ = new Date(Date.now() + 8 * 3600 * 1000)
+        const todayBJ = new Date(Date.now() + BJ_OFFSET_MS)
           .toISOString()
           .slice(0, 10);
 
@@ -8166,15 +8683,14 @@ async function handleHomeData(request, env, ctx) {
 
         let localUpcoming = [];
         try {
-          if (freshWatched !== null) {
-            localUpcoming = calendarToLocalContinue(
-              cal,
-              Date.now(),
-              droppedSet,
-              freshWatched,
-              hideMap,
-            );
-          }
+          // freshWatched 恒为 Set（watchedStateToSet 不返回 null），无需判空
+          localUpcoming = calendarToLocalContinue(
+            cal,
+            Date.now(),
+            droppedSet,
+            freshWatched,
+            hideMap,
+          );
         } catch {}
 
         if (localUpcoming && localUpcoming.length) {
@@ -8197,9 +8713,9 @@ async function handleHomeData(request, env, ctx) {
             let changed = false;
             for (const sid of filtered.__autoUnhide) {
               const k = String(sid);
-              if (hideMap[k] || hideMap[sid]) {
+              if (hideMap[k]) {
+                // hideMap 一律以 String(sid) 为键，无需再按原始值删一遍
                 delete hideMap[k];
-                delete hideMap[sid];
                 changed = true;
               }
             }
@@ -8531,7 +9047,9 @@ async function handleHomeData(request, env, ctx) {
       rememberTraktUserId(auth, profile.ids.trakt);
     }
 
-    const username =
+    // username / displayName 等用 let：displayName 会在下方被
+    // profile Cookie 提示兜底重写（原 const 在该分支会直接抛 TypeError）
+    let username =
         profile && !profile.__error && profile.username
           ? profile.username
           : "",
@@ -8830,9 +9348,21 @@ const THEATER_PLATFORMS = [
  * 平台卡片、平台行、整页骨架
  * ================================================================== */
 
+/**
+ * 平台 logo 的 src：始终走 /logo 代理。
+ * 有图床 URL 时优先拉取；失败（或无 URL）按平台名回源 GitHub img/。
+ */
+function platformLogoSrc(p) {
+  const t = encodeURIComponent(p.name || "");
+  if (p.logo) {
+    return "/logo?u=" + encodeURIComponent(p.logo) + "&t=" + t;
+  }
+  return "/logo?t=" + t;
+}
+
 function renderPlatformCard(p, extraAttr) {
   const attr = extraAttr || `data-platform-id="${esc(p.id)}"`;
-  return `<button type="button" class="platform-card" ${attr} title="${esc(p.name)}"><div class="platform-card-left"><img class="platform-card-logo" src="${esc(p.logo)}" alt="" loading="lazy"><span class="platform-card-name">${esc(p.name)}</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="${esc(p.id)}"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button>`;
+  return `<button type="button" class="platform-card" ${attr} title="${esc(p.name)}"><div class="platform-card-left"><img class="platform-card-logo" src="${platformLogoSrc(p)}" alt="" loading="lazy"><span class="platform-card-name">${esc(p.name)}</span></div><div class="platform-card-right"><div class="platform-card-posters" data-plat-posters="${esc(p.id)}"><span class="platform-card-poster p0 platform-card-poster-ph"></span><span class="platform-card-poster p1 platform-card-poster-ph"></span><span class="platform-card-poster p2 platform-card-poster-ph"></span><span class="platform-card-poster p3 platform-card-poster-ph"></span></div></div></button>`;
 }
 
 /**
@@ -8889,6 +9419,11 @@ async function handleDetailExtras(request, env, ctx) {
   const imdbId = url.searchParams.get("imdb");
 
   if (!type || (type !== "movie" && type !== "show"))
+    return new Response("bad params", { status: 400 });
+  // tmdb/imdb id 只允许受限字符，防止任意路径拼进 TMDB URL
+  if (tmdbId && !/^\d{1,12}$/.test(tmdbId))
+    return new Response("bad params", { status: 400 });
+  if (imdbId && !/^tt\d{1,10}$/.test(imdbId))
     return new Response("bad params", { status: 400 });
 
   const A = await authed(request, env, ctx);
@@ -9155,6 +9690,8 @@ async function handleSeason(request, env, ctx) {
 
   if (isNaN(seasonNum) || (!showId && !tmdbId))
     return new Response("bad params", { status: 400 });
+  if (tmdbId && !/^\d{1,12}$/.test(tmdbId))
+    return new Response("bad params", { status: 400 });
 
   const A = await authed(request, env, ctx, { html: true, strict: true });
   if (!A.ok) return A.response;
@@ -9189,7 +9726,7 @@ async function handleSeason(request, env, ctx) {
               missTtl: 60,
               swr: true,
               jitter: 180,
-              ...(freshProgress || (typeof forceSeason !== "undefined" && forceSeason)
+              ...(freshProgress || forceSeason
                 ? { bypass: true }
                 : {}),
             },
@@ -9272,8 +9809,12 @@ async function handleApiDetail(request, env, ctx) {
 
     let traktId = null,
       tmdbIdHint = null;
-    if (rawId.startsWith("tmdb-")) tmdbIdHint = rawId.slice(5);
-    else if (/^\d+$/.test(rawId)) traktId = rawId;
+    if (rawId.startsWith("tmdb-")) {
+      const hint = rawId.slice(5);
+      // 校验纯数字，防止任意字符串拼进 TMDB URL 与 KV key
+      if (/^\d{1,12}$/.test(hint)) tmdbIdHint = hint;
+      else return errResponse("参数无效", 400);
+    } else if (/^\d+$/.test(rawId)) traktId = rawId;
     else return errResponse("参数无效", 400);
 
     const t = type === "movie" ? "movie" : "tv";
@@ -9567,8 +10108,12 @@ async function handleApiDetail(request, env, ctx) {
         deferExtras: true,
       });
     } catch (renderErr) {
+      // 堆栈只对显式 debug 请求暴露，避免向客户端泄漏内部结构
+      const dbg =
+        new URL(request.url).searchParams.get("debug") === "1";
       return new Response(
-        "RENDER ERROR: " + ((renderErr && renderErr.stack) || renderErr),
+        "RENDER ERROR: " +
+          (dbg ? (renderErr && renderErr.stack) || renderErr : "internal error"),
         {
           status: 500,
           headers: { "Content-Type": "text/plain; charset=utf-8" },
@@ -9594,10 +10139,15 @@ async function handleApiDetail(request, env, ctx) {
       },
     });
   } catch (e) {
-    return new Response("DETAIL EXCEPTION: " + ((e && e.stack) || e), {
-      status: 500,
-      headers: { "Content-Type": "text/plain; charset=utf-8" },
-    });
+    // 同上：堆栈只在 debug=1 时返回
+    const dbg = new URL(request.url).searchParams.get("debug") === "1";
+    return new Response(
+      "DETAIL EXCEPTION: " + (dbg ? (e && e.stack) || e : "internal error"),
+      {
+        status: 500,
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+      },
+    );
   }
 }
 
@@ -9906,10 +10456,9 @@ async function enrichBatch(keys, env, ctx) {
 
   const bucketData = new Map();
   const bucketIds = [...new Set(keyBucket.values())];
-  const missBuckets = bucketIds;
-  if (missBuckets.length && env.TMDB_CACHE && !kvIsDown()) {
+  if (bucketIds.length && env.TMDB_CACHE && !kvIsDown()) {
     await Promise.all(
-      missBuckets.map(async (b) => {
+      bucketIds.map(async (b) => {
         try {
           const raw = await env.TMDB_CACHE.get(CK.enrichBucket(b), {
             type: "json",
@@ -10041,6 +10590,14 @@ async function enrichBatch(keys, env, ctx) {
  * 前端在列表渲染后异步调用，把占位图换成真图。
  */
 async function handleEnrich(request, env, ctx) {
+  // enrich 会触发 TMDB 抓取 + KV 写，必须登录且按 IP 限流，
+  // 否则匿名脚本可以刷成本/刷配额。
+  const A = await authed(request, env, ctx);
+  if (!A.ok) return A.response;
+  if (!allowEnrich(request)) {
+    return Response.json({}, { status: 429 });
+  }
+
   let body;
   try {
     body = await request.json();
@@ -10162,10 +10719,10 @@ function renderHistoryPage(items, env, isFragment) {
     if (!iso) return "";
     const t = Date.parse(iso);
     if (!Number.isFinite(t)) return "";
-    const d = new Date(t + 8 * 3600 * 1000);
+    const d = new Date(t + BJ_OFFSET_MS);
     return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
   };
-  const nowBJ = new Date(Date.now() + 8 * 3600 * 1000);
+  const nowBJ = new Date(Date.now() + BJ_OFFSET_MS);
   const todayStr = `${nowBJ.getUTCFullYear()}-${String(nowBJ.getUTCMonth() + 1).padStart(2, "0")}-${String(nowBJ.getUTCDate()).padStart(2, "0")}`;
   const yest = new Date(nowBJ.getTime() - 86400000);
   const yestStr = `${yest.getUTCFullYear()}-${String(yest.getUTCMonth() + 1).padStart(2, "0")}-${String(yest.getUTCDate()).padStart(2, "0")}`;
@@ -10387,7 +10944,7 @@ function renderContinueItems(upNext, mode = "grid") {
 
   const items = [];
   if (Array.isArray(upNext)) {
-    for (const entry of upNext) {
+    for (let entry of upNext) {
       if (entry.episode) {
         if (typeof entry.progress === "number" && entry.progress >= 90)
           continue;
@@ -10397,7 +10954,15 @@ function renderContinueItems(upNext, mode = "grid") {
           entry.show.ids &&
           !entry.show.ids.tmdb
         ) {
-          entry.show.ids.tmdb = entry.__tmdbId;
+          // 缓存对象不做原地修改：浅拷贝补字段，
+          // 避免污染 cachedJSON 返回的共享缓存
+          entry = {
+            ...entry,
+            show: {
+              ...entry.show,
+              ids: { ...entry.show.ids, tmdb: entry.__tmdbId },
+            },
+          };
         }
         items.push({
           source: entry.__localAired ? "localair" : "playback",
@@ -10427,10 +10992,12 @@ function renderContinueItems(upNext, mode = "grid") {
           continue;
 
         const next = entry.progress.next_episode;
-        const showObj = entry.show || {};
+        let showObj = entry.show || {};
         if (entry.__tmdbId) {
-          if (!showObj.ids) showObj.ids = {};
-          if (!showObj.ids.tmdb) showObj.ids.tmdb = entry.__tmdbId;
+          // 同上：拷贝后补字段，不改缓存对象
+          const ids = { ...(showObj.ids || {}) };
+          if (!ids.tmdb) ids.tmdb = entry.__tmdbId;
+          showObj = { ...showObj, ids };
         }
         items.push({
           source: "upnext",
@@ -10590,7 +11157,6 @@ function renderContinueItems(upNext, mode = "grid") {
       item.__zhTitle ||
       e.title ||
       show.title ||
-      "" ||
       (item.movie && item.movie.title) ||
       "";
 
@@ -10624,7 +11190,7 @@ function renderContinueItems(upNext, mode = "grid") {
         "";
       const faMs = faIso ? Date.parse(faIso) : NaN;
       if (Number.isFinite(faMs)) {
-        const bj = new Date(faMs + 8 * 3600 * 1000);
+        const bj = new Date(faMs + BJ_OFFSET_MS);
         airTimeStr = `${String(bj.getUTCHours()).padStart(2, "0")}:${String(bj.getUTCMinutes()).padStart(2, "0")}`;
         const nowMs = Date.now();
         if (!airStatus) {
@@ -10736,7 +11302,7 @@ function renderContinueItems(upNext, mode = "grid") {
         : "";
       const barHtml =
         barPct != null
-          ? `<div class="cw-bar"><div class="cw-bar-fill" style="width:${barPct}%"></div></div>`
+          ? `<div class="cw-bar"><div class="cw-bar-fill" style="width:${Math.max(0, Math.min(100, barPct))}%"></div></div>`
           : "";
       const menuHtml = dropShowId
         ? `<button class="cw-more" type="button" data-cw-menu data-cw-drop-id="${esc(dropShowId)}" data-cw-name="${esc(showTitle)}" data-cw-season="${esc(String(epSeason != null ? epSeason : ""))}" data-cw-episode="${esc(String(epNumber != null ? epNumber : ""))}" data-cw-media-type="${esc(watchedType || "")}" data-cw-media-id="${esc(watchedId != null ? String(watchedId) : "")}" aria-label="更多操作" title="更多"><svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><circle cx="5" cy="12" r="2.2"/><circle cx="12" cy="12" r="2.2"/><circle cx="19" cy="12" r="2.2"/></svg></button>`
@@ -10799,7 +11365,7 @@ function renderCalendarPage(calendar, env, zhTitles) {
 
   const toBeijingDay = (iso) => {
       if (!iso) return "";
-      const d = new Date(new Date(iso).getTime() + 8 * 3600 * 1000);
+      const d = new Date(new Date(iso).getTime() + BJ_OFFSET_MS);
       return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
     },
     groups = new Map();
@@ -10828,7 +11394,7 @@ function renderCalendarPage(calendar, env, zhTitles) {
         let timeStr = "";
         if (item.first_aired) {
           const bj = new Date(
-            new Date(item.first_aired).getTime() + 8 * 3600 * 1000,
+            new Date(item.first_aired).getTime() + BJ_OFFSET_MS,
           );
           timeStr = `${String(bj.getUTCHours()).padStart(2, "0")}:${String(bj.getUTCMinutes()).padStart(2, "0")}`;
         }
@@ -10989,7 +11555,14 @@ function renderDetailFragment(d) {
       statusHtml = `<div class="d-status"><div class="d-status-icon">○</div><div class="d-status-body"><div class="d-status-title">未观看</div><div class="d-status-sub">还没有在 Trakt 上标记</div></div></div>`;
     }
   } else if (userProgress && !userProgress.__error && userProgress.aired > 0) {
-    const pct = Math.round((userProgress.completed / userProgress.aired) * 100);
+    // rewatch 场景 completed 可能大于 aired，钳到 0-100
+    const pct = Math.max(
+      0,
+      Math.min(
+        100,
+        Math.round((userProgress.completed / userProgress.aired) * 100),
+      ),
+    );
     const pi = pausedEpInfo();
     let title,
       sub,
@@ -11473,7 +12046,7 @@ async function injectLocalUpcomingIntoContinue(
   list = list.filter((e) => !isLocalAirEntry(e));
 
   try {
-    const todayBJ = new Date(Date.now() + 8 * 3600 * 1000)
+    const todayBJ = new Date(Date.now() + BJ_OFFSET_MS)
       .toISOString()
       .slice(0, 10);
 
@@ -11536,7 +12109,12 @@ async function injectLocalUpcomingIntoContinue(
 async function handleMore(request, env, ctx) {
   const url = new URL(request.url),
     type = url.searchParams.get("type"),
-    page = parseInt(url.searchParams.get("page") || "2"),
+    // page 清洗：NaN/负数归位，并限制上限，防止 ?page=abc 或超大值
+    // 刷出任意缓存键 / 上游 URL
+    page = Math.min(
+      500,
+      Math.max(1, parseInt(url.searchParams.get("page") || "2", 10) || 1),
+    ),
     limitParam = parseInt(url.searchParams.get("limit") || "0");
 
   const A = await authed(request, env, ctx, { html: true, strict: true });
@@ -11658,15 +12236,24 @@ async function handleMore(request, env, ctx) {
         } catch (e) {
           return { __error: String(e) };
         }
-        if (!r || !r.ok) return { __error: "HTTP " + ((r && r.status) || 502) };
-        try {
-          upNextItems = await r.json();
-        } catch {
+        if (r && (r.status === 404 || r.status === 410)) {
+          // up_next_nitro 是未文档化端点：上游移除/改名时降级为空列表，
+          // 页面仍可用 paused 数据渲染，而不是整页报错
           upNextItems = [];
+          r = null;
+        } else if (!r || !r.ok) {
+          return { __error: "HTTP " + ((r && r.status) || 502) };
+        } else {
+          try {
+            upNextItems = await r.json();
+          } catch {
+            upNextItems = [];
+          }
         }
         if (!Array.isArray(upNextItems)) upNextItems = [];
-        pageCountInner =
-          parseInt(r.headers.get("X-Pagination-Page-Count") || "0") || 0;
+        pageCountInner = r
+          ? parseInt(r.headers.get("X-Pagination-Page-Count") || "0") || 0
+          : 0;
 
         let pausedItems = [];
         if (page === 1) {
@@ -11717,9 +12304,9 @@ async function handleMore(request, env, ctx) {
             let changed = false;
             for (const sid of items.__autoUnhide) {
               const k = String(sid);
-              if (hideMap[k] || hideMap[sid]) {
+              if (hideMap[k]) {
+                // hideMap 一律以 String(sid) 为键，无需再按原始值删一遍
                 delete hideMap[k];
-                delete hideMap[sid];
                 changed = true;
               }
             }
@@ -11788,9 +12375,12 @@ async function handleMore(request, env, ctx) {
     const renderMode =
       mode === "grid" ? "grid" : mode === "hscroll" ? "hscroll" : "fragment";
 
-    const html = list.length ? renderContinueItems(list, renderMode) : "";
+    // 局部变量命名避开全局 html() Response 工厂，防止遮蔽误导
+    const bodyHtml = list.length
+      ? renderContinueItems(list, renderMode)
+      : "";
     const reallyHasMore = !!(hasMore && list.length > 0);
-    return authResp(auth, needsCookieUpdate, html || "", {
+    return authResp(auth, needsCookieUpdate, bodyHtml || "", {
       extra: {
         "X-Has-More": String(reallyHasMore),
         "X-Page": String(page),
@@ -11838,6 +12428,9 @@ async function handleMore(request, env, ctx) {
 function renderLoginPage() {
   return pageShell(
     `<div class="login-wrap"><div class="login-card"><div class="login-logo"><img src="${ICON_192}" alt="MineTrakt" width="64" height="64" style="display:block;margin:0 auto"></div><h1 class="login-title">MineTrakt</h1><p class="login-sub">首页 · 待看列表 · 追剧日历 · 观看记录</p><div id="login-area" class="login-area"><button class="btn-primary" onclick="startLogin()">使用 Trakt 登录</button></div></div></div><script>
+// 登录页没有公共的 __esc，这里补一个本地转义：
+// 服务端返回的 error/hint/user_code 一律过转义再进 innerHTML，防止注入。
+function __esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 async function startLogin(){
   var area=document.getElementById('login-area');
   window.__loginGen=(window.__loginGen||0)+1;
@@ -11867,7 +12460,7 @@ async function startLogin(){
       },1000);
       return;
     }
-    area.innerHTML='<div class="err-box"><p class="err-title">没拿到验证码</p><p class="err">'+((err.error&&String(err.error))||'服务器暂时没有响应，请稍后再试')+'</p>'+(err.hint?'<p class="hint">'+err.hint+'</p>':'')+'</div><button class="btn-primary" onclick="startLogin()">重试</button>';
+    area.innerHTML='<div class="err-box"><p class="err-title">没拿到验证码</p><p class="err">'+__esc((err.error&&String(err.error))||'服务器暂时没有响应，请稍后再试')+'</p>'+(err.hint?'<p class="hint">'+__esc(err.hint)+'</p>':'')+'</div><button class="btn-primary" onclick="startLogin()">重试</button>';
     return;
   }
   var d=await r.json();
@@ -11878,7 +12471,7 @@ async function startLogin(){
     +'<div class="step"><span class="n">1</span><span>打开 <a href="'+activateUrl+'" target="_blank" rel="noopener">trakt.tv/activate</a></span></div>'
     +'<div class="step"><span class="n">2</span><span>输入下方代码</span></div>'
     +'</div>'
-    +'<div class="code-box">'+d.user_code+'</div>'
+    +'<div class="code-box">'+__esc(d.user_code)+'</div>'
     +'<button type="button" class="btn-ghost" id="refresh-code-btn" onclick="startLogin()" style="margin:4px 0 10px">换一个验证码</button>'
     +'<div class="step"><span class="n">3</span><span>在 Trakt 页面点击授权，这里会自动继续</span></div>'
     +'<p id="status" class="status" style="display:none"></p>'
@@ -11913,7 +12506,7 @@ async function startLogin(){
     var row=document.createElement('div');
     row.className='log-row'+(cls?' '+cls:'');
     if(detail)row.title=detail;
-    row.innerHTML='<span class="log-t">'+clock()+'</span><span class="log-m">'+msg+'</span>';
+    row.innerHTML='<span class="log-t">'+clock()+'</span><span class="log-m">'+__esc(msg)+'</span>';
     logEl.appendChild(row);
     logScroll();
   }
@@ -12253,7 +12846,7 @@ function splashCriticalCss() {
  * 首页引导脚本（更新时间、局部刷新等）。
  */
 function getBootstrapScript() {
-  return `(function(){var __CFG=window.__HOME_CONFIG__||{};if(!__CFG.loggedIn)return;window.__HOME_CONFIG__=null;if(__CFG.initialDetail)window.__initialDetail=__CFG.initialDetail;if(!window.__splashT0)window.__splashT0=Date.now();window.__splashHidden=false;window.__hideSplash=function(force){try{if(window.__splashHidden)return;window.__splashHidden=true;var el=document.getElementById('splash');if(!el)return;var wait=force?0:Math.max(0,120-(Date.now()-(window.__splashT0||Date.now())));setTimeout(function(){try{el.classList.add('hide');setTimeout(function(){try{if(el&&el.parentNode)el.parentNode.removeChild(el);}catch(e){}},280);}catch(e){}},wait);}catch(e){}};setTimeout(function(){if(window.__hideSplash)window.__hideSplash();},80);function lsGet(k){try{var v=localStorage.getItem(k);if(!v)return null;var o=JSON.parse(v);if(o&&o._exp&&o._exp<Date.now()){try{localStorage.removeItem(k);}catch(e){}return null;}return o&&o.data?o.data:null;}catch(e){return null;}}function lsSet(k,d,ttlSec){try{localStorage.setItem(k,JSON.stringify({data:d,_exp:Date.now()+ttlSec*1000}));}catch(e){try{localStorage.removeItem(k);}catch(e2){}}}window.__lsGet=lsGet;window.__lsSet=lsSet;function setHTML(sel,html){var el=typeof sel==='string'?document.querySelector(sel):sel;if(el)el.innerHTML=html||'';}window.__setHTML=setHTML;function applyAvatar(url,alts){if(!url)return;var av=document.getElementById('hero-avatar');if(!av)return;var list=[url];if(alts&&alts.length){for(var a=0;a<alts.length;a++){if(alts[a]&&alts[a]!==url)list.push(alts[a]);}}list.push('/avatar?u='+encodeURIComponent(url));var i=0;function next(){if(i>=list.length){av.innerHTML='<span class="hero-avatar-ph">👤</span>';return;}var src=list[i++];var img=document.createElement('img');img.onerror=next;img.alt='';img.width=56;img.height=56;img.decoding='async';img.setAttribute('referrerpolicy','no-referrer');img.src=src;av.innerHTML='';av.appendChild(img);}next();}
+  return `(function(){var __CFG=window.__HOME_CONFIG__||{};if(!__CFG.loggedIn)return;window.__HOME_CONFIG__=null;if(__CFG.initialDetail)window.__initialDetail=__CFG.initialDetail;if(!window.__splashT0)window.__splashT0=Date.now();window.__splashHidden=false;window.__hideSplash=function(force){try{if(window.__splashHidden)return;window.__splashHidden=true;var el=document.getElementById('splash');if(!el)return;var wait=force?0:Math.max(0,120-(Date.now()-(window.__splashT0||Date.now())));setTimeout(function(){try{el.classList.add('hide');setTimeout(function(){try{if(el&&el.parentNode)el.parentNode.removeChild(el);}catch(e){}},280);}catch(e){}},wait);}catch(e){}};setTimeout(function(){if(window.__hideSplash)window.__hideSplash();},80);function lsGet(k){try{var v=localStorage.getItem(k);if(!v)return null;var o=JSON.parse(v);if(o&&o._exp&&o._exp<Date.now()){try{localStorage.removeItem(k);}catch(e){}return null;}return o&&o.data?o.data:null;}catch(e){return null;}}function lsSet(k,d,ttlSec){try{localStorage.setItem(k,JSON.stringify({data:d,_exp:Date.now()+ttlSec*1000}));}catch(e){try{localStorage.removeItem(k);}catch(e2){}}}window.__lsGet=lsGet;window.__lsSet=lsSet;var MT_PB_SNAP_TTL=900;/* mt:pb 快照统一 900s，原来 600/900/1800 三种口径并存 */function setHTML(sel,html){var el=typeof sel==='string'?document.querySelector(sel):sel;if(el)el.innerHTML=html||'';}window.__setHTML=setHTML;function applyAvatar(url,alts){if(!url)return;var av=document.getElementById('hero-avatar');if(!av)return;var list=[url];if(alts&&alts.length){for(var a=0;a<alts.length;a++){if(alts[a]&&alts[a]!==url)list.push(alts[a]);}}list.push('/avatar?u='+encodeURIComponent(url));var i=0;function next(){if(i>=list.length){av.innerHTML='<span class="hero-avatar-ph">👤</span>';return;}var src=list[i++];var img=document.createElement('img');img.onerror=next;img.alt='';img.width=56;img.height=56;img.decoding='async';img.setAttribute('referrerpolicy','no-referrer');img.src=src;av.innerHTML='';av.appendChild(img);}next();}
 function __fmtFull(ts){
   var d=new Date(ts);if(isNaN(d.getTime()))return'';
   var p=function(n){return(n<10?'0':'')+n;};
@@ -12379,7 +12972,7 @@ function fetchPart(part,force,live){return __fetchWithTimeout('/api/home-data?pa
   if(__homeDataLoading&&!silent)return;
   __homeDataLoading=true;
   __lastRefreshAt=Date.now();
-  var bootState=silent?'loading':'loading';
+  var bootState='loading';
   function setBootState(s){bootState=s;try{window.__homeBootState=s;}catch(e){}}
   function finishSplash(){if(!silent&&window.__hideSplash)window.__hideSplash(true);}
   function showPlaybackError(){
@@ -12394,7 +12987,7 @@ function fetchPart(part,force,live){return __fetchWithTimeout('/api/home-data?pa
     setBootState(isCache?'cache':(from==='live'?'live':from||'live'));
     applyPlayback(d,isCache);
     if(!isCache){
-      try{lsSet('mt:pb',d,900);}catch(e){}
+      try{lsSet('mt:pb',d,MT_PB_SNAP_TTL);}catch(e){}
       if(!silent&&window.__initialDetail){
         var s=window.__initialDetail,idx=s.indexOf('/');
         if(idx>0&&window.openDetail)openDetail(s.slice(0,idx),s.slice(idx+1),false);
@@ -12433,7 +13026,7 @@ function fetchPart(part,force,live){return __fetchWithTimeout('/api/home-data?pa
     if(window.requestIdleCallback)requestIdleCallback(runMeta,{timeout:1500});
     else setTimeout(runMeta,200);
   });
-}var __refreshTick=0,__lastUserAct=Date.now(),__lastBoardReload=Date.now();['scroll','click','touchstart','keydown'].forEach(function(t){window.addEventListener(t,function(){__lastUserAct=Date.now();},{passive:true});});var __noChangeToastAt=0;
+}var __lastUserAct=Date.now(),__lastBoardReload=Date.now();['scroll','click','touchstart','keydown'].forEach(function(t){window.addEventListener(t,function(){__lastUserAct=Date.now();},{passive:true});});var __noChangeToastAt=0;
 /* 数据没变时的反馈策略：
  *   - 手动点刷新   → 每次都提示（用户主动问的，必须回答）
  *   - 从后台切回来 → 提示，但 5 分钟最多一次（切来切去太频繁会烦）
@@ -12448,8 +13041,8 @@ function __onNoChange(reason){
 /**
  * silentRefresh
  */
-function silentRefresh(reason){if(document.hidden)return;var __m=document.getElementById('modal');if(__m&&__m.classList.contains('open'))return;if(window.__forceRefreshing||window.__homeDataLoading)return;if(window.__silentRefreshing)return;window.__silentRefreshing=true;__refreshTick++;__lastRefreshAt=Date.now();function __applySilent(d,fromRetry){if(!d)return false;if(d.activityUnchanged===false){try{delete window.__loadedParts.history;localStorage.removeItem('mt:hist');}catch(e){}if(window.__fetchPartForTab&&!window.__histRefreshInflight){window.__histRefreshInflight=true;window.__fetchPartForTab('history').then(function(hd){if(!hd)return;try{hd.__fetchedAt=Date.now();window.__loadedParts.history=hd;if(window.__applyPart)__applyPart('history',hd);if(window.__savePartSnap)__savePartSnap('history',hd);}catch(e){}}).catch(function(){}).finally(function(){window.__histRefreshInflight=false;});}}var dataTs=d.lastSyncAt||d.continueUpdatedAt||d.pauseUpdatedAt||d.playbackDataTs||null;if(dataTs){try{var n=Number(dataTs);if(isFinite(n)&&n>0)__setUpdatedAt(d.stale||d.refreshFailed?'cache':(d.playbackSource||'live'),null,n);}catch(e){}}if(d.stale||d.refreshFailed){if(window.__toast&&(!window.__staleToastAt||Date.now()-(window.__staleToastAt||0)>120000)){window.__staleToastAt=Date.now();window.__toast(d.cooling?'同步失败（限流），仍显示缓存':'同步失败，仍显示缓存',{type:'warn',duration:2800});}try{lsSet('mt:pb',d,600);}catch(e){}return true;}var prevHtml=window.__lastPbHtml||null;var newHtml=(d&&d.playbackHScrollHtml)||null;if(d.activityUnchanged&&newHtml&&prevHtml&&prevHtml===newHtml){try{lsSet('mt:pb',d,600);}catch(e){}__onNoChange(reason);return true;}if(newHtml){applyPlayback(d);try{lsSet('mt:pb',d,600);}catch(e){}if(prevHtml&&newHtml!==prevHtml&&window.__toast)window.__toast('已自动更新观看进度',{type:'success',duration:2000});return true;}return !!dataTs;}fetchPart('playback',false,true).then(function(d){if(__applySilent(d))return;return fetchPart('playback',false,true).then(function(d2){__applySilent(d2,true);});}).catch(function(){return new Promise(function(r){setTimeout(r,2000);}).then(function(){return fetchPart('playback',false,true).then(function(d){if(!__applySilent(d)&&window.__toast)window.__toast('自动同步失败，请稍后手动刷新',{type:'warn',duration:2800});}).catch(function(){if(window.__toast)window.__toast('自动同步失败，请稍后手动刷新',{type:'warn',duration:2800});});});}).finally(function(){window.__silentRefreshing=false;});}window.__refreshStats=silentRefresh;
-window.forceRefresh=async function(){if(window.__forceRefreshing)return;window.__forceRefreshing=true;window.__manualRefreshPending=true;try{localStorage.removeItem('mt:pb');localStorage.removeItem('mt:meta');try{window.__cwMoreCache=null;}catch(e){}}catch(e){}var btn=document.getElementById('btn-refresh');var span=btn&&btn.querySelector('span');var oldText=span?span.textContent:'刷新';if(btn)btn.classList.add('loading');if(span)span.textContent='刷新中';var okCount=0,cacheCount=0,failCount=0,cooling=0,hitLimit=false,pbUnchanged=false,pbSeen=false;var GAP_OK=280,GAP_LIMIT=800;try{var wanted=['playback','meta','calendar','history','watchlist'];var loaded=window.__loadedParts||{};for(var i=0;i<wanted.length;i++){if(hitLimit)break;var part=wanted[i];if(i>0){var gap=cooling>0?GAP_LIMIT:GAP_OK;await new Promise(function(r){setTimeout(r,gap);});}var d=null;try{d=await __enqueueTrakt(function(){return fetchPart(part,true);});}catch(e){d=null;}if(!d){failCount++;continue;}var isCache=false;if(part==='playback'&&d.playbackSource==='cache')isCache=true;if(part==='meta'&&d.metaSource==='cache')isCache=true;if(part==='calendar'&&d.calendarSource==='cache')isCache=true;if(isCache)cacheCount++;else okCount++;if(part==='playback'){pbSeen=true;if(d&&d.activityUnchanged===true)pbUnchanged=true;applyPlayback(d);try{lsSet('mt:pb',d,900);}catch(e){}}else if(part==='meta'){applyMeta(d,false);}else if(part==='watchlist'||part==='calendar'||part==='history'){__applyPart(part,d);__savePartSnap(part,d);}window.__loadedParts[part]=d;if(__partFailed(d)){try{delete window.__loadedParts[part];}catch(e){}}if(d.rateLimited===true||(Number(d.cooling)>0&&d.rateLimited!==false)){hitLimit=true;cooling=Math.max(cooling,Number(d.cooling)||0);}}if(failCount&&!okCount&&!cacheCount){__errToast('刷新失败',new Error('无法连接，请检查网络后重试'));}else if(hitLimit&&cooling>0){__toast('Trakt 限流约 '+cooling+' 秒，已显示缓存数据',{type:'warn',duration:4200});}else if(hitLimit){__toast('上游繁忙，已显示缓存数据',{type:'warn',duration:3200});}else if(okCount&&!failCount){__toast('已刷新观看数据',{type:'success',duration:1800});}else if(pbSeen&&pbUnchanged&&!okCount){__toast('已是最新，暂无更新',{type:'info',duration:2000});try{__setUpdatedAt('nochange');}catch(e){}}else if(failCount||cacheCount){__toast('已更新（部分来自缓存）',{type:'info',duration:2800});}else{__toast('已刷新观看数据',{type:'success',duration:1800});}if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){__errToast('刷新失败',e);}finally{if(btn)btn.classList.remove('loading');if(span)span.textContent=oldText;window.__forceRefreshing=false;}};
+function silentRefresh(reason){if(document.hidden)return;var __m=document.getElementById('modal');if(__m&&__m.classList.contains('open'))return;if(window.__forceRefreshing||window.__homeDataLoading)return;if(window.__silentRefreshing)return;window.__silentRefreshing=true;__lastRefreshAt=Date.now();function __applySilent(d,fromRetry){if(!d)return false;if(d.activityUnchanged===false){try{delete window.__loadedParts.history;localStorage.removeItem('mt:hist');}catch(e){}if(window.__fetchPartForTab&&!window.__histRefreshInflight){window.__histRefreshInflight=true;window.__fetchPartForTab('history').then(function(hd){if(!hd)return;try{hd.__fetchedAt=Date.now();window.__loadedParts.history=hd;if(window.__applyPart)__applyPart('history',hd);if(window.__savePartSnap)__savePartSnap('history',hd);}catch(e){}}).catch(function(){}).finally(function(){window.__histRefreshInflight=false;});}}var dataTs=d.lastSyncAt||d.continueUpdatedAt||d.pauseUpdatedAt||d.playbackDataTs||null;if(dataTs){try{var n=Number(dataTs);if(isFinite(n)&&n>0)__setUpdatedAt(d.stale||d.refreshFailed?'cache':(d.playbackSource||'live'),null,n);}catch(e){}}if(d.stale||d.refreshFailed){if(window.__toast&&(!window.__staleToastAt||Date.now()-(window.__staleToastAt||0)>120000)){window.__staleToastAt=Date.now();window.__toast(d.cooling?'同步失败（限流），仍显示缓存':'同步失败，仍显示缓存',{type:'warn',duration:2800});}try{lsSet('mt:pb',d,MT_PB_SNAP_TTL);}catch(e){}return true;}var prevHtml=window.__lastPbHtml||null;var newHtml=(d&&d.playbackHScrollHtml)||null;if(d.activityUnchanged&&newHtml&&prevHtml&&prevHtml===newHtml){try{lsSet('mt:pb',d,MT_PB_SNAP_TTL);}catch(e){}__onNoChange(reason);return true;}if(newHtml){applyPlayback(d);try{lsSet('mt:pb',d,MT_PB_SNAP_TTL);}catch(e){}if(prevHtml&&newHtml!==prevHtml&&window.__toast)window.__toast('已自动更新观看进度',{type:'success',duration:2000});return true;}return !!dataTs;}fetchPart('playback',false,true).then(function(d){__applySilent(d);}).catch(function(){return new Promise(function(r){setTimeout(r,2000);}).then(function(){return fetchPart('playback',false,true).then(function(d){if(!__applySilent(d)&&window.__toast)window.__toast('自动同步失败，请稍后手动刷新',{type:'warn',duration:2800});}).catch(function(){if(window.__toast)window.__toast('自动同步失败，请稍后手动刷新',{type:'warn',duration:2800});});});}).finally(function(){window.__silentRefreshing=false;});}window.__refreshStats=silentRefresh;
+window.forceRefresh=async function(){if(window.__forceRefreshing)return;window.__forceRefreshing=true;window.__manualRefreshPending=true;try{localStorage.removeItem('mt:pb');localStorage.removeItem('mt:meta');try{window.__cwMoreCache=null;}catch(e){}}catch(e){}var btn=document.getElementById('btn-refresh');var span=btn&&btn.querySelector('span');var oldText=span?span.textContent:'刷新';if(btn)btn.classList.add('loading');if(span)span.textContent='刷新中';var okCount=0,cacheCount=0,failCount=0,cooling=0,hitLimit=false,pbUnchanged=false,pbSeen=false;var GAP_OK=280,GAP_LIMIT=800;try{var wanted=['playback','meta','calendar','history','watchlist'];var loaded=window.__loadedParts||{};for(var i=0;i<wanted.length;i++){if(hitLimit)break;var part=wanted[i];if(i>0){var gap=cooling>0?GAP_LIMIT:GAP_OK;await new Promise(function(r){setTimeout(r,gap);});}var d=null;try{d=await __enqueueTrakt(function(){return fetchPart(part,true);});}catch(e){d=null;}if(!d){failCount++;continue;}var isCache=false;if(part==='playback'&&d.playbackSource==='cache')isCache=true;if(part==='meta'&&d.metaSource==='cache')isCache=true;if(part==='calendar'&&d.calendarSource==='cache')isCache=true;if(isCache)cacheCount++;else okCount++;if(part==='playback'){pbSeen=true;if(d&&d.activityUnchanged===true)pbUnchanged=true;applyPlayback(d);try{lsSet('mt:pb',d,MT_PB_SNAP_TTL);}catch(e){}}else if(part==='meta'){applyMeta(d,false);}else if(part==='watchlist'||part==='calendar'||part==='history'){__applyPart(part,d);__savePartSnap(part,d);}window.__loadedParts[part]=d;if(__partFailed(d)){try{delete window.__loadedParts[part];}catch(e){}}if(d.rateLimited===true||(Number(d.cooling)>0&&d.rateLimited!==false)){hitLimit=true;cooling=Math.max(cooling,Number(d.cooling)||0);}}if(failCount&&!okCount&&!cacheCount){__errToast('刷新失败',new Error('无法连接，请检查网络后重试'));}else if(hitLimit&&cooling>0){__toast('Trakt 限流约 '+cooling+' 秒，已显示缓存数据',{type:'warn',duration:4200});}else if(hitLimit){__toast('上游繁忙，已显示缓存数据',{type:'warn',duration:3200});}else if(okCount&&!failCount){__toast('已刷新观看数据',{type:'success',duration:1800});}else if(pbSeen&&pbUnchanged&&!okCount){__toast('已是最新，暂无更新',{type:'info',duration:2000});try{__setUpdatedAt('nochange');}catch(e){}}else if(failCount||cacheCount){__toast('已更新（部分来自缓存）',{type:'info',duration:2800});}else{__toast('已刷新观看数据',{type:'success',duration:1800});}if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){__errToast('刷新失败',e);}finally{if(btn)btn.classList.remove('loading');if(span)span.textContent=oldText;window.__forceRefreshing=false;}};
 /**
  * startHomeData
  */
@@ -12589,7 +13182,9 @@ function __confirm(opts){opts=opts||{};return new Promise(function(resolve){var 
 var __traktChain=Promise.resolve(),__traktPending=0;
 /** 前端写操作串行队列，避免连点打爆 Trakt */
 function __enqueueTrakt(fn){
-  var run=function(){return new Promise(function(r){setTimeout(r,1100);}).then(fn);};
+  /* 首笔操作（队列空闲时）直接执行，不白等 1.1 秒；
+   * 只有前一笔操作刚发出去时，才补足 1.1 秒的最小间隔。 */
+  var run=function(){return __traktPending>1?new Promise(function(r){setTimeout(r,1100);}).then(fn):fn();};
   __traktPending++;
   /* 连点几个按钮时，第二个开始要排在 1.1 秒的间隔后面。
    * 以前这段等待完全没有反馈，用户以为点击丢了就继续点，越点排得越长。 */
@@ -12675,6 +13270,13 @@ window.__fetchPartForTab = __fetchPartForTab;
     if(!next)return;
     var anim=dir>0?'pane-in-left':(dir<0?'pane-in-right':'pane-in-fade');
     next.classList.add('active',anim);
+    // 切换页面后默认回到顶部：五个 tab 共用一个滚动窗口，不清的话
+    // 从首页底部切到待看会停在旧位置（甚至停在空白区）
+    try{
+      window.scrollTo(0,0);
+      var sc=document.scrollingElement;
+      if(sc)sc.scrollTop=0;
+    }catch(e){}
     // 动画结束后清掉方向 class，避免再次切换时不触发
     setTimeout(function(){
       next.classList.remove('pane-in-left','pane-in-right','pane-in-fade');
@@ -12684,6 +13286,19 @@ window.__fetchPartForTab = __fetchPartForTab;
     t.addEventListener('click',function(){
       var tabName=t.dataset.tab;
       if(!tabName)return;
+      // 再次点击当前已激活的 tab：平滑滚回顶部，不触发重新加载
+      if(tabName===lastTab){
+        try{
+          window.scrollTo({top:0,behavior:'smooth'});
+          var sc=document.scrollingElement;
+          if(sc)sc.scrollTo({top:0,behavior:'smooth'});
+        }catch(e){window.scrollTo(0,0);}
+        // 轻触反馈照样给一下
+        t.classList.remove('tab-tap');
+        void t.offsetWidth;
+        t.classList.add('tab-tap');
+        return;
+      }
       var from=lastTab;
       var dir=tabIndex(tabName)-tabIndex(from);
       document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('active');});
@@ -12990,7 +13605,7 @@ async function __hideContinueById(id, name, season, episode, mediaType, mediaId)
               var el=document.getElementById('playback-hscroll');
               if(el)el.innerHTML=d.playbackHScrollHtml;
             }
-            try{if(window.__lsSet)window.__lsSet('mt:pb',d,1800);}catch(e){}
+            try{if(window.__lsSet)window.__lsSet('mt:pb',d,MT_PB_SNAP_TTL);}catch(e){}
           }).catch(function(){});
       }catch(e){}
     });
@@ -13435,7 +14050,7 @@ var __showCal={byDay:{},year:0,month:0};
 /** 两位补零 */
 function __pad2(n){return(n<10?'0':'')+n;}
 /** ISO 时间转到北京日期 YYYY-MM-DD */
-function __bjDay(iso){if(!iso)return '';var d=new Date(new Date(iso).getTime()+8*3600*1000);return d.getUTCFullYear()+'-'+__pad2(d.getUTCMonth()+1)+'-'+__pad2(d.getUTCDate());}
+function __bjDay(iso){if(!iso)return '';var d=new Date(new Date(iso).getTime()+${BJ_OFFSET_MS});return d.getUTCFullYear()+'-'+__pad2(d.getUTCMonth()+1)+'-'+__pad2(d.getUTCDate());}
 /**
  * openShowCalendar
  */
@@ -13468,12 +14083,12 @@ const __enrichPromises=new Map();
 /** 防抖调度海报 enrich */
 function __scheduleEnrich(){if(__enrichTimer)return;__enrichTimer=setTimeout(__runEnrich,60);}window.__scheduleEnrich=__scheduleEnrich;
 /** 批量请求 /api/enrich 补全缺失海报与标题 */
-async function __runEnrich(){__enrichTimer=null;const els=[...document.querySelectorAll('[data-enrich-key]')];if(!els.length)return;const byKey=new Map();for(const el of els){const k=el.dataset.enrichKey;if(!k)continue;if(!byKey.has(k))byKey.set(k,[]);byKey.get(k).push(el);el.removeAttribute('data-enrich-key');}if(!byKey.size)return;const needFetch=[];for(const[k,group]of byKey.entries()){const existing=__enrichPromises.get(k);if(existing){existing.then(d=>{if(d)group.forEach(el=>__applyEnrich(el,d));});}else{needFetch.push(k);}}if(!needFetch.length)return;for(let bi=0;bi<needFetch.length;bi+=20){const chunk=needFetch.slice(bi,bi+20);const batchPromise=fetch('/api/enrich',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items:chunk.map(function(k){return{key:k};})})}).then(function(r){return r.ok?r.json():{};}).catch(function(){return{};});for(const k of chunk){const perKey=batchPromise.then(function(data){return(data&&data[k])||null;});__enrichPromises.set(k,perKey);perKey.then(function(d){if(d)byKey.get(k).forEach(function(el){__applyEnrich(el,d);});});}}if(__enrichPromises.size>400){const arr=[...__enrichPromises.keys()];for(let i=0;i<200;i++)__enrichPromises.delete(arr[i]);}}
+async function __runEnrich(){__enrichTimer=null;const els=[...document.querySelectorAll('[data-enrich-key]')];if(!els.length)return;const byKey=new Map();for(const el of els){const k=el.dataset.enrichKey;if(!k)continue;if(!byKey.has(k))byKey.set(k,[]);byKey.get(k).push(el);el.removeAttribute('data-enrich-key');}if(!byKey.size)return;const needFetch=[];for(const[k,group]of byKey.entries()){const existing=__enrichPromises.get(k);if(existing){existing.then(d=>{if(d)group.forEach(el=>__applyEnrich(el,d));});}else{needFetch.push(k);}}if(!needFetch.length)return;for(let bi=0;bi<needFetch.length;bi+=20){const chunk=needFetch.slice(bi,bi+20);const batchPromise=fetch('/api/enrich',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items:chunk.map(function(k){return{key:k};})})}).then(function(r){return r.ok?r.json():{};}).catch(function(){return{};});for(const k of chunk){const perKey=batchPromise.then(function(data){return(data&&data[k])||null;});__enrichPromises.set(k,perKey);perKey.then(function(d){var group=byKey.get(k)||[];if(d)group.forEach(function(el){__applyEnrich(el,d);});else{__enrichPromises.delete(k);group.forEach(function(el){if(!el.hasAttribute('data-enrich-key'))el.setAttribute('data-enrich-key',k);});}});}}if(__enrichPromises.size>400){const arr=[...__enrichPromises.keys()];for(let i=0;i<200;i++)__enrichPromises.delete(arr[i]);}}
 /** 把 enrich 结果写回 DOM 卡片 */
 function __applyEnrich(el,d){const posterBox=el.querySelector('.cw-poster')||el.querySelector('.poster');const locked=el.getAttribute('data-lock-poster')==='1';if(posterBox&&d.poster&&!locked){let cur=posterBox.querySelector('img');if(cur){if(cur.complete&&cur.naturalWidth>0)return;if(cur.src!==d.poster){cur.src=d.poster;cur.style.display='';const ph=posterBox.querySelector('.poster-ph');if(ph)ph.style.display='none';}}else{cur=posterBox.querySelector('.poster-ph');if(cur){const img=document.createElement('img');img.src=d.poster;img.loading='lazy';img.alt='';img.onerror=function(){this.style.display='none';if(this.nextElementSibling)this.nextElementSibling.style.display='flex';};const ph=document.createElement('div');ph.className='poster-ph';ph.style.display='none';ph.innerHTML=cur.innerHTML;cur.replaceWith(img,ph);}}}if(d.title){const nameEl=el.querySelector('.name');if(nameEl)nameEl.textContent=d.title;const cwTitle=el.querySelector('.cw-title');if(cwTitle)cwTitle.textContent=d.title;}if(d.overview){const info=el.querySelector('.info');if(info){let ov=info.querySelector('.overview');if(!ov){ov=document.createElement('div');ov.className='overview';const meta=info.querySelector('.meta');if(meta&&meta.nextSibling)info.insertBefore(ov,meta.nextSibling);else info.appendChild(ov);}ov.textContent=d.overview;}}}
 window.__summaryState={period:'month',ref:''};
 /** 小结默认时间锚点（北京时间月/年） */
-function __sumDefaultRef(period){var d=new Date(Date.now()+8*3600*1000);if(period==='year')return String(d.getUTCFullYear());return d.toISOString().slice(0,7);}
+function __sumDefaultRef(period){var d=new Date(Date.now()+${BJ_OFFSET_MS});if(period==='year')return String(d.getUTCFullYear());return d.toISOString().slice(0,7);}
 /** 热力最大值，用于分级着色 */
 function __sumHeatmax(days){var m=1;if(days)for(var i=0;i<days.length;i++)if(days[i].count>m)m=days[i].count;return m;}
 /** 观看小结弹层 HTML */
@@ -13885,7 +14500,9 @@ html,body{
   --brand-grad-hover:linear-gradient(145deg,#8b5cf6,#a78bfa);
   --avatar-ring:rgba(167,139,250,0.45);
   --avatar-grad:linear-gradient(135deg,#1a2233,#2a3a55);
-  --soft-card-grad:var(--soft-card-grad);
+  /* 原来这里写成 var(--soft-card-grad) 自引用，按 CSS 规范无效，
+   * 深色主题下所有引用处都会取不到值。补上深色版柔和渐变。 */
+  --soft-card-grad:linear-gradient(135deg,#16161a,#0e0e10);
   --btn-hover-bg:rgba(167,139,250,0.1);
   --btn-hover-border:rgba(167,139,250,0.35);
   --btn-hover-shadow:0 4px 16px rgba(167,139,250,0.18);
@@ -16139,9 +16756,13 @@ html[data-theme="light"] .cw-poster{
 .ext-rating{
   display:inline-flex;
   align-items:center;
-  gap:6px;
-  padding:4px 10px 4px 8px;
-  border-radius:8px;
+  justify-content:center;
+  /* 统一尺寸：固定高度 + 对称内距，六种徽章完全等高等宽节奏 */
+  height:26px;
+  box-sizing:border-box;
+  gap:5px;
+  padding:0 9px 0 7px;
+  border-radius:7px;
   background:rgba(255,255,255,0.06);
   border:1px solid rgba(255,255,255,0.1);
   line-height:1;
@@ -16156,7 +16777,10 @@ html[data-theme="light"] .cw-poster{
   border-color:rgba(255,255,255,0.16)
 }
 .ext-logo{
+  /* logo 原本各自写了 16/18/20px，视觉上导致徽章高矮不一，统一压到 16 */
   display:block;
+  width:16px;
+  height:16px;
   flex-shrink:0;
   border-radius:2px
 }
@@ -16212,6 +16836,128 @@ html[data-theme="light"] .cw-poster{
   border-color:rgba(46,150,61,0.6);
   color:#6fe089
 }
+/* Metacritic 分数档位色（深色主题） */
+.ext-score.mc-score-high{color:#66cc33}
+.ext-score.mc-score-mid{color:#ffcc33}
+.ext-score.mc-score-low{color:#ff4433}
+/* 浅色主题：改用品牌实色底 + 白字（IMDb 黄底黑字、烂番茄/TMDB/Trakt/豆瓣
+ * 各自品牌色底白字），深浅两套主题观感一致、对比度拉满。
+ * 注意 SVG logo 的 fill 是表现属性，CSS fill 可以直接覆盖它，
+ * 所以这里能把深色 logo 改成白色以适配实色底。 */
+html[data-theme="light"] .ext-rating{
+  border-color:transparent
+}
+html[data-theme="light"] .ext-rating:hover{
+  filter:brightness(0.93)
+}
+/* IMDb：品牌黄底黑字（官方样式） */
+html[data-theme="light"] .ext-rating.ext-imdb{
+  background:#f5c518;
+  color:#111
+}
+html[data-theme="light"] .ext-rating.ext-imdb .ext-score{color:#111}
+html[data-theme="light"] .ext-rating.ext-imdb .ext-logo path{fill:#111}
+/* 烂番茄：品牌红底白字 */
+html[data-theme="light"] .ext-rating.ext-rt{
+  background:#fa320a;
+  color:#fff
+}
+html[data-theme="light"] .ext-rating.ext-rt .ext-score{color:#fff}
+html[data-theme="light"] .ext-rating.ext-rt .ext-logo path{fill:#fff}
+/* Trakt：品牌红底白字 */
+html[data-theme="light"] .ext-rating.ext-trakt{
+  background:#ed1c24;
+  color:#fff
+}
+html[data-theme="light"] .ext-rating.ext-trakt .ext-score{color:#fff}
+html[data-theme="light"] .ext-rating.ext-trakt .ext-logo path{fill:#fff}
+/* TMDB：品牌青底白字 */
+html[data-theme="light"] .ext-rating.ext-tmdb{
+  background:#01b4e4;
+  color:#fff
+}
+html[data-theme="light"] .ext-rating.ext-tmdb .ext-score{color:#fff}
+html[data-theme="light"] .ext-rating.ext-tmdb .ext-logo path{fill:#fff}
+/* 豆瓣：品牌绿底白字 */
+html[data-theme="light"] .ext-rating.ext-douban{
+  background:#2d963d;
+  color:#fff
+}
+html[data-theme="light"] .ext-rating.ext-douban:hover{
+  background:#257d32;
+  color:#fff
+}
+html[data-theme="light"] .ext-rating.ext-douban .ext-score{color:#fff}
+html[data-theme="light"] .ext-rating.ext-douban .ext-logo path{fill:#fff}
+/* Metacritic：深灰实底白 logo，分数沿用高饱和档位色 */
+html[data-theme="light"] .ext-rating.ext-mc{
+  background:#26292e;
+  border-color:transparent;
+  color:#fff
+}
+html[data-theme="light"] .ext-rating.ext-mc .ext-logo path{fill:#fff}
+html[data-theme="light"] .ext-score.mc-score-high{color:#7ee650}
+html[data-theme="light"] .ext-score.mc-score-mid{color:#ffd644}
+html[data-theme="light"] .ext-score.mc-score-low{color:#ff6659}
+@media (prefers-color-scheme: light){
+/* 主题为 system 且系统是浅色时同样适用（与上方 light 分支完全同款） */
+html[data-theme="system"] .ext-rating{
+  border-color:transparent
+}
+html[data-theme="system"] .ext-rating:hover{
+  filter:brightness(0.93)
+}
+/* IMDb：品牌黄底黑字（官方样式） */
+html[data-theme="system"] .ext-rating.ext-imdb{
+  background:#f5c518;
+  color:#111
+}
+html[data-theme="system"] .ext-rating.ext-imdb .ext-score{color:#111}
+html[data-theme="system"] .ext-rating.ext-imdb .ext-logo path{fill:#111}
+/* 烂番茄：品牌红底白字 */
+html[data-theme="system"] .ext-rating.ext-rt{
+  background:#fa320a;
+  color:#fff
+}
+html[data-theme="system"] .ext-rating.ext-rt .ext-score{color:#fff}
+html[data-theme="system"] .ext-rating.ext-rt .ext-logo path{fill:#fff}
+/* Trakt：品牌红底白字 */
+html[data-theme="system"] .ext-rating.ext-trakt{
+  background:#ed1c24;
+  color:#fff
+}
+html[data-theme="system"] .ext-rating.ext-trakt .ext-score{color:#fff}
+html[data-theme="system"] .ext-rating.ext-trakt .ext-logo path{fill:#fff}
+/* TMDB：品牌青底白字 */
+html[data-theme="system"] .ext-rating.ext-tmdb{
+  background:#01b4e4;
+  color:#fff
+}
+html[data-theme="system"] .ext-rating.ext-tmdb .ext-score{color:#fff}
+html[data-theme="system"] .ext-rating.ext-tmdb .ext-logo path{fill:#fff}
+/* 豆瓣：品牌绿底白字 */
+html[data-theme="system"] .ext-rating.ext-douban{
+  background:#2d963d;
+  color:#fff
+}
+html[data-theme="system"] .ext-rating.ext-douban:hover{
+  background:#257d32;
+  color:#fff
+}
+html[data-theme="system"] .ext-rating.ext-douban .ext-score{color:#fff}
+html[data-theme="system"] .ext-rating.ext-douban .ext-logo path{fill:#fff}
+/* Metacritic：深灰实底白 logo，分数沿用高饱和档位色 */
+html[data-theme="system"] .ext-rating.ext-mc{
+  background:#26292e;
+  border-color:transparent;
+  color:#fff
+}
+html[data-theme="system"] .ext-rating.ext-mc .ext-logo path{fill:#fff}
+html[data-theme="system"] .ext-score.mc-score-high{color:#7ee650}
+html[data-theme="system"] .ext-score.mc-score-mid{color:#ffd644}
+html[data-theme="system"] .ext-score.mc-score-low{color:#ff6659}
+}
+
 .detail-ext-ratings{
   display:flex;
   flex-wrap:wrap;
@@ -16219,6 +16965,13 @@ html[data-theme="light"] .cw-poster{
   justify-content:center;
   margin-top:8px;
   align-items:center
+}
+/* 延迟填充的评分（IMDb/MC/RT/TMDB 来自第二次请求）原先装在普通 span 里，
+ * span 是 flex 的一个整体项目：里面的徽章互相紧贴、与首批徽章间距不一致。
+ * display:contents 让它本身不产生盒子，子徽章直接参与父级 flex 的 gap 分布，
+ * 六个徽章间距完全一致。 */
+.detail-ext-ratings [data-defer-section="ratings"]{
+  display:contents
 }
 @media (min-width:600px){
   .container{
