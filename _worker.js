@@ -1,4 +1,4 @@
-const APP_VERSION = "4.3.4";
+const APP_VERSION = "1.0.7";
 const APP_JS_VERSION = APP_VERSION;
 const APP_CSS_VERSION = APP_VERSION;
 const TRAKT_AUTH = "https://auth.trakt.tv";
@@ -3396,7 +3396,7 @@ async function tmdbDetailCached(path, env, ctx, ttl = TMDB_KV_TTL) {
   );
 }
 
-function tmdbPoster(path, size = "w500") {
+function tmdbPoster(path, size = "w780") {
   return path ? `${TMDB_IMG}/${size}${path}` : null;
 }
 
@@ -3416,7 +3416,7 @@ async function tmdbSeasonStillMap(tmdbId, season, env, ctx) {
   const map = new Map();
   for (const ep of data.episodes) {
     if (ep && ep.episode_number != null && ep.still_path) {
-      map.set(Number(ep.episode_number), tmdbPoster(ep.still_path, "w500"));
+      map.set(Number(ep.episode_number), tmdbPoster(ep.still_path, "w780"));
     }
   }
   return map;
@@ -3438,7 +3438,7 @@ async function tmdbEpisodeStill(tmdbId, season, episode, env, ctx) {
     ctx,
     TMDB_KV_TTL,
   );
-  if (data && data.still_path) return tmdbPoster(data.still_path, "w500");
+  if (data && data.still_path) return tmdbPoster(data.still_path, "w780");
   return null;
 }
 
@@ -3454,9 +3454,9 @@ async function tmdbShowBackdrop(tmdbId, env, ctx, kind) {
     ctx,
     86400 * 7,
   );
-  if (data && data.backdrop_path) return tmdbPoster(data.backdrop_path, "w780");
+  if (data && data.backdrop_path) return tmdbPoster(data.backdrop_path, "w1280");
   const alt = await tmdbDetailCached(`/${other}/${sid}`, env, ctx, TMDB_KV_TTL);
-  if (alt && alt.backdrop_path) return tmdbPoster(alt.backdrop_path, "w780");
+  if (alt && alt.backdrop_path) return tmdbPoster(alt.backdrop_path, "w1280");
   return null;
 }
 
@@ -4134,7 +4134,7 @@ async function attachEntityPosters(list, env, ctx, imgKey, maxFetch = 30) {
             TMDB_KV_TTL,
           );
           if (data && data.poster_path) {
-            const url = tmdbPoster(data.poster_path, "w342");
+            const url = tmdbPoster(data.poster_path, "w780");
             j.entity.__posterUrl = url;
             j.item.__posterUrl = url;
             const old = map[j.k] || {};
@@ -4193,7 +4193,7 @@ async function attachWatchlistStills(list, env, ctx, userKey, opts = {}) {
               TMDB_KV_TTL,
             );
             if (data && data.poster_path) {
-              const url = tmdbPoster(data.poster_path, "w342");
+              const url = tmdbPoster(data.poster_path, "w780");
               j.entity.__posterUrl = url;
               j.item.__posterUrl = url;
               const old = imgMap[j.k] || {};
@@ -4402,7 +4402,7 @@ function mapDoubanItem(x) {
     title: x.title || "",
     year: (x.releaseDate || "").slice(0, 4),
     poster: x.posterPath
-      ? `https://image.tmdb.org/t/p/w342${x.posterPath}`
+      ? `https://image.tmdb.org/t/p/w780${x.posterPath}`
       : null,
     overview: x.description || "",
     rating: Number(x.rating) || 0,
@@ -4658,7 +4658,7 @@ function pickTheaterSection(data, platform) {
       ).slice(0, 4),
       poster:
         x.posterPath || x.poster_path
-          ? `https://image.tmdb.org/t/p/w342${x.posterPath || x.poster_path}`
+          ? `https://image.tmdb.org/t/p/w780${x.posterPath || x.poster_path}`
           : x.poster || x.cover || x.image || null,
       overview: x.description || x.overview || x.summary || "",
       platform: theaterPlatformOf(x),
@@ -4785,7 +4785,7 @@ function mapGuduoItem(x) {
     title: x.title || "",
     year: String(x.releaseDate || x.year || "").slice(0, 4),
     poster: x.posterPath
-      ? `https://image.tmdb.org/t/p/w342${x.posterPath}`
+      ? `https://image.tmdb.org/t/p/w780${x.posterPath}`
       : x.poster || null,
     overview: x.description || x.overview || "",
     rating: Number(x.rating) || 0,
@@ -5118,7 +5118,7 @@ async function loadPlatformPreviews(env, ctx, force) {
         items[pid] = (r.items || [])
           .filter((x) => x.poster)
           .slice(0, 5)
-          .map((x) => x.poster.replace("/w185", "/w342"));
+          .map((x) => x.poster.replace("/w185", "/w780"));
       } catch {
 
 
@@ -5197,7 +5197,7 @@ async function handlePlatformList(request, env, ctx) {
         posters = (r.items || [])
           .filter((x) => x.poster)
           .slice(0, 5)
-          .map((x) => x.poster.replace("/w185", "/w342"));
+          .map((x) => x.poster.replace("/w185", "/w780"));
       } catch {
         posters = [];
       }
@@ -8883,7 +8883,7 @@ async function handleDetailExtras(request, env, ctx) {
         ? ` data-person-id="${esc(pid)}" data-person-name="${esc(c.name || "")}" role="button" tabindex="0"`
         : "";
       const cls = "cast" + (pid ? " clickable" : "");
-      return `<div class="${cls}"${personAttrs}>${c.profile_path ? `<img class="cast-img" src="${TMDB_IMG}/w185${c.profile_path}" loading="lazy" decoding="async" alt="">` : `<div class="cast-img cast-ph" aria-hidden="true"><svg class="cast-ph-icon" viewBox="0 0 24 24" width="40" height="40" fill="currentColor" aria-hidden="true"><path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v1.2c0 .7.5 1.2 1.2 1.2h16.8c.7 0 1.2-.5 1.2-1.2v-1.2c0-3.2-6.4-4.8-9.6-4.8z"/></svg></div>`}<div class="cast-name">${esc(c.name || "")}</div><div class="cast-role">${esc(c.character || "")}</div></div>`;
+      return `<div class="${cls}"${personAttrs}>${c.profile_path ? `<img class="cast-img" src="${TMDB_IMG}/w342${c.profile_path}" loading="lazy" decoding="async" alt="">` : `<div class="cast-img cast-ph" aria-hidden="true"><svg class="cast-ph-icon" viewBox="0 0 24 24" width="40" height="40" fill="currentColor" aria-hidden="true"><path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v1.2c0 .7.5 1.2 1.2 1.2h16.8c.7 0 1.2-.5 1.2-1.2v-1.2c0-3.2-6.4-4.8-9.6-4.8z"/></svg></div>`}<div class="cast-name">${esc(c.name || "")}</div><div class="cast-role">${esc(c.character || "")}</div></div>`;
     })
     .join("");
   const videos =
@@ -8990,7 +8990,7 @@ async function handlePerson(request, env, ctx) {
     );
   const name = person.name || "";
   const photo = person.profile_path
-    ? `${TMDB_IMG}/w342${person.profile_path}`
+    ? `${TMDB_IMG}/w500${person.profile_path}`
     : null;
   const dept = person.known_for_department || "";
   const genderMap = { 1: "女", 2: "男" };
@@ -11119,8 +11119,9 @@ function renderCalendarPage(calendar, env, zhTitles) {
         zhTitle = showTraktId != null && zhTitles ? zhTitles[showTraktId] : null,
         displayTitle = zhTitle || e.title || "未知节目";
       let posterUrl = e.poster || "";
-      if (posterUrl.includes("/w185/")) posterUrl = posterUrl.replace("/w185/", "/w500/");
-      else if (posterUrl.includes("/w342/")) posterUrl = posterUrl.replace("/w342/", "/w500/");
+      if (posterUrl.includes("/w185/")) posterUrl = posterUrl.replace("/w185/", "/w780/");
+      else if (posterUrl.includes("/w342/")) posterUrl = posterUrl.replace("/w342/", "/w780/");
+      else if (posterUrl.includes("/w500/")) posterUrl = posterUrl.replace("/w500/", "/w780/");
       else if (posterUrl.includes("/medium/")) posterUrl = posterUrl.replace("/medium/", "/full/");
       return mediaItem({
         poster: posterUrl || e.poster,
@@ -11219,11 +11220,11 @@ function renderDetailFragment(d) {
       (entity.genres || []).join(" · "),
     poster =
       tmdb && tmdb.poster_path
-        ? tmdbPoster(tmdb.poster_path, "w500")
+        ? tmdbPoster(tmdb.poster_path, "w780")
         : posterOfTrakt(entity),
     backdrop =
       tmdb && tmdb.backdrop_path
-        ? tmdbPoster(tmdb.backdrop_path, "w780")
+        ? tmdbPoster(tmdb.backdrop_path, "w1280")
         : null,
     tagline = entity.tagline || "",
     showSlug = (entity.ids && entity.ids.slug) || "",
@@ -11415,7 +11416,7 @@ function renderDetailFragment(d) {
         ? ` data-person-id="${esc(pid)}" data-person-name="${esc(c.name || "")}" role="button" tabindex="0"`
         : "";
       const cls = "cast" + (pid ? " clickable" : "");
-      return `<div class="${cls}"${personAttrs}>${c.profile_path ? `<img class="cast-img" src="${TMDB_IMG}/w185${c.profile_path}" loading="lazy" decoding="async" alt="">` : `<div class="cast-img cast-ph" aria-hidden="true"><svg class="cast-ph-icon" viewBox="0 0 24 24" width="40" height="40" fill="currentColor" aria-hidden="true"><path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v1.2c0 .7.5 1.2 1.2 1.2h16.8c.7 0 1.2-.5 1.2-1.2v-1.2c0-3.2-6.4-4.8-9.6-4.8z"/></svg></div>`}<div class="cast-name">${esc(c.name || "")}</div><div class="cast-role">${esc(c.character || "")}</div></div>`;
+      return `<div class="${cls}"${personAttrs}>${c.profile_path ? `<img class="cast-img" src="${TMDB_IMG}/w342${c.profile_path}" loading="lazy" decoding="async" alt="">` : `<div class="cast-img cast-ph" aria-hidden="true"><svg class="cast-ph-icon" viewBox="0 0 24 24" width="40" height="40" fill="currentColor" aria-hidden="true"><path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v1.2c0 .7.5 1.2 1.2 1.2h16.8c.7 0 1.2-.5 1.2-1.2v-1.2c0-3.2-6.4-4.8-9.6-4.8z"/></svg></div>`}<div class="cast-name">${esc(c.name || "")}</div><div class="cast-role">${esc(c.character || "")}</div></div>`;
     })
     .join("");
   const recs = (
@@ -11640,7 +11641,7 @@ function renderSeasonEpisodes(
             ? `<button class="ep-status unwatched ep-watch-btn" type="button" data-episode-id="${esc(String(epId))}" data-episode-title="${esc(ep.name || "")}" data-show-id="${showTraktId != null ? esc(String(showTraktId)) : ""}" data-season="${esc(String(seasonNum))}" data-number="${ep.number != null ? esc(String(ep.number)) : ""}" title="标记本集已看">未看</button>`
             : `<span class="ep-status unwatched">未看</span>`;
       const actionHtml = `${playHtml}${watchHtml}`;
-      const still = ep.still_path ? tmdbPoster(ep.still_path, "w300") : null;
+      const still = ep.still_path ? tmdbPoster(ep.still_path, "w780") : null;
       const stillHtml = still
         ? `<img class="ep-still" src="${esc(still)}" loading="lazy" decoding="async" alt="">`
         : `<div class="ep-still ep-still-ph">📺</div>`;
@@ -12785,7 +12786,7 @@ light:'<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="curre
 system:'<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none"/></svg>'};
 function __getTheme(){try{var t=localStorage.getItem(__THEME_KEY);return __THEME_CYCLE.indexOf(t)>=0?t:'dark';}catch(e){return 'dark';}}
 function __resolveDark(t){if(t==='system'){try{return !window.matchMedia||matchMedia('(prefers-color-scheme: dark)').matches;}catch(e){return true;}}return t!=='light';}
-function __applyTheme(t){var dark=__resolveDark(t);var d=document.documentElement;var resolved=t==='system'?(dark?'dark':'light'):t;d.setAttribute('data-theme',resolved);d.setAttribute('data-theme-pref',t);d.style.backgroundColor=dark?'#050505':'#ffffff';var tc=document.querySelector('meta[name="theme-color"]');if(tc)tc.setAttribute('content',dark?'#050505':'#ffffff');var cs=document.querySelector('meta[name="color-scheme"]');if(cs)cs.setAttribute('content',dark?'dark':'light');var sb=document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]');if(sb)sb.setAttribute('content',dark?'black-translucent':'default');var icon=document.getElementById('theme-icon');if(icon)icon.innerHTML=__THEME_ICONS[t]||__THEME_ICONS.dark;var btn=document.getElementById('btn-theme');if(btn){btn.setAttribute('aria-label','切换主题：'+__THEME_LABEL[t]);btn.setAttribute('title','主题：'+__THEME_LABEL[t]);}if(t==='system'&&!window.__themeListener){try{window.__themeListener=matchMedia('(prefers-color-scheme: dark)');window.__themeListener.addEventListener('change',function(){var pref=localStorage.getItem('mt:theme')||'dark';if(pref==='system')__applyTheme('system');});}catch(e){}}}
+function __applyTheme(t){var dark=__resolveDark(t);var d=document.documentElement;var resolved=t==='system'?(dark?'dark':'light'):t;d.setAttribute('data-theme',resolved);d.setAttribute('data-theme-pref',t);var bg=dark?'#050505':'#ffffff';d.style.backgroundColor=bg;var tc=document.querySelector('meta[name="theme-color"]');if(tc)tc.setAttribute('content',bg);var cs=document.querySelector('meta[name="color-scheme"]');if(cs)cs.setAttribute('content',dark?'dark':'light');var sb=document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]');if(sb)sb.setAttribute('content',dark?'black-translucent':'default');var icon=document.getElementById('theme-icon');if(icon)icon.innerHTML=__THEME_ICONS[t]||__THEME_ICONS.dark;var btn=document.getElementById('btn-theme');if(btn){btn.setAttribute('aria-label','切换主题：'+__THEME_LABEL[t]);btn.setAttribute('title','主题：'+__THEME_LABEL[t]);}if(t==='system'&&!window.__themeListener){try{window.__themeListener=matchMedia('(prefers-color-scheme: dark)');window.__themeListener.addEventListener('change',function(){var pref=localStorage.getItem('mt:theme')||'dark';if(pref==='system')__applyTheme('system');});}catch(e){}}}
 window.__applyTheme=__applyTheme;window.__getTheme=__getTheme;
 window.cycleTheme=function(){var cur=__getTheme();var next=__THEME_CYCLE[(__THEME_CYCLE.indexOf(cur)+1)%__THEME_CYCLE.length];try{localStorage.setItem(__THEME_KEY,next);}catch(e){}__applyTheme(next);if(window.__toast)__toast('已切换主题：'+__THEME_LABEL[next],{type:'info',duration:1500});};
 (function(){__applyTheme(__getTheme());try{var mq=matchMedia('(prefers-color-scheme: dark)');var onChange=function(){if(__getTheme()==='system')__applyTheme('system');};if(mq.addEventListener)mq.addEventListener('change',onChange);else if(mq.addListener)mq.addListener(onChange);}catch(e){}})();
@@ -12817,7 +12818,39 @@ function __fadeRemoveCard(card){if(!card)return;card.style.transition='opacity 0
 function __maybeShowEmpty(pane){if(!pane)return;setTimeout(function(){if(pane.querySelector('.item'))return;if(pane.querySelector('.empty'))return;var grid=pane.querySelector('.grid');if(!grid)return;var pid=pane.id,txt='这里暂时没有内容';if(pid==='playback')txt='暂时没有继续观看的内容';else if(pid==='watchlist')txt='待看列表是空的';else if(pid==='calendar')txt='未来 30 天没有待播剧集';else if(pid==='history')txt='还没有观看记录';grid.innerHTML='<div class="empty"><p>'+txt+'</p></div>';},120);}
 function __partHtml(d){return d?String((d.watchlistHtml||'')+(d.calendarHtml||'')+(d.historyHtml||'')):'';}
 function __partFailed(d){if(!d)return true;var h=__partHtml(d);if(!h&&d.historyMoreHtml==null)return true;return /暂时无法加载/.test(h);}
-function __applyPart(part,d){if(!d)return false;if(part==='watchlist'){if(d.watchlistHtml)__setHTML('#watchlist',d.watchlistHtml);}else if(part==='calendar'){try{d.__fetchedAt=Date.now();}catch(e){}if(d.calendarHtml){__setHTML('#calendar',d.calendarHtml);try{var dropped=JSON.parse(localStorage.getItem('mt:dropped')||'[]');if(Array.isArray(dropped)&&dropped.length){var cal=document.getElementById('calendar');if(cal)dropped.forEach(function(did){cal.querySelectorAll('[data-drop-show-id="'+did+'"]').forEach(function(b){var card=b.closest('.item');if(card){var day=card.closest('.day');card.remove();if(day&&!day.querySelector('.item'))day.remove();}});});}}catch(e){}try{if(window.__scheduleCalAirTick)window.__scheduleCalAirTick();}catch(e){}try{setTimeout(function(){var todayCol=document.querySelector('.cal-day-col.is-today');if(!todayCol)return;var row=todayCol.closest('.cal-days-row');if(!row)return;var isMobile=window.innerWidth<=767;if(isMobile){var headerH=document.querySelector('.top-sticky')?document.querySelector('.top-sticky').offsetHeight:60;var top=todayCol.getBoundingClientRect().top+window.pageYOffset-headerH-12;window.scrollTo({top:Math.max(0,top),behavior:'smooth'});}else{var colLeft=todayCol.offsetLeft;var colW=todayCol.offsetWidth;var rowW=row.clientWidth;var scrollTo=colLeft-rowW/2+colW/2;row.scrollTo({left:Math.max(0,scrollTo),behavior:'smooth'});}},150);}catch(e){}}}else if(part==='history'){if(d.historyHtml)__setHTML('#history .grid',d.historyHtml);if(d.historyMoreHtml!=null)__setHTML('#history-more',d.historyMoreHtml);}else{return false;}if(window.__scheduleEnrich)window.__scheduleEnrich();return true;}
+
+window.scrollCalendarToToday=function(){
+  function run(){
+    var todayCol=document.querySelector('.cal-day-col.is-today');
+    if(!todayCol)return false;
+    var row=todayCol.closest('.cal-days-row');
+    var isMobile=window.innerWidth<=767;
+    if(isMobile||!row||row.scrollWidth<=row.clientWidth+2){
+      var headerH=0;
+      var sticky=document.querySelector('.top-sticky');
+      if(sticky)headerH=sticky.offsetHeight||0;
+      var top=todayCol.getBoundingClientRect().top+window.pageYOffset-headerH-12;
+      window.scrollTo({top:Math.max(0,top),behavior:'smooth'});
+    }else{
+      var colLeft=todayCol.offsetLeft;
+      var colW=todayCol.offsetWidth;
+      var rowW=row.clientWidth;
+      var target=colLeft-Math.max(12,rowW/2-colW/2);
+      row.scrollTo({left:Math.max(0,target),behavior:'smooth'});
+      var headerH=0;
+      var sticky=document.querySelector('.top-sticky');
+      if(sticky)headerH=sticky.offsetHeight||0;
+      var top=row.getBoundingClientRect().top+window.pageYOffset-headerH-12;
+      if(top>80)window.scrollTo({top:Math.max(0,top),behavior:'smooth'});
+    }
+    return true;
+  }
+  if(!run()){
+    setTimeout(run,120);
+    setTimeout(run,400);
+  }
+};
+function __applyPart(part,d){if(!d)return false;if(part==='watchlist'){if(d.watchlistHtml)__setHTML('#watchlist',d.watchlistHtml);}else if(part==='calendar'){try{d.__fetchedAt=Date.now();}catch(e){}if(d.calendarHtml){__setHTML('#calendar',d.calendarHtml);try{var dropped=JSON.parse(localStorage.getItem('mt:dropped')||'[]');if(Array.isArray(dropped)&&dropped.length){var cal=document.getElementById('calendar');if(cal)dropped.forEach(function(did){cal.querySelectorAll('[data-drop-show-id="'+did+'"]').forEach(function(b){var card=b.closest('.item');if(card){var day=card.closest('.day');card.remove();if(day&&!day.querySelector('.item'))day.remove();}});});}}catch(e){}try{if(window.__scheduleCalAirTick)window.__scheduleCalAirTick();}catch(e){}try{if(window.scrollCalendarToToday)window.scrollCalendarToToday();setTimeout(function(){var todayCol=document.querySelector('.cal-day-col.is-today');if(!todayCol)return;var row=todayCol.closest('.cal-days-row');if(!row)return;var isMobile=window.innerWidth<=767;if(isMobile){var headerH=document.querySelector('.top-sticky')?document.querySelector('.top-sticky').offsetHeight:60;var top=todayCol.getBoundingClientRect().top+window.pageYOffset-headerH-12;window.scrollTo({top:Math.max(0,top),behavior:'smooth'});}else{var colLeft=todayCol.offsetLeft;var colW=todayCol.offsetWidth;var rowW=row.clientWidth;var scrollTo=colLeft-rowW/2+colW/2;row.scrollTo({left:Math.max(0,scrollTo),behavior:'smooth'});}},150);}catch(e){}}}else if(part==='history'){if(d.historyHtml)__setHTML('#history .grid',d.historyHtml);if(d.historyMoreHtml!=null)__setHTML('#history-more',d.historyMoreHtml);}else{return false;}if(window.__scheduleEnrich)window.__scheduleEnrich();return true;}
 window.__applyPart=__applyPart;window.__partFailed=__partFailed;
 var __PART_LS={watchlist:'mt:wl',calendar:'mt:cal',history:'mt:hist'};
 var __PART_SNAP_TTL=259200;
@@ -12936,7 +12969,7 @@ window.__fetchPartForTab = __fetchPartForTab;
       document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('active');});
       t.classList.add('active');
       lastTab=tabName;
-      switchPane(tabName,dir);
+      switchPane(tabName,dir);if(tabName==='calendar'&&window.scrollCalendarToToday)setTimeout(window.scrollCalendarToToday,80);
       scheduleSyncTabPill();
       // 2) 数据加载放到下一帧之后，避免和切页抢主线程
       if(tabName==='search'){
@@ -13320,7 +13353,7 @@ function __wrapTrendingSection(id,title,itemsHtml){var collapsed=__isTrendCollap
 async function __loadReco(force){try{var r=await fetch('/api/reco'+(force?'?force=1':''));if(!r.ok)return '';var d=await r.json();var items=(d&&d.items)||[];if(!items.length)return '';return __wrapTrendingSection('reco','Trakt 为你推荐',items.map(__renderSearchItem).join(''));}catch(e){return '';}}
 async function __loadTrending(force){var box=document.getElementById('search-results');if(!box)return;var inp=document.getElementById('search-input');if(inp&&inp.value.trim())return;if(box.querySelector('.trending-head')&&!force)return;box.innerHTML='<div class="pane-loading has-sk" style="padding:18px 0">'+__skGrid(6)+'<div class="loading-note">正在加载趋势与推荐</div></div>';var parts=await Promise.all([__loadReco(force),(async function(){try{var r=await fetch('/api/trending');if(!r.ok)throw new Error('HTTP '+r.status);var data=await r.json();var items=(data&&data.items)||[];if(!items.length)return '';__trendingLoaded=true;return __wrapTrendingSection('tmdb','TMDB 今日趋势',items.map(__renderSearchItem).join(''));}catch(err){return '';}})()]);var html=(parts[1]||'')+(parts[0]||'');if(!html){box.innerHTML='<div class="empty"><p>暂无推荐内容</p></div>';return;}box.innerHTML=html;}
 document.addEventListener('click',function(e){var head=e.target.closest('#search-results .trending-head');if(!head)return;var sec=head.closest('.trending-section');if(!sec)return;e.preventDefault();e.stopPropagation();var collapsed=sec.classList.toggle('is-collapsed');head.setAttribute('aria-expanded',collapsed?'false':'true');var id=sec.getAttribute('data-trend-sec');if(id){try{localStorage.setItem('mt:trend-col:'+id,collapsed?'1':'0');}catch(err){}}},true);
-document.addEventListener('wheel',function(e){var sc=e.target.closest('.h-scroll, .trending-scroll');if(!sc)return;if(Math.abs(e.deltaY)<=Math.abs(e.deltaX))return;if(sc.scrollWidth<=sc.clientWidth+2)return;var atStart=sc.scrollLeft<=0,atEnd=sc.scrollLeft+sc.clientWidth>=sc.scrollWidth-2;if((e.deltaY<0&&atStart)||(e.deltaY>0&&atEnd))return;e.preventDefault();sc.scrollLeft+=e.deltaY;},{passive:false});
+document.addEventListener('wheel',function(e){var sc=e.target.closest('.h-scroll, .trending-scroll, .cal-days-row');if(!sc)return;if(Math.abs(e.deltaY)<=Math.abs(e.deltaX))return;if(sc.scrollWidth<=sc.clientWidth+2)return;var atStart=sc.scrollLeft<=0,atEnd=sc.scrollLeft+sc.clientWidth>=sc.scrollWidth-2;if((e.deltaY<0&&atStart)||(e.deltaY>0&&atEnd))return;e.preventDefault();var start=sc.scrollLeft,delta=e.deltaY,t0=performance.now();function step(now){var p=Math.min(1,(now-t0)/140);var ease=1-Math.pow(1-p,3);sc.scrollLeft=start+delta*ease;if(p<1)requestAnimationFrame(step);}requestAnimationFrame(step);},{passive:false});
 window.__loadTrending=__loadTrending;
 (function(){var inp=document.getElementById('search-input');if(!inp)return;inp.addEventListener('input',function(){if(__searchTimer)clearTimeout(__searchTimer);var q=inp.value.trim();if(!q){__loadTrending();return;}__searchTimer=setTimeout(function(){__doSearch(q);},380);});inp.addEventListener('keydown',function(e){if(e.key==='Enter'){if(__searchTimer)clearTimeout(__searchTimer);var q=inp.value.trim();if(q)__doSearch(q);else __loadTrending(true);}});})();
 document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-wl-add-detail]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.wlAddDetailType,tmdbId=btn.dataset.wlAddDetail;if(!type||!tmdbId)return;const nameEl=document.querySelector('.detail-title');const name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'＋',title:'加入待看',message:'确定要把「'+(name||'该条目')+'」加入待看列表吗？',okText:'加入',tone:'success'})))return;const prevHtml=btn.innerHTML;btn.disabled=true;btn.classList.add('loading');try{await __enqueueWrite(async()=>{await __apiWrite('/api/watchlist/add',{type:type,tmdbId:Number(tmdbId)||tmdbId},{okMsg:'已加入待看列表',failPrefix:'加入失败'});btn.classList.remove('loading');btn.classList.add('active');btn.disabled=true;btn.removeAttribute('data-wl-add-detail');btn.removeAttribute('data-wl-add-detail-type');btn.setAttribute('title','已在待看');btn.innerHTML='<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" stroke="none"><path d="M7 3h10a1 1 0 0 1 1 1v16l-6-3.5L6 20V4a1 1 0 0 1 1-1z"/></svg>';__toast('已加入待看列表',{type:'success'});try{if(window.__loadedParts)delete window.__loadedParts.watchlist;}catch(e){}try{if(typeof fetchPart==='function'){fetchPart('watchlist',true).then(function(d){if(!d)return;if(window.__applyPart)window.__applyPart('watchlist',d);if(window.__savePartSnap)window.__savePartSnap('watchlist',d);if(window.__loadedParts)window.__loadedParts.watchlist=d;}).catch(function(){});}}catch(e){}if(document.getElementById('watchlist-grid')&&typeof onWatchlistSortChange==='function'){try{onWatchlistSortChange('added');}catch(e){}}if(window.__afterWriteSoftRefresh)window.__afterWriteSoftRefresh();});}catch(err){btn.disabled=false;btn.classList.remove('loading');btn.innerHTML=prevHtml;__errToast('加入失败',err);}},true);
@@ -14217,6 +14250,21 @@ function pageStyles() {
   --platform-shadow-hover:rgba(0,0,0,0.16);
   --scrollbar:#d4d4d8;
   --link:#6d28d9;
+  --glass-bg:rgba(255,255,255,0.72);
+  --glass-bg-strong:rgba(255,255,255,0.88);
+  --glass-bg-soft:rgba(255,255,255,0.55);
+  --glass-border:rgba(255,255,255,0.9);
+  --glass-border-soft:rgba(0,0,0,0.08);
+  --glass-highlight:rgba(255,255,255,1);
+  --glass-shadow:0 12px 40px rgba(0,0,0,0.1),inset 0 1px 0 rgba(255,255,255,1);
+  --glass-shadow-sm:0 6px 20px rgba(0,0,0,0.08),inset 0 1px 0 rgba(255,255,255,0.9);
+  --glass-blur:blur(40px) saturate(180%);
+  --dock-bg:rgba(255,255,255,0.78);
+  --sheet-glass:rgba(255,255,255,0.88);
+  --card-glass:rgba(255,255,255,0.72);
+  --close-bg:rgba(255,255,255,0.75);
+  --close-fg:#18181b;
+  --close-border:rgba(0,0,0,0.08);
   --link-hover:#5b21b6;
   --success-fg:#059669;
   --warn-fg:#b45309;
@@ -14546,6 +14594,107 @@ html[data-theme="light"] .list-modal .item .meta,html[data-theme="light"] .list-
 .top-sticky{position:sticky !important;top:0 !important;background:rgba(12,12,16,0.72) !important;backdrop-filter:blur(20px) saturate(140%) !important;-webkit-backdrop-filter:blur(20px) saturate(140%) !important;border-bottom:1px solid rgba(255,255,255,0.08) !important;box-shadow:0 4px 24px rgba(0,0,0,0.25) !important;z-index:40 !important}
 html[data-theme="light"] .top-sticky{background:rgba(255,255,255,0.78) !important;border-bottom:1px solid rgba(0,0,0,0.06) !important;box-shadow:0 4px 20px rgba(0,0,0,0.08) !important}
 html[data-theme="dark"] .top-sticky{background:rgba(12,12,16,0.75) !important;border-bottom:1px solid rgba(255,255,255,0.08) !important;box-shadow:0 4px 24px rgba(0,0,0,0.3) !important}
+
+/* theme optimize 1.0.2 */
+:root{
+  --close-bg:rgba(255,255,255,0.12);
+  --close-fg:#fff;
+  --close-border:rgba(255,255,255,0.2);
+  --sticky-bg:rgba(12,12,16,0.75);
+  --sticky-border:rgba(255,255,255,0.08);
+  --sticky-shadow:0 4px 24px rgba(0,0,0,0.3);
+}
+html[data-theme="light"]{
+  --close-bg:rgba(255,255,255,0.75);
+  --close-fg:#18181b;
+  --close-border:rgba(0,0,0,0.08);
+  --sticky-bg:rgba(255,255,255,0.82);
+  --sticky-border:rgba(0,0,0,0.06);
+  --sticky-shadow:0 4px 20px rgba(0,0,0,0.08);
+  --toast-info-bg:rgba(37,99,235,0.12);
+  --toast-info-fg:#1d4ed8;
+  --toast-ok-bg:rgba(5,150,105,0.12);
+  --toast-ok-fg:#047857;
+  --toast-err-bg:rgba(220,38,38,0.12);
+  --toast-err-fg:#b91c1c;
+  --toast-warn-bg:rgba(217,119,6,0.14);
+  --toast-warn-fg:#b45309;
+}
+.top-sticky{
+  background:var(--sticky-bg) !important;
+  border-bottom:1px solid var(--sticky-border) !important;
+  box-shadow:var(--sticky-shadow) !important;
+  backdrop-filter:var(--glass-blur) !important;
+  -webkit-backdrop-filter:var(--glass-blur) !important;
+}
+.modal-close,.list-modal-close,.summary-close,.person-close,.show-cal-close,.cw-sheet-cancel{
+  background:var(--close-bg) !important;
+  color:var(--close-fg) !important;
+  border:1px solid var(--close-border) !important;
+}
+.cw-sheet-panel,.confirm-panel,.summary-panel,.person-panel,.show-cal-panel,.list-modal-panel,.modal-shell{
+  background:var(--sheet-glass) !important;
+  border:1px solid var(--glass-border-soft) !important;
+  box-shadow:var(--glass-shadow) !important;
+}
+html[data-theme="light"] .toast-info .toast-icon{background:var(--toast-info-bg);color:var(--toast-info-fg)}
+html[data-theme="light"] .toast-success .toast-icon{background:var(--toast-ok-bg);color:var(--toast-ok-fg)}
+html[data-theme="light"] .toast-error .toast-icon{background:var(--toast-err-bg);color:var(--toast-err-fg)}
+html[data-theme="light"] .toast-warn .toast-icon{background:var(--toast-warn-bg);color:var(--toast-warn-fg)}
+@media (prefers-color-scheme:light){
+  html[data-theme="system"]{color-scheme:light}
+}
+
+/* smoothness 1.0.4 */
+html{scroll-behavior:smooth;-webkit-tap-highlight-color:transparent}
+body{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;text-rendering:optimizeLegibility}
+button,a,.item,.tab,.cw-card,.platform-card,.btn-action,.home-more-btn,.list-modal-close,.modal-close{
+  touch-action:manipulation;-webkit-tap-highlight-color:transparent;
+}
+.h-scroll,.trending-scroll,.cal-days-row,.list-modal-body,.modal-body,.summary-body,.person-body,.show-cal-panel{
+  -webkit-overflow-scrolling:touch;overscroll-behavior:contain;
+}
+.h-scroll,.trending-scroll,.cal-days-row{scroll-behavior:smooth}
+.item,.cw-card,.platform-card,.tab,.btn-action{
+  transition:transform .16s cubic-bezier(.22,.68,.32,1),opacity .16s ease,background-color .16s ease,box-shadow .16s ease!important;
+}
+.item:active,.cw-card:active,.platform-card:active,.tab:active,.btn-action:active{
+  transform:scale(.97);
+}
+.poster img,.cw-poster img{transform:translateZ(0);backface-visibility:hidden}
+.top-sticky,.tabs{transform:translateZ(0)}
+.modal-shell,.list-modal-panel,.cw-sheet-panel,.summary-panel,.person-panel,.show-cal-panel,.confirm-panel{
+  will-change:transform,opacity;
+}
+.pane{animation-duration:.2s!important;animation-timing-function:cubic-bezier(.22,.68,.32,1)!important}
+@media (prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  .item:active,.cw-card:active,.platform-card:active,.tab:active{transform:none}
+}
+
+/* centered modals on all sizes, keep translate centering */
+.list-modal-panel,.summary-panel,.person-panel,.show-cal-panel{
+  top:50% !important;
+  bottom:auto !important;
+  left:50% !important;
+  right:auto !important;
+  transform:translate(-50%,-50%) !important;
+  width:min(92vw,1000px) !important;
+  max-height:88vh !important;
+  border-radius:18px !important;
+}
+.list-modal.open .list-modal-panel,
+.summary-modal.open .summary-panel,
+.person-modal.open .person-panel,
+.show-cal-modal.open .show-cal-panel{
+  animation:mtPanelIn .28s cubic-bezier(.22,.68,.32,1) !important;
+}
+.list-modal.closing .list-modal-panel,
+.summary-modal.closing .summary-panel,
+.person-modal.closing .person-panel,
+.show-cal-modal.closing .show-cal-panel{
+  animation:mtPanelOut .16s ease forwards !important;
+}
 `;
   return __pageStylesCache;
 }
