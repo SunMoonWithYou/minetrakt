@@ -1,4 +1,4 @@
-const APP_VERSION = "6.6.0";
+const APP_VERSION = "6.6.3";
 const APP_JS_VERSION = APP_VERSION;
 const APP_CSS_VERSION = APP_VERSION;
 const TRAKT_AUTH = "https://auth.trakt.tv";
@@ -10825,8 +10825,11 @@ function renderContinueItems(upNext, mode = "grid") {
     if (playHref && playPct != null && playHref.indexOf("?") < 0) {
       playHref += "?play";
     }
-    const dropShowId =
-      !isMovie && show.ids && show.ids.trakt ? String(show.ids.trakt) : null;
+    const dropShowId = !isMovie && show.ids && show.ids.trakt
+    ? String(show.ids.trakt)
+    : (isMovie && item.movie && item.movie.ids && item.movie.ids.trakt
+      ? String(item.movie.ids.trakt)
+      : null);
     if (mode === "hscroll" || mode === "fragment") {
       const dataAttrs =
         e.detailType && e.detailId
@@ -10859,7 +10862,7 @@ function renderContinueItems(upNext, mode = "grid") {
           ? `<div class="cw-bar"><div class="cw-bar-fill" style="width:${Math.max(0, Math.min(100, barPct))}%"></div></div>`
           : "";
       const menuHtml = dropShowId
-        ? `<button class="cw-more" type="button" data-cw-menu data-cw-drop-id="${esc(dropShowId)}" data-cw-name="${esc(showTitle)}" data-cw-season="${esc(String(epSeason != null ? epSeason : ""))}" data-cw-episode="${esc(String(epNumber != null ? epNumber : ""))}" data-cw-media-type="${esc(watchedType || "")}" data-cw-media-id="${esc(watchedId != null ? String(watchedId) : "")}" aria-label="更多操作" title="更多"><svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><circle cx="5" cy="12" r="2.2"/><circle cx="12" cy="12" r="2.2"/><circle cx="19" cy="12" r="2.2"/></svg></button>`
+        ? `<button class="cw-more" type="button" data-cw-menu data-cw-drop-id="${esc(dropShowId)}" data-cw-name="${esc(showTitle)}" data-cw-season="${esc(String(epSeason != null ? epSeason : ""))}" data-cw-episode="${esc(String(epNumber != null ? epNumber : ""))}" data-cw-media-type="${esc(watchedType || (isMovie ? "movie" : ""))}" data-cw-media-id="${esc(watchedId != null ? String(watchedId) : dropShowId)}" aria-label="更多操作" title="更多"><svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><circle cx="5" cy="12" r="2.2"/><circle cx="12" cy="12" r="2.2"/><circle cx="19" cy="12" r="2.2"/></svg></button>`
         : "";
       const lockAttr =
         item.__stillUrl ||
@@ -13144,7 +13147,7 @@ function __ensureCwSheet(){
   el=document.createElement('div');
   el.id='cw-sheet';
   el.className='cw-sheet';
-  el.innerHTML='<div class="cw-sheet-backdrop" data-cw-sheet-close="1"></div><div class="cw-sheet-panel" role="menu"><div class="cw-sheet-title" id="cw-sheet-title"></div><button type="button" class="cw-sheet-item" id="cw-sheet-hide">移除进度</button><button type="button" class="cw-sheet-item danger" id="cw-sheet-drop">弃看剧集</button><button type="button" class="cw-sheet-item cw-sheet-cancel" data-cw-sheet-close="1">取消</button></div>';
+  el.innerHTML='<div class="cw-sheet-backdrop" data-cw-sheet-close="1"></div><div class="cw-sheet-panel" role="menu"><div class="cw-sheet-title" id="cw-sheet-title"></div><button type="button" class="cw-sheet-item" id="cw-sheet-hide">移除进度</button><button type="button" class="cw-sheet-item danger" id="cw-sheet-drop">弃看剧集</button><button type="button" class="cw-sheet-item" id="cw-sheet-watched" style="display:none">标记为已看</button><button type="button" class="cw-sheet-item cw-sheet-cancel" data-cw-sheet-close="1">取消</button></div>';
   document.body.appendChild(el);
   el.addEventListener('click',function(ev){
     if(ev.target.closest('[data-cw-sheet-close]')){__closeCwSheet();return;}
@@ -13294,6 +13297,36 @@ async function __hideContinueById(id, name, season, episode, mediaType, mediaId)
   }catch(err){
     __errToast('移除失败',err);
   }
+}
+function __openCwSheet(id,name,season,episode,mediaType,mediaId){
+  var el=__ensureCwSheet();
+  el.dataset.dropShowId=id||'';
+  el.dataset.cwName=name||'';
+  el.dataset.cwSeason=season!=null?String(season):'';
+  el.dataset.cwEpisode=episode!=null?String(episode):'';
+  el.dataset.cwMediaType=mediaType||'';
+  el.dataset.cwMediaId=mediaId!=null?String(mediaId):'';
+  var t=el.querySelector('#cw-sheet-title');
+  if(t)t.textContent=name||'更多操作';
+
+  var dropBtn=el.querySelector('#cw-sheet-drop');
+  var watchedBtn=el.querySelector('#cw-sheet-watched');
+  var isMovie=(mediaType==='movie');
+  if(dropBtn) dropBtn.style.display=isMovie?'none':'';
+  if(watchedBtn){
+    watchedBtn.style.display=isMovie?'':'none';
+    watchedBtn.onclick=function(ev){
+      ev.preventDefault();ev.stopPropagation();
+      __closeCwSheet();
+      setTimeout(function(){
+        if(typeof markWatched==='function') markWatched(mediaType,mediaId);
+      },80);
+    };
+  }
+
+  el.style.display='';
+  el.classList.add('open');
+  document.body.style.overflow='hidden';
 }
 async function __dropShowById(id, name){
   id=String(id||'').trim();
@@ -14648,6 +14681,7 @@ html[data-theme="light"] .poster-ph,html[data-theme="light"] .cw-poster-ph{backg
 ::-webkit-scrollbar-thumb:hover{background:rgba(167,139,250,.45);background-clip:padding-box;}
 .toast{backdrop-filter:blur(12px) saturate(165%);-webkit-backdrop-filter:blur(12px) saturate(165%);}
 .chip,.douban-filter-tab,.theater-filter-tab{transition:background-color .16s ease,color .16s ease,transform .16s ease;}
+.person-panel{background:var(--panel-grad,linear-gradient(165deg,#16161a 0%,#0e0e10 100%))!important;border:1px solid var(--border-strong)!important;box-shadow:0 30px 80px rgba(0,0,0,0.85)!important;-webkit-backdrop-filter:none!important;backdrop-filter:none!important;will-change:auto!important;}html[data-theme="dark"] .person-panel,html[data-theme="light"] .person-panel{background:var(--panel-grad,linear-gradient(165deg,#16161a 0%,#0e0e10 100%))!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important;will-change:auto!important;}.person-panel,.person-panel *{-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;filter:none!important;}.person-panel-head{padding:14px 20px!important;margin:0!important;}.person-panel-name{padding-left:4px;}
 .chip:active,.douban-filter-tab:active,.theater-filter-tab:active{transform:scale(.97);}
 `;
   return __pageStylesCache;
