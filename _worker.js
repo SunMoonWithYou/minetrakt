@@ -1,4 +1,4 @@
-const APP_VERSION = "6.6.3";
+const APP_VERSION = "6.6.9";
 const APP_JS_VERSION = APP_VERSION;
 const APP_CSS_VERSION = APP_VERSION;
 const TRAKT_AUTH = "https://auth.trakt.tv";
@@ -382,6 +382,7 @@ const CK = {
 
   playbackList: (u) => `pbl:${u}`,
   watchedEpisodes: (u) => `we:v2:${u}`,
+  watchedMovies: (u) => `wm:v1:${u}`,
   cwHide: (u) => `cwh:${u}`,
   entity: (t, id) => `te:${t}:${id}`,
   season: (id, n) => `ts:${id}:${n}`,
@@ -3241,6 +3242,7 @@ function bustHomeUserCaches(userKey, env, ctx) {
 
     const hardKeys = [
       CK.playback(userKey),
+      CK.watchedMovies(userKey),
       CK.history(userKey, 1),
       CK.history(userKey, 2),
       CK.history(userKey, 3),
@@ -3257,6 +3259,7 @@ function bustHomeUserCaches(userKey, env, ctx) {
         const prefixes = [
 
           `more:hist:${userKey}:`,
+          `more:pb:`,
           `hist:${userKey}:`,
           `act:${userKey}`,
         ];
@@ -3489,6 +3492,16 @@ function applyPbImage(j, imgMap) {
   return true;
 }
 
+// 「继续观看」里日历条目的时间窗口
+// CW_UPCOMING_WINDOW_MS：距开播多久内算「即将播出」
+// CW_AIRING_WINDOW_MS：开播后多久内算「正在播出」
+// CW_AIRED_WINDOW_MS：播完后多久内仍保留（显示「X 小时前」）
+const CW_UPCOMING_WINDOW_MS = 24 * 3600 * 1000;
+const CW_AIRING_WINDOW_MS = 2 * 3600 * 1000;
+const CW_AIRED_WINDOW_MS = 72 * 3600 * 1000;
+// 本地日历条目（即将播出 / 刚播完）的额外展示位，不占用主列表名额
+const CW_LOCAL_EXTRA_CAP = 8;
+
 function calendarToLocalContinue(
   calendar,
   nowMs,
@@ -3498,9 +3511,9 @@ function calendarToLocalContinue(
 ) {
   if (!Array.isArray(calendar) || !calendar.length) return [];
   const now = nowMs != null ? nowMs : Date.now();
-  const upcomingWindowMs = 6 * 3600 * 1000;
-  const airingWindowMs = 2 * 3600 * 1000;
-  const airedWindowMs = 24 * 3600 * 1000;
+  const upcomingWindowMs = CW_UPCOMING_WINDOW_MS;
+  const airingWindowMs = CW_AIRING_WINDOW_MS;
+  const airedWindowMs = CW_AIRED_WINDOW_MS;
   const dropped =
     droppedIds instanceof Set
       ? droppedIds
@@ -3696,9 +3709,16 @@ function mergeContinueLists(
   watchedEpIds = null,
   hideMap = null,
   localAiredList = null,
+  watchedMovieIds = null,
 ) {
   const seen = new Map();
   const out = [];
+  const movieWatched =
+    watchedMovieIds instanceof Set
+      ? watchedMovieIds
+      : watchedMovieIds
+        ? new Set([...watchedMovieIds].map(Number))
+        : null;
   const dropped =
     droppedIds instanceof Set
       ? droppedIds
@@ -3771,6 +3791,14 @@ function mergeContinueLists(
   function shouldSkip(entry) {
     if (!entry || entry.__error) return markSkip("error");
     if (isDropped(entry)) return markSkip("dropped");
+    if (
+      movieWatched &&
+      entry.movie &&
+      entry.movie.ids &&
+      entry.movie.ids.trakt != null &&
+      movieWatched.has(Number(entry.movie.ids.trakt))
+    )
+      return markSkip("watched");
     if (hideMap && isCwHiddenEntry(entry, hideMap)) return markSkip("hidden");
     if (hideMap) {
       const show = entry && entry.show;
@@ -3855,7 +3883,18 @@ function mergeContinueLists(
       (Date.parse(String(tb)) || 0) - (Date.parse(String(ta)) || 0)
     );
   });
-  const result = out.slice(0, Math.max(1, limit | 0));
+  const cap = Math.max(1, limit | 0);
+  const isLocalAirItem = (x) => !!(x && (x.__localUpcoming || x.__localAired));
+  let result;
+  if (out.length <= cap) {
+    result = out.slice();
+  } else {
+    // 本地日历条目（即将播出 / 刚播完）单独占用额外名额，
+    // 否则继续观看满 20 条时它们会被 slice 全部裁掉，等于白算
+    const localPart = out.filter(isLocalAirItem).slice(0, CW_LOCAL_EXTRA_CAP);
+    const normalPart = out.filter((x) => !isLocalAirItem(x));
+    result = normalPart.slice(0, cap).concat(localPart);
+  }
   if (autoUnhide.size) {
     Object.defineProperty(result, "__autoUnhide", {
       value: [...autoUnhide],
@@ -7177,6 +7216,50 @@ function rememberWatchedEp(userKey, set) {
   }
 }
 
+async function getWatchedMovieIds(headers, env, ctx, userKey, force = false) {
+  if (!userKey) return new Set();
+  const raw = await cachedJSON(
+    env,
+    ctx,
+    CK.watchedMovies(userKey),
+    async () => {
+      if (isTraktRateLimited(userKey)) return { __error: "429 cooling" };
+      try {
+        const res = await fetchT(
+          `${TRAKT_API}/sync/watched/movies`,
+          { headers },
+          20000,
+        );
+        if (res.status === 429) {
+          consumeRetryAfter(res, userKey);
+          return null;
+        }
+        if (!res.ok) return null;
+        const arr = await res.json();
+        if (!Array.isArray(arr)) return null;
+        const ids = [];
+        for (const w of arr) {
+          const id = w && w.movie && w.movie.ids && w.movie.ids.trakt;
+          if (id != null) ids.push(Number(id));
+        }
+        return { ids };
+      } catch {
+        return null;
+      }
+    },
+    {
+      ttl: 86400,
+      missTtl: 300,
+      swr: 0,
+      jitter: 300,
+      userKey,
+      ...(force ? { bypass: true, revalidate: true } : {}),
+    },
+  );
+  const ids = raw && Array.isArray(raw.ids) ? raw.ids : [];
+  return new Set(ids.map(Number).filter(Number.isFinite));
+}
+
 async function getWatchedEpisodeIds(headers, env, ctx, userKey, force = false) {
 
   const src = { fromCache: null, age: 0 };
@@ -7570,6 +7653,20 @@ function filterCwHiddenList(list, hideMap) {
   return out;
 }
 
+function calendarWeekStart(today) {
+  const d = new Date(String(today) + "T00:00:00Z");
+  if (!Number.isFinite(d.getTime())) return String(today);
+  const day = d.getUTCDay();
+  const diff = day === 0 ? 6 : day - 1;
+  d.setUTCDate(d.getUTCDate() - diff - 7);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+}
+
+// 写入与读取必须共用同一个 key，否则 peek 永远 miss
+function calendarCacheKey(userKey, today) {
+  return CK.calendar(userKey || "anon", "w:" + calendarWeekStart(today));
+}
+
 async function getCalendarCached(
   today,
   headers,
@@ -7581,17 +7678,11 @@ async function getCalendarCached(
 ) {
   const prefix = userKey || "anon";
 
-  const startDate = (() => {
-    const d = new Date(today + "T00:00:00Z");
-    const day = d.getUTCDay();
-    const diff = day === 0 ? 6 : day - 1;
-    d.setUTCDate(d.getUTCDate() - diff - 7);
-    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
-  })();
+  const startDate = calendarWeekStart(today);
   return cachedJSON(
     env,
     ctx,
-    CK.calendar(prefix, "w:" + startDate),
+    calendarCacheKey(prefix, today),
     async () => {
       const dbg = sourceTracker ? (sourceTracker.debug = {}) : {};
       try {
@@ -7636,26 +7727,37 @@ async function getCalendarCached(
 }
 
 async function peekCalendarCached(today, env, userKey) {
-  const key = CK.calendar(userKey || "anon", today);
-  const st = kvMemStaleGet(key);
-  if (st && Array.isArray(st.data)) return st.data;
-  if (env && env.TMDB_CACHE && !kvIsDown()) {
+  // 只读缓存：key 必须与 getCalendarCached 写入的完全一致
+  const key = calendarCacheKey(userKey, today);
+  const lgKey = CK.lastGood.calendar(userKey || "anon");
+  const memHit = (k) => {
+    const st = kvMemStaleGet(k);
+    return st && Array.isArray(st.data) ? st.data : null;
+  };
+  const readKv = async (k) => {
+    if (!env || !env.TMDB_CACHE || kvIsDown()) return null;
     try {
-      const raw = await env.TMDB_CACHE.get(key, kvReadOpts());
+      const raw = await env.TMDB_CACHE.get(k, kvReadOpts());
       kvMarkUp();
-      if (raw && !raw.miss) {
-        const v = raw.data !== undefined ? raw.data : raw;
-        if (Array.isArray(v)) {
-          kvRemember(key, { data: v, _ts: (raw && raw._ts) || Date.now() });
-          kvMemStaleSet(key, v, raw && raw._ts);
-          return v;
-        }
-      }
+      if (!raw || raw.miss) return null;
+      const v = raw.data !== undefined ? raw.data : raw;
+      if (!Array.isArray(v)) return null;
+      kvRemember(key, { data: v, _ts: (raw && raw._ts) || Date.now() });
+      kvMemStaleSet(key, v, raw && raw._ts);
+      return v;
     } catch {
       kvMarkDown();
+      return null;
     }
-  }
-  return null;
+  };
+  const hit = memHit(key);
+  if (hit) return hit;
+  const fresh = await readKv(key);
+  if (fresh) return fresh;
+  // 回落最近一次成功的日历（lastGood），避免周键轮换/缓存过期时整块空
+  const lgMem = memHit(lgKey);
+  if (lgMem) return lgMem;
+  return await readKv(lgKey);
 }
 
 async function handleActivitySig(request, env, ctx) {
@@ -7988,6 +8090,16 @@ async function handleHomeData(request, env, ctx) {
             ? hideMapRaw
             : {};
 
+        let watchedMovieIds = null;
+        try {
+          watchedMovieIds = await getWatchedMovieIds(
+            headers,
+            env,
+            ctx,
+            userKey,
+          ).catch(() => null);
+        } catch {}
+
         playback = mergeContinueLists(
           rawPaused,
           rawUpNext,
@@ -7996,6 +8108,7 @@ async function handleHomeData(request, env, ctx) {
           freshWatched,
           hideMap,
           null,
+          watchedMovieIds,
         );
         const dbgPb = playbackSrc.debug || (playbackSrc.debug = {});
         dbgPb.rawPaused = rawPaused.length;
@@ -8050,18 +8163,29 @@ async function handleHomeData(request, env, ctx) {
           .slice(0, 10);
 
         let cal = await peekCalendarCached(todayBJ, env, userKey);
-        if (!cal && ctx && typeof ctx.waitUntil === "function") {
-          ctx.waitUntil(
-            getCalendarCached(
-              todayBJ,
-              headers,
-              env,
-              ctx,
-              userKey,
-              false,
-              null,
-            ).catch(() => null),
-          );
+        const calRefresh = () =>
+          getCalendarCached(
+            todayBJ,
+            headers,
+            env,
+            ctx,
+            userKey,
+            false,
+            null,
+          ).catch(() => null);
+        if (!cal) {
+          // 首次访问 / 周键轮换 / KV 过期清理时缓存为空：
+          // 单独的 playback 请求同步补拉一次，part=all 则丢后台，避免抢限流额度
+          if (part === "playback") cal = await calRefresh();
+          else if (ctx && typeof ctx.waitUntil === "function")
+            ctx.waitUntil(calRefresh());
+        } else if (
+          part === "playback" &&
+          ctx &&
+          typeof ctx.waitUntil === "function"
+        ) {
+          // 首页只读快照不会自己更新，这里让它按 TTL 在后台刷新，避免永远是旧日历
+          ctx.waitUntil(calRefresh());
         }
         let localUpcoming = [];
         try {
@@ -8082,6 +8206,7 @@ async function handleHomeData(request, env, ctx) {
             freshWatched,
             hideMap,
             localUpcoming,
+            watchedMovieIds,
           );
         } else {
           const filtered = filterCwHiddenList(playback, hideMap);
@@ -8188,14 +8313,16 @@ async function handleHomeData(request, env, ctx) {
   if (wantWatchlist) {
     taskFns.push(async () => {
       try {
+        const watchlistForce = !rateLimitedNow && (
+        force || (partsBypass && !activityUnchanged)
+      );
         watchlist = await getWatchlist(
           headers,
           "added",
           env,
           ctx,
           userKey,
-
-          !!(partsBypass && !activityUnchanged && !rateLimitedNow),
+          watchlistForce,
           watchlistSrc,
         );
       } catch (e) {
@@ -11833,6 +11960,12 @@ async function injectLocalUpcomingIntoContinue(
       freshWatched,
       hideMap,
     );
+    const watchedMovieIds = await getWatchedMovieIds(
+      headers,
+      env,
+      ctx,
+      userKey,
+    ).catch(() => null);
     if (localUpcoming && localUpcoming.length) {
       list = mergeContinueLists(
         list,
@@ -11842,9 +11975,19 @@ async function injectLocalUpcomingIntoContinue(
         freshWatched,
         hideMap,
         localUpcoming,
+        watchedMovieIds,
       );
     } else {
-      list = filterCwHiddenList(list, hideMap);
+      list = mergeContinueLists(
+        list,
+        [],
+        Math.max(limit, list.length),
+        droppedSet,
+        freshWatched,
+        hideMap,
+        null,
+        watchedMovieIds,
+      );
     }
     list = filterContinueEntries(list, freshWatched);
     applyRewatchFlags(list, freshWatched);
@@ -11920,23 +12063,46 @@ async function handleMore(request, env, ctx) {
   if (type === "playback") {
     const limit = limitParam > 0 ? Math.min(limitParam, 40) : 20;
 
-    function asHomePlaybackList(v) {
+    function asHomePlaybackList(v, flt) {
       if (Array.isArray(v)) return v.length ? v : null;
       if (v && (Array.isArray(v.paused) || Array.isArray(v.upNext))) {
+        const f = flt || {};
         const merged = mergeContinueLists(
           Array.isArray(v.paused) ? v.paused : [],
           Array.isArray(v.upNext) ? v.upNext : [],
           20,
+          f.dropped || null,
+          f.watched || null,
+          f.hideMap || null,
           null,
-          null,
-          null,
-          null,
+          f.watchedMovies || null,
         );
         return merged && merged.length ? merged : null;
       }
       return null;
     }
     async function readHomePlaybackList() {
+      let flt = null;
+      try {
+        const userState = await getUserStateBundle(headers, env, ctx, userKey);
+        const hideMapRaw = userState && userState.hideMap;
+        flt = {
+          dropped: droppedStateToSet(userState),
+          watched: watchedStateToSet(userState.watched),
+          hideMap:
+            hideMapRaw &&
+            typeof hideMapRaw === "object" &&
+            !Array.isArray(hideMapRaw)
+              ? hideMapRaw
+              : {},
+          watchedMovies: await getWatchedMovieIds(
+            headers,
+            env,
+            ctx,
+            userKey,
+          ).catch(() => null),
+        };
+      } catch {}
       const tryKeys = [CK.playback(userKey), CK.lastGood.playback(userKey)];
       for (const key of tryKeys) {
         if (env && env.TMDB_CACHE && !kvIsDown()) {
@@ -11945,6 +12111,7 @@ async function handleMore(request, env, ctx) {
             if (raw && !raw.miss) {
               const hit = asHomePlaybackList(
                 raw.data !== undefined ? raw.data : raw,
+                flt,
               );
               if (hit) return hit;
             }
@@ -12021,6 +12188,12 @@ async function handleMore(request, env, ctx) {
           );
           const droppedSet = droppedStateToSet(userState);
           const watchedEpIds = watchedStateToSet(userState.watched);
+          const watchedMovieIds = await getWatchedMovieIds(
+            headers,
+            env,
+            ctx,
+            userKey,
+          ).catch(() => null);
           const hideMap =
             userState.hideMap &&
             typeof userState.hideMap === "object" &&
@@ -12034,6 +12207,8 @@ async function handleMore(request, env, ctx) {
             droppedSet,
             watchedEpIds,
             hideMap,
+            null,
+            watchedMovieIds,
           );
           if (
             items &&
@@ -12729,6 +12904,7 @@ function __afterWriteSoftRefresh(){
     try{delete window.__loadedParts.playback;}catch(e){}
     try{if(typeof __partDebounceAt!=='undefined')delete __partDebounceAt.playback;}catch(e){}
     try{localStorage.removeItem('mt:pb');}catch(e){}
+    try{window.__cwMoreCache=null;}catch(e){}
   }catch(e){}
   setTimeout(function(){
     if(document.hidden)return;
@@ -14431,7 +14607,8 @@ html[data-theme="dark"] .top-sticky{background:rgba(18,18,24,0.62);-webkit-backd
 html[data-theme="dark"] .platform-card{background:rgba(18,18,24,0.62);-webkit-backdrop-filter:blur(12px) saturate(165%) brightness(0.92);backdrop-filter:blur(12px) saturate(165%) brightness(0.92);border:1px solid rgba(255,255,255,0.13);box-shadow:0 10px 28px rgba(0,0,0,0.34),inset 0 1px 0 rgba(255,255,255,0.14);}html[data-theme="light"] .platform-card{background:rgba(252,252,253,0.58);-webkit-backdrop-filter:blur(12px) saturate(165%);backdrop-filter:blur(12px) saturate(165%);border:1px solid rgba(255,255,255,0.8);box-shadow:0 10px 26px rgba(0,0,0,0.07),inset 0 1px 0 rgba(255,255,255,0.95);}html:not([data-theme="light"]) .platform-card:hover,
 html[data-theme="dark"] .platform-card:hover{background:rgba(26,26,34,0.68);border-color:rgba(167,139,250,0.32);box-shadow:0 16px 36px rgba(0,0,0,0.45),inset 0 1px 0 rgba(255,255,255,0.2);}html[data-theme="light"] .platform-card:hover{background:rgba(255,255,255,0.68);border-color:rgba(109,40,217,0.28);}html .list-modal-panel,
 html[data-theme="dark"] .list-modal-panel,
-html:not([data-theme="light"]) .list-modal-panel{background:rgba(18,18,24,0.62);-webkit-backdrop-filter:blur(12px) saturate(165%) brightness(0.92);backdrop-filter:blur(12px) saturate(165%) brightness(0.92);border:1px solid rgba(255,255,255,0.14);box-shadow:0 30px 80px rgba(0,0,0,0.6),inset 0 1px 0 rgba(255,255,255,0.13);}html[data-theme="light"] .list-modal-panel{background:rgba(252,252,253,0.58);-webkit-backdrop-filter:blur(12px) saturate(165%);backdrop-filter:blur(12px) saturate(165%);border:1px solid rgba(255,255,255,0.85);box-shadow:0 30px 70px rgba(0,0,0,0.16),inset 0 1px 0 rgba(255,255,255,0.95);}.list-modal-backdrop{background:rgba(8,10,16,0.52);}html[data-theme="light"] .list-modal-backdrop{background:rgba(22,18,34,0.34);}.list-modal-head{gap:14px;padding:18px 20px 16px 22px;align-items:center;}.list-modal-title{flex:1 1 auto;min-width:0;margin:0;padding:0;text-indent:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.35;}.list-modal-close{flex:0 0 auto;margin:0;padding:0;}@media (max-width:420px){.list-modal-head{padding:16px 16px 14px 18px;gap:10px;}.list-modal-title{font-size:1rem;}}.summary-head h2,.person-panel-head h2,.show-cal-head h2,.modal-head h2{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}.platform-card-left{padding:8px 4px 8px 12px;}.platform-card-logo{width:48px;height:48px;}@media (min-width:768px){.platform-card-left{padding:12px 6px 12px 16px;}.platform-card-logo{width:62px;height:62px;}}.platform-card-left{padding-left:14px;padding-right:6px;}@media (min-width:768px){.platform-card-left{padding-left:18px;}}.list-modal-body{padding:18px 20px 26px;}.list-modal-body .item,.list-modal-body .cw-card{padding:10px 4px 8px;}.cw-title,.cw-watching,.cw-meta{padding-left:2px;padding-right:2px;}.item .name,.item .meta{padding-left:2px;padding-right:2px;}.platform-card-name,.theater-card-name,.list-modal .name,.list-modal .meta{padding-left:2px;padding-right:2px;}@media (min-width:600px){.cal-days-row,
+html:not([data-theme="light"]) .list-modal-panel{background:rgba(18,18,24,0.62);-webkit-backdrop-filter:blur(12px) saturate(165%) brightness(0.92);backdrop-filter:blur(12px) saturate(165%) brightness(0.92);border:1px solid rgba(255,255,255,0.14);box-shadow:0 30px 80px rgba(0,0,0,0.6),inset 0 1px 0 rgba(255,255,255,0.13);}html[data-theme="light"] .list-modal-panel{background:rgba(252,252,253,0.58);-webkit-backdrop-filter:blur(12px) saturate(165%);backdrop-filter:blur(12px) saturate(165%);border:1px solid rgba(255,255,255,0.85);box-shadow:0 30px 70px rgba(0,0,0,0.16),inset 0 1px 0 rgba(255,255,255,0.95);}.list-modal-backdrop{background:rgba(8,10,16,0.52);}html[data-theme="light"] .list-modal-backdrop{background:rgba(22,18,34,0.34);}html[data-theme="dark"] .summary-panel,
+html:not([data-theme="light"]) .summary-panel{background:rgba(22,22,28,0.85);-webkit-backdrop-filter:blur(20px) saturate(165%);backdrop-filter:blur(20px) saturate(165%);border:1px solid rgba(255,255,255,0.14);box-shadow:0 28px 80px rgba(0,0,0,0.6),inset 0 1px 0 rgba(255,255,255,0.12);}html[data-theme="light"] .summary-panel{background:rgba(255,255,255,0.8);-webkit-backdrop-filter:blur(20px) saturate(165%);backdrop-filter:blur(20px) saturate(165%);border:1px solid rgba(255,255,255,0.85);box-shadow:0 28px 70px rgba(35,22,70,0.22),inset 0 1px 0 rgba(255,255,255,0.95);}.list-modal-head{gap:14px;padding:18px 20px 16px 22px;align-items:center;}.list-modal-title{flex:1 1 auto;min-width:0;margin:0;padding:0;text-indent:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.35;}.list-modal-close{flex:0 0 auto;margin:0;padding:0;}@media (max-width:420px){.list-modal-head{padding:16px 16px 14px 18px;gap:10px;}.list-modal-title{font-size:1rem;}}.summary-head h2,.person-panel-head h2,.show-cal-head h2,.modal-head h2{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}.platform-card-left{padding:8px 4px 8px 12px;}.platform-card-logo{width:48px;height:48px;}@media (min-width:768px){.platform-card-left{padding:12px 6px 12px 16px;}.platform-card-logo{width:62px;height:62px;}}.platform-card-left{padding-left:14px;padding-right:6px;}@media (min-width:768px){.platform-card-left{padding-left:18px;}}.list-modal-body{padding:18px 20px 26px;}.list-modal-body .item,.list-modal-body .cw-card{padding:10px 4px 8px;}.cw-title,.cw-watching,.cw-meta{padding-left:2px;padding-right:2px;}.item .name,.item .meta{padding-left:2px;padding-right:2px;}.platform-card-name,.theater-card-name,.list-modal .name,.list-modal .meta{padding-left:2px;padding-right:2px;}@media (min-width:600px){.cal-days-row,
   .cal-strip{display:flex;gap:12px;overflow-x:auto;overflow-y:visible;scroll-snap-type:x proximity;touch-action:pan-x pan-y;-webkit-overflow-scrolling:touch;overscroll-behavior-x:contain;min-width:0;scrollbar-width:none;}.cal-strip::-webkit-scrollbar,
   .cal-days-row::-webkit-scrollbar{display:none;}.cal-day-col,
   .cal-strip-day{flex:0 0 auto;flex-shrink:0;width:calc(var(--poster-card-w) + 40px);min-width:calc(var(--poster-card-w) + 40px);max-width:calc(var(--poster-card-w) + 40px);box-sizing:border-box;content-visibility:visible;}}
@@ -14672,6 +14849,7 @@ button:focus-visible,a:focus-visible{outline-offset:3px;}
 }
 .btn-action:active,.load-more:active,.cal-open-btn:active,.cal-drop-btn:active{transform:scale(.96);}
 .empty{padding:28px 16px;}
+
 .empty p{opacity:.8;}
 img{color:transparent;}
 .poster-ph,.cw-poster-ph{background:linear-gradient(160deg,rgba(167,139,250,.12),rgba(255,255,255,.04));}
