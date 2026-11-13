@@ -1,4 +1,4 @@
-const APP_VERSION = "6.6.10";
+const APP_VERSION = "6.6.11";
 const APP_JS_VERSION = APP_VERSION;
 const APP_CSS_VERSION = APP_VERSION;
 const TRAKT_AUTH = "https://auth.trakt.tv";
