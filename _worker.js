@@ -1,4 +1,4 @@
-const APP_VERSION = "6.6.9";
+const APP_VERSION = "6.6.10";
 const APP_JS_VERSION = APP_VERSION;
 const APP_CSS_VERSION = APP_VERSION;
 const TRAKT_AUTH = "https://auth.trakt.tv";
@@ -8,9 +8,9 @@ const TMDB_IMG = "https://image.tmdb.org/t/p";
 const ACTIVATE_URL = "https://trakt.tv/activate";
 const OMDB_API = "https://www.omdbapi.com";
 const DOUBAN_SEARCH = "https://search.douban.com/movie/subject_search";
-const DOUBAN_API = "https://widget.v2too.top/data/douban.json";
-const THEATER_API = "https://widget.v2too.top/data/theater.json";
-const GUDUO_API = "https://widget.v2too.top/data/guduo.json";
+const DOUBAN_API = "https://raw.githubusercontent.com/MakkaPakka518/List/main/data/douban-hot.json";
+const THEATER_API = "https://raw.githubusercontent.com/MakkaPakka518/List/main/data/theater-data.json";
+const GUDUO_API = "https://raw.githubusercontent.com/MakkaPakka518/List/main/data/guduo-hot.json";
 const APP_NAME = "MineTrakt";
 const APP_SHORT_NAME = APP_NAME;
 const THEME_COLOR = "#050505";
@@ -271,11 +271,11 @@ const PROFILE_KV_TTL = 86400;
 const ENTITY_KV_TTL = 86400 * 14;
 const SEASON_KV_TTL = 86400 * 14;
 const SEASON_KV_TTL_LIVE = 86400;
-const DOUBAN_KV_TTL = 6 * 3600;
-const THEATER_KV_TTL = 6 * 3600;
-const GUDUO_KV_TTL = 6 * 3600;
+const DOUBAN_KV_TTL = 12 * 3600;
+const THEATER_KV_TTL = 12 * 3600;
+const GUDUO_KV_TTL = 12 * 3600;
 const PLATFORM_KV_TTL = 6 * 3600;
-const PUBLIC_STALE_RETENTION = 6 * 3600;
+const PUBLIC_STALE_RETENTION = 24 * 3600;
 const KV_STALE_RETENTION = 86400 * 2;
 const LAST_GOOD_KV_TTL = 86400 * 3;
 const SIG_CHECK_INTERVAL_MINUTES = 15;
@@ -4279,24 +4279,36 @@ function isUsableBoardPayload(data) {
   try {
     const keys = Object.keys(data);
     if (!keys.length) return false;
+    // 必须至少有一个非空数组（条目列表），单纯 last_updated 字符串不算有效
+    let hasItems = false;
     for (const k of keys) {
+      if (k === "last_updated" || k === "updated_at" || k === "source") continue;
       const v = data[k];
-      if (Array.isArray(v) && v.length > 0) return true;
-      if (v && typeof v === "object" && !Array.isArray(v)) {
-        const sub = Object.keys(v);
-        if (sub.length) {
-          for (const sk of sub) {
-            const sv = v[sk];
-            if (Array.isArray(sv) && sv.length > 0) return true;
-            if (sv && typeof sv === "object") return true;
-            if (sv != null && sv !== "") return true;
-          }
-        }
-      } else if (v != null && v !== "" && !Array.isArray(v)) {
-        return true;
+      if (Array.isArray(v) && v.length > 0) {
+        hasItems = true;
+        break;
       }
+      if (v && typeof v === "object" && !Array.isArray(v)) {
+        for (const sk of Object.keys(v)) {
+          const sv = v[sk];
+          if (Array.isArray(sv) && sv.length > 0) {
+            hasItems = true;
+            break;
+          }
+          if (sv && typeof sv === "object" && !Array.isArray(sv)) {
+            for (const ssk of Object.keys(sv)) {
+              if (Array.isArray(sv[ssk]) && sv[ssk].length > 0) {
+                hasItems = true;
+                break;
+              }
+            }
+          }
+          if (hasItems) break;
+        }
+      }
+      if (hasItems) break;
     }
-    return false;
+    return hasItems;
   } catch {
     return false;
   }
@@ -4345,10 +4357,34 @@ async function getBoardRaw(
     key,
     async () => {
       try {
-        const r = await fetchT(url, { headers: siteHeaders() }, 10000);
+        const headers = siteHeaders();
+        // 条件请求：有缓存 ETag 时带上，304 则复用旧数据
+        const etagKey = key + ":etag";
+        let prevEtag = null;
+        try {
+          if (env && env.TMDB_CACHE) {
+            const ev = await env.TMDB_CACHE.get(etagKey);
+            if (ev) prevEtag = ev;
+          }
+        } catch {}
+        if (prevEtag) headers["If-None-Match"] = prevEtag;
+        const r = await fetchT(url, { headers }, 10000);
+        if (r.status === 304) {
+          // 数据未变，返回 null 让 cachedJSON 走 fallback
+          return null;
+        }
         if (!r.ok) return null;
         const data = await r.json();
+        // 空数据或无效结构：返回 null，不覆盖已有 KV（兜底用旧数据）
         if (validateOnFetch && !isUsableBoardPayload(data)) return null;
+        if (!isUsableBoardPayload(data)) return null;
+        // 存 ETag 供下次条件请求
+        const etag = r.headers.get("ETag") || r.headers.get("etag");
+        if (etag && env && env.TMDB_CACHE) {
+          try {
+            env.TMDB_CACHE.put(etagKey, etag, { expirationTtl: ttl || 86400 }).catch(() => {});
+          } catch {}
+        }
         return data;
       } catch {
         return null;
@@ -4386,9 +4422,12 @@ function isHkTw(region) {
 }
 
 function mapDoubanItem(x) {
-  if (!x || !x.tmdbId) return null;
+  if (!x) return null;
+  // 兼容旧 tmdbId 和新数据的 id + type:"tmdb"
+  const tmdbId = x.tmdbId || (x.type === "tmdb" && x.id) || x.id;
+  if (!tmdbId) return null;
   return {
-    tmdbId: x.tmdbId,
+    tmdbId: String(tmdbId),
     title: x.title || "",
     year: (x.releaseDate || "").slice(0, 4),
     poster: x.posterPath
@@ -4417,21 +4456,23 @@ function pickDoubanSection(data, section, filter) {
   const typeFilter = filter || "all";
   let tvRaw = [];
   if (section === "domestic") tvRaw = collectDoubanLists(data, ["tv_domestic"]);
-  else if (section === "hktw") {
-    const all = Array.isArray(data.tv) ? data.tv : [];
-    tvRaw = all.filter((x) => isHkTw(x.regionTitle));
-  } else if (section === "jpkr")
+  else if (section === "jpkr")
     tvRaw = collectDoubanLists(data, ["tv_japanese", "tv_korean"]);
   else if (section === "western")
     tvRaw = collectDoubanLists(data, ["tv_american"]);
+  else if (section === "animation")
+    tvRaw = collectDoubanLists(data, ["tv_animation"]);
+  else if (section === "documentary")
+    tvRaw = collectDoubanLists(data, ["tv_documentary"]);
+  else if (section === "variety")
+    tvRaw = collectDoubanLists(data, ["show_domestic", "show_foreign"]);
+  else if (section === "hktw")
+    tvRaw = []; // 新数据源已无地区字段，港台暂隐藏
   else tvRaw = Array.isArray(data.tv) ? data.tv : [];
   let mvRaw = [];
   if (section === "domestic")
     mvRaw = collectDoubanLists(data, ["movie_domestic", "movies_domestic"]);
-  else if (section === "hktw") {
-    const all = collectDoubanLists(data, ["movies", "movie"]);
-    mvRaw = all.filter((x) => isHkTw(x.regionTitle));
-  } else if (section === "jpkr")
+  else if (section === "jpkr")
     mvRaw = collectDoubanLists(data, [
       "movie_japanese",
       "movie_korean",
@@ -4440,6 +4481,8 @@ function pickDoubanSection(data, section, filter) {
     ]);
   else if (section === "western")
     mvRaw = collectDoubanLists(data, ["movie_american", "movies_american"]);
+  else if (section === "hktw" || section === "animation" || section === "documentary" || section === "variety")
+    mvRaw = [];
   const seen = new Set(),
     out = [],
     MAX = 150;
@@ -4524,12 +4567,34 @@ async function handleDoubanList(request, env, ctx) {
   const filter = url.searchParams.get("filter") || "all";
   const force = url.searchParams.get("force") === "1";
   const data = await getDoubanRaw(env, ctx, force);
-  const items = pickDoubanSection(data, section, filter);
-  const html = renderDoubanItems(items);
   const outHeaders = {
     "Content-Type": CT_HTML,
     "Cache-Control": CC_NO_STORE,
   };
+  // 首页批量模式：一次返回所有区块 HTML，减少请求数
+  if (mode === "home") {
+    const sections = [
+      ["douban-domestic", "domestic"],
+      ["douban-jpkr", "jpkr"],
+      ["douban-western", "western"],
+      ["douban-animation", "animation"],
+      ["douban-variety", "variety"],
+      ["douban-documentary", "documentary"],
+    ];
+    const result = {};
+    for (const [id, sec] of sections) {
+      const items = pickDoubanSection(data, sec, filter);
+      const html = renderDoubanItems(items);
+      result[id] = html
+        ? `<div class="h-scroll">${html}</div>`
+        : "";
+    }
+    return new Response(JSON.stringify(result), {
+      headers: { "Content-Type": CT_JSON, "Cache-Control": CC_NO_STORE },
+    });
+  }
+  const items = pickDoubanSection(data, section, filter);
+  const html = renderDoubanItems(items);
   return listResp(html, mode, outHeaders);
 }
 
@@ -4560,8 +4625,14 @@ function walkNode(node, platform, out) {
   if (!node) return;
   if (Array.isArray(node)) {
     for (const x of node) {
-      if (x && typeof x === "object" && (x.tmdbId || x.tmdb_id || x.tmdbid)) {
-        out.push({ ...x, __platform: platform });
+      if (x && typeof x === "object") {
+        const tid =
+          x.tmdbId ||
+          x.tmdb_id ||
+          x.tmdbid ||
+          (x.type === "tmdb" && x.id) ||
+          x.id;
+        if (tid) out.push({ ...x, __platform: platform });
       }
     }
     return;
@@ -4631,11 +4702,16 @@ function pickTheaterSection(data, platform) {
   const seen = new Set(),
     out = [];
   for (const x of filtered) {
-    const tmdbId = x.tmdbId || x.tmdb_id || x.tmdbid;
-    if (!tmdbId || seen.has(tmdbId)) continue;
-    seen.add(tmdbId);
+    const tmdbId =
+      x.tmdbId ||
+      x.tmdb_id ||
+      x.tmdbid ||
+      (x.type === "tmdb" && x.id) ||
+      x.id;
+    if (!tmdbId || seen.has(String(tmdbId))) continue;
+    seen.add(String(tmdbId));
     out.push({
-      tmdbId: tmdbId,
+      tmdbId: String(tmdbId),
       title: x.title || x.name || x.showTitle || "",
       year: String(
         x.releaseDate ||
@@ -4652,7 +4728,10 @@ function pickTheaterSection(data, platform) {
       overview: x.description || x.overview || x.summary || "",
       platform: theaterPlatformOf(x),
       kind:
-        x.type === "movie" || x.media_type === "movie" || x.isMovie === true
+        x.mediaType === "movie" ||
+        x.type === "movie" ||
+        x.media_type === "movie" ||
+        x.isMovie === true
           ? "movie"
           : "tv",
     });
@@ -8817,7 +8896,7 @@ function renderHomeSkeleton(initialDetail, profileHint) {
       : `<span class="hero-avatar-ph">👤</span>`;
   const section = (id, title, extraHtml) =>
     `<div class="home-section"><div class="home-section-head"><h2 class="home-section-title">${title}</h2><button class="home-more-btn" type="button" onclick="openListModal('${id}')"><span>查看更多</span><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg></button></div>${extraHtml || ""}<div class="h-scroll-wrap"><div class="h-scroll" id="${id}-hscroll"><div class="pane-loading has-sk" style="padding:10px 0">${skRowHtml(4)}</div></div></div></div>`;
-  return `<div class="container"><div class="top-sticky"><header class="hero"><div class="hero-left"><button type="button" class="hero-avatar" id="hero-avatar" title="观看小结" aria-label="打开观看小结">${heroAvatarHtml}</button><div class="hero-text"><h1 class="hero-name" id="hero-name">${heroName}</h1><p class="updated-at" id="updated-at" title="最近一次有数据变化的更新"></p></div></div><div class="hero-actions"><button class="btn-action" id="btn-refresh" onclick="forceRefresh()" title="刷新观看数据（豆瓣/热榜/平台等按日缓存，到期自动更新）"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg><span>刷新</span></button><button class="btn-action" id="btn-theme" onclick="cycleTheme()" title="主题：深色" aria-label="切换主题：深色"><span class="theme-icon" id="theme-icon"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></span><span>主题</span></button><button class="btn-action" id="btn-logout" onclick="logout()" title="退出登录"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg><span>退出</span></button></div></header><!-- 累计统计在头像「观看小结」里 --></div><section id="playback" class="pane active">${section("playback", "继续观看")}<div class="home-section platform-section"><div class="home-section-head"><h2 class="home-section-title">流媒体平台</h2></div>${renderPlatformRows()}<div class="home-section theater-platform-section"><div class="home-section-head"><h2 class="home-section-title">平台剧场</h2></div>${renderTheaterPlatformRows()}</div>${section("guduo", "骨朵热榜", '<div class="theater-home-tabs" id="guduo-home-tabs" style="display:none"></div>')}${section("douban-domestic", "豆瓣热播国产剧")}${section("douban-hktw", "豆瓣热播港台剧")}${section("douban-jpkr", "豆瓣热播日韩剧")}${section("douban-western", "豆瓣热播欧美剧")}</section><section id="watchlist" class="pane"><div class="pane-loading has-sk" style="padding:18px 0">${skGridHtml(6)}<div class="loading-note">正在加载待看</div></div></section><section id="calendar" class="pane"><div class="pane-loading has-sk" style="padding:18px 0">${skGridHtml(6)}<div class="loading-note">正在加载日历</div></div></section><section id="history" class="pane"><div class="grid"></div><div id="history-more"></div></section><section id="search" class="pane"><div class="search-bar"><input id="search-input" class="search-input" type="search" placeholder="搜索电影 / 剧集" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></div><div id="search-results" class="grid"></div></section><nav class="tabs"><i class="tab-pill" id="tab-pill" aria-hidden="true"></i><button class="tab active" data-tab="playback"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9.5 21v-6h5v6"/></svg><span>首页</span></button><button class="tab" data-tab="calendar"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg><span>日历</span></button><button class="tab" data-tab="watchlist"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg><span>待看</span></button><button class="tab" data-tab="history"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/></svg><span>记录</span></button><button class="tab" data-tab="search"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg><span>搜索</span></button></nav></div><div id="list-modal" class="list-modal"><div class="list-modal-backdrop" onclick="closeListModal()"></div><div class="list-modal-panel"><div class="list-modal-head"><h3 class="list-modal-title" id="list-modal-title"></h3><button type="button" class="list-modal-close" onclick="closeListModal()" aria-label="关闭">×</button></div><div class="list-modal-body" id="list-modal-body"></div></div></div><div id="summary-modal" class="summary-modal" role="dialog" aria-modal="true" aria-label="观看小结"><div class="summary-backdrop" onclick="window.__closeSummary()"></div><div class="summary-panel"><div class="summary-head"><h2 class="summary-title">观看小结</h2><button type="button" class="summary-close" onclick="window.__closeSummary()" aria-label="关闭">×</button></div><div id="summary-modal-body" class="summary-body"><div class="pane-loading has-sk" style="padding:18px 0">${skGridHtml(3)}<div class="loading-note">正在统计</div></div></div></div></div><div id="person-modal" class="person-modal"><div class="person-backdrop" onclick="closePerson()"></div><div class="person-panel"><div class="person-panel-head"><div class="person-panel-name" id="person-modal-name"></div><button class="person-close" onclick="closePerson()" aria-label="关闭">×</button></div><div class="person-panel-body" id="person-modal-body"></div></div></div><div id="confirm-modal" class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title" style="display:none"><div class="confirm-backdrop"></div><div class="confirm-panel"><div class="confirm-icon" id="confirm-icon">?</div><div class="confirm-title" id="confirm-title"></div><div class="confirm-msg" id="confirm-msg"></div><div class="confirm-actions"><button class="confirm-btn confirm-cancel" id="confirm-cancel" type="button">取消</button><button class="confirm-btn confirm-ok" id="confirm-ok" type="button">确定</button></div></div></div><div id="modal" class="modal"><div class="modal-backdrop" onclick="closeDetail()"></div><div class="modal-panel"><div class="modal-shell"><button class="modal-close" onclick="closeDetail()" aria-label="关闭"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button><div class="modal-body" id="modal-body"></div></div></div></div><div id="show-cal-modal" class="show-cal-modal"><div class="show-cal-backdrop" onclick="closeShowCal()"></div><div class="show-cal-panel"><div class="show-cal-head"><div class="show-cal-name" id="show-cal-name"></div><button class="show-cal-close" onclick="closeShowCal()" aria-label="关闭">×</button></div><div class="show-cal-info" id="show-cal-info"></div><div class="show-cal-nav"><button onclick="calShiftMonth(-1)" aria-label="上个月">‹</button><div id="show-cal-month">—</div><button onclick="calShiftMonth(1)" aria-label="下个月">›</button></div><div class="show-cal-weekdays"><span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span></div><div class="show-cal-grid" id="show-cal-grid"></div><div class="show-cal-legend"><span class="legend-item"><i class="legend-dot legend-past"></i>已播出</span><span class="legend-item"><i class="legend-dot legend-today"></i>今天</span><span class="legend-item"><i class="legend-dot legend-future"></i>待播出</span></div><div class="show-cal-detail" id="show-cal-detail"></div></div></div><script src="/app.js?v=${APP_JS_VERSION}" defer><\/script>${boot}`;
+  return `<div class="container"><div class="top-sticky"><header class="hero"><div class="hero-left"><button type="button" class="hero-avatar" id="hero-avatar" title="观看小结" aria-label="打开观看小结">${heroAvatarHtml}</button><div class="hero-text"><h1 class="hero-name" id="hero-name">${heroName}</h1><p class="updated-at" id="updated-at" title="最近一次有数据变化的更新"></p></div></div><div class="hero-actions"><button class="btn-action" id="btn-refresh" onclick="forceRefresh()" title="刷新观看数据（豆瓣/热榜/平台等按日缓存，到期自动更新）"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg><span>刷新</span></button><button class="btn-action" id="btn-theme" onclick="cycleTheme()" title="主题：深色" aria-label="切换主题：深色"><span class="theme-icon" id="theme-icon"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></span><span>主题</span></button><button class="btn-action" id="btn-logout" onclick="logout()" title="退出登录"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg><span>退出</span></button></div></header><!-- 累计统计在头像「观看小结」里 --></div><section id="playback" class="pane active">${section("playback", "继续观看")}<div class="home-section platform-section"><div class="home-section-head"><h2 class="home-section-title">流媒体平台</h2></div>${renderPlatformRows()}<div class="home-section theater-platform-section"><div class="home-section-head"><h2 class="home-section-title">平台剧场</h2></div>${renderTheaterPlatformRows()}</div>${section("guduo", "骨朵热榜", '<div class="theater-home-tabs" id="guduo-home-tabs" style="display:none"></div>')}${section("douban-domestic", "豆瓣热播国产剧")}${section("douban-jpkr", "豆瓣热播日韩剧")}${section("douban-western", "豆瓣热播欧美剧")}${section("douban-animation", "豆瓣热播动画")}${section("douban-variety", "豆瓣热播综艺")}${section("douban-documentary", "豆瓣热播纪录片")}</section><section id="watchlist" class="pane"><div class="pane-loading has-sk" style="padding:18px 0">${skGridHtml(6)}<div class="loading-note">正在加载待看</div></div></section><section id="calendar" class="pane"><div class="pane-loading has-sk" style="padding:18px 0">${skGridHtml(6)}<div class="loading-note">正在加载日历</div></div></section><section id="history" class="pane"><div class="grid"></div><div id="history-more"></div></section><section id="search" class="pane"><div class="search-bar"><input id="search-input" class="search-input" type="search" placeholder="搜索电影 / 剧集" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></div><div id="search-results" class="grid"></div></section><nav class="tabs"><i class="tab-pill" id="tab-pill" aria-hidden="true"></i><button class="tab active" data-tab="playback"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9.5 21v-6h5v6"/></svg><span>首页</span></button><button class="tab" data-tab="calendar"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg><span>日历</span></button><button class="tab" data-tab="watchlist"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg><span>待看</span></button><button class="tab" data-tab="history"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/></svg><span>记录</span></button><button class="tab" data-tab="search"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg><span>搜索</span></button></nav></div><div id="list-modal" class="list-modal"><div class="list-modal-backdrop" onclick="closeListModal()"></div><div class="list-modal-panel"><div class="list-modal-head"><h3 class="list-modal-title" id="list-modal-title"></h3><button type="button" class="list-modal-close" onclick="closeListModal()" aria-label="关闭">×</button></div><div class="list-modal-body" id="list-modal-body"></div></div></div><div id="summary-modal" class="summary-modal" role="dialog" aria-modal="true" aria-label="观看小结"><div class="summary-backdrop" onclick="window.__closeSummary()"></div><div class="summary-panel"><div class="summary-head"><h2 class="summary-title">观看小结</h2><button type="button" class="summary-close" onclick="window.__closeSummary()" aria-label="关闭">×</button></div><div id="summary-modal-body" class="summary-body"><div class="pane-loading has-sk" style="padding:18px 0">${skGridHtml(3)}<div class="loading-note">正在统计</div></div></div></div></div><div id="person-modal" class="person-modal"><div class="person-backdrop" onclick="closePerson()"></div><div class="person-panel"><div class="person-panel-head"><div class="person-panel-name" id="person-modal-name"></div><button class="person-close" onclick="closePerson()" aria-label="关闭">×</button></div><div class="person-panel-body" id="person-modal-body"></div></div></div><div id="confirm-modal" class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title" style="display:none"><div class="confirm-backdrop"></div><div class="confirm-panel"><div class="confirm-icon" id="confirm-icon">?</div><div class="confirm-title" id="confirm-title"></div><div class="confirm-msg" id="confirm-msg"></div><div class="confirm-actions"><button class="confirm-btn confirm-cancel" id="confirm-cancel" type="button">取消</button><button class="confirm-btn confirm-ok" id="confirm-ok" type="button">确定</button></div></div></div><div id="modal" class="modal"><div class="modal-backdrop" onclick="closeDetail()"></div><div class="modal-panel"><div class="modal-shell"><button class="modal-close" onclick="closeDetail()" aria-label="关闭"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button><div class="modal-body" id="modal-body"></div></div></div></div><div id="show-cal-modal" class="show-cal-modal"><div class="show-cal-backdrop" onclick="closeShowCal()"></div><div class="show-cal-panel"><div class="show-cal-head"><div class="show-cal-name" id="show-cal-name"></div><button class="show-cal-close" onclick="closeShowCal()" aria-label="关闭">×</button></div><div class="show-cal-info" id="show-cal-info"></div><div class="show-cal-nav"><button onclick="calShiftMonth(-1)" aria-label="上个月">‹</button><div id="show-cal-month">—</div><button onclick="calShiftMonth(1)" aria-label="下个月">›</button></div><div class="show-cal-weekdays"><span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span></div><div class="show-cal-grid" id="show-cal-grid"></div><div class="show-cal-legend"><span class="legend-item"><i class="legend-dot legend-past"></i>已播出</span><span class="legend-item"><i class="legend-dot legend-today"></i>今天</span><span class="legend-item"><i class="legend-dot legend-future"></i>待播出</span></div><div class="show-cal-detail" id="show-cal-detail"></div></div></div><script src="/app.js?v=${APP_JS_VERSION}" defer><\/script>${boot}`;
 }
 
 async function handleDetailExtras(request, env, ctx) {
@@ -12742,6 +12821,7 @@ document.addEventListener('click',function(e){
     var week=tab.dataset.week;
     document.querySelectorAll('.cal-week-tab').forEach(function(x){x.classList.toggle('is-on',x===tab);});
     document.querySelectorAll('.cal-week-panel').forEach(function(p){p.classList.toggle('is-on',p.dataset.week===week);});
+    if(week==='this'&&window.scrollCalendarToToday)window.scrollCalendarToToday({force:true});
     return;
   }
   var dayBtn=e.target.closest('.cal-strip-day');
@@ -12753,7 +12833,7 @@ document.addEventListener('click',function(e){
   if(!col)return;
   var row=col.closest('.cal-days-row');
   if(row&&row.scrollWidth>row.clientWidth+2){
-    row.scrollTo({left:Math.max(0,col.offsetLeft-12),behavior:'smooth'});
+    __calScrollColIntoView(col,{force:true,align:'start'});
   }else{
     var headerH=document.querySelector('.top-sticky')?document.querySelector('.top-sticky').offsetHeight:60;
     var top=col.getBoundingClientRect().top+window.pageYOffset-headerH-12;
@@ -13029,38 +13109,140 @@ function __maybeShowEmpty(pane){if(!pane)return;setTimeout(function(){if(pane.qu
 function __partHtml(d){return d?String((d.watchlistHtml||'')+(d.calendarHtml||'')+(d.historyHtml||'')):'';}
 function __partFailed(d){if(!d)return true;var h=__partHtml(d);if(!h&&d.historyMoreHtml==null)return true;return /暂时无法加载/.test(h);}
 
-window.scrollCalendarToToday=function(){
-  function run(){
-    var todayCol=document.querySelector('.cal-day-col.is-today');
-    if(!todayCol)return false;
-    var row=todayCol.closest('.cal-days-row');
-    var isMobile=window.innerWidth<=767;
-    if(isMobile||!row||row.scrollWidth<=row.clientWidth+2){
-      var headerH=0;
-      var sticky=document.querySelector('.top-sticky');
-      if(sticky)headerH=sticky.offsetHeight||0;
-      var top=todayCol.getBoundingClientRect().top+window.pageYOffset-headerH-12;
-      window.scrollTo({top:Math.max(0,top),behavior:'smooth'});
-    }else{
-      var colLeft=todayCol.offsetLeft;
-      var colW=todayCol.offsetWidth;
-      var rowW=row.clientWidth;
-      var target=colLeft-Math.max(12,rowW/2-colW/2);
-      row.scrollTo({left:Math.max(0,target),behavior:'smooth'});
-      var headerH=0;
-      var sticky=document.querySelector('.top-sticky');
-      if(sticky)headerH=sticky.offsetHeight||0;
-      var top=row.getBoundingClientRect().top+window.pageYOffset-headerH-12;
-      if(top>80)window.scrollTo({top:Math.max(0,top),behavior:'smooth'});
+/* ==== 日历「今天」自动保持可见（含宽屏横向滚动） ==== */
+function __calReduceMotion(){
+  try{return !!(window.matchMedia&&window.matchMedia('(prefers-reduced-motion:reduce)').matches);}catch(e){return false;}
+}
+// 从今天那一列向上找真正的横向滚动容器（行本身、或任何祖先 overflow-x:auto/scroll）
+function __calScrollerOf(el){
+  if(!el)return null;
+  var node=el.parentElement;
+  while(node&&node!==document.body&&node!==document.documentElement){
+    var ox='';
+    try{ox=window.getComputedStyle(node).overflowX;}catch(e){}
+    if((ox==='auto'||ox==='scroll'||ox==='overlay')&&node.scrollWidth>node.clientWidth+2)return node;
+    node=node.parentElement;
+  }
+  var row=el.closest?el.closest('.cal-days-row'):null;
+  if(row&&row.scrollWidth>row.clientWidth+2)return row;
+  return null;
+}
+// 记录用户手动横向滚动的时间，避免自动对齐跟用户抢滚动位置
+var __calUserScrollAt=0;
+try{
+  document.addEventListener('scroll',function(e){
+    var t=e.target;
+    if(!t||!t.classList)return;
+    if(t.classList.contains('cal-days-row')||t.classList.contains('cal-strip')){
+      if(!t.__calAuto)__calUserScrollAt=Date.now();
+    }
+  },true);
+}catch(e){}
+// 把某一列（或日期条上的某一天）滚到可见位置；已完整可见时不动，避免每次刷新都跳
+function __calScrollColIntoView(el,opts){
+  opts=opts||{};
+  if(!el)return false;
+  var cr=el.getBoundingClientRect();
+  if(!cr||!cr.width)return false;
+  var sc=__calScrollerOf(el);
+  if(!sc){
+    // 没有横向滚动（窄屏竖排）：退化成整页纵向滚动到今天
+    if(opts.noPageScroll)return false;
+    var sticky=document.querySelector('.top-sticky');
+    var headerH=sticky?(sticky.offsetHeight||0):0;
+    var cur=window.pageYOffset||document.documentElement.scrollTop||0;
+    var topY=cr.top+cur-headerH-12;
+    if(Math.abs(cur-Math.max(0,topY))>4){
+      try{window.scrollTo({top:Math.max(0,topY),behavior:__calReduceMotion()?'auto':'smooth'});}
+      catch(e){window.scrollTo(0,Math.max(0,topY));}
     }
     return true;
   }
-  if(!run()){
-    setTimeout(run,120);
-    setTimeout(run,400);
+  var sr=sc.getBoundingClientRect();
+  var fullyVisible=cr.left>=sr.left-1&&cr.right<=sr.right+1;
+  if(fullyVisible&&!opts.force)return true;
+  var pad=12;
+  var curLeft=sc.scrollLeft;
+  var left=cr.left-sr.left+curLeft;
+  var maxLeft=Math.max(0,sc.scrollWidth-sc.clientWidth);
+  var target=opts.align==='start'
+    ? left-pad
+    : left-Math.max(pad,(sc.clientWidth-cr.width)/2);
+  target=Math.min(maxLeft,Math.max(0,target));
+  if(Math.abs(target-curLeft)<2&&!opts.force)return true;
+  try{sc.__calAuto=true;setTimeout(function(){sc.__calAuto=false;},900);}catch(e){}
+  try{sc.scrollTo({left:target,behavior:__calReduceMotion()?'auto':'smooth'});}
+  catch(e){sc.scrollLeft=target;}
+  // smooth 被忽略、或滚动过程中布局再次变化时兜底校正
+  try{clearTimeout(sc.__calFixT);}catch(e){}
+  try{
+    sc.__calFixT=setTimeout(function(){
+      var c2=el.getBoundingClientRect(),s2=sc.getBoundingClientRect();
+      if(c2.left<s2.left-2||c2.right>s2.right+2){
+        try{sc.scrollTo({left:target,behavior:'auto'});}catch(e){sc.scrollLeft=target;}
+      }
+    },420);
+  }catch(e){}
+  return true;
+}
+function __calTodayCol(){
+  var on=document.querySelectorAll('.cal-week-panel.is-on .cal-day-col.is-today');
+  if(on&&on.length)return on[0];
+  var any=document.querySelectorAll('.cal-day-col.is-today');
+  return any&&any.length?any[0]:null;
+}
+// 兼容旧调用：window.scrollCalendarToToday() / ({force:true,delay:100})
+window.scrollCalendarToToday=function(opts){
+  opts=opts||{};
+  var tries=0,maxTries=opts.attempts||8;
+  function tick(){
+    var pane=document.getElementById('calendar');
+    if(!pane||!pane.classList.contains('active')){
+      // 不在日历页时不做无谓的滚动；但如果强制要求，则仍尝试
+      if(!opts.force){return;}
+    }
+    if(opts.respectUser&&Date.now()-__calUserScrollAt<4000)return;
+    var col=__calTodayCol();
+    if(!col){
+      if(++tries<maxTries)setTimeout(tick,120+tries*80);
+      return;
+    }
+    var panel=col.closest('.cal-week-panel');
+    if(panel&&!panel.classList.contains('is-on'))return; // 用户正在看上周/下周，不抢滚动
+    var ok=__calScrollColIntoView(col,{force:!!opts.force});
+    // 顶部日期条也跟到今天
+    var chip=document.querySelector('.cal-week-panel.is-on .cal-strip-day.is-today');
+    if(chip)__calScrollColIntoView(chip,{noPageScroll:true});
+    if(!ok&&++tries<maxTries)setTimeout(tick,150);
   }
+  if(opts.delay)setTimeout(tick,opts.delay);else tick();
 };
-function __applyPart(part,d){if(!d)return false;if(part==='watchlist'){if(d.watchlistHtml)__setHTML('#watchlist',d.watchlistHtml);}else if(part==='calendar'){try{d.__fetchedAt=Date.now();}catch(e){}if(d.calendarHtml){__setHTML('#calendar',d.calendarHtml);try{var dropped=JSON.parse(localStorage.getItem('mt:dropped')||'[]');if(Array.isArray(dropped)&&dropped.length){var cal=document.getElementById('calendar');if(cal)dropped.forEach(function(did){cal.querySelectorAll('[data-drop-show-id="'+did+'"]').forEach(function(b){var card=b.closest('.item');if(card){var day=card.closest('.day');card.remove();if(day&&!day.querySelector('.item'))day.remove();}});});}}catch(e){}try{if(window.__scheduleCalAirTick)window.__scheduleCalAirTick();}catch(e){}try{if(window.scrollCalendarToToday)window.scrollCalendarToToday();setTimeout(function(){var todayCol=document.querySelector('.cal-day-col.is-today');if(!todayCol)return;var row=todayCol.closest('.cal-days-row');if(!row)return;var isMobile=window.innerWidth<=767;if(isMobile){var headerH=document.querySelector('.top-sticky')?document.querySelector('.top-sticky').offsetHeight:60;var top=todayCol.getBoundingClientRect().top+window.pageYOffset-headerH-12;window.scrollTo({top:Math.max(0,top),behavior:'smooth'});}else{var colLeft=todayCol.offsetLeft;var colW=todayCol.offsetWidth;var rowW=row.clientWidth;var scrollTo=colLeft-rowW/2+colW/2;row.scrollTo({left:Math.max(0,scrollTo),behavior:'smooth'});}},150);}catch(e){}}}else if(part==='history'){if(d.historyHtml)__setHTML('#history .grid',d.historyHtml);if(d.historyMoreHtml!=null)__setHTML('#history-more',d.historyMoreHtml);}else{return false;}if(window.__scheduleEnrich)window.__scheduleEnrich();return true;}
+// 首次进入 / 窗口尺寸变化 / 布局变化时自动对齐
+(function(){
+  var t=null;
+  function kick(delay,opts){
+    if(t)clearTimeout(t);
+    t=setTimeout(function(){
+      if(window.scrollCalendarToToday)window.scrollCalendarToToday(opts||{attempts:3});
+    },delay||120);
+  }
+  function boot(){kick(120,{attempts:4});setTimeout(function(){kick(0,{attempts:4});},700);}
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot);
+  else boot();
+  window.addEventListener('load',function(){kick(150,{attempts:3});});
+  window.addEventListener('resize',function(){kick(180,{attempts:3,respectUser:true});});
+  window.addEventListener('orientationchange',function(){kick(320,{attempts:3,respectUser:true});});
+  try{
+    if(window.ResizeObserver){
+      var ro=new ResizeObserver(function(){kick(150,{attempts:2,respectUser:true});});
+      var pane=document.getElementById('calendar');
+      if(pane)ro.observe(pane);
+      var row=document.querySelector('.cal-days-row');
+      if(row)ro.observe(row);
+    }
+  }catch(e){}
+})();
+function __applyPart(part,d){if(!d)return false;if(part==='watchlist'){if(d.watchlistHtml)__setHTML('#watchlist',d.watchlistHtml);}else if(part==='calendar'){try{d.__fetchedAt=Date.now();}catch(e){}if(d.calendarHtml){__setHTML('#calendar',d.calendarHtml);try{var dropped=JSON.parse(localStorage.getItem('mt:dropped')||'[]');if(Array.isArray(dropped)&&dropped.length){var cal=document.getElementById('calendar');if(cal)dropped.forEach(function(did){cal.querySelectorAll('[data-drop-show-id="'+did+'"]').forEach(function(b){var card=b.closest('.item');if(card){var day=card.closest('.day');card.remove();if(day&&!day.querySelector('.item'))day.remove();}});});}}catch(e){}try{if(window.__scheduleCalAirTick)window.__scheduleCalAirTick();}catch(e){}try{if(window.scrollCalendarToToday)window.scrollCalendarToToday({delay:60,attempts:6});}catch(e){}}}else if(part==='history'){if(d.historyHtml)__setHTML('#history .grid',d.historyHtml);if(d.historyMoreHtml!=null)__setHTML('#history-more',d.historyMoreHtml);}else{return false;}if(window.__scheduleEnrich)window.__scheduleEnrich();return true;}
 window.__applyPart=__applyPart;window.__partFailed=__partFailed;
 var __PART_LS={watchlist:'mt:wl',calendar:'mt:cal',history:'mt:hist'};
 var __PART_SNAP_TTL=259200;
@@ -13628,9 +13810,11 @@ var __listModalSections={
   guduo:{title:'骨朵热榜',kind:'tabsGrid',tabsApi:'/api/guduo-list?mode=categories',tabsKey:'categories',tabsParam:'category',noAll:true,defaultCat:'剧集',listApi:function(cat){return '/api/guduo-list?mode=grid&category='+encodeURIComponent(cat||'剧集');},gridId:'guduo-grid',tabsId:'guduo-filter-tabs'},
   theater:{title:'平台剧场',kind:'simpleGrid',listApi:function(){return '/api/theater-list?platform=all&mode=grid';},gridId:'theater-grid'},
   'douban-domestic':{title:'豆瓣热播国产剧',kind:'simpleGrid',listApi:function(){return '/api/douban-list?section=domestic&mode=grid';},gridId:'douban-modal-grid'},
-  'douban-hktw':{title:'豆瓣热播港台剧',kind:'simpleGrid',listApi:function(){return '/api/douban-list?section=hktw&mode=grid';},gridId:'douban-modal-grid'},
   'douban-jpkr':{title:'豆瓣热播日韩剧',kind:'simpleGrid',listApi:function(){return '/api/douban-list?section=jpkr&mode=grid';},gridId:'douban-modal-grid'},
-  'douban-western':{title:'豆瓣热播欧美剧',kind:'simpleGrid',listApi:function(){return '/api/douban-list?section=western&mode=grid';},gridId:'douban-modal-grid'}
+  'douban-western':{title:'豆瓣热播欧美剧',kind:'simpleGrid',listApi:function(){return '/api/douban-list?section=western&mode=grid';},gridId:'douban-modal-grid'},
+  'douban-animation':{title:'豆瓣热播动画',kind:'simpleGrid',listApi:function(){return '/api/douban-list?section=animation&mode=grid';},gridId:'douban-modal-grid'},
+  'douban-documentary':{title:'豆瓣热播纪录片',kind:'simpleGrid',listApi:function(){return '/api/douban-list?section=documentary&mode=grid';},gridId:'douban-modal-grid'},
+  'douban-variety':{title:'豆瓣热播综艺',kind:'simpleGrid',listApi:function(){return '/api/douban-list?section=variety&mode=grid';},gridId:'douban-modal-grid'}
 };
 function __openSimpleGridModal(body,cfg){
   var gid=cfg.gridId||'list-modal-grid';
@@ -13930,11 +14114,36 @@ async function __loadHScroll(elId,url,keepId){
 }
 async function loadGuduoHScroll(category,force){category=category||'剧集';return __loadHScroll('guduo-hscroll','/api/guduo-list?mode=hscroll&category='+encodeURIComponent(category)+(force?'&force=1':''));}async function loadGuduoHomeTabs(){var tabsBox=document.getElementById('guduo-home-tabs');if(!tabsBox||tabsBox.dataset.loaded==='1')return;try{var r=await fetch('/api/guduo-list?mode=categories');var d=r.ok?await r.json():{categories:[]};var cats=(d&&d.categories)||[];var cnts=(d&&d.counts)||{};cats=cats.length?cats:['剧集','电影','动漫','综艺'];var first=-1;for(var k=0;k<cats.length;k++){if(!(typeof cnts[cats[k]]==='number'&&cnts[cats[k]]<=0)){first=k;break;}}if(first<0)first=0;var html='';for(var i=0;i<cats.length;i++){var p=cats[i];var emp=(typeof cnts[p]==='number'&&cnts[p]<=0);html+='<button class="theater-filter-tab'+(i===first?' active':'')+(emp?' is-empty':'')+'" data-category="'+__esc(p)+'"'+(emp?' title="今日暂无数据"':'')+'>'+__esc(p)+'</button>';}tabsBox.innerHTML=html;tabsBox.style.display='';tabsBox.dataset.loaded='1';tabsBox.addEventListener('click',function(e){var btn=e.target.closest('.theater-filter-tab');if(!btn)return;tabsBox.querySelectorAll('.theater-filter-tab').forEach(function(b){b.classList.remove('active');});btn.classList.add('active');loadGuduoHScroll(btn.getAttribute('data-category')||'剧集');});}catch(e){}}
 (function(){
-  var sections=[['douban-domestic','domestic'],['douban-hktw','hktw'],['douban-jpkr','jpkr'],['douban-western','western']];
+  var sections=[['douban-domestic','domestic'],['douban-jpkr','jpkr'],['douban-western','western'],['douban-animation','animation'],['douban-variety','variety'],['douban-documentary','documentary']];
   var __boardQ=[];
   var __boardActive=0;
   var BOARD_MAX_ACTIVE=3;
   var BOARD_GAP_MS=60;
+  // 首页豆瓣区块批量加载（1 次请求拿全部）
+  var __doubanHomeLoaded=false;
+  async function loadDoubanHome(force){
+    if(!force && __doubanHomeLoaded)return;
+    try{
+      var r=await fetch('/api/douban-list?mode=home'+(force?'&force=1':''));
+      if(!r.ok)throw new Error('bad');
+      var map=await r.json();
+      for(var i=0;i<sections.length;i++){
+        var id=sections[i][0];
+        var el=document.getElementById(id+'-hscroll');
+        if(!el)continue;
+        var html=map[id]||'';
+        if(!html){el.innerHTML='<div class="h-scroll-empty"><p>暂无内容</p></div>';continue;}
+        el.outerHTML=html.replace('class="h-scroll"','class="h-scroll" id="'+id+'-hscroll"');
+      }
+      __doubanHomeLoaded=true;
+      if(window.__scheduleEnrich)window.__scheduleEnrich();
+    }catch(e){
+      for(var j=0;j<sections.length;j++){
+        var el2=document.getElementById(sections[j][0]+'-hscroll');
+        if(el2)el2.innerHTML='<div class="h-scroll-empty"><p>加载失败，请稍后重试</p></div>';
+      }
+    }
+  }
   function __runBoardQ(){
     while(__boardActive<BOARD_MAX_ACTIVE && __boardQ.length){
       var job=__boardQ.shift();
@@ -13951,7 +14160,8 @@ async function loadGuduoHScroll(category,force){category=category||'剧集';retu
   function enqueue(fn){__boardQ.push(fn);__runBoardQ();}
   function loadOne(id,section,force){
     return function(){
-      return __loadHScroll(id+'-hscroll','/api/douban-list?section='+section+'&mode=hscroll'+(force?'&force=1':''),true);
+      // 首页走批量接口，一次拿全部区块
+      return loadDoubanHome(!!force);
     };
   }
   function loadGuduoBundle(force){
