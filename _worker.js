@@ -1,4 +1,4 @@
-const APP_VERSION = "6.6.12";
+const APP_VERSION = "6.7.0";
 const APP_JS_VERSION = APP_VERSION;
 const APP_CSS_VERSION = APP_VERSION;
 const TRAKT_AUTH = "https://auth.trakt.tv";
@@ -278,7 +278,9 @@ const PLATFORM_KV_TTL = 6 * 3600;
 const PUBLIC_STALE_RETENTION = 24 * 3600;
 const KV_STALE_RETENTION = 86400 * 2;
 const LAST_GOOD_KV_TTL = 86400 * 3;
-const SIG_CHECK_INTERVAL_MINUTES = 15;
+// 「检查签名有没有变」的节奏：原来 15 分钟太钝，刚看完一集要等一刻钟才反映。
+// 3 分钟一次静默检查（带 live=1 真拉 /sync/last_activities），对 Trakt 额度无压力。
+const SIG_CHECK_INTERVAL_MINUTES = 3;
 const HOME_AUTO_REFRESH_MINUTES = SIG_CHECK_INTERVAL_MINUTES;
 const PLAYBACK_FRESH_SEC = SIG_CHECK_INTERVAL_MINUTES * 60;
 const CC_NO_STORE = "no-store";
@@ -2133,7 +2135,7 @@ function handleServiceWorker() {
   });
 }
 
-async function requireAuth(request, env) {
+async function requireAuth(request, env, ctx) {
   const cookieAuth = readAuth(request);
   if (!cookieAuth) return { ok: false };
   const ck = cookieAuth.__ck || { ver: 1, payload: null, sig: null };
@@ -2141,7 +2143,7 @@ async function requireAuth(request, env) {
 
     if (cookieSigHex(ck.payload) !== ck.sig) return { ok: false };
   }
-  const auth = await refreshIfNeeded(cookieAuth, env);
+  const auth = await refreshIfNeeded(cookieAuth, env, ctx);
   if (!auth) return { ok: false };
   return {
     ok: true,
@@ -2161,7 +2163,7 @@ async function authed(
   ctx,
   { html: wantHtml = false, strict = false } = {},
 ) {
-  const a = await requireAuth(request, env);
+  const a = await requireAuth(request, env, ctx);
   if (!a.ok) {
     return {
       ok: false,
@@ -2635,6 +2637,16 @@ async function handlePoll(request, env, ctx) {
         );
         kvRemember(CK.stats(userKey), { data: meStats, _ts: nowTs });
       }
+      // 登录成功就把 token 写进共享副本：之后任何 isolate 续期前先看这里，
+      // 避免多个请求拿同一个一次性 refresh_token 去换、把彼此弄成 invalid_grant。
+      puts.push(
+        writeSharedToken(env, ctx, traktId, {
+          access_token: at,
+          refresh_token: rt,
+          expires_at: Number(auth.expires_at) || 0,
+          trakt_id: traktId,
+        }),
+      );
     }
     if (rt) kvRemember(CK.uidRt(rt.slice(0, 32)), traktId);
     if (at) kvRemember(CK.uidAt(at.slice(0, 24)), traktId);
@@ -2714,7 +2726,7 @@ async function handleLogout(request, env, ctx) {
     const cookieAuth = readAuth(request);
     if (cookieAuth && env) {
       const auth =
-        (await refreshIfNeeded(cookieAuth, env).catch(() => null)) ||
+        (await refreshIfNeeded(cookieAuth, env, ctx).catch(() => null)) ||
         cookieAuth;
       const headers = makeTraktHeaders(env, auth);
       const userKey = await getStableUserId(auth, headers, env, ctx).catch(
@@ -2727,7 +2739,11 @@ async function handleLogout(request, env, ctx) {
           CK.stats(userKey),
           CK.history(userKey, 1),
           CK.watchlistVersion(userKey),
-        ];
+          // 顺手清掉 KV 里的共享 token 副本，避免「登出后又被自动续回来」的错觉
+          auth && auth.trakt_id
+            ? TOKEN_SHARED_PREFIX + auth.trakt_id
+            : null,
+        ].filter(Boolean);
         const p = Promise.all(
           fixedKeys.map((k) => env.TMDB_CACHE.delete(k).catch(() => {})),
         );
@@ -2793,10 +2809,65 @@ function readAuth(request) {
   }
 }
 
-async function refreshIfNeeded(auth, env) {
+// Trakt 的 access_token 有效期约 3 个月，但 refresh_token 是「一次性」的：
+// 每刷新一次，旧的 refresh_token 立刻作废。原来的续期逻辑有三个坑：
+//   1) 提前 30 分钟就续期，页面一开就并发好几个请求，每个都去刷新 →
+//      只有第一个成功，其余全部 invalid_grant；
+//   2) 续期失败后仍然拿过期 token 继续请求，于是所有接口 401，
+//      数据永久停在旧缓存，界面上却只看到「已回退到上次成功的数据」；
+//   3) 新 token 只活在当前 isolate 的内存/浏览器 cookie 里，别的 isolate
+//      还在拿旧 refresh_token 重试，继续把后续刷新也弄废。
+// 结果就是：怎么点刷新都不动，只有重新登录（换一套新 token）才恢复。
+const TOKEN_EARLY_REFRESH_MS = 24 * 3600 * 1000;
+const TOKEN_SHARED_PREFIX = "tk:u:";
+
+async function readSharedToken(env, traktId) {
+  if (!traktId || !env || !env.TMDB_CACHE || kvIsDown()) return null;
+  try {
+    const raw = await env.TMDB_CACHE.get(TOKEN_SHARED_PREFIX + traktId, {
+      type: "json",
+    });
+    if (!raw || raw.miss) return null;
+    const v = raw.data !== undefined ? raw.data : raw;
+    if (!v || !v.access_token) return null;
+    return v;
+  } catch {
+    return null;
+  }
+}
+
+async function writeSharedToken(env, ctx, traktId, t) {
+  if (!traktId || !env || !env.TMDB_CACHE || kvIsDown()) return;
+  try {
+    const left = Math.ceil((Number(t.expires_at) - Date.now()) / 1000);
+    if (!Number.isFinite(left) || left < 120) return;
+    await env.TMDB_CACHE.put(
+      TOKEN_SHARED_PREFIX + traktId,
+      JSON.stringify({ data: t, _ts: Date.now() }),
+      { expirationTtl: Math.min(left, 86400 * 30) },
+    );
+  } catch {}
+}
+
+async function refreshIfNeeded(auth, env, ctx) {
   if (!auth || !auth.access_token) return auth;
   const knownBad = tokenIsKnownBad(auth.access_token);
-  if (!knownBad && auth.expires_at - Date.now() > 30 * 60_000) return auth;
+  if (!knownBad && Number(auth.expires_at) - Date.now() > TOKEN_EARLY_REFRESH_MS)
+    return auth;
+
+  // 先看是否已经有别的请求 / 别的 isolate 换好了新 token。
+  // refresh_token 一次性，能复用就绝不再刷第二次。
+  const shared = await readSharedToken(env, auth.trakt_id);
+  if (shared && Number(shared.expires_at) - Date.now() > 5 * 60_000) {
+    __badTokens.delete(String(auth.access_token || "").slice(0, 24));
+    return {
+      ...auth,
+      access_token: shared.access_token,
+      refresh_token: shared.refresh_token || auth.refresh_token,
+      expires_at: Number(shared.expires_at),
+    };
+  }
+
   if (!auth.refresh_token) return auth;
 
   const rk = String(auth.refresh_token).slice(0, 24);
@@ -2822,10 +2893,31 @@ async function refreshIfNeeded(auth, env) {
       );
     } catch {
 
+      // 网络抖动：保留旧 token，下次请求再试
       return auth;
     }
-    if (!res.ok) return auth;
-    const data = await res.json();
+    if (!res.ok) {
+      // 4xx = refresh_token 已被轮换或用户在 Trakt 侧撤销授权，重试无意义。
+      // 先再读一次共享副本（可能刚才另一个请求刚好换成功了）。
+      if (res.status >= 400 && res.status < 500) {
+        const again = await readSharedToken(env, auth.trakt_id);
+        if (again && Number(again.expires_at) > Date.now() + 60_000) {
+          __badTokens.delete(String(auth.access_token || "").slice(0, 24));
+          return {
+            ...auth,
+            access_token: again.access_token,
+            refresh_token: again.refresh_token || auth.refresh_token,
+            expires_at: Number(again.expires_at),
+          };
+        }
+        // 真失效：返回 null，让上层明确 401 并提示重新登录，
+        // 而不是拿过期 token 继续跑出一堆「已回退到旧数据」。
+        return null;
+      }
+      // 5xx：Trakt 侧临时故障，保留旧 token
+      return auth;
+    }
+    const data = await res.json().catch(() => null);
     if (!data || !data.access_token) return auth;
     const next = {
       access_token: data.access_token,
@@ -2836,6 +2928,10 @@ async function refreshIfNeeded(auth, env) {
     };
 
     __badTokens.delete(String(auth.access_token || "").slice(0, 24));
+    // 立刻写共享副本：并发请求和其它 isolate 直接复用，不再二次刷新
+    try {
+      await writeSharedToken(env, ctx, auth.trakt_id, next);
+    } catch {}
     return next;
   })();
   __refreshInflight.set(rk, task);
@@ -3927,15 +4023,24 @@ function mergeContinueLists(
   pushList(localAiredList);
   pushList(upNextList);
   out.sort((a, b) => {
-    // 排序规则：继续观看（真实观看记录 / 刚播完）全部在前，按时间倒序；
-    // 「即将播出」永远排在最后，组内按开播时间正序（越早开播越靠前）。
-    const up = (x) => !!(x && x.__localUpcoming);
-    if (up(a) !== up(b)) return up(a) ? 1 : -1;
-    if (up(a) && up(b)) {
-      const fa = Date.parse(a.__firstAired || a.paused_at || "") || 0;
-      const fb = Date.parse(b.__firstAired || b.paused_at || "") || 0;
-      return fa - fb;
-    }
+    // 分三段排序：
+    //   0 = 继续观看（真实观看记录），按观看时间倒序
+    //   1 = 正在播出 / 刚播完（日历推送），按播出时间倒序
+    //   2 = 即将播出（日历推送），按开播时间正序（越早开播越靠前）
+    // 日历推送的条目永远排在真实观看记录之后。
+    const rank = (x) => {
+      if (!x) return 0;
+      if (x.__localUpcoming) return 2;
+      if (x.__localAired) return 1;
+      return 0;
+    };
+    const ra = rank(a);
+    const rb = rank(b);
+    if (ra !== rb) return ra - rb;
+    const fa = Date.parse(a.__firstAired || a.paused_at || "") || 0;
+    const fb = Date.parse(b.__firstAired || b.paused_at || "") || 0;
+    if (ra === 2) return fa - fb;
+    if (ra === 1) return fb - fa;
     const ta =
       a.paused_at ||
       a.last_watched_at ||
@@ -3946,24 +4051,20 @@ function mergeContinueLists(
       b.last_watched_at ||
       (b.progress && b.progress.last_watched_at) ||
       "";
-
-    return (
-      (Date.parse(String(tb)) || 0) - (Date.parse(String(ta)) || 0)
-    );
+    return (Date.parse(String(tb)) || 0) - (Date.parse(String(ta)) || 0);
   });
   const cap = Math.max(1, limit | 0);
-  const isUpcomingItem = (x) => !!(x && x.__localUpcoming);
+  const isLocalAirItem = (x) =>
+    !!(x && (x.__localUpcoming || x.__localAired));
   let result;
   if (out.length <= cap) {
     result = out.slice();
   } else {
-    // 「继续观看」优先占满主列表；「即将播出」单独占额外名额，
-    // 否则继续观看满 20 条时它们会被 slice 全部裁掉，等于白算。
-    const normalPart = out.filter((x) => !isUpcomingItem(x));
-    const upcomingPart = out
-      .filter(isUpcomingItem)
-      .slice(0, CW_LOCAL_EXTRA_CAP);
-    result = normalPart.slice(0, cap).concat(upcomingPart);
+    // 「继续观看」优先占满主列表；日历推送条目（正在播出 / 刚播完 /
+    // 即将播出）单独占额外名额，否则主列表满 20 条时会被整体裁掉。
+    const normalPart = out.filter((x) => !isLocalAirItem(x));
+    const localPart = out.filter(isLocalAirItem).slice(0, CW_LOCAL_EXTRA_CAP);
+    result = normalPart.slice(0, cap).concat(localPart);
   }
   if (autoUnhide.size) {
     Object.defineProperty(result, "__autoUnhide", {
@@ -5970,7 +6071,77 @@ async function handleWatchlistRemove(request, env, ctx) {
   });
 }
 
+async function handleDelayedMarkWatched(request, env, ctx, body) {
+  // 该集尚未播出：不请求 Trakt，本地先记已看并进延迟队列
+  const A = await authed(request, env, ctx);
+  if (!A.ok) return A.response;
+  const { auth, needsCookieUpdate, userKey } = A;
+  const epId = Number(body.id != null ? body.id : body.traktId);
+  if (!Number.isFinite(epId) || epId <= 0)
+    return authJson(auth, needsCookieUpdate, { error: "bad id" }, 400);
+  const showId = Number(body.showId != null ? body.showId : body.show_id);
+  const seasonN = Number(
+    body.season != null ? body.season : body.seasonNumber,
+  );
+  const epN = Number(body.number != null ? body.number : body.episodeNumber);
+  const byShowAdd =
+    Number.isFinite(showId) &&
+    showId > 0 &&
+    Number.isFinite(seasonN) &&
+    Number.isFinite(epN)
+      ? { [String(showId)]: { [String(seasonN)]: [epN] } }
+      : undefined;
+  try {
+    await patchWatchedEpisodes(env, ctx, userKey, { add: [epId], byShowAdd });
+    await rememberPendingWatched(env, ctx, userKey, { add: [epId], byShowAdd });
+    await enqueueDelayedSync(env, ctx, userKey, {
+      id: epId,
+      showId: Number.isFinite(showId) && showId > 0 ? showId : null,
+      season: Number.isFinite(seasonN) ? seasonN : null,
+      number: Number.isFinite(epN) ? epN : null,
+      fa: String(body.firstAired),
+    });
+    await bustHomeUserCaches(userKey, env, ctx);
+    if (Number.isFinite(showId) && showId > 0) {
+      await markProgressDirtyShow(env, ctx, userKey, showId);
+      try {
+        await safeDeleteKvKeys(
+          env,
+          ctx,
+          [
+            CK.watchProgress(userKey, showId),
+            CK.lastGood.watchProgress
+              ? CK.lastGood.watchProgress(userKey, showId)
+              : null,
+          ].filter(Boolean),
+        );
+      } catch {}
+    }
+  } catch {}
+  return authJson(auth, needsCookieUpdate, {
+    ok: true,
+    delayed: true,
+    traktId: epId,
+    message: "已本地标记为已看，将于播出后自动同步到 Trakt",
+  });
+}
+
 async function handleMarkWatched(request, env, ctx) {
+  // 未播出的集（例如资源提前流出）：本地先标已看、隐藏待播提醒，
+  // 过了播出时间再自动同步给 Trakt。
+  try {
+    const pre = await parseJsonBody(request.clone());
+    const b0 = pre.ok ? pre.body || {} : null;
+    const faMs = b0 && b0.firstAired ? Date.parse(b0.firstAired) : NaN;
+    if (
+      b0 &&
+      b0.type === "episode" &&
+      Number.isFinite(faMs) &&
+      faMs > Date.now() + 60 * 1000
+    ) {
+      return await handleDelayedMarkWatched(request, env, ctx, b0);
+    }
+  } catch {}
   return traktSyncAction(request, env, ctx, {
     allowedTypes: ["movie", "episode"],
     endpoint: "/sync/history",
@@ -6067,6 +6238,7 @@ async function handleUnmarkWatched(request, env, ctx) {
         const showId =
           body && (body.showId != null ? body.showId : body.show_id);
         if (type === "episode" && Number(id) > 0) {
+          await removeDelayedSync(env, ctx, userKey, [Number(id)]);
           await patchWatchedEpisodes(env, ctx, userKey, {
             remove: [Number(id)],
           });
@@ -7050,11 +7222,13 @@ async function getUserActivitySig(headers, env, ctx, userKey, force = false) {
     },
     {
 
-      ttl: 900,
-      missTtl: 90,
+      // 签名缓存别压太久：900 秒的 TTL 会让「刚看完」在 15 分钟内被判成没变化。
+      // 90 秒足够省额度，也足够让下一次普通请求看到新签名。
+      ttl: 90,
+      missTtl: 30,
       swr: false,
       revalidate: false,
-      jitter: 120,
+      jitter: 20,
       userKey,
       ...(force ? { bypass: true } : {}),
     },
@@ -7645,6 +7819,98 @@ async function readPendingWatched(env, userKey) {
     return null;
   }
 }
+// 「未播出先标已看」的延迟同步队列：
+// 点已看时该集还没播出 → 只写本地已看记录并进队列（待播提醒随之隐藏），
+// 等过了播出时间，任何一次带登录态的首页请求都会自动补报给 Trakt。
+function delayedSyncKey(userKey) {
+  return `delayedSync:${userKey}`;
+}
+
+async function readDelayedSync(env, userKey) {
+  if (!userKey || !env || !env.TMDB_CACHE || kvIsDown()) return [];
+  try {
+    const raw = await env.TMDB_CACHE.get(delayedSyncKey(userKey), {
+      type: "json",
+    });
+    if (!raw || raw.miss) return [];
+    const d = raw.data !== undefined ? raw.data : raw;
+    return Array.isArray(d) ? d : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writeDelayedSync(env, ctx, userKey, list) {
+  if (!userKey || !env || !env.TMDB_CACHE || kvIsDown()) return;
+  try {
+    await env.TMDB_CACHE.put(
+      delayedSyncKey(userKey),
+      JSON.stringify({ data: list, _ts: Date.now() }),
+      { expirationTtl: 86400 * 30 },
+    );
+  } catch {}
+}
+
+async function enqueueDelayedSync(env, ctx, userKey, item) {
+  const list = await readDelayedSync(env, userKey);
+  const id = Number(item && item.id);
+  const next = list.filter((x) => Number(x && x.id) !== id);
+  next.push({ ...item, id, at: Date.now() });
+  await writeDelayedSync(env, ctx, userKey, next);
+}
+
+async function removeDelayedSync(env, ctx, userKey, ids) {
+  const set = new Set((ids || []).map(Number).filter(Number.isFinite));
+  if (!set.size) return;
+  const list = await readDelayedSync(env, userKey);
+  if (!list.length) return;
+  const next = list.filter((x) => !set.has(Number(x.id)));
+  if (next.length !== list.length)
+    await writeDelayedSync(env, ctx, userKey, next);
+}
+
+async function flushDelayedWatchedSync(env, ctx, userKey, headers) {
+  if (!env || !env.TMDB_CACHE || kvIsDown() || !userKey || !headers) return [];
+  if (isTraktRateLimited(userKey)) return [];
+  const list = await readDelayedSync(env, userKey);
+  if (!list.length) return [];
+  const now = Date.now();
+  const due = list.filter((x) => {
+    const t = Date.parse(x.fa);
+    return Number.isFinite(t) && t <= now;
+  });
+  if (!due.length) return [];
+  const synced = [];
+  for (const item of due) {
+    try {
+      const r = await fetchT(
+        `${TRAKT_API}/sync/history`,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            episodes: [{ ids: { trakt: Number(item.id) } }],
+          }),
+        },
+        9000,
+        userKey,
+      );
+      if (r.ok) synced.push(item);
+      else if (r.status === 429) break; // 限流就停，剩下的下次再试
+    } catch {}
+  }
+  if (synced.length) {
+    const done = new Set(synced.map((x) => Number(x.id)));
+    await writeDelayedSync(
+      env,
+      ctx,
+      userKey,
+      list.filter((x) => !done.has(Number(x.id))),
+    );
+  }
+  return synced;
+}
+
 function mergeWatchedPayload(base, pending) {
   if (!pending) return base;
   if (!base) {
@@ -8201,20 +8467,34 @@ async function handleHomeData(request, env, ctx) {
             : upNext && upNext.__error
               ? upNext.__error
               : "null";
-          if (!pausedOk || !upNextOk) {
+          // /sync/playback（官方）失败才是真失败；
+          // up_next_nitro（第三方）失败只降级自己，不再把整个继续观看拖成
+          // 「回退到上次成功的数据」——之前两者绑死，nitro 一挂，
+          // 官方接口明明正常，页面却永远刷不出新数据。
+          if (!pausedOk) {
             const err =
-              (paused && paused.__error) ||
-              (upNext && upNext.__error) ||
-              "partial fetch failed";
+              (paused && paused.__error) || "playback fetch failed";
+            dbg.playbackError = String(err);
             return {
               __error: err,
-              __cooling:
-                (paused && paused.__cooling) ||
-                (upNext && upNext.__cooling) ||
-                undefined,
+              __cooling: (paused && paused.__cooling) || undefined,
             };
           }
-          return { paused: pausedOk, upNext: upNextOk };
+          let upNextFinal = upNextOk;
+          if (!upNextFinal) {
+            const err = String(
+              (upNext && upNext.__error) || "up_next failed",
+            );
+            dbg.upNextDegraded = err;
+            // 404/410 已在前面标记停用 6 小时；其余失败（超时/5xx/401）
+            // 也临时停用 10 分钟，避免每次刷新都干等一轮 15 秒超时。
+            __nitroDownUntil = Math.max(
+              __nitroDownUntil,
+              Date.now() + 10 * 60 * 1000,
+            );
+            upNextFinal = [];
+          }
+          return { paused: pausedOk, upNext: upNextFinal };
         },
         cacheUser({
           ...(pbBypass
@@ -8320,6 +8600,10 @@ async function handleHomeData(request, env, ctx) {
           .slice(0, 10);
 
         let cal = await peekCalendarCached(todayBJ, env, userKey);
+        // 手动点刷新（force=1）时日历也必须真拉一次：
+        // 原来这里写死 false，日历只能等 KV 的 8 小时 TTL 过期，
+        // 于是「刚播出的新集 / 刚出现的待播」怎么点刷新都不更新。
+        const calForce = !!(force && !rateLimitedNow);
         const calRefresh = () =>
           getCalendarCached(
             todayBJ,
@@ -8327,7 +8611,7 @@ async function handleHomeData(request, env, ctx) {
             env,
             ctx,
             userKey,
-            false,
+            calForce,
             null,
           ).catch(() => null);
         if (!cal) {
@@ -8462,7 +8746,8 @@ async function handleHomeData(request, env, ctx) {
         ctx,
         userKey,
 
-        !!(partsBypass && !activityUnchanged && !rateLimitedNow),
+        // force 时不看签名是否变化：手动刷新就是要绕过一切缓存
+        !!(partsBypass && (force || !activityUnchanged) && !rateLimitedNow),
         calendarSrc,
       );
     });
@@ -8581,6 +8866,31 @@ async function handleHomeData(request, env, ctx) {
         : playbackSrc.fromCache === false
           ? "live"
           : "";
+    // 手动刷新仍拿缓存时，把「被什么挡住」明确带回去，
+    // 否则前端只能笼统提示「已更新（部分来自缓存）」，看不出真因。
+    if (force) {
+      const budgetNow = traktBudgetStats(userKey);
+      if (rateLimitedNow) {
+        const left = Math.max(
+          1,
+          Math.round(
+            Math.max(kvCoolingSec, traktRateLimitedRemaining(userKey)),
+          ),
+        );
+        result.refreshBlocked = "rate-limit";
+        result.refreshHint = `Trakt 限流冷却中，约 ${left} 秒后才能真刷新`;
+      } else if (budgetNow.throttled) {
+        result.refreshBlocked = "budget";
+        result.refreshHint = `请求额度已打满（${budgetNow.userUsed}/${budgetNow.userMax} 次/分钟），请稍等 1 分钟再点刷新`;
+      } else if (result.playbackSource === "cache") {
+        const dbgPb = playbackSrc.debug || {};
+        const pbErr = dbgPb.playbackError || dbgPb.paused || dbgPb.error || null;
+        result.refreshBlocked = "upstream";
+        result.refreshHint = pbErr
+          ? `Trakt /sync/playback 异常（${pbErr}），已回退到旧数据`
+          : "Trakt 返回异常，已回退到上次成功的数据";
+      }
+    }
     let playbackAgeSec = 0;
     let playbackDataTs = 0;
     let playbackTsSource = null;
@@ -9393,6 +9703,47 @@ async function handleWatchDiag(request, env, ctx) {
   const A = await authed(request, env, ctx, { strict: true });
   if (!A.ok) return A.response;
   const { headers, userKey } = A;
+  // 原来这里直接引用了 rawTok / bearer，但两者从未定义 →
+  // /api/watch-diag 每次请求都抛 ReferenceError（500），诊断入口等于不存在。
+  const bearer =
+    headers && typeof headers.get === "function"
+      ? String(headers.get("Authorization") || "")
+      : "";
+  const rawTok = bearer ? bearer.replace(/^Bearer\s+/i, "").trim() : "";
+
+  // ?reset=1：把可能卡住刷新链路的本地状态全部清掉
+  //   1) nitro 端点被标记不可用（6 小时内不再请求）→ 置 0
+  //   2) 内存冷却 / 连续失败计数（指数退避最长 5 分钟）→ 清空
+  //   3) KV 里的冷却标记 + playback / 日历 / 签名缓存 → 删除
+  // 清完再点一次刷新，就是真正的从 Trakt 拉新数据。
+  const wantReset = url.searchParams.get("reset") === "1";
+  let didReset = false;
+  if (wantReset) {
+    const uk = userKey || "__anon__";
+    __nitroDownUntil = 0;
+    __traktRateLimitByUser.delete(uk);
+    __traktStrikes.delete(uk);
+    __traktRateLimitSource.delete(uk);
+    try {
+      const todayReset = new Date(Date.now() + BJ_OFFSET_MS)
+        .toISOString()
+        .slice(0, 10);
+      await safeDeleteKvKeys(
+        env,
+        ctx,
+        [
+          CK.playback(userKey),
+          CK.lastGood.playback(userKey),
+          calendarCacheKey(userKey, todayReset),
+          `act:${userKey}`,
+          CK.syncState(userKey),
+          "sys:trakt:cd:u:" + uk,
+        ].filter(Boolean),
+      );
+      didReset = true;
+    } catch {}
+  }
+
   const kvCooling = await syncTraktCooldownFromKV(env, userKey);
   const coolingSec =
     kvCooling > 0 ? kvCooling : traktRateLimitedRemaining(userKey);
@@ -9433,6 +9784,17 @@ async function handleWatchDiag(request, env, ctx) {
     kv: {},
     trakt: null,
     watchedList: null,
+    reset: didReset,
+    nitro: {
+      downFor: Math.max(
+        0,
+        Math.round((__nitroDownUntil - Date.now()) / 1000),
+      ),
+      note:
+        "继续观看的「下一集」来自第三方端点 /sync/progress/up_next_nitro；" +
+        "该端点返回 404/410 时会被静默停用 6 小时，期间继续观看只由 /sync/playback 支撑，" +
+        "在 Trakt 上标记看完而不留播放记录的剧就不会出现。",
+    },
     verdict: [],
   };
   const readKv = async (key) => {
@@ -9442,6 +9804,85 @@ async function handleWatchDiag(request, env, ctx) {
       return null;
     }
   };
+
+  // ── 全局刷新诊断（不用传 show 参数）──
+  // 「手动点刷新没变化」时看这一段就知道卡在哪一步：
+  //   coolingSec > 0        → Trakt 限流冷却中，force 会被降级成读缓存
+  //   budget.throttled      → 本地额度打满（每人 40 次/分钟），刷新同样被降级
+  //   auth.expiresInSec < 0 → access_token 过期（会自动用 refresh_token 续）
+  //   kv.calendar.ageSec 大 → 日历快照陈旧（本次已改成手动刷新强制重拉）
+  try {
+    const pbRaw = await readKv(CK.playback(userKey));
+    const pbD = pbRaw && pbRaw.data !== undefined ? pbRaw.data : pbRaw;
+    out.kv.playback =
+      pbRaw && !pbRaw.miss
+        ? {
+            present: true,
+            ageSec:
+              pbRaw._ts != null
+                ? Math.round((Date.now() - Number(pbRaw._ts)) / 1000)
+                : null,
+            paused: pbD && Array.isArray(pbD.paused) ? pbD.paused.length : null,
+            upNext: pbD && Array.isArray(pbD.upNext) ? pbD.upNext.length : null,
+          }
+        : { present: false };
+    const todayBj = new Date(Date.now() + BJ_OFFSET_MS)
+      .toISOString()
+      .slice(0, 10);
+    const calKey = calendarCacheKey(userKey, todayBj);
+    const calRaw = await readKv(calKey);
+    const calD = calRaw && calRaw.data !== undefined ? calRaw.data : calRaw;
+    out.kv.calendar =
+      calRaw && !calRaw.miss
+        ? {
+            present: true,
+            key: calKey,
+            ageSec:
+              calRaw._ts != null
+                ? Math.round((Date.now() - Number(calRaw._ts)) / 1000)
+                : null,
+            items: Array.isArray(calD) ? calD.length : null,
+          }
+        : { present: false, key: calKey };
+    const actRaw = await readKv(`act:${userKey}`);
+    const actD = actRaw && actRaw.data !== undefined ? actRaw.data : actRaw;
+    const ss = await readSyncState(env, userKey);
+    out.activity = {
+      cachedAgeSec:
+        actRaw && actRaw._ts != null
+          ? Math.round((Date.now() - Number(actRaw._ts)) / 1000)
+          : null,
+      cachedSig: actD && actD.sig ? String(actD.sig).slice(0, 80) : null,
+      baselineSig: ss && ss.sig ? String(ss.sig).slice(0, 80) : null,
+      changed: !!(actD && actD.sig && ss && ss.sig && actD.sig !== ss.sig),
+      watchedAt: (ss && ss.watchedAt) || null,
+      baselineAgeSec:
+        ss && ss.at != null
+          ? Math.round((Date.now() - Number(ss.at)) / 1000)
+          : null,
+    };
+    if (coolingSec > 0)
+      out.verdict.push(
+        `Trakt 冷却中，还剩 ${coolingSec} 秒：这期间点刷新只会拿到缓存`,
+      );
+    if (budgetInfo.throttled)
+      out.verdict.push(
+        `本地请求额度已打满（${budgetInfo.userUsed}/${budgetInfo.userMax} 次/分钟），这次刷新会被降级成缓存`,
+      );
+    if (
+      authInfo.expiresInSec != null &&
+      authInfo.expiresInSec < 0
+    )
+      out.verdict.push("access_token 已过期（会自动用 refresh_token 续期）");
+    if (out.activity && out.activity.changed)
+      out.verdict.push(
+        "检测到 Trakt 活动签名与基线不一致，下次自动刷新会拉新数据",
+      );
+    if (didReset)
+      out.verdict.push("已执行 reset：本地冷却、nitro 停用标记与相关缓存已清空，请再点一次刷新");
+  } catch (e) {
+    out.kv.error = String((e && e.message) || e);
+  }
 
   if (traktId) {
     const raw = await readKv(CK.watchProgress(userKey, traktId));
@@ -10848,15 +11289,22 @@ function renderContinueItems(upNext, mode = "grid") {
     }
   }
   items.sort((a, b) => {
-    // 与后端保持一致：继续观看在前，「即将播出」压到最末
-    const up = (x) => !!(x && x.raw && x.raw.__localUpcoming);
-    if (up(a) !== up(b)) return up(a) ? 1 : -1;
-    if (up(a) && up(b)) {
+    // 与后端一致的三段式：真实观看记录 → 正在/刚播完 → 即将播出
+    const rank = (x) => {
+      if (!x || !x.raw) return 0;
+      if (x.raw.__localUpcoming) return 2;
+      if (x.raw.__localAired || x.source === "localair") return 1;
+      return 0;
+    };
+    const ra = rank(a);
+    const rb = rank(b);
+    if (ra !== rb) return ra - rb;
+    if (ra > 0) {
       const fa =
         Date.parse((a.raw && a.raw.__firstAired) || a.sortKey || "") || 0;
       const fb =
         Date.parse((b.raw && b.raw.__firstAired) || b.sortKey || "") || 0;
-      return fa - fb;
+      return ra === 2 ? fa - fb : fb - fa;
     }
     return String(b.sortKey || "").localeCompare(String(a.sortKey || ""));
   });
@@ -11156,7 +11604,7 @@ function renderContinueItems(upNext, mode = "grid") {
         : "";
       const watchedHtml =
         watchedType && watchedId
-          ? `<button class="wl-watched" type="button" data-watched-type="${esc(watchedType)}" data-watched-id="${esc(String(watchedId))}" aria-label="标记为已看" title="标记为已看">✓</button>`
+          ? `<button class="wl-watched" type="button" data-watched-type="${esc(watchedType)}" data-watched-id="${esc(String(watchedId))}" data-watched-show="${esc(dropShowId != null ? String(dropShowId) : item.show && item.show.ids && item.show.ids.trakt != null ? String(item.show.ids.trakt) : "")}" data-watched-season="${esc(String(epSeason != null ? epSeason : ""))}" data-watched-episode="${esc(String(epNumber != null ? epNumber : ""))}" data-watched-fa="${esc(String(item.__firstAired || (ep && ep.first_aired) || ""))}" aria-label="标记为已看" title="标记为已看">✓</button>`
           : "";
       const epTitleRaw = ((ep && (ep.title || ep.name)) || "").trim();
       const npAttrs = ` data-ep-label="${esc(epLabel)}" data-ep-title="${esc(epTitleRaw)}" data-runtime="${runtimeMin || ""}" data-progress="${typeof playPct === "number" ? playPct : ""}" data-source="${esc(it.source || "")}" data-paused-at="${esc(item.paused_at || item.last_watched_at || it.sortKey || "")}"`;
@@ -12088,6 +12536,10 @@ async function injectLocalUpcomingIntoContinue(
       .toISOString()
       .slice(0, 10);
     const userState = await getUserStateBundle(headers, env, ctx, userKey);
+    // 到期的延迟同步（播出时间已过）在这里自动补报给 Trakt
+    try {
+      await flushDelayedWatchedSync(env, ctx, userKey, headers);
+    } catch {}
     const droppedSet = droppedStateToSet(userState);
     const freshWatched = watchedStateToSet(userState.watched);
     const hideMap =
@@ -13050,7 +13502,7 @@ function __onNoChange(reason){
 }
 function silentRefresh(reason){if(document.hidden)return;var __m=document.getElementById('modal');if(__m&&__m.classList.contains('open'))return;if(window.__forceRefreshing||window.__homeDataLoading)return;if(window.__silentRefreshing)return;
 // B3: 前台可见触发至少间隔 5 分钟；定时器本身已有 REFRESH_MS
-if(reason==='visible'&&Date.now()-(__lastRefreshAt||0)<5*60*1000)return;
+if(reason==='visible'&&Date.now()-(__lastRefreshAt||0)<60*1000)return;
 window.__silentRefreshing=true;__lastRefreshAt=Date.now();function __applySilent(d,fromRetry){if(!d)return false;if(d.activityUnchanged===false){try{delete window.__loadedParts.history;localStorage.removeItem('mt:hist');}catch(e){}if(window.__fetchPartForTab&&!window.__histRefreshInflight){window.__histRefreshInflight=true;window.__fetchPartForTab('history').then(function(hd){if(!hd)return;try{hd.__fetchedAt=Date.now();window.__loadedParts.history=hd;if(window.__applyPart)__applyPart('history',hd);if(window.__savePartSnap)__savePartSnap('history',hd);}catch(e){}}).catch(function(){}).finally(function(){window.__histRefreshInflight=false;});}}var dataTs=d.lastSyncAt||d.continueUpdatedAt||d.pauseUpdatedAt||d.playbackDataTs||null;if(dataTs){try{var n=Number(dataTs);if(isFinite(n)&&n>0)__setUpdatedAt(d.stale||d.refreshFailed?'cache':(d.playbackSource||'live'),null,n);}catch(e){}}if(d.stale||d.refreshFailed){if(window.__toast&&(!window.__staleToastAt||Date.now()-(window.__staleToastAt||0)>120000)){window.__staleToastAt=Date.now();window.__toast(d.cooling?'同步失败（限流），仍显示缓存':'同步失败，仍显示缓存',{type:'warn',duration:2800});}try{lsSet('mt:pb',d,MT_PB_SNAP_TTL);}catch(e){}return true;}var prevHtml=window.__lastPbHtml||null;var newHtml=(d&&d.playbackHScrollHtml)||null;if(d.activityUnchanged&&newHtml&&prevHtml&&prevHtml===newHtml){try{lsSet('mt:pb',d,MT_PB_SNAP_TTL);}catch(e){}__onNoChange(reason);return true;}if(newHtml){applyPlayback(d);try{lsSet('mt:pb',d,MT_PB_SNAP_TTL);}catch(e){}if(prevHtml&&newHtml!==prevHtml&&window.__toast)window.__toast('已自动更新观看进度',{type:'success',duration:2000});return true;}return !!dataTs;}fetchPart('playback',false,true).then(function(d){__applySilent(d);}).catch(function(){return new Promise(function(r){setTimeout(r,2000);}).then(function(){return fetchPart('playback',false,true).then(function(d){if(!__applySilent(d)&&window.__toast)window.__toast('自动同步失败，请稍后手动刷新',{type:'warn',duration:2800});}).catch(function(){if(window.__toast)window.__toast('自动同步失败，请稍后手动刷新',{type:'warn',duration:2800});});});}).finally(function(){window.__silentRefreshing=false;});}window.__refreshStats=silentRefresh;
 function __afterWriteSoftRefresh(){
   // 只失效播放进度内存；不要清 history 快照，否则记录栏会短暂/一直空白
@@ -13075,7 +13527,7 @@ function __afterWriteSoftRefresh(){
   },1500);
 }
 window.__afterWriteSoftRefresh=__afterWriteSoftRefresh;
-window.forceRefresh=async function(){if(window.__forceRefreshing)return;window.__forceRefreshing=true;window.__manualRefreshPending=true;try{localStorage.removeItem('mt:pb');localStorage.removeItem('mt:meta');try{window.__cwMoreCache=null;}catch(e){}}catch(e){}var btn=document.getElementById('btn-refresh');var span=btn&&btn.querySelector('span');var oldText=span?span.textContent:'刷新';if(btn)btn.classList.add('loading');if(span)span.textContent='刷新中';var okCount=0,cacheCount=0,failCount=0,cooling=0,hitLimit=false,pbUnchanged=false,pbSeen=false;var GAP_OK=1500,GAP_LIMIT=2000;try{
+window.forceRefresh=async function(){if(window.__forceRefreshing)return;window.__forceRefreshing=true;window.__manualRefreshPending=true;try{localStorage.removeItem('mt:pb');localStorage.removeItem('mt:meta');try{window.__cwMoreCache=null;}catch(e){}}catch(e){}var btn=document.getElementById('btn-refresh');var span=btn&&btn.querySelector('span');var oldText=span?span.textContent:'刷新';if(btn)btn.classList.add('loading');if(span)span.textContent='刷新中';var okCount=0,cacheCount=0,failCount=0,cooling=0,hitLimit=false,pbUnchanged=false,pbSeen=false,blockedHint='';var GAP_OK=1500,GAP_LIMIT=2000;try{
 // 只 force 当前栏目，避免一次打满 5 个 part
 var tabEl=document.querySelector('.tab.active');
 var curPart=(tabEl&&tabEl.dataset&&tabEl.dataset.tab)||'playback';
@@ -13083,8 +13535,8 @@ if(curPart==='search')curPart='playback';
 var wanted=[curPart];
 var loaded=window.__loadedParts||{};
 try{if(window.__partDebounceAt)delete window.__partDebounceAt[curPart];delete(__partDebounceAt||{})[curPart];}catch(e){}
-for(var i=0;i<wanted.length;i++){var part=wanted[i];if(i>0){var gap=cooling>0?Math.min(Math.max(GAP_LIMIT,cooling*1000+2000),8000):GAP_OK;await new Promise(function(r){setTimeout(r,gap);});}var d=null;try{d=await __enqueueTrakt(function(){return fetchPart(part,true);});}catch(e){d=null;}if(!d){failCount++;continue;}var isCache=false;if(part==='playback'&&d.playbackSource==='cache')isCache=true;if(part==='meta'&&d.metaSource==='cache')isCache=true;if(part==='calendar'&&d.calendarSource==='cache')isCache=true;if(part==='watchlist'&&d.watchlistSource==='cache')isCache=true;if(isCache)cacheCount++;else okCount++;if(part==='playback'){pbSeen=true;if(d&&d.activityUnchanged===true)pbUnchanged=true;applyPlayback(d);try{lsSet('mt:pb',d,MT_PB_SNAP_TTL);}catch(e){}}else if(part==='meta'){applyMeta(d,false);}else if(part==='watchlist'||part==='calendar'||part==='history'){__applyPart(part,d);__savePartSnap(part,d);}window.__loadedParts[part]=d;if(__partFailed(d)){try{delete window.__loadedParts[part];}catch(e){}}if(d.rateLimited===true||(Number(d.cooling)>0&&d.rateLimited!==false)){hitLimit=true;cooling=Math.max(cooling,Number(d.cooling)||0);}}if(failCount&&!okCount&&!cacheCount){__errToast('刷新失败',new Error('无法连接，请检查网络后重试'));}else if(hitLimit&&cooling>0){__toast('Trakt 限流约 '+cooling+' 秒，已显示缓存数据',{type:'warn',duration:4200});}else if(hitLimit){__toast('上游繁忙，已显示缓存数据',{type:'warn',duration:3200});}else if(okCount&&!failCount){__toast('已刷新观看数据',{type:'success',duration:1800});}else if(pbSeen&&pbUnchanged&&!okCount){__toast('已是最新，暂无更新',{type:'info',duration:2000});try{__setUpdatedAt('nochange');}catch(e){}}else if(failCount||cacheCount){__toast('已更新（部分来自缓存）',{type:'info',duration:2800});}else{__toast('已刷新观看数据',{type:'success',duration:1800});}if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){__errToast('刷新失败',e);}finally{if(btn)btn.classList.remove('loading');if(span)span.textContent=oldText;window.__forceRefreshing=false;}};
-function startHomeData(){loadHomeData({silent:false});}if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',startHomeData);}else{startHomeData();}var REFRESH_MS=${HOME_AUTO_REFRESH_MINUTES}*60*1000;var __lastRefreshAt=Date.now();if(REFRESH_MS>0){setInterval(function(){if(Date.now()-__lastUserAct<60000)return;silentRefresh();},REFRESH_MS);document.addEventListener('visibilitychange',function(){if(document.hidden)return;if(Date.now()-__lastRefreshAt<5*60*1000)return;silentRefresh('visible');});}})();`;
+for(var i=0;i<wanted.length;i++){var part=wanted[i];if(i>0){var gap=cooling>0?Math.min(Math.max(GAP_LIMIT,cooling*1000+2000),8000):GAP_OK;await new Promise(function(r){setTimeout(r,gap);});}var d=null;try{d=await __enqueueTrakt(function(){return fetchPart(part,true);});}catch(e){d=null;}if(!d){failCount++;continue;}var isCache=false;if(part==='playback'&&d.playbackSource==='cache')isCache=true;if(part==='meta'&&d.metaSource==='cache')isCache=true;if(part==='calendar'&&d.calendarSource==='cache')isCache=true;if(part==='watchlist'&&d.watchlistSource==='cache')isCache=true;if(isCache)cacheCount++;else okCount++;if(part==='playback'){pbSeen=true;if(d&&d.activityUnchanged===true)pbUnchanged=true;if(d&&d.refreshBlocked&&d.refreshHint&&!blockedHint)blockedHint=String(d.refreshHint);applyPlayback(d);try{lsSet('mt:pb',d,MT_PB_SNAP_TTL);}catch(e){}}else if(part==='meta'){applyMeta(d,false);}else if(part==='watchlist'||part==='calendar'||part==='history'){__applyPart(part,d);__savePartSnap(part,d);}window.__loadedParts[part]=d;if(__partFailed(d)){try{delete window.__loadedParts[part];}catch(e){}}if(d.rateLimited===true||(Number(d.cooling)>0&&d.rateLimited!==false)){hitLimit=true;cooling=Math.max(cooling,Number(d.cooling)||0);}}if(failCount&&!okCount&&!cacheCount){__errToast('刷新失败',new Error('无法连接，请检查网络后重试'));}else if(hitLimit&&cooling>0){__toast('Trakt 限流约 '+cooling+' 秒，已显示缓存数据',{type:'warn',duration:4200});}else if(hitLimit){__toast('上游繁忙，已显示缓存数据',{type:'warn',duration:3200});}else if(blockedHint){__toast(blockedHint,{type:'warn',duration:4500});}else if(okCount&&!failCount){__toast('已刷新观看数据',{type:'success',duration:1800});}else if(pbSeen&&pbUnchanged&&!okCount){__toast('已是最新，暂无更新',{type:'info',duration:2000});try{__setUpdatedAt('nochange');}catch(e){}}else if(failCount||cacheCount){__toast('已更新（部分来自缓存）',{type:'info',duration:2800});}else{__toast('已刷新观看数据',{type:'success',duration:1800});}if(window.__scheduleEnrich)window.__scheduleEnrich();}catch(e){__errToast('刷新失败',e);}finally{if(btn)btn.classList.remove('loading');if(span)span.textContent=oldText;window.__forceRefreshing=false;}};
+function startHomeData(){loadHomeData({silent:false});}if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',startHomeData);}else{startHomeData();}var REFRESH_MS=${HOME_AUTO_REFRESH_MINUTES}*60*1000;var __lastRefreshAt=Date.now();if(REFRESH_MS>0){setInterval(function(){if(Date.now()-__lastUserAct<20000)return;silentRefresh();},REFRESH_MS);document.addEventListener('visibilitychange',function(){if(document.hidden)return;if(Date.now()-__lastRefreshAt<60*1000)return;silentRefresh('visible');});}})();`;
 }
 
 function getClientSideScripts() {
@@ -13838,7 +14290,7 @@ document.addEventListener('click',async(e)=>{
   const name=nameEl?nameEl.textContent.trim().split(/\s+第/)[0]:'';
   await __dropShowById(id,name);
 },true);
-document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-watched-id]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.watchedType,id=btn.dataset.watchedId;if(!type||!id)return;const item=btn.closest('.item');const nameEl=item?(item.querySelector('.name')||item.querySelector('.cw-title')):null;const name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'✓',title:'标记已看',message:'确定要把「'+(name||'该条目')+'」标记为已看吗？',okText:'标记',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueTrakt(async()=>{await __apiWrite('/api/mark-watched',{type,id},{okMsg:'已标记为已看',failPrefix:'标记失败'});__fadeRemoveCard(btn.closest('.item'));});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('标记失败',err);}},true);
+document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-watched-id]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.watchedType,id=btn.dataset.watchedId,showId=btn.dataset.watchedShow||'',seasonN=btn.dataset.watchedSeason||'',epNo=btn.dataset.watchedEpisode||'',fa=btn.dataset.watchedFa||'';if(!type||!id)return;const item=btn.closest('.item');const nameEl=item?(item.querySelector('.name')||item.querySelector('.cw-title')):null;const name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'✓',title:'标记已看',message:'确定要把「'+(name||'该条目')+'」标记为已看吗？',okText:'标记',tone:'success'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueTrakt(async()=>{const payload={type,id};if(showId)payload.showId=showId;if(seasonN!=='')payload.season=seasonN;if(epNo!=='')payload.number=epNo;if(fa)payload.firstAired=fa;const faMs=fa?Date.parse(fa):NaN;const okMsg=Number.isFinite(faMs)&&faMs>Date.now()?'已本地标记，播出后自动同步到 Trakt':'已标记为已看';await __apiWrite('/api/mark-watched',payload,{okMsg:okMsg,failPrefix:'标记失败'});__fadeRemoveCard(btn.closest('.item'));});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('标记失败',err);}},true);
 document.addEventListener('click',async(e)=>{const btn=e.target.closest('[data-unwatch-id]');if(!btn)return;e.preventDefault();e.stopPropagation();if(btn.disabled)return;const type=btn.dataset.unwatchType,id=btn.dataset.unwatchId;if(!type||!id)return;const item=btn.closest('.item'),nameEl=item?item.querySelector('.name'):null,name=nameEl?nameEl.textContent:'';if(!(await __confirm({icon:'↺',title:'取消观看',message:'确定要取消「'+(name||'该条目')+'」的观看记录吗？',okText:'取消观看',tone:'warn'})))return;const prev=btn.textContent;btn.disabled=true;btn.textContent='…';try{await __enqueueTrakt(async()=>{await __apiWrite('/api/unmark-watched',{type,id},{okMsg:'已取消观看记录',failPrefix:'取消失败'});__fadeRemoveCard(btn.closest('.item'));});}catch(err){btn.disabled=false;btn.textContent=prev;__errToast('取消失败',err);}},true);
 var __searchTimer=null,__searchSeq=0;
 function __renderSearchItem(it){var emoji=it.type==='movie'?'🎬':'📺';var poster=it.poster?'<img src="'+__esc(it.poster)+'" loading="lazy" decoding="async" alt="">':'<div class="poster-ph"><span>'+emoji+'</span></div>';var tag=it.type==='movie'?'电影':'剧集';var ov=it.overview?'<div class="overview">'+__esc(it.overview)+'</div>':'';return '<div class="item clickable" data-detail-type="'+it.type+'" data-detail-id="tmdb-'+it.tmdbId+'" role="button" tabindex="0"><div class="poster">'+poster+'</div><div class="info"><div class="name-row"><span class="name">'+__esc(it.title)+'</span></div><div class="meta">'+tag+(it.year?' · '+__esc(String(it.year)):'')+'</div>'+ov+'</div></div>';}
