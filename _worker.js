@@ -1,4 +1,4 @@
-const APP_VERSION = "6.6.11";
+const APP_VERSION = "6.6.12";
 const APP_JS_VERSION = APP_VERSION;
 const APP_CSS_VERSION = APP_VERSION;
 const TRAKT_AUTH = "https://auth.trakt.tv";
@@ -3493,10 +3493,10 @@ function applyPbImage(j, imgMap) {
 }
 
 // 「继续观看」里日历条目的时间窗口
-// CW_UPCOMING_WINDOW_MS：距开播多久内算「即将播出」
+// CW_UPCOMING_WINDOW_MS：距开播多久内算「即将播出」（提前 6 小时开始提醒）
 // CW_AIRING_WINDOW_MS：开播后多久内算「正在播出」
 // CW_AIRED_WINDOW_MS：播完后多久内仍保留（显示「X 小时前」）
-const CW_UPCOMING_WINDOW_MS = 24 * 3600 * 1000;
+const CW_UPCOMING_WINDOW_MS = 6 * 3600 * 1000;
 const CW_AIRING_WINDOW_MS = 2 * 3600 * 1000;
 const CW_AIRED_WINDOW_MS = 72 * 3600 * 1000;
 // 本地日历条目（即将播出 / 刚播完）的额外展示位，不占用主列表名额
@@ -3526,16 +3526,24 @@ function calendarToLocalContinue(
       : watchedEpIds
         ? new Set([...watchedEpIds].map(Number))
         : null;
+
+  // 从「已看」数据里收集看过的剧（show 级）
   const watchedShows = new Set();
-  if (watchedEpIds && watchedEpIds.__showLastAt) {
-    for (const sid of Object.keys(watchedEpIds.__showLastAt)) {
-      if (watchedEpIds.__showLastAt[sid] > 0) watchedShows.add(Number(sid));
+  const showLastAtMap =
+    watchedEpIds && watchedEpIds.__showLastAt
+      ? watchedEpIds.__showLastAt
+      : null;
+  if (showLastAtMap) {
+    for (const sid of Object.keys(showLastAtMap)) {
+      if (Number(showLastAtMap[sid]) > 0) watchedShows.add(Number(sid));
     }
   }
   // 兜底：showLastAt 缺失（老缓存 / 手工补记）时，用 byShow 里挂的集号判断「看过」
-  if (watchedEpIds && watchedEpIds.__byShow) {
-    for (const sid of Object.keys(watchedEpIds.__byShow)) {
-      const seasons = watchedEpIds.__byShow[sid];
+  const byShowMap =
+    watchedEpIds && watchedEpIds.__byShow ? watchedEpIds.__byShow : null;
+  if (byShowMap) {
+    for (const sid of Object.keys(byShowMap)) {
+      const seasons = byShowMap[sid];
       if (
         seasons &&
         typeof seasons === "object" &&
@@ -3544,54 +3552,100 @@ function calendarToLocalContinue(
         watchedShows.add(Number(sid));
     }
   }
-  // 有没有拿到可信的「已看」数据；拿不到时不额外过滤，避免整块空白
-  const hasWatchedData = !!(
-    watchedEpIds &&
-    (watchedEpIds.__showLastAt || watchedEpIds.__byShow)
-  );
-  const out = [];
-  for (const item of calendar) {
-    if (!item || !item.show || !item.episode) continue;
-    const fa = item.first_aired ? Date.parse(item.first_aired) : NaN;
-    if (!Number.isFinite(fa)) continue;
-    const show = item.show;
-    const ep = item.episode;
-    const sid = show.ids && show.ids.trakt;
-    const epid = ep.ids && ep.ids.trakt;
-    if (sid == null) continue;
-    if (dropped && dropped.has(Number(sid))) continue;
-    if (epid != null && watched && watched.has(Number(epid))) continue;
-    let status = null;
-    if (fa > now) {
-      if (fa - now <= upcomingWindowMs) status = "upcoming";
-    } else {
-      const ago = now - fa;
-      if (ago <= airingWindowMs) status = "airing";
-      else if (ago <= airedWindowMs) status = "aired";
-    }
-    if (!status) continue;
+  // 有没有拿到可信的「已看」数据：必须 watchedShows 里真的有剧才算数。
+  // 老缓存 / 拉取失败时 watched 会挂一个空对象 showLastAt:{}，它是 truthy
+  // 但没有任何内容；旧写法 !!({}) === true，会把下面所有日历条目全部
+  // continue 掉，导致「即将播出 / 刚播完」整块空白。
+  const hasWatchedData = watchedShows.size > 0;
 
-    // 待播出 / 正在播出 / 刚播完 都必须「看过至少一集」才进继续观看
-    // 一集都没看过的剧，即使马上要播新集，也不在继续观看里出现
-    if (hasWatchedData && !watchedShows.has(Number(sid))) continue;
-    const entry = {
-      show,
-      episode: ep,
-      paused_at: item.first_aired,
-      last_watched_at: item.first_aired,
-      __localUpcoming: status === "upcoming",
-      __localAired: status === "aired" || status === "airing",
-      __localAirStatus: status,
-      __firstAired: item.first_aired,
-    };
-    if (
-      hideMap &&
-      typeof isCwHiddenEntry === "function" &&
-      isCwHiddenEntry(entry, hideMap)
-    )
-      continue;
-    out.push(entry);
+  // 每部剧「已看到哪一集」：byShow 结构是 byShow[sid][季号][集号] = 1。
+  // 用来挡住「这一集其实已经看过了」的待播 / 刚播完提醒。
+  const maxWatchedEp = new Map();
+  if (byShowMap) {
+    for (const sk of Object.keys(byShowMap)) {
+      const seasons = byShowMap[sk];
+      if (!seasons || typeof seasons !== "object") continue;
+      let best = null;
+      for (const sKey of Object.keys(seasons)) {
+        const sn = Number(sKey);
+        if (!Number.isFinite(sn)) continue;
+        const eps = seasons[sKey];
+        if (!eps || typeof eps !== "object") continue;
+        for (const eKey of Object.keys(eps)) {
+          const en = Number(eKey);
+          if (!Number.isFinite(en)) continue;
+          if (!best || sn > best.s || (sn === best.s && en > best.n))
+            best = { s: sn, n: en };
+        }
+      }
+      if (best) maxWatchedEp.set(Number(sk), best);
+    }
   }
+  // 这一集是否已经看过（含「已经看过更后面的集」的情况）
+  function isEpAlreadyWatched(sid, ep) {
+    const max = maxWatchedEp.get(Number(sid));
+    if (!max) return false;
+    const s = Number(ep.season != null ? ep.season : ep.season_number);
+    const n = Number(ep.number != null ? ep.number : ep.episode_number);
+    if (!Number.isFinite(s) || !Number.isFinite(n)) return false;
+    return s < max.s || (s === max.s && n <= max.n);
+  }
+
+  const buildOut = (strictWatched) => {
+    const out = [];
+    for (const item of calendar) {
+      if (!item || !item.show || !item.episode) continue;
+      const fa = item.first_aired ? Date.parse(item.first_aired) : NaN;
+      if (!Number.isFinite(fa)) continue;
+      const show = item.show;
+      const ep = item.episode;
+      const sid = show.ids && show.ids.trakt;
+      const epid = ep.ids && ep.ids.trakt;
+      if (sid == null) continue;
+      if (dropped && dropped.has(Number(sid))) continue;
+      if (epid != null && watched && watched.has(Number(epid))) continue;
+      let status = null;
+      if (fa > now) {
+        if (fa - now <= upcomingWindowMs) status = "upcoming";
+      } else {
+        const ago = now - fa;
+        if (ago <= airingWindowMs) status = "airing";
+        else if (ago <= airedWindowMs) status = "aired";
+      }
+      if (!status) continue;
+
+      // 这一集在「已看」记录里已经存在（或已看过更后面的集），
+      // 说明用户已经看过，不再作为待播 / 刚播完提醒出现。
+      if (isEpAlreadyWatched(sid, ep)) continue;
+
+      // 待播出 / 正在播出 / 刚播完 都优先要求「看过至少一集」；
+      // 若这条规则导致整块为空，下面会整体放宽一次，不会白屏。
+      if (strictWatched && !watchedShows.has(Number(sid))) continue;
+      const entry = {
+        show,
+        episode: ep,
+        paused_at: item.first_aired,
+        last_watched_at: item.first_aired,
+        __localUpcoming: status === "upcoming",
+        __localAired: status === "aired" || status === "airing",
+        __localAirStatus: status,
+        __firstAired: item.first_aired,
+      };
+      if (
+        hideMap &&
+        typeof isCwHiddenEntry === "function" &&
+        isCwHiddenEntry(entry, hideMap)
+      )
+        continue;
+      out.push(entry);
+    }
+    return out;
+  };
+
+  let out = buildOut(hasWatchedData);
+  // 兜底：严格过滤后一条都不剩，说明「看过」索引不可用或不完整，
+  // 与其整块空白，不如放宽为「日历里有排期的都展示」。
+  if (!out.length && hasWatchedData) out = buildOut(false);
   return out;
 }
 
@@ -3847,6 +3901,18 @@ function mergeContinueLists(
       if (k) {
         if (seen.has(k)) {
           const idx = seen.get(k);
+          const oldEntry = out[idx];
+          const newIsLocal = !!(
+            entry && (entry.__localUpcoming || entry.__localAired)
+          );
+          const oldIsLocal = !!(
+            oldEntry && (oldEntry.__localUpcoming || oldEntry.__localAired)
+          );
+          // 观看记录优先：本地日历条目（即将播出 / 刚播完）不覆盖真实观看记录。
+          // 用户还没追平最新集时，继续展示自己的观看进度；
+          // 若已追平（观看记录被 caughtUp 规则过滤掉），本地条目才会自然顶上，
+          // 起到「下一集要播了」的提醒作用。
+          if (newIsLocal && !oldIsLocal) continue;
           if (entryTime(entry) > entryTime(out[idx])) {
             out[idx] = entry;
           }
@@ -3861,9 +3927,11 @@ function mergeContinueLists(
   pushList(localAiredList);
   pushList(upNextList);
   out.sort((a, b) => {
-    const loc = (x) => !!(x && (x.__localUpcoming || x.__localAired));
-    if (loc(a) !== loc(b)) return loc(a) ? 1 : -1;
-    if (loc(a) && loc(b)) {
+    // 排序规则：继续观看（真实观看记录 / 刚播完）全部在前，按时间倒序；
+    // 「即将播出」永远排在最后，组内按开播时间正序（越早开播越靠前）。
+    const up = (x) => !!(x && x.__localUpcoming);
+    if (up(a) !== up(b)) return up(a) ? 1 : -1;
+    if (up(a) && up(b)) {
       const fa = Date.parse(a.__firstAired || a.paused_at || "") || 0;
       const fb = Date.parse(b.__firstAired || b.paused_at || "") || 0;
       return fa - fb;
@@ -3884,16 +3952,18 @@ function mergeContinueLists(
     );
   });
   const cap = Math.max(1, limit | 0);
-  const isLocalAirItem = (x) => !!(x && (x.__localUpcoming || x.__localAired));
+  const isUpcomingItem = (x) => !!(x && x.__localUpcoming);
   let result;
   if (out.length <= cap) {
     result = out.slice();
   } else {
-    // 本地日历条目（即将播出 / 刚播完）单独占用额外名额，
-    // 否则继续观看满 20 条时它们会被 slice 全部裁掉，等于白算
-    const localPart = out.filter(isLocalAirItem).slice(0, CW_LOCAL_EXTRA_CAP);
-    const normalPart = out.filter((x) => !isLocalAirItem(x));
-    result = normalPart.slice(0, cap).concat(localPart);
+    // 「继续观看」优先占满主列表；「即将播出」单独占额外名额，
+    // 否则继续观看满 20 条时它们会被 slice 全部裁掉，等于白算。
+    const normalPart = out.filter((x) => !isUpcomingItem(x));
+    const upcomingPart = out
+      .filter(isUpcomingItem)
+      .slice(0, CW_LOCAL_EXTRA_CAP);
+    result = normalPart.slice(0, cap).concat(upcomingPart);
   }
   if (autoUnhide.size) {
     Object.defineProperty(result, "__autoUnhide", {
@@ -7667,8 +7737,16 @@ function isCwHiddenEntry(entry, hideMap) {
   if (sid == null) return false;
   const h = hideMap[String(sid)] || hideMap[sid];
   if (!h || typeof h !== "object") return false;
+  // 本地日历条目（即将播出 / 刚播完）的 paused_at 是「未来的播出时间」，
+  // 拿它和隐藏时间比必然更大，会让隐藏过的剧每推一集就自己冒回来。
+  const isLocal = !!(entry.__localUpcoming || entry.__localAired);
   const pausedAt = entry.paused_at ? Date.parse(entry.paused_at) : NaN;
-  if (h.at && Number.isFinite(pausedAt) && pausedAt > Number(h.at)) {
+  if (
+    !isLocal &&
+    h.at &&
+    Number.isFinite(pausedAt) &&
+    pausedAt > Number(h.at)
+  ) {
     return false;
   }
   const ep =
@@ -7684,7 +7762,7 @@ function isCwHiddenEntry(entry, hideMap) {
     Number.isFinite(hs) &&
     Number.isFinite(hn) &&
     (s > hs || (s === hs && n > hn));
-  if (newer) {
+  if (newer && !isLocal) {
     const fa = ep.first_aired ? Date.parse(ep.first_aired) : NaN;
     const lw = entry.last_watched_at
       ? Date.parse(entry.last_watched_at)
@@ -10770,14 +10848,10 @@ function renderContinueItems(upNext, mode = "grid") {
     }
   }
   items.sort((a, b) => {
-    const loc = (x) =>
-      !!(
-        x &&
-        x.raw &&
-        (x.raw.__localUpcoming || x.raw.__localAired || x.source === "localair")
-      );
-    if (loc(a) !== loc(b)) return loc(a) ? 1 : -1;
-    if (loc(a) && loc(b)) {
+    // 与后端保持一致：继续观看在前，「即将播出」压到最末
+    const up = (x) => !!(x && x.raw && x.raw.__localUpcoming);
+    if (up(a) !== up(b)) return up(a) ? 1 : -1;
+    if (up(a) && up(b)) {
       const fa =
         Date.parse((a.raw && a.raw.__firstAired) || a.sortKey || "") || 0;
       const fb =
