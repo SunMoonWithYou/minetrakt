@@ -1,4 +1,4 @@
-const APP_VERSION = "6.7.0";
+const APP_VERSION = "6.7.7";
 const APP_JS_VERSION = APP_VERSION;
 const APP_CSS_VERSION = APP_VERSION;
 const TRAKT_AUTH = "https://auth.trakt.tv";
@@ -613,14 +613,22 @@ function markTraktRateLimited(ms, userKey, source = "trakt") {
   const k = userKey || "__anon__";
   const strikes = (__traktStrikes.get(k) || 0) + 1;
   __traktStrikes.set(k, strikes);
-  const exp = Math.min(
-    TRAKT_RATE_LIMIT_MAX_COOLDOWN,
-    TRAKT_RATE_LIMIT_COOLDOWN * Math.pow(2, strikes - 1),
-  );
-  const wait = Math.max(
-    exp,
-    Math.min(Number(ms) || 0, TRAKT_RATE_LIMIT_MAX_COOLDOWN),
-  );
+  const given = Math.min(Number(ms) || 0, TRAKT_RATE_LIMIT_MAX_COOLDOWN);
+  let wait;
+  if (source === "cloudflare") {
+    // Cloudflare 拦截（1015 等）不透传 Retry-After，维持最长冷却
+    wait = Math.max(given, TRAKT_RATE_LIMIT_MAX_COOLDOWN);
+  } else if (given > 0) {
+    // Trakt 明确给了 Retry-After：严格执行（+1s 缓冲），不再指数放大，
+    // 避免一次 429 把后续几分钟全部短路成"冷却中"
+    wait = Math.min(given + 1000, TRAKT_RATE_LIMIT_MAX_COOLDOWN);
+  } else {
+    // 无 Retry-After 的未知限流才使用指数退避
+    wait = Math.min(
+      TRAKT_RATE_LIMIT_MAX_COOLDOWN,
+      TRAKT_RATE_LIMIT_COOLDOWN * Math.pow(2, strikes - 1),
+    );
+  }
   const until = Date.now() + wait;
   const cur = __traktRateLimitByUser.get(k) || 0;
   if (until > cur) __traktRateLimitByUser.set(k, until);
@@ -849,6 +857,7 @@ async function __traktFetchInner(
   errShape,
 ) {
   let lastErr = null;
+  let waitedOn429 = false;
   for (let i = 0; i <= retries; i++) {
     try {
       const r = await fetchT(url, { headers }, timeout, userKey);
@@ -862,7 +871,14 @@ async function __traktFetchInner(
         };
       }
       if (r.status === 429) {
-
+        const ra = parseInt(r.headers.get("Retry-After") || "", 10);
+        const shortWait = Number.isFinite(ra) && ra > 0 && ra <= 5;
+        if (!r.headers.get("cf-mitigated") && shortWait && !waitedOn429) {
+          // 服务器只要求等几秒：原地等待后重试一次，而不是把本次请求直接判失败
+          waitedOn429 = true;
+          await sleep(Math.min(ra * 1000, 5000) + 250);
+          continue;
+        }
         if (r.headers.get("cf-mitigated"))
           markTraktRateLimited(TRAKT_RATE_LIMIT_MAX_COOLDOWN, userKey, "cloudflare");
         else consumeRetryAfter(r, userKey);
@@ -881,6 +897,17 @@ async function __traktFetchInner(
           : null;
       }
       if (r.status === 403) {
+        // Cloudflare 1015（IP 限流）经常以 403 + HTML 错误页返回，按限流处理
+        let bodyText = "";
+        try { bodyText = await r.text(); } catch {}
+        if (/error code:\s*1015|cf-ray/i.test(bodyText)) {
+          markTraktRateLimited(TRAKT_RATE_LIMIT_MAX_COOLDOWN, userKey, "cloudflare");
+          return {
+            __error: "HTTP 403 (cloudflare)",
+            __cooling: traktRateLimitedRemaining(userKey),
+            ...errShape,
+          };
+        }
         return { __error: "HTTP 403", ...errShape };
       }
       if (!r.ok) {
@@ -913,6 +940,62 @@ function traktLiveSerial(fn) {
   __traktLiveQ = run.then(() => {}, () => {});
   return run;
 }
+
+// ---- 传输层微缓存 + 并发去重：同一 URL 短时间内的重复请求不再打到 Trakt ----
+const TRAKT_MICRO_TTL_MS = 45000;
+const TRAKT_MICRO_STALE_MS = 10 * 60 * 1000;
+const TRAKT_MICRO_MAX = 300;
+const __traktMicro = new Map();
+const __traktInflightURL = new Map();
+
+function __traktMicroKey(userKey, url) {
+  return (userKey || "__anon__") + "|" + url;
+}
+function __traktMicroGet(key, { allowStale = false } = {}) {
+  const e = __traktMicro.get(key);
+  if (!e) return null;
+  const age = Date.now() - e.ts;
+  if (age > TRAKT_MICRO_STALE_MS) {
+    __traktMicro.delete(key);
+    return null;
+  }
+  if (age > TRAKT_MICRO_TTL_MS && !allowStale) return null;
+  return e.data;
+}
+function __traktMicroPut(key, data) {
+  if (data == null || typeof data !== "object") return;
+  if (__traktMicro.size >= TRAKT_MICRO_MAX) {
+    const now = Date.now();
+    for (const [k, v] of __traktMicro) {
+      if (now - v.ts > TRAKT_MICRO_STALE_MS) __traktMicro.delete(k);
+    }
+    if (__traktMicro.size >= TRAKT_MICRO_MAX) {
+      const first = __traktMicro.keys().next().value;
+      if (first !== undefined) __traktMicro.delete(first);
+    }
+  }
+  __traktMicro.set(key, { data, ts: Date.now() });
+}
+function __cloneTraktData(data) {
+  if (Array.isArray(data)) {
+    const out = data.slice();
+    const pc = data.__pageCount;
+    if (pc !== undefined)
+      Object.defineProperty(out, "__pageCount", {
+        value: pc,
+        enumerable: false,
+      });
+    return out;
+  }
+  if (data && typeof data === "object") return { ...data };
+  return data;
+}
+function __staleClone(data) {
+  const d = __cloneTraktData(data);
+  if (d && typeof d === "object" && !Array.isArray(d)) d.__stale = true;
+  return d;
+}
+
 async function traktFetch(
   url,
   headers,
@@ -925,35 +1008,67 @@ async function traktFetch(
   } = {},
 ) {
   const errShape = wantPageCount ? { __pageCount: 1 } : {};
-  if (isTraktRateLimited(userKey)) {
-    return {
-      __error: "429 rate limited",
-      __cooling: traktRateLimitedRemaining(userKey),
-      ...errShape,
-    };
-  }
+  const mkey = __traktMicroKey(userKey, url);
 
-  const waitMs = traktBudgetCheck(userKey);
-  if (waitMs > 0) {
-    __sweepTraktBudget();
-    return {
-      __error: "budget exceeded",
-      __budget: true,
-      __cooling: Math.ceil(waitMs / 1000),
-      ...errShape,
-    };
-  }
-  traktBudgetTake(userKey);
-  try {
-    return await traktLiveSerial(() => __traktFetchInner(
-      url,
-      headers,
-      { retries, timeout, userKey, wantPageCount, backoffBase },
-      errShape,
-    ));
-  } finally {
-    traktBudgetRelease();
-  }
+  // 1) 并发去重：同一 URL 的在途请求直接复用，不消耗预算
+  const infl = __traktInflightURL.get(mkey);
+  if (infl) return infl;
+
+  // 2) 微缓存命中：45 秒内同一 URL 不重复请求
+  const fresh = __traktMicroGet(mkey);
+  if (fresh) return __cloneTraktData(fresh);
+
+  const run = (async () => {
+    // 3) 限流冷却中：优先返回过期缓存（最长 10 分钟），而不是硬报错
+    if (isTraktRateLimited(userKey)) {
+      const stale = __traktMicroGet(mkey, { allowStale: true });
+      if (stale) return __staleClone(stale);
+      return {
+        __error: "429 rate limited",
+        __cooling: traktRateLimitedRemaining(userKey),
+        ...errShape,
+      };
+    }
+
+    // 4) 预算小幅超限（≤2s）：短暂等待后重查，不再直接判失败
+    let waitMs = traktBudgetCheck(userKey);
+    if (waitMs > 0 && waitMs <= 2000) {
+      __sweepTraktBudget();
+      await sleep(waitMs + 50);
+      waitMs = traktBudgetCheck(userKey);
+    }
+    if (waitMs > 0) {
+      const stale = __traktMicroGet(mkey, { allowStale: true });
+      if (stale) return __staleClone(stale);
+      return {
+        __error: "budget exceeded",
+        __budget: true,
+        __cooling: Math.ceil(waitMs / 1000),
+        ...errShape,
+      };
+    }
+    traktBudgetTake(userKey);
+    try {
+      const res = await traktLiveSerial(() => __traktFetchInner(
+        url,
+        headers,
+        { retries, timeout, userKey, wantPageCount, backoffBase },
+        errShape,
+      ));
+      if (res && !res.__error) __traktMicroPut(mkey, res);
+      return res;
+    } finally {
+      traktBudgetRelease();
+    }
+  })();
+
+  __traktInflightURL.set(mkey, run);
+  const __cleanup = () => {
+    const cur = __traktInflightURL.get(mkey);
+    if (cur === run) __traktInflightURL.delete(mkey);
+  };
+  run.then(__cleanup, __cleanup);
+  return run;
 }
 
 const traktGet = (url, headers, retries = 2, userKey) =>
@@ -1620,6 +1735,7 @@ self.addEventListener("fetch", function (event) {
   if (
     url.pathname === "/app.css" ||
     url.pathname === "/app.js" ||
+    url.pathname === "/img" ||
     url.pathname === "/manifest.webmanifest" ||
     url.pathname === "/favicon.ico" ||
     url.pathname.indexOf("/assets/") === 0 ||
@@ -1756,6 +1872,7 @@ export default {
     if (path === "/app.js") return handleAppJs(request);
     if (path === "/favicon.ico") return Response.redirect(FAVICON_URL, 302);
     if (path === "/avatar") return handleAvatar(request, ctx);
+    if (path === "/img") return handleImg(request, ctx);
     if (path === "/logo") return handleLogo(request, ctx);
     if (path === "/manifest.webmanifest") return handleManifest();
     if (path === "/sw.js") return handleServiceWorker();
@@ -2015,6 +2132,66 @@ async function handleAvatar(request, ctx) {
     headers: {
       "Content-Type": r.headers.get("Content-Type") || "image/jpeg",
       "Cache-Control": "public, max-age=86400, immutable",
+    },
+  });
+  if (cache && ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(cache.put(cacheKey, resp.clone()).catch(() => {}));
+  }
+  return resp;
+}
+
+// 把 image.tmdb.org 的图片 URL 改写为走本 Worker 的 /img 代理。
+// image.tmdb.org 在部分地区直连很慢且不稳定；走代理后首次回源、
+// 之后命中 Cloudflare 边缘缓存 + 浏览器长缓存，海报基本秒出。
+function tmdbProxyUrl(u) {
+  if (u && typeof u === "string" && u.startsWith("https://image.tmdb.org/"))
+    return "/img?u=" + encodeURIComponent(u);
+  return u;
+}
+
+// TMDB 图片代理：仅允许 image.tmdb.org/t/p/ 路径，防止被当成开放代理
+async function handleImg(request, ctx) {
+  const raw = new URL(request.url).searchParams.get("u") || "";
+  let target;
+  try {
+    target = new URL(raw);
+  } catch {
+    return new Response("bad url", { status: 400 });
+  }
+  if (
+    target.protocol !== "https:" ||
+    target.hostname !== "image.tmdb.org" ||
+    !target.pathname.startsWith("/t/p/")
+  )
+    return new Response("forbidden", { status: 403 });
+  let cache = null;
+  try {
+    cache = caches.default;
+  } catch {}
+  const cacheKey = new Request(target.toString(), { method: "GET" });
+  if (cache) {
+    try {
+      const hit = await cache.match(cacheKey);
+      if (hit) return hit;
+    } catch {}
+  }
+  let r;
+  try {
+    r = await fetch(target.toString(), {
+      headers: { "User-Agent": traktAuthUa() },
+    });
+  } catch {
+    return new Response("bad gateway", { status: 502 });
+  }
+  if (!r.ok)
+    return new Response("not found", { status: r.status === 404 ? 404 : 502 });
+  const resp = new Response(r.body, {
+    status: 200,
+    headers: {
+      "Content-Type": r.headers.get("Content-Type") || "image/jpeg",
+      // TMDB 同一路径的图片内容不变，浏览器可以放心长期缓存
+      "Cache-Control": "public, max-age=31536000, immutable",
+      "Access-Control-Allow-Origin": "*",
     },
   });
   if (cache && ctx && typeof ctx.waitUntil === "function") {
@@ -4295,7 +4472,7 @@ async function attachEntityPosters(list, env, ctx, imgKey, maxFetch = 30) {
             TMDB_KV_TTL,
           );
           if (data && data.poster_path) {
-            const url = tmdbPoster(data.poster_path, "w780");
+            const url = tmdbPoster(data.poster_path, "w342");
             j.entity.__posterUrl = url;
             j.item.__posterUrl = url;
             const old = map[j.k] || {};
@@ -4354,7 +4531,7 @@ async function attachWatchlistStills(list, env, ctx, userKey, opts = {}) {
               TMDB_KV_TTL,
             );
             if (data && data.poster_path) {
-              const url = tmdbPoster(data.poster_path, "w780");
+              const url = tmdbPoster(data.poster_path, "w342");
               j.entity.__posterUrl = url;
               j.item.__posterUrl = url;
               const old = imgMap[j.k] || {};
@@ -4602,7 +4779,7 @@ function mapDoubanItem(x) {
     title: x.title || "",
     year: (x.releaseDate || "").slice(0, 4),
     poster: x.posterPath
-      ? `https://image.tmdb.org/t/p/w780${x.posterPath}`
+      ? `https://image.tmdb.org/t/p/w342${x.posterPath}`
       : null,
     overview: x.description || "",
     rating: Number(x.rating) || 0,
@@ -4894,7 +5071,7 @@ function pickTheaterSection(data, platform) {
       ).slice(0, 4),
       poster:
         x.posterPath || x.poster_path
-          ? `https://image.tmdb.org/t/p/w780${x.posterPath || x.poster_path}`
+          ? `https://image.tmdb.org/t/p/w342${x.posterPath || x.poster_path}`
           : x.poster || x.cover || x.image || null,
       overview: x.description || x.overview || x.summary || "",
       platform: theaterPlatformOf(x),
@@ -5023,7 +5200,7 @@ function mapGuduoItem(x) {
     title: x.title || "",
     year: String(x.releaseDate || x.year || "").slice(0, 4),
     poster: x.posterPath
-      ? `https://image.tmdb.org/t/p/w780${x.posterPath}`
+      ? `https://image.tmdb.org/t/p/w342${x.posterPath}`
       : x.poster || null,
     overview: x.description || x.overview || "",
     rating: Number(x.rating) || 0,
@@ -5372,7 +5549,7 @@ async function loadPlatformPreviews(env, ctx, force) {
         items[pid] = (r.items || [])
           .filter((x) => x.poster)
           .slice(0, 5)
-          .map((x) => x.poster.replace("/w185", "/w780"));
+          .map((x) => x.poster);
       } catch {
 
         items[pid] = [];
@@ -5449,7 +5626,7 @@ async function handlePlatformList(request, env, ctx) {
         posters = (r.items || [])
           .filter((x) => x.poster)
           .slice(0, 5)
-          .map((x) => x.poster.replace("/w185", "/w780"));
+          .map((x) => x.poster);
       } catch {
         posters = [];
       }
@@ -7100,6 +7277,19 @@ function launchLinkHeader(request) {
   return parts.join(", ");
 }
 
+// 首页/登录页共用的预加载 Link 头：
+// Cloudflare 会把 HTML 响应上的 Link 头转成 103 Early Hints，
+// 浏览器在收到 HTML 正文前就能开始下载 app.js / app.css（约省 1 个 RTT）
+function assetPreloadLinkHeader() {
+  return [
+    "<https://api.trakt.tv>; rel=preconnect; crossorigin",
+    "<https://api.themoviedb.org>; rel=preconnect; crossorigin",
+    "<https://image.tmdb.org>; rel=preconnect",
+    `</app.css?v=${APP_CSS_VERSION}>; rel=preload; as=style`,
+    `</app.js?v=${APP_JS_VERSION}>; rel=preload; as=script`,
+  ].join(", ");
+}
+
 function handleLaunch(request) {
   return new Response(renderLaunchPage(request), {
     headers: {
@@ -7115,7 +7305,10 @@ function handleLaunch(request) {
 function handleLogin(request) {
   const url = new URL(request.url);
   if (readAuth(request)) return Response.redirect(new URL("/home", url), 302);
-  return html(renderLoginPage());
+  const resp = html(renderLoginPage());
+  // 登录页同样走 app.js/app.css，提前下发 Early Hints
+  resp.headers.set("Link", assetPreloadLinkHeader());
+  return resp;
 }
 
 function handleAuthStatus(request) {
@@ -7145,7 +7338,7 @@ function streamHomeShell(initialDetail, profileHint) {
       try {
         controller.enqueue(
           enc.encode(
-            `<!DOCTYPE html><html lang="zh-CN" data-theme="dark"><head>${commonHeadMeta()}<link rel="preload" href="/app.css?v=${APP_CSS_VERSION}" as="style"><link rel="modulepreload" href="/app.js?v=${APP_JS_VERSION}"><link rel="stylesheet" href="/app.css?v=${APP_CSS_VERSION}"><style>${splashCriticalCss()}</style><script>window.__splashT0=Date.now();window.__splashHidden=false;window.__primaryBootP=null;try{window.__primaryBootP=fetch('/api/home-data?part=playback',{credentials:'same-origin',cache:'no-store'}).then(function(r){if(r.status===401){location.href='/login';return null;}if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){window.__primaryBoot=d;return d;}).catch(function(){return null;});}catch(e){}</script></head><body style="background:var(--bg-solid,#000000);margin:0;min-height:100vh;min-height:100dvh">${renderSplash()}`,
+            `<!DOCTYPE html><html lang="zh-CN" data-theme="dark"><head>${commonHeadMeta()}<link rel="preload" href="/app.css?v=${APP_CSS_VERSION}" as="style" fetchpriority="high"><link rel="modulepreload" href="/app.js?v=${APP_JS_VERSION}" fetchpriority="high"><link rel="stylesheet" href="/app.css?v=${APP_CSS_VERSION}"><style>${splashCriticalCss()}</style><script>window.__splashT0=Date.now();window.__splashHidden=false;window.__primaryBootP=null;try{window.__primaryBootP=fetch('/api/home-data?part=playback',{credentials:'same-origin',cache:'no-store'}).then(function(r){if(r.status===401){location.href='/login';return null;}if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){window.__primaryBoot=d;return d;}).catch(function(){return null;});}catch(e){}window.__metaBootP=null;try{window.__metaBootP=fetch('/api/home-data?part=meta',{credentials:'same-origin',cache:'no-store'}).then(function(r){if(!r.ok)return null;return r.json();}).catch(function(){return null;});}catch(e){}</script></head><body style="background:var(--bg-solid,#000000);margin:0;min-height:100vh;min-height:100dvh">${renderSplash()}`,
           ),
         );
         controller.enqueue(
@@ -7173,6 +7366,7 @@ function streamHomeShell(initialDetail, profileHint) {
       Pragma: "no-cache",
       Expires: "0",
       "X-Content-Type-Options": "nosniff",
+      Link: assetPreloadLinkHeader(),
     },
   });
 }
@@ -8416,6 +8610,12 @@ async function handleHomeData(request, env, ctx) {
         watchedBypass,
       ).catch(() => null);
 
+      // 已看电影 ID 提前与 playback 主请求并行拉取（KV 命中时近乎免费，
+      // 未命中时省掉一次「playback 完成后再串行等它」的往返）
+      const watchedIdsP = getWatchedMovieIds(headers, env, ctx, userKey).catch(
+        () => null,
+      );
+
       const rawPb = await cachedJSON(
         env,
         ctx,
@@ -8529,12 +8729,7 @@ async function handleHomeData(request, env, ctx) {
 
         let watchedMovieIds = null;
         try {
-          watchedMovieIds = await getWatchedMovieIds(
-            headers,
-            env,
-            ctx,
-            userKey,
-          ).catch(() => null);
+          watchedMovieIds = await watchedIdsP;
         } catch {}
 
         playback = mergeContinueLists(
@@ -9540,11 +9735,11 @@ async function handlePerson(request, env, ctx) {
 
 async function handleSeason(request, env, ctx) {
   const url = new URL(request.url),
-    showId = url.searchParams.get("show") || "",
     seasonNum = parseInt(url.searchParams.get("season") || "0"),
     tmdbId = url.searchParams.get("tmdb"),
     slug = url.searchParams.get("slug") || "",
     forceSeason = url.searchParams.get("force") === "1";
+  let showId = url.searchParams.get("show") || "";
   if (isNaN(seasonNum) || (!showId && !tmdbId))
     return new Response("bad params", { status: 400 });
   if (tmdbId && !/^\d{1,12}$/.test(tmdbId))
@@ -10527,7 +10722,7 @@ function posterOfTrakt(obj) {
     if (!arr || !Array.isArray(arr) || !arr.length) return null;
     if (typeof arr[0] === "string") return arr[0];
     if (typeof arr[0] === "object")
-      return arr[0].full || arr[0].medium || arr[0].thumb || null;
+      return arr[0].medium || arr[0].full || arr[0].thumb || null;
     return null;
   };
   return (
@@ -10979,6 +11174,8 @@ function mediaItem(opts) {
   const calendarBtnHtml = calendarBtns
     ? `<div class="cal-action-row">${calendarBtns}</div>`
     : "";
+  // TMDB 海报统一走 /img 代理（边缘缓存），直连 image.tmdb.org 在部分地区很慢
+  const posterSrc = tmdbProxyUrl(opts.poster);
   const lockPosterAttr =
     opts.lockPoster || opts.hasPoster ? ` data-lock-poster="1"` : "";
   const timeBadgeHtml = opts.timeBadge
@@ -10987,7 +11184,7 @@ function mediaItem(opts) {
     const finaleBadgeHtml = opts.finaleBadge
       ? `<span class="cal-finale-badge">大结局</span>`
       : "";
-  return `<div class="item${clickable}"${dataAttrs}${enrichAttrs}${lockPosterAttr}${opts.itemAttrs || ""}${style}>${removeHtml}${watchedHtml}${unwatchHtml}<div class="poster">${opts.poster ? `<img src="${opts.poster}" loading="lazy" decoding="async" alt="" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"><div class="poster-ph" style="display:none"><span>${opts.tagClass === "movie" ? "🎬" : "📺"}</span></div>` : `<div class="poster-ph"><span>${opts.tagClass === "movie" ? "🎬" : "📺"}</span></div>`}${finaleBadgeHtml}${timeBadgeHtml}${playHtml}${dropHtml}</div><div class="info"><div class="name-row"><span class="name">${esc(opts.title)}</span>${rewatchBadge}${tagHtml}</div>${opts.line1 ? `<div class="meta">${esc(opts.line1)}</div>` : ""}${opts.overview ? `<div class="overview">${esc(opts.overview)}</div>` : ""}${opts.line2 ? `<div class="meta dim">${esc(opts.line2)}</div>` : ""}${bar}${cwActionsHtml}${calendarBtnHtml}</div></div>`;
+  return `<div class="item${clickable}"${dataAttrs}${enrichAttrs}${lockPosterAttr}${opts.itemAttrs || ""}${style}>${removeHtml}${watchedHtml}${unwatchHtml}<div class="poster">${posterSrc ? `<img src="${posterSrc}" loading="lazy" decoding="async" alt="" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"><div class="poster-ph" style="display:none"><span>${opts.tagClass === "movie" ? "🎬" : "📺"}</span></div>` : `<div class="poster-ph"><span>${opts.tagClass === "movie" ? "🎬" : "📺"}</span></div>`}${finaleBadgeHtml}${timeBadgeHtml}${playHtml}${dropHtml}</div><div class="info"><div class="name-row"><span class="name">${esc(opts.title)}</span>${rewatchBadge}${tagHtml}</div>${opts.line1 ? `<div class="meta">${esc(opts.line1)}</div>` : ""}${opts.overview ? `<div class="overview">${esc(opts.overview)}</div>` : ""}${opts.line2 ? `<div class="meta dim">${esc(opts.line2)}</div>` : ""}${bar}${cwActionsHtml}${calendarBtnHtml}</div></div>`;
 }
 
 function renderHistoryPage(items, env, isFragment) {
@@ -11569,7 +11766,7 @@ function renderContinueItems(upNext, mode = "grid") {
       const clickable = e.detailType && e.detailId ? " clickable" : "";
       const style = delay ? ` style="animation-delay:${delay}ms"` : "";
       const posterHtml = coverImg
-        ? `<img src="${coverImg}" loading="lazy" decoding="async" alt="" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"><div class="poster-ph" style="display:none"><span>${isMovie ? "🎬" : "📺"}</span></div>`
+        ? `<img src="${tmdbProxyUrl(coverImg)}" loading="lazy" decoding="async" alt="" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"><div class="poster-ph" style="display:none"><span>${isMovie ? "🎬" : "📺"}</span></div>`
         : `<div class="poster-ph"><span>${isMovie ? "🎬" : "📺"}</span></div>`;
       const playHtml = playHref
         ? `<a class="poster-play" href="${esc(playHref)}" rel="noopener" aria-label="在 Infuse 中播放" title="在 Infuse 中播放" onclick="event.stopPropagation()"><svg viewBox="0 0 24 24" width="26" height="26" fill="currentColor" stroke="none"><path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11.04-6.86a1 1 0 0 0 0-1.72L9.5 4.28A1 1 0 0 0 8 5.14z"/></svg></a>`
@@ -11859,10 +12056,9 @@ function renderCalendarPage(calendar, env, zhTitles) {
         zhTitle = showTraktId != null && zhTitles ? zhTitles[showTraktId] : null,
         displayTitle = zhTitle || e.title || "未知节目";
       let posterUrl = e.poster || "";
-      if (posterUrl.includes("/w185/")) posterUrl = posterUrl.replace("/w185/", "/w780/");
-      else if (posterUrl.includes("/w342/")) posterUrl = posterUrl.replace("/w342/", "/w780/");
-      else if (posterUrl.includes("/w500/")) posterUrl = posterUrl.replace("/w500/", "/w780/");
-      else if (posterUrl.includes("/medium/")) posterUrl = posterUrl.replace("/medium/", "/full/");
+      if (posterUrl.includes("/w185/")) posterUrl = posterUrl.replace("/w185/", "/w342/");
+      else if (posterUrl.includes("/w500/")) posterUrl = posterUrl.replace("/w500/", "/w342/");
+      else if (posterUrl.includes("/w780/")) posterUrl = posterUrl.replace("/w780/", "/w342/");
       return mediaItem({
         poster: posterUrl || e.poster,
         tagClass: "upcoming",
@@ -13132,7 +13328,7 @@ function launchLogoSvg() {
 function launchCriticalCss() {
   const B = "box-sizing:border-box";
   return (
-    `html,body{background:#000!important;color:#eef1f7;margin:0;padding:0;width:100%;height:100%;min-width:100%;min-height:100%;min-height:100vh;min-height:100dvh;min-height:-webkit-fill-available;min-height:calc(100dvh + env(safe-area-inset-bottom,0px));overflow:hidden}` +
+    `html,body{background:#000!important;color:#eef1f7;margin:0;padding:0;width:100%;height:100%;min-width:100%;min-height:100%;min-height:100vh;min-height:100dvh;min-height:-webkit-fill-available;min-height:calc(100dvh + env(safe-area-inset-bottom,0px));overflow:hidden;overscroll-behavior:none}` +
     `*{${B}}` +
     `.splash,.splash-persist{position:fixed!important;top:0;left:0;right:0;bottom:0;bottom:calc(-1 * env(safe-area-inset-bottom,0px));width:100%;min-width:100%;height:auto;min-height:100%;min-height:100vh;min-height:100dvh;min-height:-webkit-fill-available;min-height:calc(100dvh + env(safe-area-inset-bottom,0px));padding:0;padding-bottom:env(safe-area-inset-bottom,0px);box-sizing:border-box;z-index:99999;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000;}` +
     `.splash-inner{position:relative;z-index:1;display:flex;flex-direction:column;align-items:center;gap:16px}` +
@@ -13209,7 +13405,7 @@ function commonHeadMeta() {
 }
 
 function pageHeadEarly() {
-  return `<!DOCTYPE html><html lang="zh-CN" data-theme="dark"><head>${commonHeadMeta()}<link rel="preload" as="script" href="/app.js?v=${APP_JS_VERSION}"><link rel="preload" href="/app.css?v=${APP_CSS_VERSION}" as="style"><link rel="stylesheet" href="/app.css?v=${APP_CSS_VERSION}"><style>${splashCriticalCss()}</style></head><body style="background:var(--bg-solid,#000000);margin:0;min-height:100vh;min-height:100dvh">${renderSplash()}`;
+  return `<!DOCTYPE html><html lang="zh-CN" data-theme="dark"><head>${commonHeadMeta()}<link rel="preload" as="script" href="/app.js?v=${APP_JS_VERSION}" fetchpriority="high"><link rel="preload" href="/app.css?v=${APP_CSS_VERSION}" as="style" fetchpriority="high"><link rel="stylesheet" href="/app.css?v=${APP_CSS_VERSION}"><style>${splashCriticalCss()}</style></head><body style="background:var(--bg-solid,#000000);margin:0;min-height:100vh;min-height:100dvh">${renderSplash()}`;
 }
 
 function pageTail() {
@@ -13245,7 +13441,7 @@ function pageShell(body) {
 }
 
 function splashCriticalCss() {
-  return `html,body{background:var(--bg-solid,#000);color:var(--text,#eef1f7);margin:0;padding:0;min-height:100%;min-height:100dvh}
+  return `html,body{background:var(--bg-solid,#000);color:var(--text,#eef1f7);margin:0;padding:0;min-height:100%;min-height:100dvh;overscroll-behavior:none}
 *{box-sizing:border-box}
 .splash{position:fixed;top:0;left:0;right:0;bottom:calc(-1 * env(safe-area-inset-bottom,0px));width:100%;min-height:100%;min-height:100dvh;min-height:-webkit-fill-available;min-height:calc(100dvh + env(safe-area-inset-bottom,0px));padding-bottom:env(safe-area-inset-bottom,0px);box-sizing:border-box;z-index:99999;display:flex;align-items:center;justify-content:center;overflow:hidden;transition:opacity .18s ease;background:var(--splash-bg,#000);}
 .splash.hide{opacity:0;pointer-events:none;animation:none}
@@ -13369,7 +13565,7 @@ document.addEventListener('click',function(e){
 
 function applyPlayback(d,isCache){
   if(!d)return;
-  if(d.playbackHScrollHtml){window.__lastPbHtml=d.playbackHScrollHtml;setHTML('#playback-hscroll',d.playbackHScrollHtml);}
+  if(d.playbackHScrollHtml){var __pbSame=window.__lastPbHtml===d.playbackHScrollHtml;window.__lastPbHtml=d.playbackHScrollHtml;if(!__pbSame)setHTML('#playback-hscroll',d.playbackHScrollHtml);}
   else{setHTML('#playback-hscroll','<div class="empty" style="padding:50px 20px"><p style="margin:0;font-size:.92rem">暂无继续观看</p></div>');}
   try{__rememberCwTimes(d);}catch(e){}
   var src=isCache?'cache':(d.playbackSource||'');
@@ -13470,7 +13666,9 @@ window.__fetchPart=fetchPart;function loadPartOnce(part){if(__loadedParts[part])
       window.__primaryBootP=null;
       if(d){
         onPlayback(d,d.playbackSource==='cache'?'cache':'live');
-        setTimeout(function(){
+        // 首屏已经是 live 新鲜数据时不再于 2.5s 后重复拉取：
+        // 重复拉取会拿到相同 HTML 再重渲染一遍（继续观看闪一下），还白耗 Trakt 配额
+        if(d.playbackSource!=='live')setTimeout(function(){
           if(window.__forceRefreshing||window.__silentRefreshing)return;
           fetchLive().catch(function(){});
         },2500);
@@ -13488,7 +13686,12 @@ window.__fetchPart=fetchPart;function loadPartOnce(part){if(__loadedParts[part])
       var cachedMeta=lsGet('mt:meta');
       if(cachedMeta)setTimeout(function(){try{applyMeta(cachedMeta,true);}catch(e){}},0);
     }
-    var runMeta=function(){fetchPart('meta').then(function(d){applyMeta(d,false);}).catch(function(){});};
+    var runMeta=function(){
+      var boot=window.__metaBootP;window.__metaBootP=null;
+      var fallback=function(){fetchPart('meta').then(function(d){applyMeta(d,false);}).catch(function(){});};
+      if(boot){boot.then(function(d){if(d&&!d.login&&!d.__error)applyMeta(d,false);else fallback();}).catch(fallback);}
+      else fallback();
+    };
     if(window.requestIdleCallback)requestIdleCallback(runMeta,{timeout:1500});
     else setTimeout(runMeta,200);
   });
@@ -13543,6 +13746,7 @@ function getClientSideScripts() {
   return (
     getBootstrapScript() +
     `function __esc(s){s=String(s==null?'':s);return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+function __imgProxy(u){return (u&&String(u).indexOf('https://image.tmdb.org/')===0)?'/img?u='+encodeURIComponent(u):u;}
 var __toastSeen={};
 function __toastOnce(key,message,opts){
   if(!message)return;
@@ -13950,6 +14154,8 @@ window.__fetchPartForTab = __fetchPartForTab;
     setTimeout(syncTabPill,120);
   });
 })();
+// boot 时立即用本地快照渲染隐藏面板：切换标签零等待（不产生任何网络请求）
+(function(){var parts=['watchlist','calendar','history'];for(var i=0;i<parts.length;i++){try{var p=parts[i];window.__loadedParts=window.__loadedParts||{};if(window.__loadedParts[p])continue;var snap=__loadPartSnap(p);if(snap&&!__partFailed(snap))__applyPart(p,snap);}catch(e){}}})();
 (function(){var order=['watchlist','calendar','history'],GAP=4000;function warm(i){if(i>=order.length||document.hidden)return;var p=order[i];function next(){setTimeout(function(){warm(i+1);},GAP);}var loaded=window.__loadedParts||{};if(loaded[p]&&!__partFailed(loaded[p])){next();return;}__fetchPartForTab(p).then(function(d){if(d)__applyPart(p,d);next();});}function start(){setTimeout(function(){warm(0);},1500);}if(window.requestIdleCallback)window.requestIdleCallback(start,{timeout:3000});else start();})();
 async function logout(){
   if(!(await __confirm({icon:'➜]',title:'退出登录',message:'确定要退出当前 Trakt 账号吗？',okText:'退出',cancelText:'取消',tone:'warn'})))return;
@@ -14568,7 +14774,7 @@ window.openTheaterPlatformList=function(platform){
     var html="",i;
     for(i=0;i<4;i++){
       if(posters&&posters[i]){
-        html+='<img class="platform-card-poster p'+i+'" src="'+posters[i]+'" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer">';
+        html+='<img class="platform-card-poster p'+i+'" src="'+__imgProxy(posters[i])+'" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer">';
       }else{
         html+='<span class="platform-card-poster p'+i+' platform-card-poster-ph"></span>';
       }
@@ -14956,7 +15162,7 @@ let __enrichTimer=null;
 const __enrichPromises=new Map();
 function __scheduleEnrich(){if(__enrichTimer)return;__enrichTimer=setTimeout(__runEnrich,60);}window.__scheduleEnrich=__scheduleEnrich;
 async function __runEnrich(){__enrichTimer=null;const els=[...document.querySelectorAll('[data-enrich-key]')];if(!els.length)return;const byKey=new Map();for(const el of els){const k=el.dataset.enrichKey;if(!k)continue;if(!byKey.has(k))byKey.set(k,[]);byKey.get(k).push(el);el.removeAttribute('data-enrich-key');}if(!byKey.size)return;const needFetch=[];for(const[k,group]of byKey.entries()){const existing=__enrichPromises.get(k);if(existing){existing.then(d=>{if(d)group.forEach(el=>__applyEnrich(el,d));});}else{needFetch.push(k);}}if(!needFetch.length)return;for(let bi=0;bi<needFetch.length;bi+=20){const chunk=needFetch.slice(bi,bi+20);const batchPromise=fetch('/api/enrich',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items:chunk.map(function(k){return{key:k};})})}).then(function(r){return r.ok?r.json():{};}).catch(function(){return{};});for(const k of chunk){const perKey=batchPromise.then(function(data){return(data&&data[k])||null;});__enrichPromises.set(k,perKey);perKey.then(function(d){var group=byKey.get(k)||[];if(d)group.forEach(function(el){__applyEnrich(el,d);});else{__enrichPromises.delete(k);group.forEach(function(el){if(!el.hasAttribute('data-enrich-key'))el.setAttribute('data-enrich-key',k);});}});}}if(__enrichPromises.size>400){const arr=[...__enrichPromises.keys()];for(let i=0;i<200;i++)__enrichPromises.delete(arr[i]);}}
-function __applyEnrich(el,d){const posterBox=el.querySelector('.cw-poster')||el.querySelector('.poster');const locked=el.getAttribute('data-lock-poster')==='1';if(posterBox&&d.poster&&!locked){let cur=posterBox.querySelector('img');if(cur){if(cur.complete&&cur.naturalWidth>0)return;if(cur.src!==d.poster){cur.src=d.poster;cur.style.display='';const ph=posterBox.querySelector('.poster-ph');if(ph)ph.style.display='none';}}else{cur=posterBox.querySelector('.poster-ph');if(cur){const img=document.createElement('img');img.src=d.poster;img.loading='lazy';img.alt='';img.onerror=function(){this.style.display='none';if(this.nextElementSibling)this.nextElementSibling.style.display='flex';};const ph=document.createElement('div');ph.className='poster-ph';ph.style.display='none';ph.innerHTML=cur.innerHTML;cur.replaceWith(img,ph);}}}if(d.title){const nameEl=el.querySelector('.name');if(nameEl)nameEl.textContent=d.title;const cwTitle=el.querySelector('.cw-title');if(cwTitle)cwTitle.textContent=d.title;}if(d.overview){const info=el.querySelector('.info');if(info){let ov=info.querySelector('.overview');if(!ov){ov=document.createElement('div');ov.className='overview';const meta=info.querySelector('.meta');if(meta&&meta.nextSibling)info.insertBefore(ov,meta.nextSibling);else info.appendChild(ov);}ov.textContent=d.overview;}}}
+function __applyEnrich(el,d){const posterBox=el.querySelector('.cw-poster')||el.querySelector('.poster');const locked=el.getAttribute('data-lock-poster')==='1';if(posterBox&&d.poster&&!locked){const proxiedPoster=__imgProxy(d.poster);let cur=posterBox.querySelector('img');if(cur){if(cur.complete&&cur.naturalWidth>0)return;if(cur.src!==proxiedPoster){cur.src=proxiedPoster;cur.style.display='';const ph=posterBox.querySelector('.poster-ph');if(ph)ph.style.display='none';}}else{cur=posterBox.querySelector('.poster-ph');if(cur){const img=document.createElement('img');img.src=proxiedPoster;img.loading='lazy';img.alt='';img.onerror=function(){this.style.display='none';if(this.nextElementSibling)this.nextElementSibling.style.display='flex';};const ph=document.createElement('div');ph.className='poster-ph';ph.style.display='none';ph.innerHTML=cur.innerHTML;cur.replaceWith(img,ph);}}}if(d.title){const nameEl=el.querySelector('.name');if(nameEl)nameEl.textContent=d.title;const cwTitle=el.querySelector('.cw-title');if(cwTitle)cwTitle.textContent=d.title;}if(d.overview){const info=el.querySelector('.info');if(info){let ov=info.querySelector('.overview');if(!ov){ov=document.createElement('div');ov.className='overview';const meta=info.querySelector('.meta');if(meta&&meta.nextSibling)info.insertBefore(ov,meta.nextSibling);else info.appendChild(ov);}ov.textContent=d.overview;}}}
 window.__summaryState={period:'month',ref:''};
 function __sumDefaultRef(period){var d=new Date(Date.now()+${BJ_OFFSET_MS});if(period==='year')return String(d.getUTCFullYear());return d.toISOString().slice(0,7);}
 function __sumHeatmax(days){var m=1;if(days)for(var i=0;i<days.length;i++)if(days[i].count>m)m=days[i].count;return m;}
